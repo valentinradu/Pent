@@ -86,6 +86,7 @@ impl FromStr for Profile {
 pub fn profile_requires(p: Profile) -> &'static [Profile] {
     static NODE_DEP: [Profile; 1] = [Profile::Node];
     static SSH_DEP: [Profile; 1] = [Profile::Ssh];
+    static KEYCHAIN_DEP: [Profile; 1] = [Profile::Keychain];
     static NODE_BASE_DEP: [Profile; 2] = [Profile::Node, Profile::Base];
     static NPM_SSH_GIT_DEP: [Profile; 3] = [Profile::Npm, Profile::Ssh, Profile::Git];
     static NPM_DEP: [Profile; 1] = [Profile::Npm];
@@ -95,6 +96,7 @@ pub fn profile_requires(p: Profile) -> &'static [Profile] {
         Profile::Gemini => &NODE_DEP,
         Profile::Npm => &NODE_BASE_DEP,
         Profile::Gh => &SSH_DEP,
+        Profile::Git => &KEYCHAIN_DEP,
         _ => &[],
     }
 }
@@ -369,16 +371,6 @@ fn profile_config(p: Profile) -> HaltConfig {
                         // GitHub CLI config (read for auth; @gh adds read_write if needed)
                         "~/.config/gh".to_string(),
                     ],
-                    // Git credential storage: osxkeychain on macOS, keyring daemons on Linux.
-                    // Without this, HTTPS git operations cannot read stored tokens.
-                    read_write: if macos {
-                        vec!["~/Library/Keychains".to_string()]
-                    } else {
-                        vec![
-                            "~/.local/share/keyrings".to_string(),
-                            "~/.local/share/kwalletd".to_string(),
-                        ]
-                    },
                     ..Default::default()
                 },
                 ..Default::default()
