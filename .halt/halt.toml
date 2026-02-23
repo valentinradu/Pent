@@ -6,6 +6,7 @@ traversal = [
     "~",
     "~/.local",
     "~/.ssh",
+    "~/.agents",
 ]
 read = [
     "~/.CFUserTextEncoding",
@@ -27,17 +28,22 @@ read = [
     "~/.config/git",
     "~/.gitconfig_local",
     "~/.config/gh",
+    "~/.agents/skills",
+    "~/.cargo/env",
 ]
 read_write = [
     "~/.npm",
-    "~/.cargo",
-    "~/.rustup",
     "~/.claude",
     "~/.claude.json*",
     "~/.claude.lock",
     "~/.local/share/claude",
     "~/Library/Application Support/claude",
     "~/.cache/claude",
+    "~/Library/Application Support/gemini-cli",
+    "~/.codex",
+    "~/.cargo",
+    "~/.rustup",
+    "~/Library/Keychains",
 ]
 
 [proxy]
@@ -47,4 +53,14 @@ domain_allowlist = [
     "api.anthropic.com",
     "statsig.anthropic.com",
     "sentry.io",
+    "generativelanguage.googleapis.com",
+    "aiplatform.googleapis.com",
+    "cloudresourcemanager.googleapis.com",
+    "oauth2.googleapis.com",
+    "accounts.google.com",
+    "api.openai.com",
+    "*.openai.com",
+    "crates.io",
+    "static.crates.io",
+    "index.crates.io",
 ]

@@ -369,6 +369,16 @@ fn profile_config(p: Profile) -> HaltConfig {
                         // GitHub CLI config (read for auth; @gh adds read_write if needed)
                         "~/.config/gh".to_string(),
                     ],
+                    // Git credential storage: osxkeychain on macOS, keyring daemons on Linux.
+                    // Without this, HTTPS git operations cannot read stored tokens.
+                    read_write: if macos {
+                        vec!["~/Library/Keychains".to_string()]
+                    } else {
+                        vec![
+                            "~/.local/share/keyrings".to_string(),
+                            "~/.local/share/kwalletd".to_string(),
+                        ]
+                    },
                     ..Default::default()
                 },
                 ..Default::default()
