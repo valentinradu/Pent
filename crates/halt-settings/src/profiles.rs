@@ -439,6 +439,10 @@ fn profile_config(p: Profile) -> HaltConfig {
                         vec![
                             "~/.claude".to_string(),
                             "~/.claude.json*".to_string(),
+                            // Lock file used by Claude Code for single-instance
+                            // coordination; must be separate from the json* glob
+                            // since halt only supports trailing-* globs.
+                            "~/.claude.lock".to_string(),
                             "~/.local/share/claude".to_string(),
                             // macOS user app data — Claude Code stores runtime
                             // state here (e.g. "Application Support/claude/...").
@@ -450,6 +454,7 @@ fn profile_config(p: Profile) -> HaltConfig {
                         vec![
                             "~/.claude".to_string(),
                             "~/.claude.json*".to_string(),
+                            "~/.claude.lock".to_string(),
                             "~/.local/share/claude".to_string(),
                             "~/.cache/claude".to_string(),
                         ]
