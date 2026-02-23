@@ -109,7 +109,9 @@ pub fn check_netns_privileges() -> Result<(), SandboxError> {
     }
 
     Err(SandboxError::PrivilegeRequired(
-        "Network namespace requires root or CAP_NET_ADMIN. Run with sudo or add capability: sudo setcap cap_net_admin+ep <binary>".to_string()
+        "ProxyOnly mode on Linux requires root or CAP_NET_ADMIN to create the veth bridge \
+         between the sandbox and the proxy. Run with sudo, or use --network localhost/blocked \
+         which do not require root. Alternatively: sudo setcap cap_net_admin+ep <binary>".to_string()
     ))
 }
 

@@ -268,37 +268,111 @@ unsafe fn bring_up_loopback() {
     libc::close(sock);
 }
 
+/// Set up UID/GID mappings for a newly created user namespace.
+///
+/// Maps the caller's real UID/GID to 0 (root) inside the user namespace.
+/// This grants `CAP_NET_ADMIN` within the namespace — required to bring up
+/// the loopback interface via ioctl — while leaving host filesystem permission
+/// checks unchanged (the kernel uses the real/host UID for those).
+///
+/// Must be called after `unshare(CLONE_NEWUSER | CLONE_NEWNET)`, in a
+/// post-fork, single-threaded child before exec.
+///
+/// # Safety
+/// Uses raw libc open/write/close, which are safe in a post-fork child.
+#[cfg(target_os = "linux")]
+unsafe fn setup_userns_mappings(uid: u32, gid: u32) {
+    // Kernels >= 3.19 require "deny" in setgroups before writing gid_map
+    // when the caller is unprivileged.
+    let fd = libc::open(
+        b"/proc/self/setgroups\0".as_ptr() as *const libc::c_char,
+        libc::O_WRONLY | libc::O_CLOEXEC,
+    );
+    if fd >= 0 {
+        let deny = b"deny";
+        libc::write(fd, deny.as_ptr() as *const libc::c_void, deny.len());
+        libc::close(fd);
+    }
+
+    // Map host GID → 0 inside namespace.
+    let gid_map = format!("0 {gid} 1\n");
+    let fd = libc::open(
+        b"/proc/self/gid_map\0".as_ptr() as *const libc::c_char,
+        libc::O_WRONLY | libc::O_CLOEXEC,
+    );
+    if fd >= 0 {
+        let b = gid_map.as_bytes();
+        libc::write(fd, b.as_ptr() as *const libc::c_void, b.len());
+        libc::close(fd);
+    }
+
+    // Map host UID → 0 inside namespace.
+    let uid_map = format!("0 {uid} 1\n");
+    let fd = libc::open(
+        b"/proc/self/uid_map\0".as_ptr() as *const libc::c_char,
+        libc::O_WRONLY | libc::O_CLOEXEC,
+    );
+    if fd >= 0 {
+        let b = uid_map.as_bytes();
+        libc::write(fd, b.as_ptr() as *const libc::c_void, b.len());
+        libc::close(fd);
+    }
+}
+
 /// Apply network isolation to the current process for the given mode.
 ///
-/// Uses `unshare(CLONE_NEWNET)` to create an anonymous network namespace.
-/// For modes requiring loopback, brings it up via ioctl.
+/// Uses `unshare(CLONE_NEWUSER | CLONE_NEWNET)` — no root required on any
+/// kernel that allows unprivileged user namespaces (Ubuntu 22.04+, Fedora,
+/// Arch, etc.). The user namespace maps the caller's UID/GID to 0 inside,
+/// which grants `CAP_NET_ADMIN` within the namespace for loopback setup.
+///
+/// Note: ProxyOnly mode uses a veth pair set up by the parent
+/// (`spawn_with_landlock`) and is handled via `setns` there, not here.
+/// When `apply_network_isolation` is called for ProxyOnly (e.g. from
+/// `exec_with_landlock`), it falls back to loopback-only isolation.
 ///
 /// # Errors
-/// Returns `io::Error` if unshare fails (e.g. insufficient privileges).
+/// Returns `io::Error` if unshare fails.  On systems with unprivileged user
+/// namespaces disabled (`/proc/sys/kernel/unprivileged_userns_clone = 0`)
+/// this will fail with EPERM.
 #[cfg(target_os = "linux")]
 fn apply_network_isolation(network: &NetworkMode) -> std::io::Result<()> {
     match network {
         NetworkMode::LocalhostOnly | NetworkMode::ProxyOnly { .. } => {
-            // SAFETY: unshare(CLONE_NEWNET) creates a new network namespace for
-            // the current process. Called in a post-fork, single-threaded child.
+            // SAFETY: getuid/getgid are always safe.
             // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-            let ret = unsafe { libc::unshare(libc::CLONE_NEWNET) };
+            let uid = unsafe { libc::getuid() };
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            let gid = unsafe { libc::getgid() };
+            // CLONE_NEWUSER | CLONE_NEWNET: create both namespaces atomically.
+            // Does not require root when unprivileged user namespaces are enabled.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            let ret =
+                unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) };
             if ret != 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            // SAFETY: bring_up_loopback uses ioctl in a post-fork child process.
-            // Single-threaded at this point; no locks are held from the parent.
             // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-            unsafe { bring_up_loopback() };
+            unsafe {
+                // Map real UID/GID to root inside namespace (gives CAP_NET_ADMIN).
+                setup_userns_mappings(uid, gid);
+                // Bring up loopback (requires CAP_NET_ADMIN, now available).
+                bring_up_loopback();
+            }
         }
         NetworkMode::Blocked => {
-            // SAFETY: unshare(CLONE_NEWNET) creates a new network namespace for
-            // the current process. Called in a post-fork, single-threaded child.
             // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-            let ret = unsafe { libc::unshare(libc::CLONE_NEWNET) };
+            let uid = unsafe { libc::getuid() };
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            let gid = unsafe { libc::getgid() };
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            let ret =
+                unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) };
             if ret != 0 {
                 return Err(std::io::Error::last_os_error());
             }
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            unsafe { setup_userns_mappings(uid, gid) };
         }
         NetworkMode::Unrestricted => {}
     }
@@ -444,12 +518,31 @@ pub fn spawn_with_landlock(
         if let (NetworkMode::ProxyOnly { proxy_addr }, Some((_, _, outer_ip))) =
             (&config.network, &proxy_netns)
         {
-            let proxy_url = format!("http://{}:{}", outer_ip, proxy_addr.port());
+            let port = proxy_addr.port();
+            let http_url = format!("http://{}:{}", outer_ip, port);
+            // socks5h = hostname resolved by the proxy, so the sandboxed process
+            // never calls getaddrinfo for external hosts — DNS stays on the proxy side.
+            let socks_url = format!("socks5h://{}:{}", outer_ip, port);
+            let no_proxy = "localhost,127.0.0.1,::1";
             let mut e = env.clone();
-            e.insert("HTTP_PROXY".to_string(), proxy_url.clone());
-            e.insert("HTTPS_PROXY".to_string(), proxy_url.clone());
-            e.insert("http_proxy".to_string(), proxy_url.clone());
-            e.insert("https_proxy".to_string(), proxy_url.clone());
+            e.insert("HTTP_PROXY".to_string(), http_url.clone());
+            e.insert("HTTPS_PROXY".to_string(), http_url.clone());
+            e.insert("http_proxy".to_string(), http_url.clone());
+            e.insert("https_proxy".to_string(), http_url.clone());
+            e.insert("ALL_PROXY".to_string(), socks_url.clone());
+            e.insert("all_proxy".to_string(), socks_url.clone());
+            e.insert("GRPC_PROXY".to_string(), socks_url.clone());
+            e.insert("grpc_proxy".to_string(), socks_url);
+            e.insert("NO_PROXY".to_string(), no_proxy.to_string());
+            e.insert("no_proxy".to_string(), no_proxy.to_string());
+            // Route git-over-SSH through the SOCKS5 proxy (nc -X 5 = SOCKS5).
+            e.insert(
+                "GIT_SSH_COMMAND".to_string(),
+                format!("ssh -o ProxyCommand='nc -X 5 -x {}:{} %h %p'", outer_ip, port),
+            );
+            // Signal to the sandboxed process that it is running inside a proxy sandbox.
+            // Claude Code checks this flag to activate its own proxy-aware networking.
+            e.insert("SANDBOX_RUNTIME".to_string(), "1".to_string());
             e
         } else {
             env.clone()

@@ -1,7 +1,25 @@
 # Halt
 
-
 Wrap AI coding agents, or any process, in a lightweight containment layer that restricts filesystem and network access using native OS mechanisms.
+
+```bash
+# Setup — run once to write ~/.config/halt/halt.toml.
+# @claude, @npm, @gh, etc. are profiles: named sets of domains and filesystem paths.
+# @claude is not the binary — it's the profile that covers Anthropic's API endpoints.
+# @npm also adds @node (a filesystem-only profile) as a dependency.
+halt config add --global @claude @gh @npm @cargo @pip @gem @go @git
+
+# Run — every invocation. halt reads the config written above and enforces it:
+# only the listed domains resolve, only the listed paths are accessible.
+halt run -- claude
+
+# Inspect what's allowed
+halt config show
+
+# Adjust profiles at any time
+halt config add --global @keychain   # grant access to the system keychain
+halt config rm  --global @keychain   # revoke it
+```
 
 ---
 
@@ -37,7 +55,7 @@ On macOS, halt generates a [Sandbox Profile Language (SBPL)](https://reverse.put
 - Keeps `file-read-metadata` (stat/lstat) unrestricted — macOS DNS resolution (`getaddrinfo`) and the dynamic linker need to stat arbitrary paths to function.
 - Denies all file writes globally, then re-allows them for permitted read-write paths.
 
-For proxy-mode networking, halt injects `HTTP_PROXY`, `HTTPS_PROXY`, and `http_proxy`/`https_proxy` environment variables pointing at the built-in proxy, and the generated SBPL profile allows TCP connections only to the loopback address where the proxy listens.
+**Network containment is not enforced on macOS.** See [Platform limitations](#platform-limitations) below.
 
 ### Linux — Landlock LSM + network namespaces
 
@@ -54,6 +72,35 @@ Halt includes a DNS + TCP proxy that runs on `127.0.0.1` for the lifetime of the
 2. **TCP forwarding** — outbound TCP connections are accepted only if the destination IP was resolved from an allowed domain. Connections to any other IP are rejected.
 
 The proxy binds only to loopback and is not reachable from the network.
+
+---
+
+## Platform limitations
+
+### macOS — no network containment
+
+`--allow` and `--network proxy` are accepted on macOS but **do not enforce network policy**. Halt degrades silently and runs with unrestricted network access.
+
+The root cause is architectural: macOS has no per-process network namespace primitive available to unprivileged processes.
+
+**On Linux**, `unshare(CLONE_NEWNET)` creates an isolated network stack for the child process. All outbound traffic — regardless of language runtime, proxy awareness, or binary signing — must pass through halt's proxy via a veth pair. Network policy is enforced at the kernel level.
+
+**On macOS**, the only available mechanisms are:
+
+| Approach | What it does | Why it fails |
+|---|---|---|
+| `DYLD_INSERT_LIBRARIES` (proxychains-style) | Hooks libc `connect()` | Go binaries make raw syscalls; hardened-runtime binaries strip the var |
+| `pf` packet filter | Redirects TCP at the kernel | Requires root; rules are system-wide, not per-process |
+| Network Extension / `NETransparentProxyProvider` | System-level proxy | Requires an entitlement Apple must grant; intended for VPN/MDM tools |
+
+On macOS, halt provides **filesystem isolation only**. Domain allowlists in your config are still written and read correctly — they simply have no enforcement effect when running on macOS.
+
+**For network containment on macOS**, run halt inside a Linux VM or container:
+
+```bash
+# Build and run the Linux e2e suite (requires Docker)
+make e2e-linux
+```
 
 ---
 
@@ -121,8 +168,9 @@ halt run --read /etc/ssl/certs -- my-app
 # Grant a process read-write access to a directory
 halt run --write /tmp/workspace -- my-app
 
-# Use a pre-built config file
-halt run --config configs/claude.toml -- claude
+# Set up a config for Claude Code and run it
+halt config add --global @claude @gh @npm @cargo @pip @gem @go @git
+halt run -- claude
 ```
 
 ---
@@ -137,27 +185,12 @@ Halt loads configuration from up to three sources, merged in order (later source
 | Project | `.halt/halt.toml` (in the working directory) |
 | CLI flags | Highest priority |
 
-### Initialize a config file
-
-```bash
-# Create a project-level config
-halt config init
-
-# Create a global config
-halt config init --global
-
-# Show the effective merged config
-halt config show
-
-# Open the config in $EDITOR
-halt config edit
-```
-
 ### Config file format
+
+The config file is a TOML file you can edit directly. Profiles (see below) are a convenience shortcut that writes to this file, but you don't have to use them — you can add domains and paths by hand:
 
 ```toml
 [sandbox]
-# Network mode: "unrestricted", "localhost_only", "proxy_only", or "blocked"
 network = { mode = "proxy_only" }
 
 [proxy]
@@ -190,79 +223,100 @@ tcp_connect_timeout_secs = 30
 tcp_idle_timeout_secs = 60
 ```
 
----
-
-## Example configurations
-
-The `configs/` directory contains ready-made profiles for popular AI coding agents.
-
-### Claude Code
-
-Restricts Claude Code to Anthropic's API endpoints and common package registries.
-
 ```bash
-halt run --config configs/claude.toml -- claude
+# Create and edit the global config directly
+halt config init --global
+halt config edit --global
+
+# Or create a project-level config
+halt config init
+halt config edit
 ```
 
-For strict mode (ignore global and project configs, use only this file):
+### Profiles
+
+Profiles are an optional convenience — named sets of domains and filesystem paths for common tools. `halt config add` writes their values into your TOML config file; you can achieve the same result by editing the file directly. Profiles are composable — some automatically pull in others.
+
+| Profile | Domains | Paths | Depends on |
+|---------|---------|-------|------------|
+| `@claude` | api.anthropic.com, statsig.anthropic.com, sentry.io | — | `@node`, `@ssh` |
+| `@codex` | api.openai.com, *.openai.com | — | `@node` |
+| `@gemini` | generativelanguage.googleapis.com, aiplatform.googleapis.com, cloudresourcemanager.googleapis.com, oauth2.googleapis.com, accounts.google.com | — | `@node` |
+| `@gh` | github.com, *.github.com, raw.githubusercontent.com, objects.githubusercontent.com, codeload.github.com, api.github.com | ~/.config/gh | `@ssh` |
+| `@ssh` | — | ~/.ssh/known_hosts, ~/.ssh/config (read-only) | — |
+| `@npm` | registry.npmjs.org, *.npmjs.org | ~/.npm | `@node` |
+| `@cargo` | crates.io, static.crates.io, index.crates.io | ~/.cargo | — |
+| `@pip` | pypi.org, files.pythonhosted.org | ~/Library/Caches/pip (macOS), ~/.cache/pip (Linux) | — |
+| `@gem` | rubygems.org, *.rubygems.org | ~/.gem | — |
+| `@go` | proxy.golang.org, sum.golang.org, storage.googleapis.com | ~/go | — |
+| `@brew` | formulae.brew.sh, ghcr.io | /opt/homebrew, /usr/local (macOS), /home/linuxbrew/.linuxbrew (Linux) | — |
+| `@node` | — | traversal: ~ (+ macOS TCC/Preferences reads) | — |
+| `@git` | — | ~/.gitconfig, ~/.config/git (read-only) | — |
+| `@keychain` | — | ~/Library/Keychains (macOS), ~/.local/share/keyrings, ~/.local/share/kwalletd, ~/.password-store (Linux) | — |
+
+When you add a profile its dependencies are added automatically. When you remove a profile, halt warns if a dependent profile is still active.
 
 ```bash
-halt run --no-config --config configs/claude.toml -- claude
+# Add profiles (@npm also adds @node automatically)
+halt config add @npm @cargo @gh
+
+# Remove profiles
+halt config rm @npm
+halt config rm @gemini @node   # remove both at once when @gemini depends on @node
+
+# Show what was added
+halt config show
 ```
 
-See [`configs/claude.toml`](configs/claude.toml) for the full allowlist.
-
-### OpenAI Codex
+**Recommended setups:**
 
 ```bash
-halt run --config configs/codex.toml -- codex
+# Claude Code
+halt config add --global @claude @gh @npm @cargo @pip @gem @go @git
+
+# OpenAI Codex
+halt config add --global @codex @gh @npm @cargo @pip @gem @go @git
+
+# Google Gemini CLI
+halt config add --global @gemini @gh @npm @cargo @pip @gem @go @git
 ```
 
-See [`configs/codex.toml`](configs/codex.toml).
-
-### Google Gemini CLI
+### Other config commands
 
 ```bash
-halt run --config configs/gemini.toml -- gemini
-```
+# Show the effective merged config
+halt config show
 
-See [`configs/gemini.toml`](configs/gemini.toml).
+# Open the config in $EDITOR
+halt config edit
+```
 
 ---
 
 ## Command reference
 
-### `halt run`
-
 ```
-halt run [OPTIONS] -- COMMAND [ARGS...]
+halt [-v|-vv|-vvv] <COMMAND>
 
-Options:
+halt run [OPTIONS] -- COMMAND [ARGS...]
   --network <MODE>        unrestricted | localhost | proxy | blocked
-  --allow <DOMAIN>        Add domain to proxy allowlist (implies --network proxy)
-  --read <PATH>           Add read-only filesystem path
-  --write <PATH>          Add read-write filesystem path
-  --traverse <PATH>       Add traversal-only filesystem path
-  --env <KEY[=VALUE]>     Pass or set an environment variable
+  --allow <DOMAIN>        Add domain to proxy allowlist (implies proxy; repeatable)
+  --read <PATH>           Add read-only filesystem path (repeatable)
+  --write <PATH>          Add read-write filesystem path (repeatable)
+  --traverse <PATH>       Add traversal-only filesystem path (repeatable)
+  --env <KEY[=VALUE]>     Pass or set an environment variable (repeatable)
   --config <PATH>         Load an additional config file
   --no-config             Ignore all config files; use only CLI flags
+  --trace                 Log all access events to .halt/trace.log without killing the process
   --data-dir <PATH>       Override sandbox data directory
-```
 
-### `halt check`
-
-Verify that sandboxing and the proxy are available on your system:
-
-```bash
 halt check
-```
 
-### `halt config`
-
-```
-halt config init [--global]          Write a starter config file
-halt config show [--format toml|json] Print effective merged configuration
-halt config edit [--global]          Open config in $EDITOR
+halt config init   [--global]                  Write a starter config file
+halt config show   [--format toml|json]         Print effective merged configuration
+halt config edit   [--global]                  Open config in $EDITOR
+halt config add    [--global] <PROFILE>...      Add one or more profiles
+halt config rm     [--global] <PROFILE>...      Remove one or more profiles
 ```
 
 ---
@@ -276,6 +330,49 @@ Pass `-v` (repeatable) to increase log output:
 -vv   debug
 -vvv  trace
 ```
+
+---
+
+## Debugging
+
+Use `--trace` to observe what a sandboxed process actually does — both what it is denied and what it is allowed to access — without killing or restarting it.
+
+`--trace` runs the process to completion and writes every sandbox and proxy event to `.halt/trace.log` in the working directory. Two kinds of entries appear:
+
+- **`[denied]`** — an access was blocked. A fix hint is included.
+- **`[allowed]`** — a proxy connection was permitted (network, Linux only).
+
+The process is never killed; it receives the access error (EPERM) for each denial and keeps running so you can observe its full access pattern in a single pass.
+
+On **macOS**, filesystem denials from Seatbelt are captured via the system's `log stream`. On **Linux**, both blocked and allowed proxy connections are captured. The proxy is started automatically in trace mode so network events are always visible.
+
+### Workflow
+
+```bash
+# 1. Start the app under halt with tracing enabled.
+halt run --trace -- claude
+
+# 2. Use the app normally, then exit it.
+
+# 3. Review what was accessed.
+cat .halt/trace.log
+```
+
+Example log output:
+
+```
+halt: [denied] filesystem: "claude" was denied "read" access to "/Users/alice/.ssh/id_rsa"
+halt: fix: add "/Users/alice/.ssh/id_rsa" to [sandbox.paths.read] or [sandbox.paths.read_write] in your halt config
+
+halt: [denied] network: DNS query for "registry.npmjs.org" blocked — domain not in allowlist
+halt: fix: add "registry.npmjs.org" to [proxy.domain_allowlist] in your halt config
+
+halt: [allowed] network: connection to "api.anthropic.com" allowed
+```
+
+Each `[denied]` entry shows exactly which path or domain was blocked and the one-line config change needed to allow it. Apply the fixes to your halt config (or use `halt config add @npm` etc. if a matching profile exists), then re-run normally.
+
+`--trace` is compatible with `--network proxy` and any explicit `--allow` or `--read`/`--write` flags.
 
 ---
 

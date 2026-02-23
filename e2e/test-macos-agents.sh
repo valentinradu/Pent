@@ -6,10 +6,11 @@
 #      - workspace write succeeds (true positive)
 #      - workspace read succeeds (true positive)
 #      - write outside allowed paths is denied (true negative)
-#   2. Network proxy:
-#      - blocked domain via HTTPS CONNECT is rejected (curl exit 56)
-#      - strict mode exits 2 on blocked SOCKS5 domain CONNECT
-#      - strict mode does NOT trip on an allowlisted SOCKS5 domain
+#
+# Network containment is NOT tested on macOS: transparent proxy enforcement
+# is not supported (no per-process network namespaces; DYLD_INSERT_LIBRARIES
+# is unreliable across Go binaries and hardened-runtime binaries). See README
+# for the full explanation. Use the Linux e2e suite for network tests.
 #
 # Requirements:
 #   - macOS (sandbox-exec available)
@@ -51,12 +52,25 @@ HALT=$(resolve_halt) || {
     echo "error: could not find halt binary. Set HALT=/path/to/halt or build target/release/halt." >&2
     exit 1
 }
-CONFIGS_DIR=${CONFIGS_DIR:-"${ROOT_DIR}/configs"}
 PASS=0
 FAIL=0
 LAST_EXIT=0
 WORKSPACE=$(mktemp -d)
-trap 'rm -rf "$WORKSPACE"' EXIT
+CONFIGS_TMPDIR=$(mktemp -d)
+trap 'rm -rf "$WORKSPACE" "$CONFIGS_TMPDIR"' EXIT
+
+# Generate per-agent config files using the profile system.
+# On macOS, dirs::config_dir() resolves to ~/Library/Application Support,
+# so the config lands at $HOME/Library/Application Support/halt/halt.toml.
+config_file_for() {
+    echo "${CONFIGS_TMPDIR}/${1}_home/Library/Application Support/halt/halt.toml"
+}
+
+for _agent in claude codex gemini; do
+    _agent_home="${CONFIGS_TMPDIR}/${_agent}_home"
+    mkdir -p "${_agent_home}"
+    HOME="${_agent_home}" "$HALT" config add --global "@${_agent}"
+done
 
 green() { printf '\033[0;32m✓ %s\033[0m\n' "$*"; }
 red()   { printf '\033[0;31m✗ %s\033[0m\n' "$*" >&2; }
@@ -106,45 +120,11 @@ assert_one_of_exits() {
     return 1
 }
 
-strict_socks5_script() {
-    cat <<'SOCKS5'
-set -e
-PROXY_PORT=$(echo "${HTTP_PROXY:-}" | grep -oE '[0-9]+$' || true)
-[ -z "$PROXY_PORT" ] && exit 1
-exec 3<>/dev/tcp/127.0.0.1/${PROXY_PORT}
-printf '\x05\x01\x00' >&3
-sleep 0.1
-printf '%b' "${SOCKS5_PAYLOAD:?}" >&3
-exec 3>&-
-sleep 0.3
-SOCKS5
-}
-
-blocked_socks5_payload() {
-    # SOCKS5 CONNECT request for "blocked-domain.example" (len 0x16), port 80.
-    echo '\x05\x01\x00\x03\x16blocked-domain.example\x00\x50'
-}
-
-allowed_socks5_payload_for() {
-    case "$1" in
-        # "api.anthropic.com" len 17 (0x11)
-        claude) echo '\x05\x01\x00\x03\x11api.anthropic.com\x00\x50' ;;
-        # "api.openai.com" len 14 (0x0e)
-        codex) echo '\x05\x01\x00\x03\x0eapi.openai.com\x00\x50' ;;
-        # "generativelanguage.googleapis.com" len 33 (0x21)
-        gemini) echo '\x05\x01\x00\x03\x21generativelanguage.googleapis.com\x00\x50' ;;
-        *) echo '\x05\x01\x00\x03\x0bexample.com\x00\x50' ;;
-    esac
-}
-
 for AGENT in claude codex gemini; do
-    CONFIG="${CONFIGS_DIR}/${AGENT}.toml"
+    CONFIG=$(config_file_for "$AGENT")
     STDERR="/tmp/halt_stderr_${AGENT}_$$"
     SENTINEL="${WORKSPACE}/sentinel-${AGENT}.txt"
     BLOCKED_FILE="${HOME}/halt-test-blocked-${AGENT}.$$"
-    ALLOWED_SOCKS5_PAYLOAD=$(allowed_socks5_payload_for "$AGENT")
-    BLOCKED_SOCKS5_PAYLOAD=$(blocked_socks5_payload)
-
     echo ""
     echo "── ${AGENT} ─────────────────────────────────────────────────────────"
 
@@ -168,20 +148,6 @@ for AGENT in claude codex gemini; do
         fail "${AGENT}: write to \$HOME was NOT blocked (SBPL not enforced)"
         rm -f "$BLOCKED_FILE"
     fi
-
-    run_halt "$STDERR" --config "$CONFIG" \
-        -- curl -sS --max-time 5 https://blocked-domain.invalid -o /dev/null
-    assert_one_of_exits "$LAST_EXIT" "${AGENT}: blocked domain rejected by proxy/DNS block" "$STDERR" 56 6
-
-    run_halt "$STDERR" --config "$CONFIG" --strict \
-        -- /usr/bin/env SOCKS5_PAYLOAD="${BLOCKED_SOCKS5_PAYLOAD}" \
-           /bin/bash -c "$(strict_socks5_script)"
-    assert_exit 2 "$LAST_EXIT" "${AGENT}: strict mode exits 2 on blocked SOCKS5 CONNECT" "$STDERR"
-
-    run_halt "$STDERR" --config "$CONFIG" --strict \
-        -- /usr/bin/env SOCKS5_PAYLOAD="${ALLOWED_SOCKS5_PAYLOAD}" \
-           /bin/bash -c "$(strict_socks5_script)"
-    assert_exit 0 "$LAST_EXIT" "${AGENT}: strict mode allows allowlisted SOCKS5 CONNECT domain" "$STDERR"
 
     rm -f "$STDERR"
 done

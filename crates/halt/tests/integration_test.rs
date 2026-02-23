@@ -61,9 +61,20 @@ fn expect_failure(out: &Output) {
     );
 }
 
-/// True when we are on macOS and sandbox-exec is present.
+/// True when we are on macOS and sandbox-exec can actually apply a profile.
+///
+/// Merely checking that the binary exists is insufficient: macOS does not
+/// allow nested Seatbelt sandboxes, so `sandbox_apply` returns EPERM when
+/// `halt` is itself running under `sandbox-exec` (e.g. during development).
 fn sandbox_available() -> bool {
-    cfg!(target_os = "macos") && Path::new("/usr/bin/sandbox-exec").exists()
+    if !cfg!(target_os = "macos") || !Path::new("/usr/bin/sandbox-exec").exists() {
+        return false;
+    }
+    Command::new("/usr/bin/sandbox-exec")
+        .args(["-p", "(version 1) (allow default)", "/bin/true"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 /// Extra --read flags that must be added to give the sandboxed shell
@@ -233,10 +244,10 @@ fn test_check_reports_platform() {
     // is unavailable. The exit status may be non-zero in restricted envs.
     let dir = TempDir::new().unwrap();
     let out = run_halt(dir.path(), &["check"]);
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stdout.contains("Platform:"),
-        "Expected 'Platform:' in check output, got: {stdout}"
+        stderr.contains("platform"),
+        "Expected 'platform' in check stderr, got: {stderr}"
     );
 }
 
@@ -291,9 +302,8 @@ fn test_run_cannot_read_file_in_home_dir() {
         return;
     }
 
-    let secret_path = match home_path("secret.txt") {
-        Some(p) => p,
-        None => return, // no HOME env var, skip
+    let Some(secret_path) = home_path("secret.txt") else {
+        return; // no HOME env var, skip
     };
 
     fs::write(&secret_path, "should-not-be-readable\n").unwrap();
@@ -318,9 +328,8 @@ fn test_run_extra_read_gives_access_to_home_dir_file() {
         return;
     }
 
-    let secret_dir = match home_path("extra-read-dir") {
-        Some(p) => p,
-        None => return,
+    let Some(secret_dir) = home_path("extra-read-dir") else {
+        return;
     };
     fs::create_dir_all(&secret_dir).unwrap();
     let secret_file = secret_dir.join("data.txt");
@@ -365,9 +374,8 @@ fn test_run_extra_write_gives_write_access() {
         return;
     }
 
-    let write_dir = match home_path("extra-write-dir") {
-        Some(p) => p,
-        None => return,
+    let Some(write_dir) = home_path("extra-write-dir") else {
+        return;
     };
     fs::create_dir_all(&write_dir).unwrap();
     let target = write_dir.join("out.txt");
@@ -574,156 +582,146 @@ fn test_run_no_config_ignores_project_config() {
 // ============================================================================
 // H. Run — extra config file via --config flag
 // ============================================================================
-// (existing tests follow)
 
 // ============================================================================
-// I. Example config file content validation (no sandbox required)
+// I. Profile add / rm commands
 // ============================================================================
 
-/// Absolute path to the `configs/` directory at the workspace root.
-fn configs_dir() -> std::path::PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../configs")
-        .canonicalize()
-        .expect("configs/ directory should exist at workspace root")
-}
-
-/// Copy an example config as the project config and return the effective
-/// configuration as parsed JSON via `halt config show --format json`.
-fn show_example_config(config_path: &Path) -> serde_json::Value {
+#[test]
+fn test_config_add_creates_config_if_missing() {
     let dir = TempDir::new().unwrap();
-    let dot_halt = dir.path().join(".halt");
-    fs::create_dir_all(&dot_halt).unwrap();
-    fs::copy(config_path, dot_halt.join("halt.toml")).unwrap();
-    let out = run_halt(dir.path(), &["config", "show", "--format", "json"]);
-    let stdout = expect_success(&out);
-    serde_json::from_str(&stdout).expect("config show should produce valid JSON")
-}
+    let config_path = dir.path().join(".halt").join("halt.toml");
+    assert!(!config_path.exists());
 
-fn allowlist_contains(json: &serde_json::Value, domain: &str) -> bool {
-    json["proxy"]["domain_allowlist"]
-        .as_array()
-        .map(|a| a.iter().any(|v| v.as_str() == Some(domain)))
-        .unwrap_or(false)
+    let out = run_halt(dir.path(), &["config", "add", "@cargo"]);
+    expect_success(&out);
+
+    assert!(config_path.exists(), "config should be created by add");
 }
 
 #[test]
-fn test_example_claude_config_has_anthropic_domains() {
-    let json = show_example_config(&configs_dir().join("claude.toml"));
-    for domain in &["api.anthropic.com", "statsig.anthropic.com"] {
-        assert!(
-            allowlist_contains(&json, domain),
-            "Expected {domain} in claude.toml allowlist"
-        );
-    }
-}
-
-#[test]
-fn test_example_codex_config_has_openai_domains() {
-    let json = show_example_config(&configs_dir().join("codex.toml"));
-    for domain in &["api.openai.com", "*.openai.com"] {
-        assert!(
-            allowlist_contains(&json, domain),
-            "Expected {domain} in codex.toml allowlist"
-        );
-    }
-}
-
-#[test]
-fn test_example_gemini_config_has_google_domains() {
-    let json = show_example_config(&configs_dir().join("gemini.toml"));
-    for domain in &[
-        "generativelanguage.googleapis.com",
-        "oauth2.googleapis.com",
-        "accounts.google.com",
-    ] {
-        assert!(
-            allowlist_contains(&json, domain),
-            "Expected {domain} in gemini.toml allowlist"
-        );
-    }
-}
-
-#[test]
-fn test_example_configs_have_common_registries() {
-    // All three configs should grant access to the package registries that
-    // agents commonly need (npm, PyPI, crates.io, GitHub).
-    let required = ["registry.npmjs.org", "pypi.org", "crates.io", "github.com"];
-    let dir = configs_dir();
-    for config in &["claude.toml", "codex.toml", "gemini.toml"] {
-        let json = show_example_config(&dir.join(config));
-        for domain in &required {
-            assert!(
-                allowlist_contains(&json, domain),
-                "Expected {domain} in {config}"
-            );
-        }
-    }
-}
-
-// ============================================================================
-// J. Example config — proxy startup and command execution (macOS sandbox)
-// ============================================================================
-
-/// Run a command inside the sandbox using an example config file.
-/// Passes `--no-config` so only the given file is loaded.
-fn run_with_example_config(config_path: &Path, cmd_args: &[&str]) -> Output {
+fn test_config_add_writes_domains() {
     let dir = TempDir::new().unwrap();
-    let mut args: Vec<String> = vec![
-        "run".into(),
-        "--no-config".into(),
-        "--config".into(),
-        config_path.to_str().unwrap().into(),
-    ];
-    args.extend(sys_exec_args());
-    args.push("--".into());
-    args.extend(cmd_args.iter().map(|s| s.to_string()));
-    Command::new(HALT)
-        .args(&args)
-        .current_dir(dir.path())
-        .env_remove("HALT_LOG")
-        .output()
-        .unwrap_or_else(|e| panic!("Failed to spawn halt: {e}"))
+    let out = run_halt(dir.path(), &["config", "add", "@npm"]);
+    expect_success(&out);
+
+    let config_path = dir.path().join(".halt").join("halt.toml");
+    let contents = fs::read_to_string(&config_path).unwrap();
+    assert!(
+        contents.contains("registry.npmjs.org"),
+        "Expected registry.npmjs.org in config after adding @npm: {contents}"
+    );
 }
 
 #[test]
-fn test_example_claude_config_proxy_starts_cleanly() {
-    if !sandbox_available() {
-        return;
-    }
-    let out = run_with_example_config(
-        &configs_dir().join("claude.toml"),
-        &["/bin/echo", "claude-ok"],
+fn test_config_add_npm_also_adds_node() {
+    let dir = TempDir::new().unwrap();
+    let out = run_halt(dir.path(), &["config", "add", "@npm"]);
+    expect_success(&out);
+
+    // @npm depends on @node; @node adds traversal: ~ on all platforms
+    let config_path = dir.path().join(".halt").join("halt.toml");
+    let contents = fs::read_to_string(&config_path).unwrap();
+    assert!(
+        contents.contains("\"~\""),
+        "Expected traversal '~' from @node profile after adding @npm: {contents}"
     );
-    assert!(expect_success(&out).contains("claude-ok"));
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("@node"),
+        "Expected '@node' in add stderr: {stderr}"
+    );
 }
 
 #[test]
-fn test_example_codex_config_proxy_starts_cleanly() {
-    if !sandbox_available() {
-        return;
-    }
-    let out = run_with_example_config(
-        &configs_dir().join("codex.toml"),
-        &["/bin/echo", "codex-ok"],
+fn test_config_add_deduplicates() {
+    let dir = TempDir::new().unwrap();
+    expect_success(&run_halt(dir.path(), &["config", "add", "@npm"]));
+    expect_success(&run_halt(dir.path(), &["config", "add", "@npm"]));
+
+    let config_path = dir.path().join(".halt").join("halt.toml");
+    let contents = fs::read_to_string(&config_path).unwrap();
+    let count = contents.matches("registry.npmjs.org").count();
+    assert_eq!(
+        count, 1,
+        "registry.npmjs.org should appear exactly once: {contents}"
     );
-    assert!(expect_success(&out).contains("codex-ok"));
 }
 
 #[test]
-fn test_example_gemini_config_proxy_starts_cleanly() {
-    if !sandbox_available() {
-        return;
-    }
-    let out = run_with_example_config(
-        &configs_dir().join("gemini.toml"),
-        &["/bin/echo", "gemini-ok"],
+fn test_config_rm_removes_domains() {
+    let dir = TempDir::new().unwrap();
+    expect_success(&run_halt(dir.path(), &["config", "add", "@npm"]));
+    expect_success(&run_halt(dir.path(), &["config", "rm", "@npm"]));
+
+    let config_path = dir.path().join(".halt").join("halt.toml");
+    let contents = fs::read_to_string(&config_path).unwrap();
+    assert!(
+        !contents.contains("registry.npmjs.org"),
+        "registry.npmjs.org should be removed after rm @npm: {contents}"
     );
-    assert!(expect_success(&out).contains("gemini-ok"));
+}
+
+#[test]
+fn test_config_rm_node_blocked_by_gemini() {
+    let dir = TempDir::new().unwrap();
+    expect_success(&run_halt(dir.path(), &["config", "add", "@gemini"]));
+
+    let out = run_halt(dir.path(), &["config", "rm", "@node"]);
+    expect_failure(&out);
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("@gemini") || stderr.contains("depends"),
+        "Expected error mentioning @gemini dependency: {stderr}"
+    );
+}
+
+#[test]
+fn test_config_rm_gemini_node_together_succeeds() {
+    let dir = TempDir::new().unwrap();
+    expect_success(&run_halt(dir.path(), &["config", "add", "@gemini"]));
+
+    let out = run_halt(dir.path(), &["config", "rm", "@gemini", "@node"]);
+    expect_success(&out);
+
+    let config_path = dir.path().join(".halt").join("halt.toml");
+    let contents = fs::read_to_string(&config_path).unwrap();
+    assert!(
+        !contents.contains("generativelanguage.googleapis.com"),
+        "gemini domains should be removed: {contents}"
+    );
+}
+
+#[test]
+fn test_config_add_multiple_profiles() {
+    let dir = TempDir::new().unwrap();
+    let out = run_halt(dir.path(), &["config", "add", "@npm", "@cargo", "@gh"]);
+    expect_success(&out);
+
+    let config_path = dir.path().join(".halt").join("halt.toml");
+    let contents = fs::read_to_string(&config_path).unwrap();
+    assert!(contents.contains("registry.npmjs.org"), "npm domain missing");
+    assert!(contents.contains("crates.io"), "cargo domain missing");
+    assert!(contents.contains("github.com"), "gh domain missing");
+}
+
+#[test]
+fn test_config_add_unknown_profile_fails() {
+    let dir = TempDir::new().unwrap();
+    let out = run_halt(dir.path(), &["config", "add", "@not-a-real-profile"]);
+    expect_failure(&out);
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unknown") || stderr.contains("@not-a-real-profile"),
+        "Expected error about unknown profile: {stderr}"
+    );
 }
 
 // ============================================================================
-// K. MCP server accessibility — localhost connectivity in proxy_only mode
+// J. MCP server accessibility — localhost connectivity in proxy_only mode
 // ============================================================================
 
 #[test]
@@ -809,124 +807,106 @@ fn test_run_extra_config_merges_domain_allowlist() {
     );
 }
 
+
 // ============================================================================
-// L. Run — --strict mode
+// N. Profile content verification (all platforms)
 // ============================================================================
 
-/// Invoke `halt run --no-config --strict [extra_args] -- [cmd_args]`.
-fn strict_run(workspace: &Path, extra_args: &[String], cmd_args: &[&str]) -> Output {
-    let mut args: Vec<String> = vec!["run".into(), "--no-config".into(), "--strict".into()];
-    args.extend_from_slice(extra_args);
-    args.push("--".into());
-    for a in cmd_args {
-        args.push((*a).to_string());
-    }
-    Command::new(HALT)
-        .args(&args)
-        .current_dir(workspace)
-        .env_remove("HALT_LOG")
-        .output()
-        .unwrap_or_else(|e| panic!("Failed to spawn halt: {e}"))
+#[test]
+fn test_config_add_claude_has_correct_domains_and_paths() {
+    let dir = TempDir::new().unwrap();
+    expect_success(&run_halt(dir.path(), &["config", "add", "@claude"]));
+
+    let contents =
+        fs::read_to_string(dir.path().join(".halt").join("halt.toml")).unwrap();
+    assert!(
+        contents.contains("api.anthropic.com"),
+        "@claude missing api.anthropic.com: {contents}"
+    );
+    assert!(
+        contents.contains("statsig.anthropic.com"),
+        "@claude missing statsig.anthropic.com: {contents}"
+    );
+    assert!(
+        contents.contains("~/.claude\""),
+        "@claude missing ~/.claude path: {contents}"
+    );
+    assert!(
+        contents.contains("~/.local/share/claude"),
+        "@claude missing ~/.local/share/claude: {contents}"
+    );
 }
 
 #[test]
-fn test_strict_mode_exits_on_socks5_domain_violation() {
-    // --strict with proxy mode: sending a SOCKS5 domain request to the halt
-    // proxy for a domain NOT in the allowlist triggers a violation, causing
-    // halt to kill the child and exit with code 2.
-    //
-    // Mechanism: the sandbox injects HTTP_PROXY=http://127.0.0.1:PORT into the
-    // child environment.  We extract that port and use Python's socket module
-    // to send a raw SOCKS5 CONNECT request with a domain name (ATYP=0x03).
-    // The proxy reports the violation immediately.
-    if !sandbox_available() {
-        return;
-    }
-
+#[cfg(target_os = "macos")]
+fn test_config_add_claude_has_macos_app_support_path() {
     let dir = TempDir::new().unwrap();
-    let mut extra = sys_exec_args();
-    // --allow sets up the proxy; "allowed.internal" is the only permitted domain.
-    extra.extend_from_slice(&["--allow".into(), "allowed.internal".into()]);
+    expect_success(&run_halt(dir.path(), &["config", "add", "@claude"]));
 
-    // Bash script: extract proxy port from $HTTP_PROXY, open a raw SOCKS5
-    // connection using bash's /dev/tcp, send a CONNECT for a blocked domain,
-    // then sleep so halt has time to receive the violation before we exit.
-    //
-    // blocked-domain.example is 22 chars (0x16).
-    // We pause between the greeting and the CONNECT so the server processes
-    // each phase separately (avoids the server reading both in one recv).
-    let script = concat!(
-        "PROXY_PORT=$(echo \"${HTTP_PROXY:-}\" | grep -oE '[0-9]+$'); ",
-        "[ -z \"$PROXY_PORT\" ] && exit 0; ",
-        "exec 3<>/dev/tcp/127.0.0.1/${PROXY_PORT}; ",
-        // SOCKS5 greeting: v5, 1 method, no-auth
-        "printf '\\x05\\x01\\x00' >&3; ",
-        // Brief pause so server reads greeting, sends 2-byte reply, awaits CONNECT
-        "sleep 0.1; ",
-        // SOCKS5 CONNECT: v5, CONNECT, RSV, ATYP=domain(0x03), len=22,
-        // "blocked-domain.example", port=80 (0x00 0x50)
-        "printf '\\x05\\x01\\x00\\x03\\x16blocked-domain.example\\x00\\x50' >&3; ",
-        "exec 3>&-; ",
-        // Sleep so halt detects violation before we exit
-        "sleep 0.3"
+    let contents =
+        fs::read_to_string(dir.path().join(".halt").join("halt.toml")).unwrap();
+    assert!(
+        contents.contains("Application Support/claude"),
+        "@claude missing ~/Library/Application Support/claude on macOS: {contents}"
     );
+}
 
-    let out = strict_run(dir.path(), &extra, &["/bin/bash", "-c", script]);
+#[test]
+fn test_config_add_codex_has_correct_domains_and_paths() {
+    let dir = TempDir::new().unwrap();
+    expect_success(&run_halt(dir.path(), &["config", "add", "@codex"]));
 
-    // halt --strict exits 2 on violation; the child is killed first.
-    assert_eq!(
-        out.status.code(),
-        Some(2),
-        "Expected exit 2 (strict violation), got {:?}\nstdout: {}\nstderr: {}",
-        out.status.code(),
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
+    let contents =
+        fs::read_to_string(dir.path().join(".halt").join("halt.toml")).unwrap();
+    assert!(
+        contents.contains("api.openai.com"),
+        "@codex missing api.openai.com: {contents}"
     );
+    assert!(
+        contents.contains("~/.codex"),
+        "@codex missing ~/.codex path: {contents}"
+    );
+}
 
+#[test]
+fn test_config_add_gemini_has_correct_domains_and_paths() {
+    let dir = TempDir::new().unwrap();
+    expect_success(&run_halt(dir.path(), &["config", "add", "@gemini"]));
+
+    let contents =
+        fs::read_to_string(dir.path().join(".halt").join("halt.toml")).unwrap();
+    assert!(
+        contents.contains("generativelanguage.googleapis.com"),
+        "@gemini missing generativelanguage.googleapis.com: {contents}"
+    );
+    assert!(
+        contents.contains("~/.gemini") || contents.contains("gemini-cli"),
+        "@gemini missing data path (~/.gemini or gemini-cli): {contents}"
+    );
+}
+
+#[test]
+fn test_config_add_output_shows_file_path() {
+    let dir = TempDir::new().unwrap();
+    let out = run_halt(dir.path(), &["config", "add", "@cargo"]);
+    expect_success(&out);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("VIOLATION") || stderr.contains("violation") || stderr.contains("blocked"),
-        "Expected violation message in stderr, got: {stderr}"
+        stderr.contains("halt.toml"),
+        "Expected halt.toml path in add stderr: {stderr}"
     );
 }
 
 #[test]
-fn test_strict_mode_does_not_trigger_on_allowed_domain() {
-    // Sanity check: --strict with a matching domain in the allowlist must
-    // NOT kill the process.  The child should exit normally.
-    if !sandbox_available() {
-        return;
-    }
-
+fn test_config_rm_output_shows_file_path() {
     let dir = TempDir::new().unwrap();
-    let mut extra = sys_exec_args();
-    // Allow "localhost" style so the child can bind/connect loopback.
-    extra.extend_from_slice(&["--allow".into(), "localhost".into()]);
-
-    let out = strict_run(dir.path(), &extra, &["/bin/echo", "strict-ok"]);
-    let stdout = expect_success(&out);
+    expect_success(&run_halt(dir.path(), &["config", "add", "@cargo"]));
+    let out = run_halt(dir.path(), &["config", "rm", "@cargo"]);
+    expect_success(&out);
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stdout.contains("strict-ok"),
-        "Expected 'strict-ok' in stdout, got: {stdout}"
+        stderr.contains("halt.toml"),
+        "Expected halt.toml path in rm stderr: {stderr}"
     );
 }
 
-#[test]
-fn test_strict_mode_without_proxy_runs_normally() {
-    // --strict without a proxy (no --allow / not proxy mode): should not
-    // interfere with normal execution since there are no network violations
-    // to detect via the proxy channel.
-    if !sandbox_available() {
-        return;
-    }
-
-    let dir = TempDir::new().unwrap();
-    let extra = sys_exec_args();
-
-    let out = strict_run(dir.path(), &extra, &["/bin/echo", "no-proxy-strict-ok"]);
-    let stdout = expect_success(&out);
-    assert!(
-        stdout.contains("no-proxy-strict-ok"),
-        "Expected output, got: {stdout}"
-    );
-}

@@ -24,6 +24,7 @@
 
 use crate::{
     DnsServer, DnsServerConfig, ProxyError, Result, SharedState, TcpProxy, TcpProxyConfig,
+    TraceEvent,
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -63,10 +64,9 @@ pub struct ProxyConfig {
     /// Default: 5 minutes
     pub tcp_idle_timeout: std::time::Duration,
 
-    /// Optional channel for reporting policy violations in strict mode.
-    /// When set, blocked DNS queries and rejected TCP connections send a
-    /// human-readable message on this channel.
-    pub violation_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    /// Optional channel for reporting trace events (violations and granted access).
+    /// When set, both blocked and allowed connections send a typed [`TraceEvent`].
+    pub violation_tx: Option<tokio::sync::mpsc::UnboundedSender<TraceEvent>>,
 }
 
 impl Default for ProxyConfig {
@@ -187,6 +187,24 @@ impl ProxyHandle {
     /// Get the current domain allowlist.
     pub fn allowlist(&self) -> Vec<String> {
         self.state.allowlist()
+    }
+
+    /// Total number of TCP proxy connections accepted since the proxy started.
+    ///
+    /// Monotonically increasing. A value of zero after the sandboxed process
+    /// has been running for several seconds suggests the process is not routing
+    /// traffic through the proxy (i.e. it does not honour `HTTP_PROXY` /
+    /// `ALL_PROXY`).
+    pub fn connections_accepted(&self) -> u64 {
+        self.state
+            .connections_accepted
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Return a cloned Arc to the connections-accepted counter so callers can
+    /// pass it into spawned tasks without keeping the full handle alive.
+    pub fn connections_accepted_ref(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        Arc::clone(&self.state.connections_accepted)
     }
 
     /// Add a domain to the allowlist at runtime.
@@ -352,6 +370,37 @@ impl ProxyServer {
     /// Note: This does not persist the change to config - only updates the runtime state.
     pub fn add_domain(&self, domain: String) {
         self.state.add_domain(domain);
+    }
+}
+
+/// Convert a `ProxySettings` fragment (from `halt-settings`) into a `ProxyConfig`.
+///
+/// Returns `Err(String)` if any `upstream_dns` entry cannot be parsed as a
+/// `SocketAddr`.  All other fields have infallible defaults.
+impl TryFrom<&halt_settings::ProxySettings> for ProxyConfig {
+    type Error = String;
+
+    fn try_from(settings: &halt_settings::ProxySettings) -> std::result::Result<Self, String> {
+        let mut config = Self {
+            domain_allowlist: settings.domain_allowlist.clone(),
+            ..Default::default()
+        };
+        if let Some(ttl) = settings.dns_ttl_seconds {
+            config.dns_ttl = std::time::Duration::from_secs(u64::from(ttl));
+        }
+        if let Some(t) = settings.tcp_connect_timeout_secs {
+            config.tcp_connect_timeout = std::time::Duration::from_secs(t);
+        }
+        if let Some(t) = settings.tcp_idle_timeout_secs {
+            config.tcp_idle_timeout = std::time::Duration::from_secs(t);
+        }
+        if let Some(upstream) = &settings.upstream_dns {
+            let addrs: std::result::Result<Vec<std::net::SocketAddr>, _> =
+                upstream.iter().map(|s| s.parse()).collect();
+            config.upstream_dns =
+                Some(addrs.map_err(|e| format!("Invalid upstream_dns entry: {e}"))?);
+        }
+        Ok(config)
     }
 }
 
@@ -719,6 +768,7 @@ mod tests {
     // Integration Tests - End to End
     // ========================================================================
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_integration_allowed_domain_flow() {
         skip_if_no_bind!();
@@ -834,6 +884,7 @@ mod tests {
         handle.shutdown().await.unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_integration_wildcard_subdomain() {
         skip_if_no_bind!();
@@ -1011,6 +1062,7 @@ mod tests {
     // Concurrent Operations Tests
     // ========================================================================
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_concurrent_dns_and_tcp() {
         skip_if_no_bind!();
@@ -1158,7 +1210,7 @@ mod tests {
 
         // Question: domain name in DNS format
         for label in domain.split('.') {
-            query.push(label.len() as u8);
+            query.push(u8::try_from(label.len()).expect("DNS label exceeds 255 bytes"));
             query.extend_from_slice(label.as_bytes());
         }
         query.push(0); // Root label

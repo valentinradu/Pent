@@ -36,9 +36,9 @@ mod linux;
 #[cfg(target_os = "linux")]
 mod linux_netns;
 
-pub use config::SandboxConfig;
+pub use config::{system_default_paths, SandboxConfig};
 pub use env::{build_env, resolve_path_directories};
-pub use halt_settings::{Mount, NetworkMode, SandboxPaths};
+pub use halt_settings::{Mount, NetworkMode, SandboxPaths, SandboxSettings};
 
 use std::convert::Infallible;
 use std::process::Child;
@@ -83,16 +83,35 @@ pub fn exec_sandboxed(
     #[cfg(target_os = "macos")]
     {
         let profile = macos::generate_sbpl_profile(config)?;
-        // For ProxyOnly, inject HTTP_PROXY / HTTPS_PROXY so the child routes
-        // traffic through the proxy running on localhost.
         let env_with_proxy;
         let env = if let NetworkMode::ProxyOnly { proxy_addr } = &config.network {
-            let proxy_url = format!("http://127.0.0.1:{}", proxy_addr.port());
+            let port = proxy_addr.port();
+            let http_url = format!("http://127.0.0.1:{port}");
+            let socks_url = format!("socks5h://127.0.0.1:{port}");
+            let no_proxy = "localhost,127.0.0.1,::1";
             let mut e = config.env.clone();
-            e.insert("HTTP_PROXY".to_string(), proxy_url.clone());
-            e.insert("HTTPS_PROXY".to_string(), proxy_url.clone());
-            e.insert("http_proxy".to_string(), proxy_url.clone());
-            e.insert("https_proxy".to_string(), proxy_url);
+            // HTTP/HTTPS via CONNECT tunnel — most Node.js/Python/Ruby clients honour these.
+            e.insert("HTTP_PROXY".to_string(), http_url.clone());
+            e.insert("HTTPS_PROXY".to_string(), http_url.clone());
+            e.insert("http_proxy".to_string(), http_url.clone());
+            e.insert("https_proxy".to_string(), http_url.clone());
+            // socks5h = hostname resolved by the proxy, so the sandboxed process
+            // never calls getaddrinfo for external hosts — DNS stays on the proxy side.
+            e.insert("ALL_PROXY".to_string(), socks_url.clone());
+            e.insert("all_proxy".to_string(), socks_url.clone());
+            e.insert("GRPC_PROXY".to_string(), socks_url.clone());
+            e.insert("grpc_proxy".to_string(), socks_url);
+            // Prevent proxy being used for loopback traffic.
+            e.insert("NO_PROXY".to_string(), no_proxy.to_string());
+            e.insert("no_proxy".to_string(), no_proxy.to_string());
+            // Route git-over-SSH through the SOCKS5 proxy (nc -X 5 = SOCKS5).
+            e.insert(
+                "GIT_SSH_COMMAND".to_string(),
+                format!("ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:{port} %h %p'"),
+            );
+            // Signal to the sandboxed process that it is running inside a proxy sandbox.
+            // Claude Code checks this flag to activate its own proxy-aware networking.
+            e.insert("SANDBOX_RUNTIME".to_string(), "1".to_string());
             env_with_proxy = e;
             &env_with_proxy
         } else {
@@ -120,16 +139,28 @@ pub fn spawn_sandboxed(
     #[cfg(target_os = "macos")]
     {
         let profile = macos::generate_sbpl_profile(config)?;
-        // For ProxyOnly, inject HTTP_PROXY / HTTPS_PROXY so the child routes
-        // traffic through the proxy running on localhost.
         let env_with_proxy;
         let env = if let NetworkMode::ProxyOnly { proxy_addr } = &config.network {
-            let proxy_url = format!("http://127.0.0.1:{}", proxy_addr.port());
+            let port = proxy_addr.port();
+            let http_url = format!("http://127.0.0.1:{port}");
+            let socks_url = format!("socks5h://127.0.0.1:{port}");
+            let no_proxy = "localhost,127.0.0.1,::1";
             let mut e = config.env.clone();
-            e.insert("HTTP_PROXY".to_string(), proxy_url.clone());
-            e.insert("HTTPS_PROXY".to_string(), proxy_url.clone());
-            e.insert("http_proxy".to_string(), proxy_url.clone());
-            e.insert("https_proxy".to_string(), proxy_url);
+            e.insert("HTTP_PROXY".to_string(), http_url.clone());
+            e.insert("HTTPS_PROXY".to_string(), http_url.clone());
+            e.insert("http_proxy".to_string(), http_url.clone());
+            e.insert("https_proxy".to_string(), http_url.clone());
+            e.insert("ALL_PROXY".to_string(), socks_url.clone());
+            e.insert("all_proxy".to_string(), socks_url.clone());
+            e.insert("GRPC_PROXY".to_string(), socks_url.clone());
+            e.insert("grpc_proxy".to_string(), socks_url);
+            e.insert("NO_PROXY".to_string(), no_proxy.to_string());
+            e.insert("no_proxy".to_string(), no_proxy.to_string());
+            e.insert(
+                "GIT_SSH_COMMAND".to_string(),
+                format!("ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:{port} %h %p'"),
+            );
+            e.insert("SANDBOX_RUNTIME".to_string(), "1".to_string());
             env_with_proxy = e;
             &env_with_proxy
         } else {
@@ -237,7 +268,7 @@ mod tests {
         let workspace = temp.path().join("workspace");
         std::fs::create_dir_all(&workspace).ok();
 
-        let paths = SandboxPaths::system_defaults();
+        let paths = system_default_paths();
         let config =
             SandboxConfig::new(workspace.clone(), paths, workspace).with_env(build_env(&[]));
         TestDirs {
@@ -321,7 +352,7 @@ mod tests {
     fn linux_test_config(workspace: std::path::PathBuf, network: NetworkMode) -> SandboxConfig {
         SandboxConfig::new(
             workspace.clone(),
-            SandboxPaths::system_defaults(),
+            system_default_paths(),
             workspace,
         )
         .with_network(network)

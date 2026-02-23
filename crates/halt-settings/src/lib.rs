@@ -17,8 +17,13 @@
 //! ```
 
 mod loader;
+mod profiles;
 
 pub use loader::ConfigLoader;
+pub use profiles::{
+    build_profiles_config, is_profile_likely_active, profile_deps_transitive, profile_requires,
+    Profile,
+};
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -83,6 +88,18 @@ pub struct SandboxPaths {
 }
 
 impl SandboxPaths {
+    /// Merge `other` paths on top of `self`, deduplicating all three lists.
+    #[must_use]
+    pub fn merge(mut self, other: SandboxPaths) -> SandboxPaths {
+        self.traversal.extend(other.traversal);
+        dedup_preserve_order(&mut self.traversal);
+        self.read.extend(other.read);
+        dedup_preserve_order(&mut self.read);
+        self.read_write.extend(other.read_write);
+        dedup_preserve_order(&mut self.read_write);
+        self
+    }
+
     /// Expand each list into `PathBuf` values.
     ///
     /// Returns `(traversal, read, read_write)`.
@@ -126,34 +143,6 @@ impl SandboxPaths {
         )
     }
 
-    /// Sensible system-wide defaults for a typical development environment.
-    pub fn system_defaults() -> Self {
-        Self {
-            traversal: vec!["/".to_string()],
-            read: vec![
-                "/bin".to_string(),
-                "/sbin".to_string(),
-                "/usr/bin".to_string(),
-                "/usr/sbin".to_string(),
-                "/usr/lib".to_string(),
-                "/usr/share".to_string(),
-                "/etc".to_string(),
-                // macOS system libraries and frameworks
-                "/Library".to_string(),
-                "/System/Library".to_string(),
-                "/System/Volumes/Preboot/Cryptexes".to_string(),
-                // macOS system databases (needed by Security framework, Keychain, timezone, dyld cache)
-                "/private/var/db".to_string(),
-            ],
-            read_write: vec![
-                "/tmp".to_string(),
-                // Device files — processes need to open /dev/null, /dev/urandom, etc.
-                "/dev".to_string(),
-                // macOS per-user volatile cache dirs (used by Keychain/MDS/Security framework)
-                "/private/var/folders".to_string(),
-            ],
-        }
-    }
 }
 
 /// An additional mount point exposed inside the sandbox.
@@ -274,18 +263,7 @@ impl HaltConfig {
             self.sandbox.network = other.sandbox.network;
         }
         // sandbox lists: global + project (deduplicated)
-        self.sandbox
-            .paths
-            .traversal
-            .extend(other.sandbox.paths.traversal);
-        dedup_preserve_order(&mut self.sandbox.paths.traversal);
-        self.sandbox.paths.read.extend(other.sandbox.paths.read);
-        dedup_preserve_order(&mut self.sandbox.paths.read);
-        self.sandbox
-            .paths
-            .read_write
-            .extend(other.sandbox.paths.read_write);
-        dedup_preserve_order(&mut self.sandbox.paths.read_write);
+        self.sandbox.paths = self.sandbox.paths.merge(other.sandbox.paths);
         self.sandbox.mounts.extend(other.sandbox.mounts);
 
         // proxy lists: global + project (deduplicated)
@@ -431,6 +409,25 @@ mod tests {
     }
 
     #[test]
+    fn test_sandbox_paths_merge() {
+        let base = SandboxPaths {
+            traversal: vec!["/".to_string()],
+            read: vec!["/usr/lib".to_string()],
+            read_write: vec!["/tmp".to_string()],
+        };
+        let extra = SandboxPaths {
+            traversal: vec![],
+            read: vec!["/opt/foo".to_string()],
+            read_write: vec!["/tmp".to_string(), "/var".to_string()],
+        };
+        let merged = base.merge(extra);
+        assert_eq!(merged.traversal, vec!["/"]);
+        assert_eq!(merged.read, vec!["/usr/lib", "/opt/foo"]);
+        // /tmp deduplicated
+        assert_eq!(merged.read_write, vec!["/tmp", "/var"]);
+    }
+
+    #[test]
     fn test_sandbox_paths_expand_paths() {
         let paths = SandboxPaths {
             traversal: vec!["/".to_string()],
@@ -441,14 +438,6 @@ mod tests {
         assert_eq!(traversal, vec![(PathBuf::from("/"), false)]);
         assert_eq!(read, vec![(PathBuf::from("/usr/lib"), false)]);
         assert_eq!(read_write, vec![(PathBuf::from("/tmp"), false)]);
-    }
-
-    #[test]
-    fn test_sandbox_paths_system_defaults() {
-        let defaults = SandboxPaths::system_defaults();
-        assert!(defaults.traversal.contains(&"/".to_string()));
-        assert!(!defaults.read.is_empty());
-        assert!(!defaults.read_write.is_empty());
     }
 
     #[test]

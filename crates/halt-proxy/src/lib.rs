@@ -68,9 +68,35 @@ pub use proxy::{TcpProxy, TcpProxyConfig};
 pub use server::{ProxyConfig, ProxyHandle, ProxyServer};
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 /// Result type for proxy operations.
 pub type Result<T> = std::result::Result<T, ProxyError>;
+
+/// A structured event emitted by the proxy during trace mode.
+///
+/// Replaces the previous stringly-typed `"access:..."` prefix convention,
+/// giving receivers a proper discriminant without string parsing.
+#[derive(Debug, Clone)]
+pub enum TraceEvent {
+    /// A connection or DNS query was blocked by the allowlist.
+    Violation(String),
+    /// A connection or DNS query was permitted.
+    Access(String),
+}
+
+// ── Lock helpers ─────────────────────────────────────────────────────────────
+//
+// These centralise the `unwrap_or_else(|e| e.into_inner())` poisoning-recovery
+// pattern so it isn't repeated at every lock site.
+
+fn read_lock<T>(lock: &std::sync::RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn write_lock<T>(lock: &std::sync::RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    lock.write().unwrap_or_else(|e| e.into_inner())
+}
 
 /// Errors that can occur in proxy operations.
 #[derive(Debug, thiserror::Error)]
@@ -166,8 +192,7 @@ impl ResolutionCache {
     /// # Arguments
     /// * `resolved` - The resolved address to cache
     pub fn insert(&self, resolved: ResolvedAddress) {
-        // Use unwrap_or_else to recover from poisoned lock - the data is still valid
-        let mut entries = self.entries.write().unwrap_or_else(|e| e.into_inner());
+        let mut entries = write_lock(&self.entries);
         let now = std::time::Instant::now();
 
         // 1. Evict expired entries
@@ -200,8 +225,7 @@ impl ResolutionCache {
     /// # Arguments
     /// * `addr` - The IP address to look up
     pub fn lookup(&self, addr: &std::net::IpAddr) -> Option<String> {
-        // Use unwrap_or_else to recover from poisoned lock - the data is still valid
-        let entries = self.entries.read().unwrap_or_else(|e| e.into_inner());
+        let entries = read_lock(&self.entries);
         entries.get(addr).and_then(|(resolved, _)| {
             if resolved.expires_at > std::time::Instant::now() {
                 Some(resolved.domain.clone())
@@ -211,27 +235,14 @@ impl ResolutionCache {
         })
     }
 
-    /// Remove expired entries from the cache.
-    pub fn cleanup_expired(&self) {
-        let now = std::time::Instant::now();
-        // Use unwrap_or_else to recover from poisoned lock - the data is still valid
-        let mut entries = self.entries.write().unwrap_or_else(|e| e.into_inner());
-        entries.retain(|_, (resolved, _)| resolved.expires_at > now);
-    }
-
     /// Returns true if the cache is empty.
     pub fn is_empty(&self) -> bool {
-        // Use unwrap_or_else to recover from poisoned lock - the data is still valid
-        self.entries
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_empty()
+        read_lock(&self.entries).is_empty()
     }
 
     /// Returns the number of entries in the cache.
     pub fn len(&self) -> usize {
-        // Use unwrap_or_else to recover from poisoned lock - the data is still valid
-        self.entries.read().unwrap_or_else(|e| e.into_inner()).len()
+        read_lock(&self.entries).len()
     }
 }
 
@@ -252,8 +263,15 @@ pub struct SharedState {
     /// Cache of resolved addresses.
     pub(crate) cache: ResolutionCache,
 
-    /// Optional channel for reporting policy violations in strict mode.
-    violation_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    /// Optional channel for reporting trace events (violations and granted access).
+    violation_tx: Option<tokio::sync::mpsc::UnboundedSender<TraceEvent>>,
+
+    /// Total number of proxy connections ever accepted (DNS queries + TCP
+    /// CONNECT requests).  Monotonically increasing; used by the caller to
+    /// detect whether the sandboxed process is actually routing traffic
+    /// through the proxy.  Stored as an Arc so callers can cheaply clone
+    /// a reference for use in background tasks.
+    pub connections_accepted: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl SharedState {
@@ -268,38 +286,40 @@ impl SharedState {
     /// Create new shared state, optionally wiring up a violation channel.
     pub fn with_violation_tx(
         allowlist: Vec<String>,
-        violation_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+        violation_tx: Option<tokio::sync::mpsc::UnboundedSender<TraceEvent>>,
     ) -> Self {
         Self {
             filter: std::sync::RwLock::new(DomainFilter::new(allowlist)),
             cache: ResolutionCache::new(),
             violation_tx,
+            connections_accepted: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
-    /// Report a policy violation if a violation channel is configured.
+    /// Report a policy violation (denied access) if a trace channel is configured.
     pub fn report_violation(&self, message: String) {
         if let Some(tx) = &self.violation_tx {
-            let _ = tx.send(message);
+            let _ = tx.send(TraceEvent::Violation(message));
+        }
+    }
+
+    /// Report a granted-access event if a trace channel is configured.
+    pub fn report_access(&self, message: String) {
+        if let Some(tx) = &self.violation_tx {
+            let _ = tx.send(TraceEvent::Access(message));
         }
     }
 
     /// Check if a domain is allowed by the filter.
     pub fn is_allowed(&self, domain: &str) -> bool {
-        // Use unwrap_or_else to recover from poisoned lock - the data is still valid
-        self.filter
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_allowed(domain)
+        read_lock(&self.filter).is_allowed(domain)
     }
 
     /// Add a domain to the allowlist.
     ///
     /// Mutates the filter in-place in O(1) amortized time.
     pub fn add_domain(&self, domain: String) {
-        // Use unwrap_or_else to recover from poisoned lock - the data is still valid
-        let mut filter = self.filter.write().unwrap_or_else(|e| e.into_inner());
-        filter.push(domain);
+        write_lock(&self.filter).push(domain);
     }
 
     /// Insert a resolved address into the cache.
@@ -321,10 +341,7 @@ impl SharedState {
 
     /// Get the current allowlist patterns.
     pub fn allowlist(&self) -> Vec<String> {
-        // Use unwrap_or_else to recover from poisoned lock - the data is still valid
-        self.filter
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
+        read_lock(&self.filter)
             .patterns()
             .iter()
             .map(|s| s.to_string())
@@ -388,7 +405,9 @@ mod tests {
         let resolved = ResolvedAddress {
             domain: "example.com".to_string(),
             addresses: vec![ip],
-            expires_at: std::time::Instant::now() - std::time::Duration::from_secs(1),
+            expires_at: std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(1))
+                .expect("system monotonic clock predates program start"),
         };
         cache.insert(resolved);
         assert_eq!(cache.lookup(&ip), None);
@@ -405,35 +424,6 @@ mod tests {
         };
         cache.insert(resolved);
         assert_eq!(cache.lookup(&ip), Some("example.com".to_string()));
-    }
-
-    #[test]
-    fn test_resolution_cache_cleanup_removes_expired() {
-        let cache = ResolutionCache::new();
-        let ip: std::net::IpAddr = "1.2.3.4".parse().unwrap();
-        let resolved = ResolvedAddress {
-            domain: "example.com".to_string(),
-            addresses: vec![ip],
-            expires_at: std::time::Instant::now() - std::time::Duration::from_secs(1),
-        };
-        cache.insert(resolved);
-        assert_eq!(cache.len(), 1);
-        cache.cleanup_expired();
-        assert!(cache.is_empty());
-    }
-
-    #[test]
-    fn test_resolution_cache_cleanup_keeps_valid() {
-        let cache = ResolutionCache::new();
-        let ip: std::net::IpAddr = "1.2.3.4".parse().unwrap();
-        let resolved = ResolvedAddress {
-            domain: "example.com".to_string(),
-            addresses: vec![ip],
-            expires_at: std::time::Instant::now() + std::time::Duration::from_secs(300),
-        };
-        cache.insert(resolved);
-        cache.cleanup_expired();
-        assert_eq!(cache.len(), 1);
     }
 
     #[test]

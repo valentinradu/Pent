@@ -64,16 +64,18 @@ pub struct RunArgs {
     #[arg(long)]
     pub no_config: bool,
 
-    /// Kill the process and log a readable error on any sandbox or proxy violation
+    /// Log every sandbox and proxy violation to .halt/trace.log without
+    /// killing the process (useful for discovering which paths and domains to
+    /// add to a profile)
     #[arg(long)]
-    pub strict: bool,
+    pub trace: bool,
 
     /// Command and arguments to run inside the sandbox
     #[arg(trailing_var_arg = true, required = true, value_name = "COMMAND")]
     pub command: Vec<String>,
 }
 
-#[derive(ValueEnum, Clone, Copy)]
+#[derive(ValueEnum, Clone, Copy, PartialEq, Eq)]
 pub enum NetworkModeArg {
     Unrestricted,
     Localhost,
@@ -101,6 +103,21 @@ pub enum ConfigSubcommand {
     },
     /// Open config in $EDITOR
     Edit {
+        #[arg(long)]
+        global: bool,
+    },
+    /// Add one or more profiles (e.g. @npm @cargo @gh)
+    Add {
+        #[arg(required = true, num_args = 1..)]
+        profiles: Vec<String>,
+        #[arg(long)]
+        global: bool,
+    },
+    /// Remove one or more profiles
+    #[command(name = "rm")]
+    Remove {
+        #[arg(required = true, num_args = 1..)]
+        profiles: Vec<String>,
         #[arg(long)]
         global: bool,
     },

@@ -150,6 +150,12 @@ impl TcpProxy {
                 continue;
             }
 
+            // Count every accepted connection so callers can detect whether the
+            // sandboxed process is routing traffic through the proxy at all.
+            self.state
+                .connections_accepted
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
             // Increment connection count
             self.connection_count
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -205,22 +211,34 @@ impl TcpProxy {
     async fn handle_socks5(&self, mut client: TcpStream, first_byte: u8) -> Result<()> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        // Read the rest of the SOCKS5 greeting (up to 257 more bytes after the first).
-        let mut rest = [0u8; 257];
-        let n = client
-            .read(&mut rest)
-            .await
-            .map_err(|e| ProxyError::Internal(format!("Failed to read SOCKS5 greeting: {e}")))?;
-
-        // greeting[0] = first_byte (version = 0x05), rest[0..n] = nmethods + methods
+        // greeting[0] = first_byte (version = 0x05)
         let _ = first_byte; // already verified == 0x05 by caller
+
+        // Read NMETHODS (exactly 1 byte).  Using read_exact here and below is
+        // critical: a plain read() with a large buffer can accidentally consume
+        // the CONNECT request when the greeting and CONNECT arrive in the same
+        // TCP segment (Nagle batching), leaving the second read() with 0 bytes
+        // and silently returning without ever reporting a violation.
+        let mut nmethods_buf = [0u8; 1];
+        client
+            .read_exact(&mut nmethods_buf)
+            .await
+            .map_err(|e| ProxyError::Internal(format!("Failed to read SOCKS5 nmethods: {e}")))?;
+        let nmethods = nmethods_buf[0] as usize;
+
+        // Read METHODS list (exactly nmethods bytes) — always use no-auth.
+        if nmethods > 0 {
+            let mut methods = vec![0u8; nmethods];
+            client
+                .read_exact(&mut methods)
+                .await
+                .map_err(|e| ProxyError::Internal(format!("Failed to read SOCKS5 methods: {e}")))?;
+        }
 
         // Send greeting response: no authentication required
         client.write_all(&[0x05, 0x00]).await.map_err(|e| {
             ProxyError::Internal(format!("Failed to send SOCKS5 greeting response: {e}"))
         })?;
-
-        let _ = (n, rest); // greeting parsed — methods ignored, we always use no-auth
 
         // Read SOCKS5 CONNECT request
         let mut request = [0u8; 262];
@@ -335,6 +353,9 @@ impl TcpProxy {
                 domain: domain_lower,
             });
         }
+        self.state.report_access(format!(
+            "network: connection to \"{domain_lower}\" allowed"
+        ));
 
         // Resolve the host.
         let addr_str = format!("{host}:{port}");
@@ -424,6 +445,9 @@ impl TcpProxy {
                 domain: domain_lower,
             });
         }
+        self.state.report_access(format!(
+            "network: connection to \"{domain_lower}\" allowed"
+        ));
 
         // Resolve via system resolver (domain is allowed).
         let addr_str = format!("{domain}:{port}");

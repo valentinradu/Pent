@@ -1,8 +1,43 @@
 //! Sandbox configuration types.
 
-use crate::{Mount, NetworkMode, SandboxPaths};
+use crate::{Mount, NetworkMode, SandboxPaths, SandboxSettings};
 use std::collections::HashMap;
 use std::path::PathBuf;
+
+/// Platform-appropriate system-wide sandbox path defaults.
+///
+/// Provides sensible baseline access (system binaries, libraries, temp dirs)
+/// that most processes need. Lives here rather than in `halt-settings` because
+/// the content is platform-specific knowledge, not config-format knowledge.
+pub fn system_default_paths() -> SandboxPaths {
+    SandboxPaths {
+        traversal: vec!["/".to_string()],
+        read: vec![
+            "/bin".to_string(),
+            "/sbin".to_string(),
+            "/usr/bin".to_string(),
+            "/usr/sbin".to_string(),
+            "/usr/lib".to_string(),
+            "/usr/share".to_string(),
+            "/etc".to_string(),
+            // macOS system libraries and frameworks
+            "/Library".to_string(),
+            "/System/Library".to_string(),
+            "/System/Volumes/Preboot/Cryptexes".to_string(),
+            // macOS system databases (Security framework, Keychain, timezone, dyld cache)
+            "/private/var/db".to_string(),
+            // Homebrew: ARM Macs → /opt/homebrew, Intel → /usr/local (covered by /usr/*)
+            "/opt/homebrew".to_string(),
+        ],
+        read_write: vec![
+            "/tmp".to_string(),
+            // Device files — processes need /dev/null, /dev/urandom, etc.
+            "/dev".to_string(),
+            // macOS per-user volatile cache dirs (Keychain/MDS/Security framework)
+            "/private/var/folders".to_string(),
+        ],
+    }
+}
 
 /// Configuration for sandboxed process execution.
 ///
@@ -33,10 +68,6 @@ pub struct SandboxConfig {
     /// Working directory for the process.
     pub cwd: PathBuf,
 
-    /// Strict mode: report sandbox violations via the system log and kill the
-    /// process on the first violation.  On macOS this adds `(with report)` to
-    /// the SBPL deny rules so denials appear in `log stream`.
-    pub strict: bool,
 }
 
 impl SandboxConfig {
@@ -55,14 +86,7 @@ impl SandboxConfig {
             env: HashMap::new(),
             network: NetworkMode::default(),
             cwd,
-            strict: false,
         }
-    }
-
-    /// Enable or disable strict mode.
-    pub fn with_strict(mut self, strict: bool) -> Self {
-        self.strict = strict;
-        self
     }
 
     /// Set the environment variables.
@@ -87,6 +111,24 @@ impl SandboxConfig {
     pub fn with_mount(mut self, mount: Mount) -> Self {
         self.mounts.push(mount);
         self
+    }
+
+    /// Build a `SandboxConfig` from a `SandboxSettings` fragment, merging
+    /// the settings' paths on top of [`system_default_paths()`].
+    ///
+    /// This is the canonical way to construct a `SandboxConfig` from loaded
+    /// config files; it avoids the manual path-extension boilerplate in callers.
+    pub fn from_sandbox_settings(
+        settings: SandboxSettings,
+        workspace: PathBuf,
+        cwd: PathBuf,
+    ) -> Self {
+        let paths = system_default_paths().merge(settings.paths);
+        let mut cfg = Self::new(workspace, paths, cwd);
+        for mount in settings.mounts {
+            cfg.mounts.push(mount);
+        }
+        cfg
     }
 }
 

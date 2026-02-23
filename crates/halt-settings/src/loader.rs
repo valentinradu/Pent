@@ -54,15 +54,37 @@ impl ConfigLoader {
         workspace.join(".halt")
     }
 
-    /// Load a config file, returning `None` if the file does not exist.
+    /// Load a config file, returning `None` if it is absent or inaccessible.
+    ///
+    /// IO errors (not-found, permission-denied, EPERM from a sandbox, etc.) are
+    /// treated as "no config" so that optional config files — in particular the
+    /// global one — never prevent the tool from running in restricted environments.
     ///
     /// # Errors
-    /// Returns an error if the file exists but cannot be parsed.
+    /// Returns an error only if the file is readable but contains invalid TOML.
     fn load_file(path: &Path) -> Result<Option<HaltConfig>, SettingsError> {
-        if !path.exists() {
-            return Ok(None);
+        match std::fs::read_to_string(path) {
+            Ok(contents) => HaltConfig::parse(&contents).map(Some),
+            Err(e) if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+            ) => Ok(None),
+            // EPERM (raw os error 1) is not always mapped to PermissionDenied by
+            // std on macOS; handle it explicitly so sandboxed environments work.
+            Err(ref e) if e.raw_os_error() == Some(1) => Ok(None),
+            Err(e) => Err(SettingsError::Io(e)),
         }
-        HaltConfig::load(path).map(Some)
+    }
+}
+
+#[cfg(test)]
+impl ConfigLoader {
+    /// Load only the project-level config, skipping the global file.
+    ///
+    /// Used in unit tests to avoid pollution from the developer's real global
+    /// halt.toml (`~/Library/Application Support/halt/halt.toml`).
+    fn load_project_only(workspace: &Path) -> Result<HaltConfig, SettingsError> {
+        Ok(Self::load_file(&Self::project_config_path(workspace))?.unwrap_or_default())
     }
 }
 
@@ -75,7 +97,8 @@ mod tests {
     #[test]
     fn test_load_missing_workspace_returns_default() {
         let dir = tempfile::tempdir().unwrap();
-        let config = ConfigLoader::load(dir.path()).unwrap();
+        // Use load_project_only to avoid pollution from the real global config.
+        let config = ConfigLoader::load_project_only(dir.path()).unwrap();
         assert!(config.sandbox.network.is_none());
         assert!(config.proxy.domain_allowlist.is_empty());
     }
@@ -91,7 +114,8 @@ mod tests {
         )
         .unwrap();
 
-        let config = ConfigLoader::load(dir.path()).unwrap();
+        // Use load_project_only to avoid pollution from the real global config.
+        let config = ConfigLoader::load_project_only(dir.path()).unwrap();
         assert_eq!(
             config.proxy.domain_allowlist,
             vec!["example.com".to_string()]

@@ -65,7 +65,7 @@ e2e-macos: build-release
 
 e2e-linux:
 	docker build --file e2e/Dockerfile --tag "$(DOCKER_IMAGE)" .
-	docker run --rm --cap-add NET_ADMIN "$(DOCKER_IMAGE)" /halt/e2e/test-linux-agents.sh
+	docker run --rm --cap-add NET_ADMIN --cap-add SYS_ADMIN "$(DOCKER_IMAGE)" /halt/e2e/test-linux-agents.sh
 
 release-check:
 	@if [[ -z "$${VERSION:-}" ]]; then \

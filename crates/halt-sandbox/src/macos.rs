@@ -20,6 +20,7 @@
 //! No lightweight alternative exists for process sandboxing on macOS.
 
 use crate::{NetworkMode, SandboxConfig, SandboxError};
+use std::fmt::Write as _;
 use std::path::Path;
 
 /// Check if sandbox-exec is available on this system.
@@ -57,9 +58,8 @@ fn validate_path_for_sbpl(path: &Path) -> Result<(), SandboxError> {
     for ch in ['(', ')', ';', '*'] {
         if s.contains(ch) {
             return Err(SandboxError::InvalidConfig(format!(
-                "Path {:?} contains SBPL control character {:?}; \
-                 refusing to include it in the sandbox profile to prevent rule injection",
-                path, ch
+                "Path {path:?} contains SBPL control character {ch}; \
+                 refusing to include it in the sandbox profile to prevent rule injection"
             )));
         }
     }
@@ -94,7 +94,6 @@ pub fn generate_sbpl_profile(config: &SandboxConfig) -> Result<String, SandboxEr
     // file-read* broke DNS for every program that uses getaddrinfo().
     profile.push_str("(version 1)\n");
     profile.push_str("(allow default)\n");
-    // Sandbox denials are logged automatically by sandboxd; no extra modifier needed.
     profile.push_str("(deny file-read-data)\n");
     profile.push_str("(deny file-write*)\n");
 
@@ -110,10 +109,7 @@ pub fn generate_sbpl_profile(config: &SandboxConfig) -> Result<String, SandboxEr
         } else {
             validate_path_for_sbpl(path)?;
             let escaped = escape_sbpl_path(path);
-            profile.push_str(&format!(
-                "(allow file-read-data (literal \"{}\"))\n",
-                escaped
-            ));
+            write!(profile, "(allow file-read-data (literal \"{escaped}\"))\n").unwrap();
         }
     }
 
@@ -121,10 +117,7 @@ pub fn generate_sbpl_profile(config: &SandboxConfig) -> Result<String, SandboxEr
     let mut parent = config.workspace.parent();
     while let Some(p) = parent {
         let canonical = canonicalize_for_sbpl(p);
-        profile.push_str(&format!(
-            "(allow file-read-data (literal \"{}\"))\n",
-            canonical
-        ));
+        write!(profile, "(allow file-read-data (literal \"{canonical}\"))\n").unwrap();
         parent = p.parent();
     }
 
@@ -183,16 +176,21 @@ pub fn generate_sbpl_profile(config: &SandboxConfig) -> Result<String, SandboxEr
 ///
 /// # Network Rules
 /// - Unrestricted: No network rules (allow default permits it)
-/// - LocalhostOnly: Deny network, then allow localhost only
-/// - ProxyOnly: Same as LocalhostOnly (proxy runs on localhost)
+/// - LocalhostOnly: Deny network, then allow all loopback outbound
+/// - ProxyOnly: No network rules — proxy enforcement is not supported on macOS.
+///   On macOS there is no per-process network namespace (unlike Linux), so traffic
+///   cannot be transparently redirected through a proxy regardless of DYLD injection
+///   limitations. ProxyOnly is therefore treated as Unrestricted at the Seatbelt
+///   level; the caller (halt CLI) is responsible for warning the user.
 /// - Blocked: `(deny network*)`
 fn generate_network_rules(mode: &NetworkMode) -> String {
     match mode {
-        NetworkMode::Unrestricted => {
-            // Allow default already permits network
+        NetworkMode::Unrestricted | NetworkMode::ProxyOnly { .. } => {
+            // Allow default already permits network.
+            // ProxyOnly is treated as Unrestricted on macOS — see doc comment above.
             String::new()
         }
-        NetworkMode::LocalhostOnly | NetworkMode::ProxyOnly { .. } => {
+        NetworkMode::LocalhostOnly => {
             // Deny all network, then allow only loopback.
             // network-outbound to remote localhost: allows TCP/UDP connects to 127.x
             // network-bind to local localhost: allows binding loopback server sockets
@@ -245,12 +243,9 @@ fn add_sbpl_glob_rule(profile: &mut String, path: &Path, access: &str) {
         .map(|p| p.to_string_lossy().replace('.', "\\."))
         .unwrap_or_else(|_| escaped_regex.clone());
 
-    profile.push_str(&format!("(allow {} (regex \"^{}\"))\n", access, canonical));
+    write!(profile, "(allow {access} (regex \"^{canonical}\"))\n").unwrap();
     if escaped_regex != canonical {
-        profile.push_str(&format!(
-            "(allow {} (regex \"^{}\"))\n",
-            access, escaped_regex
-        ));
+        write!(profile, "(allow {access} (regex \"^{escaped_regex}\"))\n").unwrap();
     }
 }
 
@@ -267,30 +262,18 @@ fn add_sbpl_path_rule(profile: &mut String, path: &Path, access: &str) {
     let modifier = if is_file { "literal" } else { "subpath" };
 
     // Always add the canonical path
-    profile.push_str(&format!(
-        "(allow {} ({} \"{}\"))\n",
-        access, modifier, canonical
-    ));
+    write!(profile, "(allow {access} ({modifier} \"{canonical}\"))\n").unwrap();
 
     // If original differs from canonical (symlink), add it too
     if original != canonical {
-        profile.push_str(&format!(
-            "(allow {} ({} \"{}\"))\n",
-            access, modifier, original
-        ));
+        write!(profile, "(allow {access} ({modifier} \"{original}\"))\n").unwrap();
     }
 
     // For executable files, also allow process-exec
     if is_file && is_executable(path) {
-        profile.push_str(&format!(
-            "(allow process-exec (literal \"{}\"))\n",
-            canonical
-        ));
+        write!(profile, "(allow process-exec (literal \"{canonical}\"))\n").unwrap();
         if original != canonical {
-            profile.push_str(&format!(
-                "(allow process-exec (literal \"{}\"))\n",
-                original
-            ));
+            write!(profile, "(allow process-exec (literal \"{original}\"))\n").unwrap();
         }
     }
 }
@@ -494,9 +477,12 @@ mod tests {
     fn test_network_rules_proxy_only() {
         let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
         let rules = generate_network_rules(&NetworkMode::ProxyOnly { proxy_addr: addr });
-        // ProxyOnly should be same as LocalhostOnly
-        assert!(rules.contains("(deny network*)"));
-        assert!(rules.contains("localhost"));
+        // On macOS, ProxyOnly produces no Seatbelt network rules — enforcement is
+        // impossible without per-process network namespaces (Linux-only).
+        assert!(
+            rules.is_empty(),
+            "ProxyOnly should generate no network rules on macOS, got: {rules}"
+        );
     }
 
     #[test]

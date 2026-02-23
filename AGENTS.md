@@ -122,3 +122,17 @@ These rules are non-negotiable. All code must comply before being committed.
   binaries, network access) without a runtime guard that skips the test
   gracefully when the state is unavailable.
 - Integration / e2e tests belong in a separate `tests/` directory.
+
+---
+
+## Platform notes
+
+### macOS — network containment not enforced
+
+Proxy-based network enforcement (`--allow`, `--network proxy`) is accepted by the CLI but has **no effect on macOS**. The reasons:
+
+- macOS has no per-process network namespaces. On Linux, `unshare(CLONE_NEWNET)` isolates the child's network stack entirely; all traffic is forced through the proxy via a veth pair regardless of what the process does. No equivalent exists on macOS for unprivileged processes.
+- `DYLD_INSERT_LIBRARIES` interposition (the proxychains approach) only hooks libc's `connect()`. Go binaries make raw syscalls and bypass it entirely. Binaries built with hardened runtime (`com.apple.security.cs.disable-library-validation` absent) strip `DYLD_INSERT_LIBRARIES` before loading.
+- `pf` packet-filter redirection requires root and is system-wide — it cannot be scoped to a single process without also injecting a source-address bind, which circles back to the DYLD limitation.
+
+On macOS, halt provides **filesystem isolation only** (via Seatbelt/SBPL). Network access is unrestricted. For network containment use the Linux e2e environment (`make e2e-linux`) or run halt on a Linux host.

@@ -44,12 +44,25 @@ HALT=$(resolve_halt) || {
     echo "error: could not find halt binary. Set HALT=/path/to/halt or build target/release/halt." >&2
     exit 1
 }
-CONFIGS_DIR=${CONFIGS_DIR:-"${ROOT_DIR}/configs/linux"}
 PASS=0
 FAIL=0
 LAST_EXIT=0
 WORKSPACE=$(mktemp -d)
-trap 'rm -rf "$WORKSPACE"' EXIT
+CONFIGS_TMPDIR=$(mktemp -d)
+trap 'rm -rf "$WORKSPACE" "$CONFIGS_TMPDIR"' EXIT
+
+# Generate per-agent config files using the profile system.
+# On Linux, dirs::config_dir() resolves to ~/.config,
+# so the config lands at $HOME/.config/halt/halt.toml.
+config_file_for() {
+    echo "${CONFIGS_TMPDIR}/${1}_home/.config/halt/halt.toml"
+}
+
+for _agent in claude codex gemini; do
+    _agent_home="${CONFIGS_TMPDIR}/${_agent}_home"
+    mkdir -p "${_agent_home}"
+    HOME="${_agent_home}" "$HALT" config add --global "@${_agent}"
+done
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -100,13 +113,39 @@ assert_one_of_exits() {
     return 1
 }
 
+# ── Check Landlock availability ───────────────────────────────────────────────
+# halt check only verifies the Landlock API is present; some kernels (e.g.
+# Docker Desktop on macOS) expose the syscall but do not enforce restrictions.
+# Probe by actually running a sandboxed write to a path that must be blocked.
+LANDLOCK_AVAILABLE=false
+if "$HALT" check 2>/dev/null; then
+    "$HALT" run --no-config --network unrestricted \
+        -- bash -c "echo probe > /etc/halt-landlock-probe 2>/dev/null; exit 0" \
+        2>/dev/null </dev/null || true
+    if [ ! -f /etc/halt-landlock-probe ]; then
+        LANDLOCK_AVAILABLE=true
+    else
+        rm -f /etc/halt-landlock-probe
+        echo "NOTE: Landlock API available but not enforcing (kernel limitation) — skipping filesystem tests"
+    fi
+else
+    echo "NOTE: halt check reports sandbox unavailable — skipping Landlock filesystem tests"
+fi
+
 # ── Landlock filesystem tests ─────────────────────────────────────────────────
 # These do not require NET_ADMIN because we use --network unrestricted to skip
 # network namespace creation while still exercising Landlock.
 
 test_filesystem() {
     local agent="$1"
-    local config="$CONFIGS_DIR/${agent}.toml"
+    local config
+    config=$(config_file_for "$agent")
+
+    if [ "$LANDLOCK_AVAILABLE" = false ]; then
+        echo ""
+        echo "── $agent: filesystem (Landlock) — SKIPPED (kernel lacks Landlock) ──"
+        return 0
+    fi
 
     echo ""
     echo "── $agent: filesystem (Landlock) ──────────────────────────────────"
@@ -150,7 +189,8 @@ test_filesystem() {
 
 test_network() {
     local agent="$1"
-    local config="$CONFIGS_DIR/${agent}.toml"
+    local config
+    config=$(config_file_for "$agent")
     # Determine the first domain in the allowlist for this agent.
     local allowed_domain blocked_domain="blocked-domain.invalid"
 
@@ -190,89 +230,6 @@ test_network() {
     code=$LAST_EXIT
     assert_one_of_exits "$code" "$agent: blocked domain '$blocked_domain' denied" 6 56
 
-    # 6. Strict mode: a SOCKS5 request for a blocked domain triggers violation → exit 2.
-    #    We use bash /dev/tcp to speak raw SOCKS5 directly to the proxy port,
-    #    mirroring the integration test already in the Rust test suite.
-    local socks5_script
-    socks5_script=$(cat <<'SOCKS5'
-PROXY_PORT=$(echo "${HTTP_PROXY:-}" | grep -oE '[0-9]+$')
-[ -z "$PROXY_PORT" ] && exit 0
-exec 3<>/dev/tcp/127.0.0.1/${PROXY_PORT}
-printf '\x05\x01\x00' >&3
-sleep 0.1
-printf '\x05\x01\x00\x03\x16blocked-domain.example\x00\x50' >&3
-exec 3>&-
-sleep 0.3
-SOCKS5
-    )
-    run_halt "$config" \
-        --strict \
-        -- bash -c "$socks5_script" </dev/null
-    code=$LAST_EXIT
-    assert_exit 2 "$code" "$agent: strict mode exits 2 on blocked SOCKS5 CONNECT"
-
-    # 7. Strict mode allowlisted SOCKS5 domain should not trigger a violation.
-    local allowed_socks5_script
-    case "$agent" in
-        claude)
-            allowed_socks5_script=$(cat <<'SOCKS5'
-PROXY_PORT=$(echo "${HTTP_PROXY:-}" | grep -oE '[0-9]+$')
-[ -z "$PROXY_PORT" ] && exit 1
-exec 3<>/dev/tcp/127.0.0.1/${PROXY_PORT}
-printf '\x05\x01\x00' >&3
-sleep 0.1
-printf '\x05\x01\x00\x03\x11api.anthropic.com\x00\x50' >&3
-exec 3>&-
-sleep 0.3
-SOCKS5
-)
-            ;;
-        codex)
-            allowed_socks5_script=$(cat <<'SOCKS5'
-PROXY_PORT=$(echo "${HTTP_PROXY:-}" | grep -oE '[0-9]+$')
-[ -z "$PROXY_PORT" ] && exit 1
-exec 3<>/dev/tcp/127.0.0.1/${PROXY_PORT}
-printf '\x05\x01\x00' >&3
-sleep 0.1
-printf '\x05\x01\x00\x03\x0eapi.openai.com\x00\x50' >&3
-exec 3>&-
-sleep 0.3
-SOCKS5
-)
-            ;;
-        gemini)
-            allowed_socks5_script=$(cat <<'SOCKS5'
-PROXY_PORT=$(echo "${HTTP_PROXY:-}" | grep -oE '[0-9]+$')
-[ -z "$PROXY_PORT" ] && exit 1
-exec 3<>/dev/tcp/127.0.0.1/${PROXY_PORT}
-printf '\x05\x01\x00' >&3
-sleep 0.1
-printf '\x05\x01\x00\x03\x21generativelanguage.googleapis.com\x00\x50' >&3
-exec 3>&-
-sleep 0.3
-SOCKS5
-)
-            ;;
-        *)
-            allowed_socks5_script=$(cat <<'SOCKS5'
-PROXY_PORT=$(echo "${HTTP_PROXY:-}" | grep -oE '[0-9]+$')
-[ -z "$PROXY_PORT" ] && exit 1
-exec 3<>/dev/tcp/127.0.0.1/${PROXY_PORT}
-printf '\x05\x01\x00' >&3
-sleep 0.1
-printf '\x05\x01\x00\x03\x0bexample.com\x00\x50' >&3
-exec 3>&-
-sleep 0.3
-SOCKS5
-)
-            ;;
-    esac
-
-    run_halt "$config" \
-        --strict \
-        -- bash -c "$allowed_socks5_script" </dev/null
-    code=$LAST_EXIT
-    assert_exit 0 "$code" "$agent: strict mode allows allowlisted SOCKS5 CONNECT domain"
 }
 
 # ── Run all tests for every agent ─────────────────────────────────────────────

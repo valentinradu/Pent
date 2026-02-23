@@ -44,8 +44,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy the compiled halt binary.
 COPY --from=builder /halt/target/release/halt /usr/local/bin/halt
 
-# Copy configs and test script so they are available inside the container.
-COPY configs/ /halt/configs/
+# Copy test script so it is available inside the container.
 COPY e2e/test-linux-agents.sh /halt/e2e/test-linux-agents.sh
 RUN chmod +x /halt/e2e/test-linux-agents.sh
 

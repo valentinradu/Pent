@@ -13,7 +13,7 @@ async fn main() {
 
     let result = dispatch(cli).await;
     if let Err(e) = result {
-        eprintln!("error: {e}");
+        tracing::error!("{e}");
         std::process::exit(1);
     }
 }
@@ -29,9 +29,8 @@ async fn dispatch(cli: Cli) -> Result<(), CliError> {
 
 fn setup_tracing(verbose: u8) {
     let level = match verbose {
-        0 => "warn",
-        1 => "info",
-        2 => "debug",
+        0 => "info",
+        1 => "debug",
         _ => "trace",
     };
 
