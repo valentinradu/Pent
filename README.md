@@ -1,4 +1,4 @@
-# halt
+# Halt
 
 Wrap AI coding agents, or any process, in a lightweight containment layer that restricts filesystem and network access using native OS mechanisms.
 
