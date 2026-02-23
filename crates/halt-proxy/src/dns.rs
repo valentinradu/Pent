@@ -51,6 +51,10 @@ pub struct DnsServerConfig {
     /// Used for caching and client-side caching hints.
     /// Default: 5 minutes
     pub ttl: std::time::Duration,
+
+    /// Per-upstream timeout when resolving a query.
+    /// Default: 5 seconds
+    pub resolve_timeout: std::time::Duration,
 }
 
 impl Default for DnsServerConfig {
@@ -59,6 +63,7 @@ impl Default for DnsServerConfig {
             bind_addr: "127.0.0.1:0".parse().expect("hardcoded loopback address"),
             upstream: None, // Use system resolvers
             ttl: std::time::Duration::from_secs(300),
+            resolve_timeout: std::time::Duration::from_secs(5),
         }
     }
 }
@@ -410,7 +415,7 @@ impl DnsServer {
 
                 let mut buf = [0u8; 512];
                 let result =
-                    tokio::time::timeout(std::time::Duration::from_secs(5), socket.recv(&mut buf))
+                    tokio::time::timeout(self.config.resolve_timeout, socket.recv(&mut buf))
                         .await;
 
                 if let Ok(Ok(len)) = result {
@@ -1119,10 +1124,15 @@ mod tests {
     #[tokio::test]
     async fn test_resolve_upstream_timeout() {
         use crate::SharedState;
+        // Bind a local silent UDP server — accepts packets but never responds.
+        let silent = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let silent_addr = silent.local_addr().unwrap();
+
         let state = Arc::new(SharedState::new(vec!["example.com".to_string()]));
-        // Use a non-routable IP as upstream to force timeout
         let config = DnsServerConfig {
-            upstream: Some(vec!["10.255.255.1:53".parse().unwrap()]),
+            upstream: Some(vec![silent_addr]),
+            // Short timeout so the test completes quickly.
+            resolve_timeout: std::time::Duration::from_millis(100),
             ..Default::default()
         };
         let server = DnsServer::new(config, state).unwrap();

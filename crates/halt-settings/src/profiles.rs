@@ -501,7 +501,10 @@ fn profile_config(p: Profile) -> HaltConfig {
             sandbox: SandboxSettings {
                 paths: SandboxPaths {
                     read_write: if macos {
-                        vec!["~/Library/Application Support/gemini-cli".to_string()]
+                        vec![
+                            "~/Library/Application Support/gemini-cli".to_string(),
+                            "~/.gemini".to_string(),
+                        ]
                     } else {
                         vec!["~/.gemini".to_string()]
                     },

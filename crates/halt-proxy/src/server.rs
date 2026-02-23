@@ -297,6 +297,7 @@ impl ProxyServer {
                 bind_addr: actual_dns_addr,
                 upstream: config.upstream_dns.clone(),
                 ttl: config.dns_ttl,
+                ..Default::default()
             };
             let tcp_config = TcpProxyConfig {
                 bind_addr: actual_proxy_addr,
@@ -339,6 +340,7 @@ impl ProxyServer {
             bind_addr: self.config.dns_bind_addr,
             upstream: self.config.upstream_dns.clone(),
             ttl: self.config.dns_ttl,
+            ..Default::default()
         };
         let tcp_config = TcpProxyConfig {
             bind_addr: self.config.proxy_bind_addr,
