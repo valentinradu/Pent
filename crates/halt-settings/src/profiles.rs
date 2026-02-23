@@ -366,6 +366,8 @@ fn profile_config(p: Profile) -> HaltConfig {
                         "~/.config/git".to_string(),
                         // Common machine-local include (often referenced from .gitconfig)
                         "~/.gitconfig_local".to_string(),
+                        // GitHub CLI config (read for auth; @gh adds read_write if needed)
+                        "~/.config/gh".to_string(),
                     ],
                     ..Default::default()
                 },

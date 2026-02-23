@@ -1,0 +1,53 @@
+[sandbox]
+mounts = []
+
+[sandbox.paths]
+traversal = [
+    "~",
+    "~/.local",
+    "~/.ssh",
+]
+read = [
+    "~/.cargo/env",
+    "~/.CFUserTextEncoding",
+    "~/Library/Preferences",
+    "~/Library/Application Support/com.apple.TCC",
+    "~/.zshrc",
+    "~/.ssh/known_hosts",
+    "~/.ssh/config",
+    "~/.gitconfig",
+    "~/.config/git",
+    "~/.zshenv",
+    "~/.zprofile",
+    "~/.bashrc",
+    "~/.bash_profile",
+    "~/.profile",
+    "/usr/libexec/path_helper",
+    "~/.local/bin",
+    "~/.npmrc",
+    "~/.ssh/config.d",
+    "~/.gitconfig_local",
+    "~/.config/gh",
+]
+read_write = [
+    "~/.cargo",
+    "~/.rustup",
+    "~/.npm",
+    "~/.claude",
+    "~/.claude.json*",
+    "~/.local/share/claude",
+    "~/Library/Application Support/claude",
+    "~/.cache/claude",
+]
+
+[proxy]
+domain_allowlist = [
+    "crates.io",
+    "static.crates.io",
+    "index.crates.io",
+    "registry.npmjs.org",
+    "*.npmjs.org",
+    "api.anthropic.com",
+    "statsig.anthropic.com",
+    "sentry.io",
+]
