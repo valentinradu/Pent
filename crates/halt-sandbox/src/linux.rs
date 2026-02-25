@@ -111,23 +111,19 @@ pub fn build_landlock_ruleset(
         Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr, ABI,
     };
 
-    // Access rights to control: all except Execute.
-    // Exec is NOT restricted by the Landlock ruleset so that the binary can be
-    // loaded from any path (e.g. ~/.local/share/claude) without the caller
-    // needing to enumerate every launcher location.  The sandbox governs what
-    // the running process can *read* and *write*, not which binaries it can run.
-    let mut handle_access = AccessFs::from_all(ABI::V4);
-    handle_access.remove(AccessFs::Execute);
+    // All filesystem access rights for deny-all baseline
+    let all_access = AccessFs::from_all(ABI::V4);
 
-    // Read-only access rights (no Execute — not controlled by this ruleset)
-    let read_access = AccessFs::ReadFile | AccessFs::ReadDir;
+    // Read-only access rights: readable paths are also executable.
+    // A process that can read a file can execute it — visibility implies executability.
+    let read_access = AccessFs::ReadFile | AccessFs::ReadDir | AccessFs::Execute;
 
-    // Read-write access rights
-    let write_access = handle_access;
+    // Read-write access rights (all)
+    let write_access = all_access;
 
-    // Create ruleset with deny-all baseline (excluding Execute)
+    // Create ruleset with deny-all baseline
     let mut ruleset = Ruleset::default()
-        .handle_access(handle_access)
+        .handle_access(all_access)
         .map_err(|e| SandboxError::InvalidConfig(format!("Failed to create ruleset: {}", e)))?
         .create()
         .map_err(|e| SandboxError::InvalidConfig(format!("Failed to create ruleset: {}", e)))?;
@@ -165,11 +161,9 @@ pub fn build_landlock_ruleset(
     }
 
     // Configured SandboxPaths (from profiles and TOML config).
-    // traversal = ReadDir only (stat/list, no file reads).
-    // read = ReadFile | ReadDir.
-    // read_write = all write access rights.
-    // These paths also enable the kernel to read ELF binaries during exec(),
-    // which requires ReadFile even though Execute is not in handle_access.
+    // traversal = ReadDir only (stat/list, no file reads or exec).
+    // read = ReadFile | ReadDir | Execute (visible → executable).
+    // read_write = all access rights.
     let traversal_access = AccessFs::ReadDir;
     let (traversal_paths, read_paths, rw_paths) = config.paths.expand_paths();
     for (path, _) in &traversal_paths {
@@ -593,15 +587,13 @@ pub fn spawn_with_landlock(
     unsafe {
         command.pre_exec(move || {
             // Build and apply Landlock in child process.
-            // Execute is excluded from handle_access so exec is unrestricted —
-            // the sandbox governs reads/writes only, not which binaries run.
-            let mut handle_access = AccessFs::from_all(ABI::V4);
-            handle_access.remove(AccessFs::Execute);
-            let read_access = AccessFs::ReadFile | AccessFs::ReadDir;
-            let write_access = handle_access;
+            // Readable paths are also executable: visibility implies executability.
+            let all_access = AccessFs::from_all(ABI::V4);
+            let read_access = AccessFs::ReadFile | AccessFs::ReadDir | AccessFs::Execute;
+            let write_access = all_access;
 
             let mut ruleset = Ruleset::default()
-                .handle_access(handle_access)
+                .handle_access(all_access)
                 .map_err(|e| std::io::Error::other(e.to_string()))?
                 .create()
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
