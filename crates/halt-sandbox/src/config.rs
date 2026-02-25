@@ -48,7 +48,7 @@ pub struct SandboxConfig {
     pub workspace: PathBuf,
 
     /// Sandbox filesystem paths (traversal, read, read_write).
-    /// Used by the macOS SBPL profile generator.
+    /// Applied by both the macOS SBPL profile generator and Linux Landlock ruleset.
     pub paths: SandboxPaths,
 
     /// Application data directory (e.g. `~/.myapp`) — read-write inside sandbox.

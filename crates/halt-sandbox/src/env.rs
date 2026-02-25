@@ -62,35 +62,41 @@ pub fn build_env(env_allowlist: &[String]) -> HashMap<String, String> {
         .collect()
 }
 
-/// Resolve PATH directories that exist on the filesystem.
+/// Resolve PATH directories from a PATH string.
 ///
-/// Parses the PATH environment variable and returns only directories
-/// that actually exist. Used for sandbox path allowlists.
+/// Parses the given PATH string and returns only directories that actually
+/// exist. Used for sandbox path allowlists so that the child's PATH (which
+/// may differ from the parent's, e.g. when running under sudo) drives the
+/// Landlock ruleset.
+///
+/// # Arguments
+/// * `path_str` - A colon-separated (Unix) or semicolon-separated (Windows) PATH string
 ///
 /// # Returns
 /// Vec of existing PATH directories as PathBuf
-pub fn resolve_path_directories() -> Vec<PathBuf> {
-    let path_var = match std::env::var("PATH") {
-        Ok(p) => p,
-        Err(_) => return Vec::new(),
-    };
-
-    if path_var.is_empty() {
+pub fn resolve_path_dirs_from(path_str: &str) -> Vec<PathBuf> {
+    if path_str.is_empty() {
         return Vec::new();
     }
 
-    // PATH separator is : on Unix, ; on Windows
     #[cfg(unix)]
     const PATH_SEP: char = ':';
     #[cfg(windows)]
     const PATH_SEP: char = ';';
 
-    path_var
+    path_str
         .split(PATH_SEP)
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
         .filter(|p| p.exists() && p.is_dir())
         .collect()
+}
+
+/// Resolve PATH directories from the current process's PATH environment variable.
+///
+/// Convenience wrapper around [`resolve_path_dirs_from`].
+pub fn resolve_path_directories() -> Vec<PathBuf> {
+    resolve_path_dirs_from(&std::env::var("PATH").unwrap_or_default())
 }
 
 #[cfg(test)]

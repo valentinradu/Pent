@@ -8,8 +8,9 @@ pkgdesc="Wrap any process in a filesystem and network sandbox"
 arch=('x86_64' 'aarch64')
 url="https://github.com/valentinradu/Halt"
 license=('MIT')
-depends=()
+depends=('libcap')
 makedepends=('cargo')
+install="halt.install"
 source=("$pkgname-$pkgver.tar.gz::https://github.com/valentinradu/Halt/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('PLACEHOLDER_SOURCE_SHA256')
 

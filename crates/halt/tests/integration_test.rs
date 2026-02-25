@@ -835,6 +835,14 @@ fn test_config_add_claude_has_correct_domains_and_paths() {
         contents.contains("~/.local/share/claude"),
         "@claude missing ~/.local/share/claude: {contents}"
     );
+    assert!(
+        contents.contains("api.github.com"),
+        "@claude missing api.github.com (marketplace): {contents}"
+    );
+    assert!(
+        contents.contains("raw.githubusercontent.com"),
+        "@claude missing raw.githubusercontent.com (marketplace): {contents}"
+    );
 }
 
 #[test]

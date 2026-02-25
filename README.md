@@ -57,11 +57,11 @@ On macOS, halt generates a [Sandbox Profile Language (SBPL)](https://reverse.put
 
 **Network containment is not enforced on macOS.** See [Platform limitations](#platform-limitations) below.
 
-### Linux — Landlock LSM + network namespaces
+### Linux — Landlock + network namespaces
 
-On Linux (kernel 5.13+), halt uses two mechanisms:
+On Linux, halt uses two mechanisms:
 
-- **[Landlock LSM](https://landlock.io/)** restricts filesystem access. Halt applies a Landlock ruleset that grants the child only the filesystem rights you configure (read, read-write, or traversal-only per path).
+- **Landlock LSM** restricts filesystem access. The child process is confined to the paths you configure using the kernel's Landlock security module. Requires kernel ≥ 5.13 (Landlock ABI v1); full ruleset support requires ≥ 5.19 (ABI v2).
 - **Network namespaces** (`unshare(CLONE_NEWNET)`) isolate the child's network stack. For `proxy_only` mode, the proxy listens on the loopback interface of the parent namespace and a `veth` pair bridges traffic from the child's namespace to the proxy. For `blocked` mode, the child gets a fresh namespace with no external connectivity.
 
 ### Built-in proxy

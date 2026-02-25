@@ -8,6 +8,7 @@ use halt_settings::{
 
 use crate::cli::{ConfigSubcommand, OutputFormat};
 use crate::error::CliError;
+use crate::ui;
 
 /// Resolve the config file path for `--global` or project-local operations.
 fn resolve_config_path(global: bool, cwd: &Path) -> Result<PathBuf, CliError> {
@@ -47,7 +48,7 @@ fn init(global: bool, cwd: &Path) -> Result<(), CliError> {
     }
 
     HaltConfig::default().save(&path)?;
-    tracing::info!(path = %path.display(), "created config");
+    ui::ok(format!("created {}", path.display()));
     Ok(())
 }
 
@@ -101,7 +102,7 @@ fn add_profile(global: bool, profiles: Vec<String>, cwd: &Path) -> Result<(), Cl
     merged.save(&path)?;
 
     let names: Vec<String> = expanded.iter().map(ToString::to_string).collect();
-    tracing::info!(profiles = %names.join(" "), path = %path.display(), "added profiles");
+    ui::ok(format!("added {} → {}", names.join(" "), path.display()));
     Ok(())
 }
 
@@ -179,6 +180,6 @@ fn rm_profile(global: bool, profiles: Vec<String>, cwd: &Path) -> Result<(), Cli
     config.save(&path)?;
 
     let names: Vec<String> = parsed.iter().map(ToString::to_string).collect();
-    tracing::info!(profiles = %names.join(" "), path = %path.display(), "removed profiles");
+    ui::ok(format!("removed {} from {}", names.join(" "), path.display()));
     Ok(())
 }

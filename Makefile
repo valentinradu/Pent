@@ -60,12 +60,12 @@ fmt-check:
 
 check: fmt-check clippy test
 
-e2e-macos: build-release
-	HALT="$(HALT_BIN)" bash e2e/test-macos-agents.sh
+e2e-macos:
+	cargo test --test e2e_macos -- --nocapture
 
 e2e-linux:
 	docker build --file e2e/Dockerfile --tag "$(DOCKER_IMAGE)" .
-	docker run --rm --cap-add NET_ADMIN --cap-add SYS_ADMIN "$(DOCKER_IMAGE)" /halt/e2e/test-linux-agents.sh
+	docker run --rm --cap-add NET_ADMIN "$(DOCKER_IMAGE)"
 
 release-check:
 	@if [[ -z "$${VERSION:-}" ]]; then \

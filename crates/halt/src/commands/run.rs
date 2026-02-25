@@ -11,8 +11,11 @@ use halt_proxy::TraceEvent;
 use halt_sandbox::{build_env, check_availability, spawn_sandboxed, NetworkMode, SandboxConfig};
 use halt_settings::{ConfigLoader, HaltConfig};
 
-use crate::cli::{NetworkModeArg, RunArgs};
+#[cfg(target_os = "macos")]
+use crate::cli::NetworkModeArg;
+use crate::cli::RunArgs;
 use crate::error::CliError;
+use crate::ui;
 
 pub async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
     // 1. Load and merge config.
@@ -65,7 +68,6 @@ pub async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
     for (k, v) in explicit_env {
         env_map.insert(k, v);
     }
-
     // 4. Open violations log when tracing.
     let trace_log_path: Option<PathBuf> = if args.trace {
         let halt_dir = cwd.join(".halt");
@@ -75,17 +77,17 @@ pub async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
                 // Truncate/create fresh for this run.
                 match std::fs::File::create(&log_path) {
                     Ok(_) => {
-                        tracing::info!(path = %log_path.display(), "tracing enabled");
+                        ui::status("tracing", log_path.display());
                         Some(log_path)
                     }
                     Err(e) => {
-                        tracing::warn!(error = %e, "could not create trace log");
+                        ui::warn(format!("could not create trace log: {e}"));
                         None
                     }
                 }
             }
             Err(e) => {
-                tracing::warn!(error = %e, "could not create .halt directory");
+                ui::warn(format!("could not create .halt directory: {e}"));
                 None
             }
         }
@@ -179,10 +181,10 @@ pub async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(8)).await;
             if handle_ref.load(std::sync::atomic::Ordering::Relaxed) == 0 {
-                tracing::warn!(
+                ui::warn(
                     "8s elapsed with no proxy connections; \
                      process may not honor HTTP_PROXY / ALL_PROXY — \
-                     direct network connections are blocked"
+                     direct network connections are blocked",
                 );
             }
         });
@@ -238,7 +240,7 @@ pub async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
     #[cfg(not(target_os = "macos"))]
     if needs_netns_cleanup {
         if let Err(e) = halt_sandbox::delete_sandbox_netns(std::process::id()) {
-            tracing::warn!(error = %e, "Failed to delete network namespace; it will be reaped on process exit");
+            ui::warn(format!("failed to delete network namespace: {e}"));
         }
     }
 
@@ -517,7 +519,7 @@ async fn setup_proxy(
         }
         let handle = ProxyServer::new(proxy_config)?.start().await?;
         let proxy_addr = handle.proxy_addr();
-        tracing::info!(
+        tracing::debug!(
             http_proxy = %format!("http://127.0.0.1:{}", proxy_addr.port()),
             socks5_proxy = %format!("socks5h://127.0.0.1:{}", proxy_addr.port()),
             dns = %handle.dns_addr(),

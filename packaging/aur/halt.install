@@ -1,0 +1,10 @@
+post_install() {
+    setcap cap_net_admin=ep usr/bin/halt 2>/dev/null || {
+        echo "WARNING: setcap failed; proxy mode will not be available."
+        echo "         Run: sudo setcap cap_net_admin=ep /usr/bin/halt"
+    }
+}
+
+post_upgrade() {
+    post_install "$1"
+}

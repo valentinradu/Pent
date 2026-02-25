@@ -15,6 +15,7 @@ halt-settings = { path = "../halt-settings" }
 halt-sandbox  = { path = "../halt-sandbox" }
 halt-proxy    = { path = "../halt-proxy" }
 clap          = { workspace = true }
+console       = "0.15"
 tokio         = { workspace = true }
 tracing       = { workspace = true }
 tracing-subscriber = { workspace = true }

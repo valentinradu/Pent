@@ -5,18 +5,22 @@ use halt_sandbox::check_availability;
 use halt_settings::ConfigLoader;
 
 use crate::error::CliError;
+use crate::ui;
 
 pub async fn check(cwd: PathBuf) -> Result<(), CliError> {
     let mut all_ok = true;
 
     // 1. Platform info
-    tracing::info!(os = std::env::consts::OS, arch = std::env::consts::ARCH, "platform");
+    ui::status(
+        "platform",
+        format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
+    );
 
     // 2. Sandbox availability
     match check_availability() {
-        Ok(()) => tracing::info!("sandbox: OK"),
+        Ok(()) => ui::ok("sandbox"),
         Err(e) => {
-            tracing::error!("sandbox: FAIL — {e}");
+            ui::error(format!("sandbox: {e}"));
             all_ok = false;
         }
     }
@@ -26,46 +30,46 @@ pub async fn check(cwd: PathBuf) -> Result<(), CliError> {
     match ProxyServer::new(proxy_config) {
         Ok(server) => match server.start().await {
             Ok(handle) => match handle.shutdown().await {
-                Ok(()) => tracing::info!("proxy: OK"),
+                Ok(()) => ui::ok("proxy"),
                 Err(e) => {
-                    tracing::error!("proxy: FAIL (shutdown) — {e}");
+                    ui::error(format!("proxy shutdown: {e}"));
                     all_ok = false;
                 }
             },
             Err(e) => {
-                tracing::error!("proxy: FAIL (start) — {e}");
+                ui::error(format!("proxy start: {e}"));
                 all_ok = false;
             }
         },
         Err(e) => {
-            tracing::error!("proxy: FAIL (init) — {e}");
+            ui::error(format!("proxy init: {e}"));
             all_ok = false;
         }
     }
 
-    // 4. Config
+    // 4. Config paths
     let global_path = ConfigLoader::global_config_path();
     let project_path = ConfigLoader::project_config_path(&cwd);
 
     if let Some(ref path) = global_path {
-        let status = if path.exists() { "found" } else { "not found" };
-        tracing::info!(path = %path.display(), status, "global config");
+        let found = if path.exists() { "found" } else { "not found" };
+        ui::status("global", format!("{} ({})", path.display(), found));
     } else {
-        tracing::info!("global config: n/a (home directory not available)");
+        ui::status("global", "n/a (home directory not available)");
     }
-    let status = if project_path.exists() { "found" } else { "not found" };
-    tracing::info!(path = %project_path.display(), status, "project config");
+    let found = if project_path.exists() { "found" } else { "not found" };
+    ui::status("project", format!("{} ({})", project_path.display(), found));
 
     match ConfigLoader::load(&cwd) {
-        Ok(_) => tracing::info!("config loaded: OK"),
+        Ok(_) => ui::ok("config"),
         Err(e) => {
-            tracing::error!("config loaded: FAIL — {e}");
+            ui::error(format!("config: {e}"));
             all_ok = false;
         }
     }
 
     if !all_ok {
-        return Err(CliError::Other("One or more checks failed".to_string()));
+        return Err(CliError::Other("one or more checks failed".to_string()));
     }
 
     Ok(())

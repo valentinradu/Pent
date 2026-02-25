@@ -428,6 +428,12 @@ fn profile_config(p: Profile) -> HaltConfig {
                     "api.anthropic.com".to_string(),
                     "statsig.anthropic.com".to_string(),
                     "sentry.io".to_string(),
+                    // Claude Code marketplace fetches plugin indices and files from GitHub.
+                    "github.com".to_string(),
+                    "api.github.com".to_string(),
+                    "raw.githubusercontent.com".to_string(),
+                    "objects.githubusercontent.com".to_string(),
+                    "codeload.github.com".to_string(),
                 ],
                 ..Default::default()
             },
@@ -500,6 +506,11 @@ fn profile_config(p: Profile) -> HaltConfig {
             },
             sandbox: SandboxSettings {
                 paths: SandboxPaths {
+                    // Read access to npm global install directory so Node can
+                    // resolve modules from ~/.npm-global/lib/node_modules/.
+                    // The binary (~/.npm-global/bin) is covered automatically
+                    // via PATH resolution in the Landlock path_dirs ruleset.
+                    read: vec!["~/.npm-global".to_string()],
                     read_write: if macos {
                         vec![
                             "~/Library/Application Support/gemini-cli".to_string(),

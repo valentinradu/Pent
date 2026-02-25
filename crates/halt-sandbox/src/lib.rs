@@ -37,7 +37,7 @@ mod linux;
 mod linux_netns;
 
 pub use config::{system_default_paths, SandboxConfig};
-pub use env::{build_env, resolve_path_directories};
+pub use env::{build_env, resolve_path_dirs_from, resolve_path_directories};
 pub use halt_settings::{Mount, NetworkMode, SandboxPaths, SandboxSettings};
 
 use std::convert::Infallible;
@@ -121,7 +121,11 @@ pub fn exec_sandboxed(
     }
     #[cfg(target_os = "linux")]
     {
-        let path_dirs = resolve_path_directories();
+        // Derive path_dirs from the child's PATH env, not the process's PATH.
+        // When running under sudo the process PATH is stripped; the child's env
+        // already has the user's full PATH (augmented by run.rs).
+        let child_path = config.env.get("PATH").map_or("", |s| s.as_str());
+        let path_dirs = resolve_path_dirs_from(child_path);
         linux::exec_with_landlock(config, cmd, args, &config.env, &path_dirs)
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -170,7 +174,8 @@ pub fn spawn_sandboxed(
     }
     #[cfg(target_os = "linux")]
     {
-        let path_dirs = resolve_path_directories();
+        let child_path = config.env.get("PATH").map_or("", |s| s.as_str());
+        let path_dirs = resolve_path_dirs_from(child_path);
         linux::spawn_with_landlock(config, cmd, args, &config.env, &path_dirs)
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -179,14 +184,15 @@ pub fn spawn_sandboxed(
     }
 }
 
-/// Delete the named network namespace created for a proxied child process.
+/// Clean up Linux sandbox resources created by `spawn_sandboxed`.
 ///
-/// Called after `child.wait()` when the child was spawned with `ProxyOnly`
-/// network mode on Linux. The namespace is named `halt-{pid}` where `pid` is
-/// the caller's process ID (the halt parent process).
+/// Called after `child.wait()` to remove the named network namespace
+/// (created for `ProxyOnly` mode): `halt-{pid}`.
+///
+/// Keyed by the *parent* process ID (`std::process::id()`).
 ///
 /// # Errors
-/// Returns `NetworkSetupFailed` if the namespace cannot be deleted.
+/// Returns `NetworkSetupFailed` if the network namespace cannot be deleted.
 /// Non-Linux platforms always return `Ok(())`.
 #[cfg(target_os = "linux")]
 pub fn delete_sandbox_netns(pid: u32) -> Result<(), SandboxError> {
@@ -225,8 +231,8 @@ mod tests {
     #[test]
     fn test_sandbox_error_display() {
         let err = SandboxError::SandboxUnavailable {
-            reason: "Landlock ABI v4 not available".to_string(),
-            remediation: "Upgrade to kernel 5.19+".to_string(),
+            reason: "Landlock is not supported on this kernel".to_string(),
+            remediation: "Upgrade to kernel 5.19 or later".to_string(),
         };
         assert!(err.to_string().contains("Landlock"));
         assert!(err.to_string().contains("5.19"));
@@ -324,8 +330,8 @@ mod tests {
     // =========================================================================
     // Linux Landlock enforcement tests
     //
-    // These tests exercise apply_landlock / spawn_with_landlock by verifying
-    // that the sandboxed child process actually has the expected restrictions.
+    // These tests exercise spawn_with_landlock by verifying that the sandboxed
+    // child process actually has the expected restrictions.
     // They are subprocess-based: the child is spawned with spawn_sandboxed and
     // the parent checks the exit code.
     //
@@ -392,9 +398,9 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_linux_landlock_sysfs_blocked() {
-        // /sys is not in SYSTEM_PATHS, TEMP_PATHS, or DEVICE_PATHS, so Landlock
-        // must deny access. /sys/kernel/version is present on every Linux kernel
-        // and readable without root — it's a reliable blocked-path canary.
+        // /sys is not in the allowed read set, so access must fail.
+        // /sys/kernel/version is present on every Linux kernel and readable
+        // without root — it's a reliable blocked-path canary.
         if check_availability().is_err() {
             return;
         }
@@ -417,7 +423,7 @@ mod tests {
         };
         assert!(
             code != Some(0),
-            "cat /sys/kernel/version should fail because /sys is not in the Landlock allowlist"
+            "cat /sys/kernel/version should fail because /sys is not in the Landlock allow set"
         );
     }
 

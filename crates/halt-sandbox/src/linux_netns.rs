@@ -109,9 +109,10 @@ pub fn check_netns_privileges() -> Result<(), SandboxError> {
     }
 
     Err(SandboxError::PrivilegeRequired(
-        "ProxyOnly mode on Linux requires root or CAP_NET_ADMIN to create the veth bridge \
-         between the sandbox and the proxy. Run with sudo, or use --network localhost/blocked \
-         which do not require root. Alternatively: sudo setcap cap_net_admin+ep <binary>".to_string()
+        "ProxyOnly mode on Linux requires CAP_NET_ADMIN to create the veth bridge \
+         between the sandbox and the proxy. \
+         Run: sudo setcap cap_net_admin=ep $(which halt)\n\
+         Or use --network localhost/blocked which do not require elevated privileges.".to_string()
     ))
 }
 
@@ -197,6 +198,86 @@ pub fn create_netns(config: &NetnsConfig) -> Result<(), SandboxError> {
         return Err(e);
     }
 
+    // Add a policy routing rule so that packets destined for the veth subnet
+    // (i.e. proxy → sandboxed process responses) are routed via the main table.
+    //
+    // On systems with VPN policy routing (e.g. Tailscale, WireGuard, OpenVPN)
+    // a "from all lookup <vpn-table>" rule at some priority combined with a
+    // "default dev tun0" in that VPN table would otherwise intercept response
+    // packets and route them via the VPN tunnel rather than the veth pair,
+    // silently breaking TCP.
+    //
+    // Priority 100 is chosen to beat any user-space policy routing rule while
+    // staying below 0 (the kernel-managed local table). halt owns the
+    // 10.200.0.0/8 address range exclusively for its veth interfaces, so no
+    // real external traffic is ever destined for this subnet — the rule is
+    // safe at this high priority. Failure is silently ignored: on plain kernels
+    // without conflicting policy rules this rule is a no-op.
+    let _ = Command::new("ip")
+        .args(["rule", "add", "to", &outer_cidr, "table", "main", "priority", "100"])
+        .output();
+
+    // Allow traffic through the veth interface in the host firewall.
+    //
+    // Systems with a DROP-by-default host firewall silently drop:
+    //   • SYN packets from the namespace arriving on veth-out   → INPUT chain
+    //   • SYN-ACK packets leaving via veth-out to the namespace → OUTPUT chain
+    //
+    // We handle two common firewall backends:
+    //
+    // 1. nftables (modern Linux, e.g. Arch Linux with a hardened /etc/nftables.conf
+    //    that has `policy drop` on the inet filter input and output chains):
+    //    `nft insert rule` prepends an ACCEPT for the veth interface to each chain.
+    //    Failure is silently ignored — on systems without an `inet filter` table
+    //    the command exits non-zero and the no-op is the correct behaviour.
+    //
+    // 2. iptables (legacy, or nft-backed via iptables-nft wrapper):
+    //    `-I INPUT 1` prepends an ACCEPT rule before any DROP rules.
+    //    Failure is silently ignored — on pure-nftables systems iptables is absent
+    //    or does not share rules with the nftables table, but the nftables rules
+    //    above already cover that case.
+    // NOTE: interface names containing hyphens (e.g. "veth-123-out") MUST be
+    // quoted in nft's rule language; otherwise nft's lexer interprets the
+    // hyphens as subtraction operators and the parse fails silently.  We
+    // route the rule through `sh -c` so the shell passes a properly-quoted
+    // string to nft's parser.  The veth name only contains [a-z0-9-] so
+    // single-quoting is safe.
+    let _ = Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "nft insert rule inet filter input iifname '{}' accept",
+            veth_outer
+        ))
+        .output();
+    let _ = Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "nft insert rule inet filter output oifname '{}' accept",
+            veth_outer
+        ))
+        .output();
+    let _ = Command::new("iptables")
+        .args(["-I", "INPUT", "1", "-i", &veth_outer, "-j", "ACCEPT"])
+        .output();
+
+    // Disable strict reverse-path filter on the veth-out interface.
+    //
+    // rp_filter=2 (strict) on a newly created interface (inherited from
+    // /proc/sys/net/ipv4/conf/default/rp_filter) causes the kernel to verify
+    // that the best outgoing path for the source address of an incoming packet
+    // goes through the same interface. When VPN policy routing is active the
+    // strict check can be confused by the VPN routing table even though our
+    // priority-100 rule makes the correct main-table route preferred. Setting
+    // rp_filter=0 on the veth-out interface disables the check only for that
+    // single interface, leaving all other interfaces unaffected. Failure is
+    // silently ignored.
+    let _ = Command::new("sysctl")
+        .args([
+            "-w",
+            &format!("net.ipv4.conf.{}.rp_filter=0", veth_outer),
+        ])
+        .output();
+
     // Configure inner veth inside namespace
     if let Err(e) = run_ip(&[
         "netns",
@@ -249,6 +330,40 @@ pub fn create_netns(config: &NetnsConfig) -> Result<(), SandboxError> {
     Ok(())
 }
 
+/// Find the handle number of an nftables ACCEPT rule for a specific interface.
+///
+/// Runs `nft -a list chain inet filter {chain}` and returns the handle of the
+/// first rule that references `{iface_name}` with `{iface_keyword}` (either
+/// `iifname` for input or `oifname` for output). Returns `None` if the rule is
+/// not found or if nftables is unavailable.
+fn nft_find_iface_rule_handle(chain: &str, iface_keyword: &str, iface_name: &str) -> Option<u64> {
+    use std::process::Command;
+
+    let output = Command::new("nft")
+        .args(["-a", "list", "chain", "inet", "filter", chain])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let quoted = format!("\"{}\"", iface_name);
+
+    for line in stdout.lines() {
+        if line.contains(iface_keyword) && line.contains(quoted.as_str()) {
+            // Rule output looks like: `iifname "veth-X-out" accept # handle 42`
+            if let Some(pos) = line.rfind("# handle ") {
+                let handle_str = line[pos + 9..].trim();
+                return handle_str.parse().ok();
+            }
+        }
+    }
+
+    None
+}
+
 /// Delete a network namespace.
 ///
 /// Cleans up namespace and associated veth pair.
@@ -261,6 +376,50 @@ pub fn create_netns(config: &NetnsConfig) -> Result<(), SandboxError> {
 /// * `NetworkSetupFailed` - If deletion fails
 pub fn delete_netns(name: &str) -> Result<(), SandboxError> {
     use std::process::Command;
+
+    // Remove the rules added in create_netns for this namespace.
+    // The rules are keyed on the veth name / subnet derived from the namespace
+    // name ("halt-{pid}"). Failure is silently ignored — rules may already be
+    // gone (e.g. kernel reboot) or may never have been added.
+    if let Some(pid_str) = name.strip_prefix("halt-") {
+        let veth_outer = format!("veth-{}-out", pid_str);
+
+        // Remove nftables rules for the veth interface (added in create_netns).
+        // nft delete rule requires the numeric handle; look it up first.
+        if let Some(handle) = nft_find_iface_rule_handle("input", "iifname", &veth_outer) {
+            let _ = Command::new("nft")
+                .args([
+                    "delete", "rule", "inet", "filter", "input",
+                    "handle", &handle.to_string(),
+                ])
+                .output();
+        }
+        if let Some(handle) = nft_find_iface_rule_handle("output", "oifname", &veth_outer) {
+            let _ = Command::new("nft")
+                .args([
+                    "delete", "rule", "inet", "filter", "output",
+                    "handle", &handle.to_string(),
+                ])
+                .output();
+        }
+
+        // Remove the iptables INPUT ACCEPT rule for the veth interface.
+        // iptables rules reference interface names; the rule can be removed even
+        // after the interface has been deleted.
+        let _ = Command::new("iptables")
+            .args(["-D", "INPUT", "-i", &veth_outer, "-j", "ACCEPT"])
+            .output();
+
+        // Remove the policy routing rule.
+        if let Ok(pid) = pid_str.parse::<u32>() {
+            let octet = (pid % 256) as u8;
+            let outer_ip = Ipv4Addr::new(10, 200, octet, 1);
+            let outer_cidr = format!("{}/24", outer_ip);
+            let _ = Command::new("ip")
+                .args(["rule", "del", "to", &outer_cidr, "table", "main", "priority", "100"])
+                .output();
+        }
+    }
 
     // Delete the namespace - veth pair is auto-deleted
     let output = Command::new("ip")
