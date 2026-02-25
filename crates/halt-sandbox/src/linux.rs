@@ -111,18 +111,23 @@ pub fn build_landlock_ruleset(
         Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr, ABI,
     };
 
-    // All filesystem access rights for deny-all baseline
-    let all_access = AccessFs::from_all(ABI::V4);
+    // Access rights to control: all except Execute.
+    // Exec is NOT restricted by the Landlock ruleset so that the binary can be
+    // loaded from any path (e.g. ~/.local/share/claude) without the caller
+    // needing to enumerate every launcher location.  The sandbox governs what
+    // the running process can *read* and *write*, not which binaries it can run.
+    let mut handle_access = AccessFs::from_all(ABI::V4);
+    handle_access.remove(AccessFs::Execute);
 
-    // Read-only access rights
-    let read_access = AccessFs::ReadFile | AccessFs::ReadDir | AccessFs::Execute;
+    // Read-only access rights (no Execute — not controlled by this ruleset)
+    let read_access = AccessFs::ReadFile | AccessFs::ReadDir;
 
-    // Read-write access rights (all except Execute which is read-only)
-    let write_access = all_access;
+    // Read-write access rights
+    let write_access = handle_access;
 
-    // Create ruleset with deny-all baseline
+    // Create ruleset with deny-all baseline (excluding Execute)
     let mut ruleset = Ruleset::default()
-        .handle_access(all_access)
+        .handle_access(handle_access)
         .map_err(|e| SandboxError::InvalidConfig(format!("Failed to create ruleset: {}", e)))?
         .create()
         .map_err(|e| SandboxError::InvalidConfig(format!("Failed to create ruleset: {}", e)))?;
@@ -159,7 +164,25 @@ pub fn build_landlock_ruleset(
         }
     }
 
-    // PATH directories - read/execute
+    // Configured SandboxPaths (from profiles and TOML config).
+    // traversal = ReadDir only (stat/list, no file reads).
+    // read = ReadFile | ReadDir.
+    // read_write = all write access rights.
+    // These paths also enable the kernel to read ELF binaries during exec(),
+    // which requires ReadFile even though Execute is not in handle_access.
+    let traversal_access = AccessFs::ReadDir;
+    let (traversal_paths, read_paths, rw_paths) = config.paths.expand_paths();
+    for (path, _) in &traversal_paths {
+        add_path(&mut ruleset, path, traversal_access.into())?;
+    }
+    for (path, _) in &read_paths {
+        add_path(&mut ruleset, path, read_access)?;
+    }
+    for (path, _) in &rw_paths {
+        add_path(&mut ruleset, path, write_access)?;
+    }
+
+    // PATH directories - read
     for path_dir in path_dirs {
         add_path(&mut ruleset, path_dir, read_access)?;
     }
@@ -471,6 +494,7 @@ pub fn spawn_with_landlock(
     let workspace = config.workspace.clone();
     let data_dir = config.data_dir.clone();
     let mounts = config.mounts.clone();
+    let paths = config.paths.clone();
     let path_dirs = path_dirs.to_vec();
     let network = config.network.clone();
 
@@ -568,13 +592,16 @@ pub fn spawn_with_landlock(
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         command.pre_exec(move || {
-            // Build and apply Landlock in child process
-            let all_access = AccessFs::from_all(ABI::V4);
-            let read_access = AccessFs::ReadFile | AccessFs::ReadDir | AccessFs::Execute;
-            let write_access = all_access;
+            // Build and apply Landlock in child process.
+            // Execute is excluded from handle_access so exec is unrestricted —
+            // the sandbox governs reads/writes only, not which binaries run.
+            let mut handle_access = AccessFs::from_all(ABI::V4);
+            handle_access.remove(AccessFs::Execute);
+            let read_access = AccessFs::ReadFile | AccessFs::ReadDir;
+            let write_access = handle_access;
 
             let mut ruleset = Ruleset::default()
-                .handle_access(all_access)
+                .handle_access(handle_access)
                 .map_err(|e| std::io::Error::other(e.to_string()))?
                 .create()
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -605,6 +632,19 @@ pub fn spawn_with_landlock(
                 } else {
                     add_path(&mut ruleset, &mount.path, write_access)?;
                 }
+            }
+
+            // Add configured SandboxPaths (from profiles and TOML config)
+            let traversal_access = AccessFs::ReadDir;
+            let (traversal_paths, read_paths, rw_paths) = paths.expand_paths();
+            for (path, _) in &traversal_paths {
+                add_path(&mut ruleset, path, traversal_access.into())?;
+            }
+            for (path, _) in &read_paths {
+                add_path(&mut ruleset, path, read_access)?;
+            }
+            for (path, _) in &rw_paths {
+                add_path(&mut ruleset, path, write_access)?;
             }
 
             // Add PATH directories
