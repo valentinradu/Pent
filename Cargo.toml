@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/halt", "crates/halt-proxy", "crates/halt-sandbox", "crates/halt-settings"]
+members = ["crates/pent", "crates/pent-proxy", "crates/pent-sandbox", "crates/pent-settings"]
 resolver = "2"
 
 [workspace.package]

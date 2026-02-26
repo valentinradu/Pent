@@ -1,0 +1,16 @@
+[package]
+name = "pent-settings"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Layered TOML configuration for the pent sandbox"
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+toml = "0.8"
+dirs = "5"
+
+[dev-dependencies]
+tempfile = { workspace = true }

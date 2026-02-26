@@ -1,0 +1,46 @@
+[package]
+name = "pent"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Run processes under filesystem and network containment"
+
+[[bin]]
+name = "pent"
+path = "src/main.rs"
+
+[dependencies]
+pent-settings = { path = "../pent-settings" }
+pent-sandbox  = { path = "../pent-sandbox" }
+pent-proxy    = { path = "../pent-proxy" }
+clap          = { workspace = true }
+console       = "0.15"
+tokio         = { workspace = true }
+tracing       = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror     = { workspace = true }
+serde_json    = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+toml = "0.8"
+
+[package.metadata.deb]
+name = "pent"
+maintainer = "Valentin Radu"
+copyright = "2024, Valentin Radu"
+license-file = ["../../LICENSE", "4"]
+extended-description = """\
+Wrap any process in a filesystem and network sandbox using native OS \
+mechanisms (Linux Landlock + network namespaces) with a built-in \
+DNS/TCP proxy for domain allowlisting."""
+depends = "$auto"
+section = "utils"
+priority = "optional"
+assets = [
+    ["target/release/pent", "usr/bin/", "755"],
+]

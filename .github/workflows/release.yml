@@ -54,28 +54,28 @@ jobs:
 
       - name: Build (macOS)
         if: runner.os == 'macOS'
-        run: cargo build --release -p halt --target ${{ matrix.target }}
+        run: cargo build --release -p pent --target ${{ matrix.target }}
 
       - name: Build (Linux musl via cross)
         if: runner.os == 'Linux'
-        run: cross build --release -p halt --target ${{ matrix.target }}
+        run: cross build --release -p pent --target ${{ matrix.target }}
 
       - name: Package binary
         shell: bash
         run: |
-          BIN=target/${{ matrix.target }}/release/halt
-          ARCHIVE=halt-${{ matrix.target }}.tar.gz
-          tar -czf "$ARCHIVE" -C "$(dirname "$BIN")" halt
+          BIN=target/${{ matrix.target }}/release/pent
+          ARCHIVE=pent-${{ matrix.target }}.tar.gz
+          tar -czf "$ARCHIVE" -C "$(dirname "$BIN")" pent
           echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
           sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: halt-${{ matrix.target }}
+          name: pent-${{ matrix.target }}
           path: |
-            halt-${{ matrix.target }}.tar.gz
-            halt-${{ matrix.target }}.tar.gz.sha256
+            pent-${{ matrix.target }}.tar.gz
+            pent-${{ matrix.target }}.tar.gz.sha256
 
   # ── Build Debian packages ─────────────────────────────────────────────────
   deb:
@@ -113,13 +113,13 @@ jobs:
           key: deb-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build binary
-        run: cross build --release -p halt --target ${{ matrix.target }}
+        run: cross build --release -p pent --target ${{ matrix.target }}
 
       - name: Build .deb
         run: |
           VERSION="${{ github.ref_name }}"
           VERSION="${VERSION#v}"
-          cargo deb -p halt --target ${{ matrix.target }} --no-build \
+          cargo deb -p pent --target ${{ matrix.target }} --no-build \
             --deb-version "$VERSION" \
             --no-strip
           mv target/${{ matrix.target }}/debian/*.deb \
@@ -166,8 +166,8 @@ jobs:
           curl -sfL -X POST \
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer ${TAP_REPO_TOKEN}" \
-            https://api.github.com/repos/valentinradu/homebrew-halt/dispatches \
-            -d "{\"event_type\":\"halt_release_published\",\"client_payload\":{\"tag\":\"${RELEASE_TAG}\"}}"
+            https://api.github.com/repos/valentinradu/homebrew-pent/dispatches \
+            -d "{\"event_type\":\"pent_release_published\",\"client_payload\":{\"tag\":\"${RELEASE_TAG}\"}}"
 
   # ── Publish AUR package ───────────────────────────────────────────────────
   aur:
@@ -181,7 +181,7 @@ jobs:
       - name: Compute source tarball SHA256
         id: sha
         run: |
-          URL="https://github.com/valentinradu/Halt/archive/refs/tags/${{ github.ref_name }}.tar.gz"
+          URL="https://github.com/valentinradu/Pent/archive/refs/tags/${{ github.ref_name }}.tar.gz"
           curl -sfL "$URL" -o source.tar.gz
           echo "sha=$(sha256sum source.tar.gz | awk '{print $1}')" >> "$GITHUB_OUTPUT"
 
@@ -197,7 +197,7 @@ jobs:
       - name: Publish to AUR
         uses: KSXGitHub/github-actions-deploy-aur@v3.0.0
         with:
-          pkgname: halt
+          pkgname: pent
           pkgbuild: packaging/aur/PKGBUILD
           commit_username: github-actions[bot]
           commit_email: github-actions[bot]@users.noreply.github.com
@@ -253,13 +253,13 @@ jobs:
         run: |
           cd apt
           cat > Release <<EOF
-          Origin: Halt
-          Label: Halt
+          Origin: Pent
+          Label: Pent
           Suite: stable
           Codename: stable
           Architectures: amd64 arm64
           Components: main
-          Description: Halt APT repository
+          Description: Pent APT repository
           EOF
           apt-ftparchive release . >> Release
 
@@ -278,5 +278,5 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add apt/
-          git commit -m "apt: publish halt ${{ github.ref_name }}" || echo "Nothing to commit"
+          git commit -m "apt: publish pent ${{ github.ref_name }}" || echo "Nothing to commit"
           git push

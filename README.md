@@ -1,31 +1,31 @@
-# Halt
+# Pent
 
 Wrap AI coding agents, or any process, in a lightweight containment layer that restricts filesystem and network access using native OS mechanisms.
 
 ```bash
-# Setup — run once to write ~/.config/halt/halt.toml.
+# Setup — run once to write ~/.config/pent/pent.toml.
 # @claude, @npm, @gh, etc. are profiles: named sets of domains and filesystem paths.
 # @claude is not the binary — it's the profile that covers Anthropic's API endpoints.
 # @npm also adds @node (a filesystem-only profile) as a dependency.
-halt config add --global @claude @gh @npm @cargo @pip @gem @go @git
+pent config add --global @claude @gh @npm @cargo @pip @gem @go @git
 
-# Run — every invocation. halt reads the config written above and enforces it:
+# Run — every invocation. pent reads the config written above and enforces it:
 # only the listed domains resolve, only the listed paths are accessible.
-halt run -- claude
+pent run -- claude
 
 # Inspect what's allowed
-halt config show
+pent config show
 
 # Adjust profiles at any time
-halt config add --global @keychain   # grant access to the system keychain
-halt config rm  --global @keychain   # revoke it
+pent config add --global @keychain   # grant access to the system keychain
+pent config rm  --global @keychain   # revoke it
 ```
 
 ---
 
-## What halt does
+## What pent does
 
-Halt launches a child process inside a sandbox with two complementary controls:
+Pent launches a child process inside a sandbox with two complementary controls:
 
 1. **Filesystem isolation** — the child can only read and write the paths you allow.
 2. **Network isolation** — the child's outbound traffic is gated by a built-in proxy that enforces a domain allowlist.
@@ -36,11 +36,11 @@ These two layers work together. Even if a rogue process manipulates its environm
 
 ## Security disclaimer
 
-**Halt is not a security tool.** It is designed to catch accidental misbehaviour, not to stop a determined adversary.
+**Pent is not a security tool.** It is designed to catch accidental misbehaviour, not to stop a determined adversary.
 
 A persistent or sufficiently sophisticated process can likely escape the sandbox. macOS Seatbelt and Linux Landlock are not designed to contain root processes, and there are known bypass classes for both mechanisms. The built-in proxy is also process-level, not kernel-level.
 
-Use halt to add a reasonable guard-rail around AI coding agents operating on your workstation — not as a substitute for proper network segmentation, least-privilege service accounts, or other security controls.
+Use pent to add a reasonable guard-rail around AI coding agents operating on your workstation — not as a substitute for proper network segmentation, least-privilege service accounts, or other security controls.
 
 ---
 
@@ -48,7 +48,7 @@ Use halt to add a reasonable guard-rail around AI coding agents operating on you
 
 ### macOS — Seatbelt (sandbox-exec + SBPL)
 
-On macOS, halt generates a [Sandbox Profile Language (SBPL)](https://reverse.put.as/wp-content/uploads/2011/09/Apple-Sandbox-Guide-v1.0.pdf) policy and launches the child process via `sandbox-exec`. The generated profile:
+On macOS, pent generates a [Sandbox Profile Language (SBPL)](https://reverse.put.as/wp-content/uploads/2011/09/Apple-Sandbox-Guide-v1.0.pdf) policy and launches the child process via `sandbox-exec`. The generated profile:
 
 - Allows all actions by default.
 - Denies `file-read-data` (file content reads) globally, then re-allows it only for permitted paths.
@@ -59,14 +59,14 @@ On macOS, halt generates a [Sandbox Profile Language (SBPL)](https://reverse.put
 
 ### Linux — Landlock + network namespaces
 
-On Linux, halt uses two mechanisms:
+On Linux, pent uses two mechanisms:
 
 - **Landlock LSM** restricts filesystem access. The child process is confined to the paths you configure using the kernel's Landlock security module. Requires kernel ≥ 5.13 (Landlock ABI v1); full ruleset support requires ≥ 5.19 (ABI v2).
 - **Network namespaces** (`unshare(CLONE_NEWNET)`) isolate the child's network stack. For `proxy_only` mode, the proxy listens on the loopback interface of the parent namespace and a `veth` pair bridges traffic from the child's namespace to the proxy. For `blocked` mode, the child gets a fresh namespace with no external connectivity.
 
 ### Built-in proxy
 
-Halt includes a DNS + TCP proxy that runs on `127.0.0.1` for the lifetime of the child process. It has two jobs:
+Pent includes a DNS + TCP proxy that runs on `127.0.0.1` for the lifetime of the child process. It has two jobs:
 
 1. **DNS interception** — DNS queries for disallowed domains receive an `NXDOMAIN` response. Allowed domains are resolved against your system's upstream DNS and the results are cached with a TTL.
 2. **TCP forwarding** — outbound TCP connections are accepted only if the destination IP was resolved from an allowed domain. Connections to any other IP are rejected.
@@ -79,11 +79,11 @@ The proxy binds only to loopback and is not reachable from the network.
 
 ### macOS — no network containment
 
-`--allow` and `--network proxy` are accepted on macOS but **do not enforce network policy**. Halt degrades silently and runs with unrestricted network access.
+`--allow` and `--network proxy` are accepted on macOS but **do not enforce network policy**. Pent degrades silently and runs with unrestricted network access.
 
 The root cause is architectural: macOS has no per-process network namespace primitive available to unprivileged processes.
 
-**On Linux**, `unshare(CLONE_NEWNET)` creates an isolated network stack for the child process. All outbound traffic — regardless of language runtime, proxy awareness, or binary signing — must pass through halt's proxy via a veth pair. Network policy is enforced at the kernel level.
+**On Linux**, `unshare(CLONE_NEWNET)` creates an isolated network stack for the child process. All outbound traffic — regardless of language runtime, proxy awareness, or binary signing — must pass through pent's proxy via a veth pair. Network policy is enforced at the kernel level.
 
 **On macOS**, the only available mechanisms are:
 
@@ -93,9 +93,9 @@ The root cause is architectural: macOS has no per-process network namespace prim
 | `pf` packet filter | Redirects TCP at the kernel | Requires root; rules are system-wide, not per-process |
 | Network Extension / `NETransparentProxyProvider` | System-level proxy | Requires an entitlement Apple must grant; intended for VPN/MDM tools |
 
-On macOS, halt provides **filesystem isolation only**. Domain allowlists in your config are still written and read correctly — they simply have no enforcement effect when running on macOS.
+On macOS, pent provides **filesystem isolation only**. Domain allowlists in your config are still written and read correctly — they simply have no enforcement effect when running on macOS.
 
-**For network containment on macOS**, run halt inside a Linux VM or container:
+**For network containment on macOS**, run pent inside a Linux VM or container:
 
 ```bash
 # Build and run the Linux e2e suite (requires Docker)
@@ -109,34 +109,34 @@ make e2e-linux
 ### From source (requires Rust ≥ 1.78)
 
 ```bash
-git clone https://github.com/valentinradu/Halt.git
-cd Halt
-cargo install --path crates/halt
+git clone https://github.com/valentinradu/Pent.git
+cd Pent
+cargo install --path crates/pent
 ```
 
 ### Homebrew (macOS / Linux)
 
 ```bash
-brew tap valentinradu/halt
-brew install halt
+brew tap valentinradu/pent
+brew install pent
 ```
 
 ### AUR (Arch Linux)
 
 ```bash
-yay -S halt
+yay -S pent
 ```
 
 ### Debian / Ubuntu
 
 ```bash
-curl -fsSL https://valentinradu.github.io/Halt/apt/KEY.gpg \
-  | sudo gpg --dearmor -o /etc/apt/keyrings/halt.gpg
-echo "deb [signed-by=/etc/apt/keyrings/halt.gpg arch=$(dpkg --print-architecture)] \
-  https://valentinradu.github.io/Halt/apt ./" \
-  | sudo tee /etc/apt/sources.list.d/halt.list
+curl -fsSL https://valentinradu.github.io/Pent/apt/KEY.gpg \
+  | sudo gpg --dearmor -o /etc/apt/keyrings/pent.gpg
+echo "deb [signed-by=/etc/apt/keyrings/pent.gpg arch=$(dpkg --print-architecture)] \
+  https://valentinradu.github.io/Pent/apt ./" \
+  | sudo tee /etc/apt/sources.list.d/pent.list
 sudo apt update
-sudo apt install halt
+sudo apt install pent
 ```
 
 ---
@@ -145,44 +145,44 @@ sudo apt install halt
 
 ```bash
 # Check that sandboxing is available on your system
-halt check
+pent check
 
 # Run curl with full network access but restricted filesystem
-halt run -- curl https://example.com
+pent run -- curl https://example.com
 
 # Run curl with no network access at all
-halt run --network blocked -- curl https://example.com
+pent run --network blocked -- curl https://example.com
 
 # Run curl limited to localhost only
-halt run --network localhost -- curl http://localhost:8080/health
+pent run --network localhost -- curl http://localhost:8080/health
 
 # Run curl restricted to a specific domain
-halt run --network proxy --allow example.com -- curl https://example.com
+pent run --network proxy --allow example.com -- curl https://example.com
 
 # Allow multiple domains
-halt run --allow api.openai.com --allow pypi.org -- python script.py
+pent run --allow api.openai.com --allow pypi.org -- python script.py
 
 # Grant a process read access to a specific path
-halt run --read /etc/ssl/certs -- my-app
+pent run --read /etc/ssl/certs -- my-app
 
 # Grant a process read-write access to a directory
-halt run --write /tmp/workspace -- my-app
+pent run --write /tmp/workspace -- my-app
 
 # Set up a config for Claude Code and run it
-halt config add --global @claude @gh @npm @cargo @pip @gem @go @git
-halt run -- claude
+pent config add --global @claude @gh @npm @cargo @pip @gem @go @git
+pent run -- claude
 ```
 
 ---
 
 ## Configuration
 
-Halt loads configuration from up to three sources, merged in order (later sources win for scalars; lists are extended and deduplicated):
+Pent loads configuration from up to three sources, merged in order (later sources win for scalars; lists are extended and deduplicated):
 
 | Source | Path |
 |---|---|
-| Global | `~/.config/halt/halt.toml` |
-| Project | `.halt/halt.toml` (in the working directory) |
+| Global | `~/.config/pent/pent.toml` |
+| Project | `.pent/pent.toml` (in the working directory) |
 | CLI flags | Highest priority |
 
 ### Config file format
@@ -226,17 +226,17 @@ tcp_idle_timeout_secs = 60
 
 ```bash
 # Create and edit the global config directly
-halt config init --global
-halt config edit --global
+pent config init --global
+pent config edit --global
 
 # Or create a project-level config
-halt config init
-halt config edit
+pent config init
+pent config edit
 ```
 
 ### Profiles
 
-Profiles are an optional convenience — named sets of domains and filesystem paths for common tools. `halt config add` writes their values into your TOML config file; you can achieve the same result by editing the file directly. Profiles are composable — some automatically pull in others.
+Profiles are an optional convenience — named sets of domains and filesystem paths for common tools. `pent config add` writes their values into your TOML config file; you can achieve the same result by editing the file directly. Profiles are composable — some automatically pull in others.
 
 | Profile | Domains | Read Paths | Execute Paths | Depends on |
 |---------|---------|------------|---------------|------------|
@@ -256,41 +256,41 @@ Profiles are an optional convenience — named sets of domains and filesystem pa
 | `@keychain` | — | ~/Library/Keychains (macOS), ~/.local/share/keyrings, ~/.local/share/kwalletd, ~/.password-store (Linux) | — | — |
 | `@base` | — | shell init files (~/.zshrc, ~/.bashrc, etc.) | ~/.local/bin (+ /usr/libexec/path_helper on macOS) | — |
 
-When you add a profile its dependencies are added automatically. When you remove a profile, halt warns if a dependent profile is still active.
+When you add a profile its dependencies are added automatically. When you remove a profile, pent warns if a dependent profile is still active.
 
 ```bash
 # Add profiles (@npm also adds @node automatically)
-halt config add @npm @cargo @gh
+pent config add @npm @cargo @gh
 
 # Remove profiles
-halt config rm @npm
-halt config rm @gemini @node   # remove both at once when @gemini depends on @node
+pent config rm @npm
+pent config rm @gemini @node   # remove both at once when @gemini depends on @node
 
 # Show what was added
-halt config show
+pent config show
 ```
 
 **Recommended setups:**
 
 ```bash
 # Claude Code
-halt config add --global @claude @gh @npm @cargo @pip @gem @go @git
+pent config add --global @claude @gh @npm @cargo @pip @gem @go @git
 
 # OpenAI Codex
-halt config add --global @codex @gh @npm @cargo @pip @gem @go @git
+pent config add --global @codex @gh @npm @cargo @pip @gem @go @git
 
 # Google Gemini CLI
-halt config add --global @gemini @gh @npm @cargo @pip @gem @go @git
+pent config add --global @gemini @gh @npm @cargo @pip @gem @go @git
 ```
 
 ### Other config commands
 
 ```bash
 # Show the effective merged config
-halt config show
+pent config show
 
 # Open the config in $EDITOR
-halt config edit
+pent config edit
 ```
 
 ---
@@ -298,9 +298,9 @@ halt config edit
 ## Command reference
 
 ```
-halt [-v|-vv|-vvv] <COMMAND>
+pent [-v|-vv|-vvv] <COMMAND>
 
-halt run [OPTIONS] -- COMMAND [ARGS...]
+pent run [OPTIONS] -- COMMAND [ARGS...]
   --network <MODE>        unrestricted | localhost | proxy | blocked
   --allow <DOMAIN>        Add domain to proxy allowlist (implies proxy; repeatable)
   --read <PATH>           Add read-only filesystem path (repeatable)
@@ -310,16 +310,16 @@ halt run [OPTIONS] -- COMMAND [ARGS...]
   --env <KEY[=VALUE]>     Pass or set an environment variable (repeatable)
   --config <PATH>         Load an additional config file
   --no-config             Ignore all config files; use only CLI flags
-  --trace                 Log all access events to .halt/trace.log without killing the process
+  --trace                 Log all access events to .pent/trace.log without killing the process
   --data-dir <PATH>       Override sandbox data directory
 
-halt check
+pent check
 
-halt config init   [--global]                  Write a starter config file
-halt config show   [--format toml|json]         Print effective merged configuration
-halt config edit   [--global]                  Open config in $EDITOR
-halt config add    [--global] <PROFILE>...      Add one or more profiles
-halt config rm     [--global] <PROFILE>...      Remove one or more profiles
+pent config init   [--global]                  Write a starter config file
+pent config show   [--format toml|json]         Print effective merged configuration
+pent config edit   [--global]                  Open config in $EDITOR
+pent config add    [--global] <PROFILE>...      Add one or more profiles
+pent config rm     [--global] <PROFILE>...      Remove one or more profiles
 ```
 
 ---
@@ -340,7 +340,7 @@ Pass `-v` (repeatable) to increase log output:
 
 Use `--trace` to observe what a sandboxed process actually does — both what it is denied and what it is allowed to access — without killing or restarting it.
 
-`--trace` runs the process to completion and writes every sandbox and proxy event to `.halt/trace.log` in the working directory. Two kinds of entries appear:
+`--trace` runs the process to completion and writes every sandbox and proxy event to `.pent/trace.log` in the working directory. Two kinds of entries appear:
 
 - **`[denied]`** — an access was blocked. A fix hint is included.
 - **`[allowed]`** — a proxy connection was permitted (network, Linux only).
@@ -352,28 +352,28 @@ On **macOS**, filesystem denials from Seatbelt are captured via the system's `lo
 ### Workflow
 
 ```bash
-# 1. Start the app under halt with tracing enabled.
-halt run --trace -- claude
+# 1. Start the app under pent with tracing enabled.
+pent run --trace -- claude
 
 # 2. Use the app normally, then exit it.
 
 # 3. Review what was accessed.
-cat .halt/trace.log
+cat .pent/trace.log
 ```
 
 Example log output:
 
 ```
-halt: [denied] filesystem: "claude" was denied "read" access to "/Users/alice/.ssh/id_rsa"
-halt: fix: add "/Users/alice/.ssh/id_rsa" to [sandbox.paths.read] or [sandbox.paths.read_write] in your halt config
+pent: [denied] filesystem: "claude" was denied "read" access to "/Users/alice/.ssh/id_rsa"
+pent: fix: add "/Users/alice/.ssh/id_rsa" to [sandbox.paths.read] or [sandbox.paths.read_write] in your pent config
 
-halt: [denied] network: DNS query for "registry.npmjs.org" blocked — domain not in allowlist
-halt: fix: add "registry.npmjs.org" to [proxy.domain_allowlist] in your halt config
+pent: [denied] network: DNS query for "registry.npmjs.org" blocked — domain not in allowlist
+pent: fix: add "registry.npmjs.org" to [proxy.domain_allowlist] in your pent config
 
-halt: [allowed] network: connection to "api.anthropic.com" allowed
+pent: [allowed] network: connection to "api.anthropic.com" allowed
 ```
 
-Each `[denied]` entry shows exactly which path or domain was blocked and the one-line config change needed to allow it. Apply the fixes to your halt config (or use `halt config add @npm` etc. if a matching profile exists), then re-run normally.
+Each `[denied]` entry shows exactly which path or domain was blocked and the one-line config change needed to allow it. Apply the fixes to your pent config (or use `pent config add @npm` etc. if a matching profile exists), then re-run normally.
 
 `--trace` is compatible with `--network proxy` and any explicit `--allow` or `--read`/`--write` flags.
 
@@ -386,7 +386,7 @@ Each `[denied]` entry shows exactly which path or domain was blocked and the one
 cargo test --workspace
 
 # Build a release binary
-cargo build --release -p halt
+cargo build --release -p pent
 ```
 
 ---

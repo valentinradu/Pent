@@ -3,8 +3,8 @@ SHELL := /bin/bash
 
 DEFAULT_GOAL := help
 
-HALT_BIN ?= ./target/release/halt
-DOCKER_IMAGE ?= halt-test
+PENT_BIN ?= ./target/release/pent
+DOCKER_IMAGE ?= pent-test
 REMOTE ?= origin
 BRANCH ?= main
 
@@ -12,12 +12,12 @@ BRANCH ?= main
 	e2e-macos e2e-linux release-check release-tag release-publish-all
 
 help:
-	@echo "Halt developer tasks"
+	@echo "Pent developer tasks"
 	@echo ""
 	@echo "Build/Test:"
 	@echo "  make build               Build workspace (debug)"
 	@echo "  make build-release       Build workspace (release)"
-	@echo "  make install             Install local halt to ~/.cargo/bin"
+	@echo "  make install             Install local pent to ~/.cargo/bin"
 	@echo "  make test                Run workspace tests"
 	@echo "  make clippy              Run clippy with -D warnings"
 	@echo "  make fmt                Format all Rust code"
@@ -44,10 +44,10 @@ build-release:
 	cargo build --workspace --release
 
 install:
-	cargo install --path crates/halt --force
-	@HALT_BIN="$${CARGO_HOME:-$$HOME/.cargo}/bin/halt"; \
-	setcap cap_net_admin=ep "$$HALT_BIN" 2>/dev/null || \
-		echo "note: setcap failed — run: sudo setcap cap_net_admin=ep $$HALT_BIN"
+	cargo install --path crates/pent --force
+	@PENT_BIN="$${CARGO_HOME:-$$HOME/.cargo}/bin/pent"; \
+	setcap cap_net_admin=ep "$$PENT_BIN" 2>/dev/null || \
+		echo "note: setcap failed — run: sudo setcap cap_net_admin=ep $$PENT_BIN"
 
 test:
 	cargo test --workspace

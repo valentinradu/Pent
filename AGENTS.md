@@ -1,8 +1,8 @@
-# Halt — Agent Instructions
+# Pent — Agent Instructions
 
 ## Project Overview
 
-`halt` is an open-source (MIT) tool for running arbitrary processes under
+`pent` is an open-source (MIT) tool for running arbitrary processes under
 filesystem and network containment. It is designed to be embedded in other
 tools (AI coding assistants, CI runners, etc.) that need to restrict what a
 child process can access.
@@ -10,15 +10,15 @@ child process can access.
 ## Repository Structure
 
 ```
-halt/
+pent/
 ├── Cargo.toml                    # Workspace root
 ├── AGENTS.md                     # This file
 └── crates/
-    ├── halt-settings/            # Layered TOML config + shared types
+    ├── pent-settings/            # Layered TOML config + shared types
     │   └── src/
-    │       ├── lib.rs            # HaltConfig, SandboxMode, NetworkMode, …
+    │       ├── lib.rs            # PentConfig, SandboxMode, NetworkMode, …
     │       └── loader.rs         # ConfigLoader (global + project merge)
-    ├── halt-sandbox/             # OS-level process sandboxing
+    ├── pent-sandbox/             # OS-level process sandboxing
     │   └── src/
     │       ├── lib.rs            # spawn_sandboxed, SandboxError
     │       ├── config.rs         # SandboxConfig builder
@@ -26,7 +26,7 @@ halt/
     │       ├── macos.rs          # macOS Seatbelt (SBPL) backend
     │       ├── linux.rs          # Linux Landlock backend
     │       └── linux_netns.rs    # Linux network-namespace helpers
-    └── halt-proxy/               # DNS + TCP proxy with allowlist enforcement
+    └── pent-proxy/               # DNS + TCP proxy with allowlist enforcement
         └── src/
             ├── lib.rs            # Public API surface
             ├── server.rs         # ProxyServer, ProxyHandle, ProxyConfig
@@ -39,15 +39,15 @@ halt/
 
 | Crate | Description |
 |-------|-------------|
-| `halt-settings` | Owns `SandboxMode`, `NetworkMode`, `SandboxPaths`, `Mount`. Provides `HaltConfig` (serializable TOML config) and `ConfigLoader` (global `~/.config/halt/halt.toml` + project `.halt/halt.toml` merge). |
-| `halt-sandbox` | Spawns or execs a process under OS-native sandbox constraints. Re-exports the shared types from `halt-settings`. |
-| `halt-proxy` | DNS server + SOCKS5 TCP proxy. Only forwards traffic to domains on the allowlist; everything else is rejected at the DNS layer. |
+| `pent-settings` | Owns `SandboxMode`, `NetworkMode`, `SandboxPaths`, `Mount`. Provides `PentConfig` (serializable TOML config) and `ConfigLoader` (global `~/.config/pent/pent.toml` + project `.pent/pent.toml` merge). |
+| `pent-sandbox` | Spawns or execs a process under OS-native sandbox constraints. Re-exports the shared types from `pent-settings`. |
+| `pent-proxy` | DNS server + SOCKS5 TCP proxy. Only forwards traffic to domains on the allowlist; everything else is rejected at the DNS layer. |
 
 ### Dependency graph
 
 ```
-halt-sandbox  →  halt-settings
-halt-proxy    (standalone, no dependency on the other crates)
+pent-sandbox  →  pent-settings
+pent-proxy    (standalone, no dependency on the other crates)
 ```
 
 ---
@@ -72,8 +72,8 @@ These rules are non-negotiable. All code must comply before being committed.
 - Every `Result` and `Option` must be explicitly handled.
 - Do not silently discard errors with `let _ = expr;` unless the discard is
   intentional and accompanied by a comment explaining why.
-- Do not use `unwrap()` or `expect()` in library code (`halt-settings`,
-  `halt-sandbox`, `halt-proxy`). These are permitted only in:
+- Do not use `unwrap()` or `expect()` in library code (`pent-settings`,
+  `pent-sandbox`, `pent-proxy`). These are permitted only in:
   - `#[cfg(test)]` modules.
   - Provably-infallible calls on hardcoded literals (e.g.
     `"127.0.0.1:0".parse().expect("hardcoded loopback")`), with the comment
@@ -135,4 +135,4 @@ Proxy-based network enforcement (`--allow`, `--network proxy`) is accepted by th
 - `DYLD_INSERT_LIBRARIES` interposition (the proxychains approach) only hooks libc's `connect()`. Go binaries make raw syscalls and bypass it entirely. Binaries built with hardened runtime (`com.apple.security.cs.disable-library-validation` absent) strip `DYLD_INSERT_LIBRARIES` before loading.
 - `pf` packet-filter redirection requires root and is system-wide — it cannot be scoped to a single process without also injecting a source-address bind, which circles back to the DYLD limitation.
 
-On macOS, halt provides **filesystem isolation only** (via Seatbelt/SBPL). Network access is unrestricted. For network containment use the Linux e2e environment (`make e2e-linux`) or run halt on a Linux host.
+On macOS, pent provides **filesystem isolation only** (via Seatbelt/SBPL). Network access is unrestricted. For network containment use the Linux e2e environment (`make e2e-linux`) or run pent on a Linux host.

@@ -1,36 +1,36 @@
 # Maintainer: Valentin Radu
 #
-# Package name is "halt". If that is taken on AUR, use "halt-sandbox".
-pkgname=halt
+# Package name is "pent". If that is taken on AUR, use "pent-sandbox".
+pkgname=pent
 pkgver=0.0.1
 pkgrel=1
 pkgdesc="Wrap any process in a filesystem and network sandbox"
 arch=('x86_64' 'aarch64')
-url="https://github.com/valentinradu/Halt"
+url="https://github.com/valentinradu/Pent"
 license=('MIT')
 depends=('libcap')
 makedepends=('cargo')
-install="halt.install"
-source=("$pkgname-$pkgver.tar.gz::https://github.com/valentinradu/Halt/archive/refs/tags/v$pkgver.tar.gz")
+install="pent.install"
+source=("$pkgname-$pkgver.tar.gz::https://github.com/valentinradu/Pent/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('PLACEHOLDER_SOURCE_SHA256')
 
 prepare() {
-    cd "Halt-$pkgver"
+    cd "Pent-$pkgver"
     cargo fetch --locked --target "$CARCH-unknown-linux-gnu"
 }
 
 build() {
-    cd "Halt-$pkgver"
-    cargo build --release --locked -p halt
+    cd "Pent-$pkgver"
+    cargo build --release --locked -p pent
 }
 
 check() {
-    cd "Halt-$pkgver"
-    cargo test --release --locked -p halt
+    cd "Pent-$pkgver"
+    cargo test --release --locked -p pent
 }
 
 package() {
-    cd "Halt-$pkgver"
-    install -Dm755 target/release/halt "$pkgdir/usr/bin/halt"
+    cd "Pent-$pkgver"
+    install -Dm755 target/release/pent "$pkgdir/usr/bin/pent"
     install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }

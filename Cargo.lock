@@ -279,59 +279,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "halt"
-version = "0.0.2"
-dependencies = [
- "clap",
- "console",
- "halt-proxy",
- "halt-sandbox",
- "halt-settings",
- "libc",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "toml",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "halt-proxy"
-version = "0.0.2"
-dependencies = [
- "halt-settings",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "halt-sandbox"
-version = "0.0.2"
-dependencies = [
- "dirs",
- "halt-settings",
- "landlock",
- "libc",
- "serial_test",
- "tempfile",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "halt-settings"
-version = "0.0.2"
-dependencies = [
- "dirs",
- "serde",
- "tempfile",
- "thiserror 2.0.18",
- "toml",
-]
-
-[[package]]
 name = "hashbrown"
 version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -516,6 +463,59 @@ dependencies = [
  "redox_syscall",
  "smallvec",
  "windows-link",
+]
+
+[[package]]
+name = "pent"
+version = "0.0.2"
+dependencies = [
+ "clap",
+ "console",
+ "libc",
+ "pent-proxy",
+ "pent-sandbox",
+ "pent-settings",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "pent-proxy"
+version = "0.0.2"
+dependencies = [
+ "pent-settings",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "pent-sandbox"
+version = "0.0.2"
+dependencies = [
+ "dirs",
+ "landlock",
+ "libc",
+ "pent-settings",
+ "serial_test",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "pent-settings"
+version = "0.0.2"
+dependencies = [
+ "dirs",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.18",
+ "toml",
 ]
 
 [[package]]
