@@ -71,7 +71,7 @@ fn default_proxy_addr() -> std::net::SocketAddr {
 }
 
 type ExpandedPath = (PathBuf, bool);
-type ExpandedPathLists = (Vec<ExpandedPath>, Vec<ExpandedPath>, Vec<ExpandedPath>);
+type ExpandedPathLists = (Vec<ExpandedPath>, Vec<ExpandedPath>, Vec<ExpandedPath>, Vec<ExpandedPath>);
 
 /// Filesystem paths made available to the sandboxed process.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -82,19 +82,24 @@ pub struct SandboxPaths {
     /// Paths accessible for reading.
     #[serde(default)]
     pub read: Vec<String>,
+    /// Paths accessible for reading and execution (binary directories, installed tools).
+    #[serde(default)]
+    pub execute: Vec<String>,
     /// Paths accessible for reading and writing.
     #[serde(default)]
     pub read_write: Vec<String>,
 }
 
 impl SandboxPaths {
-    /// Merge `other` paths on top of `self`, deduplicating all three lists.
+    /// Merge `other` paths on top of `self`, deduplicating all four lists.
     #[must_use]
     pub fn merge(mut self, other: SandboxPaths) -> SandboxPaths {
         self.traversal.extend(other.traversal);
         dedup_preserve_order(&mut self.traversal);
         self.read.extend(other.read);
         dedup_preserve_order(&mut self.read);
+        self.execute.extend(other.execute);
+        dedup_preserve_order(&mut self.execute);
         self.read_write.extend(other.read_write);
         dedup_preserve_order(&mut self.read_write);
         self
@@ -102,10 +107,9 @@ impl SandboxPaths {
 
     /// Expand each list into `PathBuf` values.
     ///
-    /// Returns `(traversal, read, read_write)`.
     /// Expand paths, resolving `~/` to the user's home directory.
     ///
-    /// Returns `(traversal, read, read_write)` where each list contains
+    /// Returns `(traversal, read, execute, read_write)` where each list contains
     /// `(path, is_glob)` pairs.  A path is a glob when the config entry ends
     /// with `*`; the `*` is stripped from the returned `PathBuf` and callers
     /// should treat the path as a prefix (matching the path and everything
@@ -139,6 +143,7 @@ impl SandboxPaths {
         (
             to_paths(&self.traversal),
             to_paths(&self.read),
+            to_paths(&self.execute),
             to_paths(&self.read_write),
         )
     }
@@ -338,10 +343,11 @@ mod tests {
     #[test]
     fn test_parse_sandbox_paths() {
         let toml =
-            "[sandbox.paths]\ntraversal = [\"/\"]\nread = [\"/usr/lib\"]\nread_write = [\"/tmp\"]";
+            "[sandbox.paths]\ntraversal = [\"/\"]\nread = [\"/usr/lib\"]\nexecute = [\"/usr/bin\"]\nread_write = [\"/tmp\"]";
         let config = HaltConfig::parse(toml).unwrap();
         assert_eq!(config.sandbox.paths.traversal, vec!["/"]);
         assert_eq!(config.sandbox.paths.read, vec!["/usr/lib"]);
+        assert_eq!(config.sandbox.paths.execute, vec!["/usr/bin"]);
         assert_eq!(config.sandbox.paths.read_write, vec!["/tmp"]);
     }
 
@@ -413,16 +419,20 @@ mod tests {
         let base = SandboxPaths {
             traversal: vec!["/".to_string()],
             read: vec!["/usr/lib".to_string()],
+            execute: vec!["/usr/bin".to_string()],
             read_write: vec!["/tmp".to_string()],
         };
         let extra = SandboxPaths {
             traversal: vec![],
             read: vec!["/opt/foo".to_string()],
+            execute: vec!["/usr/bin".to_string(), "/usr/local/bin".to_string()],
             read_write: vec!["/tmp".to_string(), "/var".to_string()],
         };
         let merged = base.merge(extra);
         assert_eq!(merged.traversal, vec!["/"]);
         assert_eq!(merged.read, vec!["/usr/lib", "/opt/foo"]);
+        // /usr/bin deduplicated
+        assert_eq!(merged.execute, vec!["/usr/bin", "/usr/local/bin"]);
         // /tmp deduplicated
         assert_eq!(merged.read_write, vec!["/tmp", "/var"]);
     }
@@ -432,11 +442,13 @@ mod tests {
         let paths = SandboxPaths {
             traversal: vec!["/".to_string()],
             read: vec!["/usr/lib".to_string()],
+            execute: vec!["/usr/bin".to_string()],
             read_write: vec!["/tmp".to_string()],
         };
-        let (traversal, read, read_write) = paths.expand_paths();
+        let (traversal, read, execute, read_write) = paths.expand_paths();
         assert_eq!(traversal, vec![(PathBuf::from("/"), false)]);
         assert_eq!(read, vec![(PathBuf::from("/usr/lib"), false)]);
+        assert_eq!(execute, vec![(PathBuf::from("/usr/bin"), false)]);
         assert_eq!(read_write, vec![(PathBuf::from("/tmp"), false)]);
     }
 

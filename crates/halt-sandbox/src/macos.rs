@@ -98,7 +98,7 @@ pub fn generate_sbpl_profile(config: &SandboxConfig) -> Result<String, SandboxEr
     profile.push_str("(deny file-write*)\n");
 
     // Expand paths from config
-    let (traversal, read, read_write) = config.paths.expand_paths();
+    let (traversal, read, execute, read_write) = config.paths.expand_paths();
 
     // =========================================================================
     // TRAVERSAL PATHS - allow reading the directory entry itself
@@ -130,6 +130,28 @@ pub fn generate_sbpl_profile(config: &SandboxConfig) -> Result<String, SandboxEr
         } else {
             validate_path_for_sbpl(path)?;
             add_sbpl_path_rule(&mut profile, path, "file-read-data");
+        }
+    }
+
+    // =========================================================================
+    // EXECUTE PATHS - file content read + process execution
+    // =========================================================================
+    for (path, is_glob) in &execute {
+        if *is_glob {
+            add_sbpl_glob_rule(&mut profile, path, "file-read-data");
+            add_sbpl_glob_rule(&mut profile, path, "process-exec");
+        } else {
+            validate_path_for_sbpl(path)?;
+            add_sbpl_path_rule(&mut profile, path, "file-read-data");
+            // Unconditionally grant process-exec for execute paths (unlike read paths
+            // which only add process-exec for individual executable files found on disk).
+            let canonical = canonicalize_for_sbpl(path);
+            let original = escape_sbpl_path(path);
+            let modifier = if path.is_file() { "literal" } else { "subpath" };
+            write!(profile, "(allow process-exec ({modifier} \"{canonical}\"))\n").unwrap();
+            if original != canonical {
+                write!(profile, "(allow process-exec ({modifier} \"{original}\"))\n").unwrap();
+            }
         }
     }
 
@@ -514,6 +536,7 @@ mod tests {
         SandboxPaths {
             traversal: vec!["/".to_string(), "/Users".to_string()],
             read: vec!["/usr/lib".to_string()],
+            execute: vec![],
             read_write: vec!["/tmp".to_string()],
         }
     }
@@ -550,6 +573,7 @@ mod tests {
         let paths = SandboxPaths {
             traversal: vec!["/".to_string(), "/custom/traversal".to_string()],
             read: vec![],
+            execute: vec![],
             read_write: vec![],
         };
         let config = SandboxConfig::new("/workspace".into(), paths, "/workspace".into());
@@ -571,6 +595,7 @@ mod tests {
         let paths = SandboxPaths {
             traversal: vec!["/bad) (deny network*) (allow file-read* (subpath \"/".to_string()],
             read: vec![],
+            execute: vec![],
             read_write: vec![],
         };
         let config = SandboxConfig::new("/workspace".into(), paths, "/workspace".into());
@@ -586,6 +611,7 @@ mod tests {
         let paths = SandboxPaths {
             traversal: vec![],
             read: vec!["/path/with/*/wildcard".to_string()],
+            execute: vec![],
             read_write: vec![],
         };
         let config = SandboxConfig::new("/workspace".into(), paths, "/workspace".into());

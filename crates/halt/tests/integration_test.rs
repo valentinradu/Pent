@@ -809,6 +809,36 @@ fn test_run_extra_config_merges_domain_allowlist() {
 
 
 // ============================================================================
+// K. Run — --execute flag
+// ============================================================================
+
+#[test]
+#[cfg(target_os = "linux")]
+fn test_execute_flag_allows_binary() {
+    // Only runs when Landlock is enforcing; otherwise meaningless.
+    // We skip silently if unavailable.
+    let out = run_halt(
+        std::path::Path::new("/tmp"),
+        &[
+            "run",
+            "--no-config",
+            "--network",
+            "unrestricted",
+            "--execute",
+            "/usr/bin",
+            "--",
+            "/usr/bin/true",
+        ],
+    );
+    // If Landlock is not available halt falls back gracefully; either way exit 0.
+    assert!(
+        out.status.success(),
+        "halt --execute /usr/bin -- /usr/bin/true should succeed\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr),
+    );
+}
+
+// ============================================================================
 // N. Profile content verification (all platforms)
 // ============================================================================
 

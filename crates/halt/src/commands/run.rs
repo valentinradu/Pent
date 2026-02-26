@@ -47,6 +47,11 @@ pub async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
         .read_write
         .extend(args.write.iter().map(|p| p.to_string_lossy().into_owned()));
     config
+        .sandbox
+        .paths
+        .execute
+        .extend(args.execute.iter().map(|p| p.to_string_lossy().into_owned()));
+    config
         .proxy
         .domain_allowlist
         .extend(args.allow.iter().cloned());

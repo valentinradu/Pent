@@ -13,10 +13,6 @@ pub fn system_default_paths() -> SandboxPaths {
     SandboxPaths {
         traversal: vec!["/".to_string()],
         read: vec![
-            "/bin".to_string(),
-            "/sbin".to_string(),
-            "/usr/bin".to_string(),
-            "/usr/sbin".to_string(),
             "/usr/lib".to_string(),
             "/usr/share".to_string(),
             "/etc".to_string(),
@@ -26,6 +22,12 @@ pub fn system_default_paths() -> SandboxPaths {
             "/System/Volumes/Preboot/Cryptexes".to_string(),
             // macOS system databases (Security framework, Keychain, timezone, dyld cache)
             "/private/var/db".to_string(),
+        ],
+        execute: vec![
+            "/bin".to_string(),
+            "/sbin".to_string(),
+            "/usr/bin".to_string(),
+            "/usr/sbin".to_string(),
             // Homebrew: ARM Macs → /opt/homebrew, Intel → /usr/local (covered by /usr/*)
             "/opt/homebrew".to_string(),
         ],
@@ -47,7 +49,7 @@ pub struct SandboxConfig {
     /// Workspace directory — always granted read-write access.
     pub workspace: PathBuf,
 
-    /// Sandbox filesystem paths (traversal, read, read_write).
+    /// Sandbox filesystem paths (traversal, read, execute, read_write).
     /// Applied by both the macOS SBPL profile generator and Linux Landlock ruleset.
     pub paths: SandboxPaths,
 
@@ -156,6 +158,7 @@ mod tests {
         let paths = SandboxPaths {
             traversal: vec!["/".to_string()],
             read: vec!["/usr/lib".to_string()],
+            execute: vec![],
             read_write: vec!["/tmp".to_string()],
         };
 

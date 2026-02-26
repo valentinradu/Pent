@@ -44,6 +44,10 @@ pub struct RunArgs {
     #[arg(long = "write", value_name = "PATH")]
     pub write: Vec<PathBuf>,
 
+    /// Add executable filesystem path — implies read access (repeatable)
+    #[arg(long = "execute", value_name = "PATH")]
+    pub execute: Vec<PathBuf>,
+
     /// Add traversal-only filesystem path (repeatable)
     #[arg(long = "traverse", value_name = "PATH")]
     pub traverse: Vec<PathBuf>,

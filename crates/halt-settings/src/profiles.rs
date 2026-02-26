@@ -150,6 +150,16 @@ fn profile_config(p: Profile) -> HaltConfig {
                             "~/.bash_profile".to_string(),
                             // POSIX shell profile
                             "~/.profile".to_string(),
+                        ]
+                    } else {
+                        vec![
+                            "~/.bashrc".to_string(),
+                            "~/.bash_profile".to_string(),
+                            "~/.profile".to_string(),
+                        ]
+                    },
+                    execute: if macos {
+                        vec![
                             // macOS PATH helper — reads /etc/paths and /etc/paths.d
                             "/usr/libexec/path_helper".to_string(),
                             // user-local binaries (e.g. pipx, mise, custom env shims)
@@ -157,9 +167,7 @@ fn profile_config(p: Profile) -> HaltConfig {
                         ]
                     } else {
                         vec![
-                            "~/.bashrc".to_string(),
-                            "~/.bash_profile".to_string(),
-                            "~/.profile".to_string(),
+                            // user-local binaries (e.g. pipx, mise, custom env shims)
                             "~/.local/bin".to_string(),
                         ]
                     },
@@ -488,6 +496,7 @@ fn profile_config(p: Profile) -> HaltConfig {
                     // ~/.agents/skills is the built-in user-level skills directory
                     // where Codex discovers custom automation plugins.
                     read: vec!["~/.agents/skills".to_string()],
+                    ..Default::default()
                 },
                 ..Default::default()
             },
@@ -506,11 +515,10 @@ fn profile_config(p: Profile) -> HaltConfig {
             },
             sandbox: SandboxSettings {
                 paths: SandboxPaths {
-                    // Read access to npm global install directory so Node can
-                    // resolve modules from ~/.npm-global/lib/node_modules/.
-                    // The binary (~/.npm-global/bin) is covered automatically
-                    // via PATH resolution in the Landlock path_dirs ruleset.
-                    read: vec!["~/.npm-global".to_string()],
+                    // Execute access to npm global install directory so Node can
+                    // resolve modules from ~/.npm-global/lib/node_modules/ and
+                    // run the binary at ~/.npm-global/bin/gemini.
+                    execute: vec!["~/.npm-global".to_string()],
                     read_write: if macos {
                         vec![
                             "~/Library/Application Support/gemini-cli".to_string(),
@@ -559,6 +567,11 @@ pub fn is_profile_likely_active(config: &HaltConfig, p: Profile) -> bool {
     }
     for path in &paths.read {
         if config.sandbox.paths.read.contains(path) {
+            return true;
+        }
+    }
+    for path in &paths.execute {
+        if config.sandbox.paths.execute.contains(path) {
             return true;
         }
     }

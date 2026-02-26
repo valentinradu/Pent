@@ -19,7 +19,9 @@
 //!   +-- Allow workspace (rw)
 //!   +-- Allow data_dir (rw)
 //!   +-- Allow mounts (per config)
-//!   +-- Allow PATH dirs (ro+exec)
+//!   +-- Allow PATH dirs (read+exec)
+//!   +-- Allow execute paths (read+exec) — binary dirs, installed tools
+//!   +-- Allow read paths (read only) — config files, libraries, data
 //!   +-- Allow system libs (ro)
 //!   +-- Allow /tmp (rw)
 //!   +-- Allow /dev (ro)
@@ -114,11 +116,13 @@ pub fn build_landlock_ruleset(
     // All filesystem access rights for deny-all baseline
     let all_access = AccessFs::from_all(ABI::V4);
 
-    // Read-only access rights: readable paths are also executable.
-    // A process that can read a file can execute it — visibility implies executability.
-    let read_access = AccessFs::ReadFile | AccessFs::ReadDir | AccessFs::Execute;
+    // Read-only: no Execute (config files, libraries, data).
+    let read_access = AccessFs::ReadFile | AccessFs::ReadDir;
 
-    // Read-write access rights (all)
+    // Execute: readable and runnable (binary directories, installed tools).
+    let execute_access = AccessFs::ReadFile | AccessFs::ReadDir | AccessFs::Execute;
+
+    // Write: all rights (workspace, temp dirs, cache dirs); unchanged.
     let write_access = all_access;
 
     // Create ruleset with deny-all baseline
@@ -162,28 +166,32 @@ pub fn build_landlock_ruleset(
 
     // Configured SandboxPaths (from profiles and TOML config).
     // traversal = ReadDir only (stat/list, no file reads or exec).
-    // read = ReadFile | ReadDir | Execute (visible → executable).
+    // read = ReadFile | ReadDir (config files, libraries, data; no exec).
+    // execute = ReadFile | ReadDir | Execute (binary directories, installed tools).
     // read_write = all access rights.
     let traversal_access = AccessFs::ReadDir;
-    let (traversal_paths, read_paths, rw_paths) = config.paths.expand_paths();
+    let (traversal_paths, read_paths, execute_paths, rw_paths) = config.paths.expand_paths();
     for (path, _) in &traversal_paths {
         add_path(&mut ruleset, path, traversal_access.into())?;
     }
     for (path, _) in &read_paths {
         add_path(&mut ruleset, path, read_access)?;
     }
+    for (path, _) in &execute_paths {
+        add_path(&mut ruleset, path, execute_access)?;
+    }
     for (path, _) in &rw_paths {
         add_path(&mut ruleset, path, write_access)?;
     }
 
-    // PATH directories - read
+    // PATH directories - read + execute (these are binary dirs)
     for path_dir in path_dirs {
-        add_path(&mut ruleset, path_dir, read_access)?;
+        add_path(&mut ruleset, path_dir, execute_access)?;
     }
 
-    // System libraries - read only
+    // System libraries - read + execute (dynamic linker in /usr/lib, /lib64 needs Execute)
     for sys_path in SYSTEM_PATHS {
-        add_path(&mut ruleset, Path::new(sys_path), read_access)?;
+        add_path(&mut ruleset, Path::new(sys_path), execute_access)?;
     }
 
     // Temp directories - read/write
@@ -587,9 +595,9 @@ pub fn spawn_with_landlock(
     unsafe {
         command.pre_exec(move || {
             // Build and apply Landlock in child process.
-            // Readable paths are also executable: visibility implies executability.
             let all_access = AccessFs::from_all(ABI::V4);
-            let read_access = AccessFs::ReadFile | AccessFs::ReadDir | AccessFs::Execute;
+            let read_access = AccessFs::ReadFile | AccessFs::ReadDir;
+            let execute_access = AccessFs::ReadFile | AccessFs::ReadDir | AccessFs::Execute;
             let write_access = all_access;
 
             let mut ruleset = Ruleset::default()
@@ -628,25 +636,28 @@ pub fn spawn_with_landlock(
 
             // Add configured SandboxPaths (from profiles and TOML config)
             let traversal_access = AccessFs::ReadDir;
-            let (traversal_paths, read_paths, rw_paths) = paths.expand_paths();
+            let (traversal_paths, read_paths, execute_paths, rw_paths) = paths.expand_paths();
             for (path, _) in &traversal_paths {
                 add_path(&mut ruleset, path, traversal_access.into())?;
             }
             for (path, _) in &read_paths {
                 add_path(&mut ruleset, path, read_access)?;
             }
+            for (path, _) in &execute_paths {
+                add_path(&mut ruleset, path, execute_access)?;
+            }
             for (path, _) in &rw_paths {
                 add_path(&mut ruleset, path, write_access)?;
             }
 
-            // Add PATH directories
+            // Add PATH directories (binary dirs — read + execute)
             for path_dir in &path_dirs {
-                add_path(&mut ruleset, path_dir, read_access)?;
+                add_path(&mut ruleset, path_dir, execute_access)?;
             }
 
-            // Add system paths
+            // Add system paths (dynamic linker in /usr/lib, /lib64 needs Execute)
             for sys_path in SYSTEM_PATHS {
-                add_path(&mut ruleset, Path::new(sys_path), read_access)?;
+                add_path(&mut ruleset, Path::new(sys_path), execute_access)?;
             }
 
             // Add temp paths

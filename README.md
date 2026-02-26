@@ -212,7 +212,8 @@ network = { mode = "proxy_only" }          # Network mode
 
 [sandbox.paths]
 traversal = ["/"]                          # Can stat/readdir, not read or write
-read = ["/usr/lib", "/etc"]               # Read-only
+read = ["/usr/lib", "/etc"]               # Read-only (no execute)
+execute = ["/usr/bin", "~/.local/bin"]    # Read + execute (binary directories)
 read_write = ["/tmp"]                      # Read + write
 
 [proxy]
@@ -237,22 +238,23 @@ halt config edit
 
 Profiles are an optional convenience — named sets of domains and filesystem paths for common tools. `halt config add` writes their values into your TOML config file; you can achieve the same result by editing the file directly. Profiles are composable — some automatically pull in others.
 
-| Profile | Domains | Paths | Depends on |
-|---------|---------|-------|------------|
-| `@claude` | api.anthropic.com, statsig.anthropic.com, sentry.io | — | `@node`, `@ssh` |
-| `@codex` | api.openai.com, *.openai.com | — | `@node` |
-| `@gemini` | generativelanguage.googleapis.com, aiplatform.googleapis.com, cloudresourcemanager.googleapis.com, oauth2.googleapis.com, accounts.google.com | — | `@node` |
-| `@gh` | github.com, *.github.com, raw.githubusercontent.com, objects.githubusercontent.com, codeload.github.com, api.github.com | ~/.config/gh | `@ssh` |
-| `@ssh` | — | ~/.ssh/known_hosts, ~/.ssh/config (read-only) | — |
-| `@npm` | registry.npmjs.org, *.npmjs.org | ~/.npm | `@node` |
-| `@cargo` | crates.io, static.crates.io, index.crates.io | ~/.cargo | — |
-| `@pip` | pypi.org, files.pythonhosted.org | ~/Library/Caches/pip (macOS), ~/.cache/pip (Linux) | — |
-| `@gem` | rubygems.org, *.rubygems.org | ~/.gem | — |
-| `@go` | proxy.golang.org, sum.golang.org, storage.googleapis.com | ~/go | — |
-| `@brew` | formulae.brew.sh, ghcr.io | /opt/homebrew, /usr/local (macOS), /home/linuxbrew/.linuxbrew (Linux) | — |
-| `@node` | — | traversal: ~ (+ macOS TCC/Preferences reads) | — |
-| `@git` | — | ~/.gitconfig, ~/.config/git (read-only) | — |
-| `@keychain` | — | ~/Library/Keychains (macOS), ~/.local/share/keyrings, ~/.local/share/kwalletd, ~/.password-store (Linux) | — |
+| Profile | Domains | Read Paths | Execute Paths | Depends on |
+|---------|---------|------------|---------------|------------|
+| `@claude` | api.anthropic.com, statsig.anthropic.com, sentry.io | — | — | `@node`, `@ssh` |
+| `@codex` | api.openai.com, *.openai.com | — | — | `@node` |
+| `@gemini` | generativelanguage.googleapis.com, aiplatform.googleapis.com, cloudresourcemanager.googleapis.com, oauth2.googleapis.com, accounts.google.com | — | ~/.npm-global | `@node` |
+| `@gh` | github.com, *.github.com, raw.githubusercontent.com, objects.githubusercontent.com, codeload.github.com, api.github.com | ~/.config/gh | — | `@ssh` |
+| `@ssh` | — | ~/.ssh/known_hosts, ~/.ssh/config | — | — |
+| `@npm` | registry.npmjs.org, *.npmjs.org | ~/.npm | — | `@node` |
+| `@cargo` | crates.io, static.crates.io, index.crates.io | ~/.cargo | — | — |
+| `@pip` | pypi.org, files.pythonhosted.org | ~/Library/Caches/pip (macOS), ~/.cache/pip (Linux) | — | — |
+| `@gem` | rubygems.org, *.rubygems.org | ~/.gem | — | — |
+| `@go` | proxy.golang.org, sum.golang.org, storage.googleapis.com | ~/go | — | — |
+| `@brew` | formulae.brew.sh, ghcr.io | /opt/homebrew, /usr/local (macOS), /home/linuxbrew/.linuxbrew (Linux) | — | — |
+| `@node` | — | traversal: ~ (+ macOS TCC/Preferences reads) | — | — |
+| `@git` | — | ~/.gitconfig, ~/.config/git | — | — |
+| `@keychain` | — | ~/Library/Keychains (macOS), ~/.local/share/keyrings, ~/.local/share/kwalletd, ~/.password-store (Linux) | — | — |
+| `@base` | — | shell init files (~/.zshrc, ~/.bashrc, etc.) | ~/.local/bin (+ /usr/libexec/path_helper on macOS) | — |
 
 When you add a profile its dependencies are added automatically. When you remove a profile, halt warns if a dependent profile is still active.
 
@@ -303,6 +305,7 @@ halt run [OPTIONS] -- COMMAND [ARGS...]
   --allow <DOMAIN>        Add domain to proxy allowlist (implies proxy; repeatable)
   --read <PATH>           Add read-only filesystem path (repeatable)
   --write <PATH>          Add read-write filesystem path (repeatable)
+  --execute <PATH>        Add executable filesystem path — implies read access (repeatable)
   --traverse <PATH>       Add traversal-only filesystem path (repeatable)
   --env <KEY[=VALUE]>     Pass or set an environment variable (repeatable)
   --config <PATH>         Load an additional config file
