@@ -457,7 +457,7 @@ pub fn spawn_with_landlock(
     // Identify write-listed file paths (as opposed to directories) and prepare
     // overlayfs staging directories for them. Directories use regular Landlock
     // write rules; files get inode-stable access via the overlayfs + inotify path.
-    let (_, _, _, rw_expanded) = config.paths.expand_paths();
+    let (_, read_expanded, execute_expanded, rw_expanded) = config.paths.expand_paths();
     let overlay_file_paths: Vec<PathBuf> = rw_expanded
         .iter()
         .filter_map(|(path, _)| {
@@ -475,9 +475,34 @@ pub fn spawn_with_landlock(
         .collect();
     let write_set: HashSet<PathBuf> = overlay_file_paths.iter().cloned().collect();
 
+    // Build the set of paths the sandboxed process is allowed to read.
+    // Traversal-only paths are intentionally excluded (ReadDir but not ReadFile).
+    let mut accessible: HashSet<PathBuf> = HashSet::new();
+    for (p, _) in read_expanded.iter().chain(&execute_expanded).chain(&rw_expanded) {
+        accessible.insert(p.clone());
+    }
+    accessible.extend(write_set.iter().cloned());
+    accessible.insert(config.workspace.clone());
+    accessible.insert(config.data_dir.clone());
+    for mount in &config.mounts {
+        accessible.insert(mount.path.clone());
+    }
+    for sys_path in SYSTEM_PATHS {
+        accessible.insert(PathBuf::from(sys_path));
+    }
+    for tmp_path in TEMP_PATHS {
+        accessible.insert(PathBuf::from(tmp_path));
+    }
+    for dev_path in DEVICE_PATHS {
+        accessible.insert(PathBuf::from(dev_path));
+    }
+    for path_dir in path_dirs.iter() {
+        accessible.insert(path_dir.clone());
+    }
+
     let pid = std::process::id();
     let overlay_mounts =
-        super::linux_overlayfs::prepare_overlay_dirs(&overlay_file_paths, pid)
+        super::linux_overlayfs::prepare_overlay_dirs(&overlay_file_paths, &accessible, pid)
             .map_err(SandboxError::SpawnFailed)?;
 
     // Compute the set of parent directories covered by overlayfs (for Landlock rules).

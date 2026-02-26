@@ -13,17 +13,27 @@
 //!
 //! 1. Creates staging directories (`upper/` and `work/`) under
 //!    `/tmp/halt-ovl-<pid>-N/` in the parent process before fork.
-//! 2. In the child's `pre_exec` hook, mounts overlayfs on the parent directory
-//!    inside the child's mount namespace (lower = real dir, upper = tmpfs staging).
-//! 3. Starts an `inotify` watcher thread in the **parent** that watches `upper/`
+//! 2. Pre-populates `upper/` with stub entries for non-manifest content:
+//!    - Directories with no manifest descendants → `user.overlay.opaque=y`
+//!      (entire subtree invisible: `ENOENT` on any access).
+//!    - Non-manifest files (kernel ≥ 6.7) → zero-size file + `user.overlay.whiteout`
+//!      xattr (`ENOENT` on `open`/`stat`; name hidden from `readdir` when parent
+//!      has `user.overlay.opaque=x`).
+//!    - Non-manifest files (kernel < 6.7) → empty stub file (empty content).
+//! 3. In the child's `pre_exec` hook, mounts overlayfs on the parent directory
+//!    inside the child's mount namespace (lower = real dir, upper = staging),
+//!    using `-o userxattr` so `user.overlay.*` xattrs are honoured.
+//! 4. Starts an `inotify` watcher thread in the **parent** that watches `upper/`
 //!    for `IN_CLOSE_WRITE` and `IN_MOVED_TO` events.
-//! 4. On each matching event for a write-listed file: flushes the upper-layer
+//! 5. On each matching event for a write-listed file: flushes the upper-layer
 //!    content back to the real file **in-place** (`O_WRONLY | O_TRUNC`) — never
 //!    via `rename()` — preserving the inode that Landlock is bound to.
-//! 5. On child exit, performs a final flush pass then removes staging directories.
+//! 6. On child exit, performs a final flush pass then removes staging directories.
 //!
 //! Inside the child's namespace the process can write freely (writes go to upper);
 //! from the real filesystem's perspective only write-listed files are ever modified.
+//! Non-manifest files in the overlay parent directory are invisible (`ENOENT`) or
+//! empty, depending on kernel version.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
@@ -51,6 +61,183 @@ pub struct OverlayHandle {
     write_set: HashSet<PathBuf>,
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Kernel version probe
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Returns `true` if the running kernel is ≥ 6.7.
+///
+/// Kernel 6.7 added `OVL_XATTR_XWHITEOUT` (`user.overlay.whiteout`), which
+/// allows unprivileged creation of per-file whiteouts in the overlayfs upper
+/// layer when the filesystem is mounted with `-o userxattr`.
+fn kernel_supports_xwhiteout() -> bool {
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let mut uts: libc::utsname = unsafe { std::mem::zeroed() };
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    if unsafe { libc::uname(&mut uts) } != 0 {
+        return false;
+    }
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let release = unsafe { std::ffi::CStr::from_ptr(uts.release.as_ptr()) };
+    let s = release.to_string_lossy();
+    let mut parts = s.splitn(3, '.');
+    let major: u32 = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    let minor: u32 = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    (major, minor) >= (6, 7)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// xattr helper
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Set an extended attribute on `path`.
+fn set_xattr(path: &Path, name: &str, value: &[u8]) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let path_c = CString::new(path.as_os_str().as_bytes())
+        .map_err(std::io::Error::other)?;
+    let name_c = CString::new(name).map_err(std::io::Error::other)?;
+    let ptr = if value.is_empty() {
+        std::ptr::null()
+    } else {
+        value.as_ptr() as *const libc::c_void
+    };
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let ret = unsafe { libc::setxattr(path_c.as_ptr(), name_c.as_ptr(), ptr, value.len(), 0) };
+    if ret != 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Accessibility helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Returns `true` if any strict ancestor of `path` is in `accessible`,
+/// meaning `path` lies within an accessible subtree.
+fn is_in_accessible_subtree(path: &Path, accessible: &HashSet<PathBuf>) -> bool {
+    path.ancestors().skip(1).any(|a| accessible.contains(a))
+}
+
+/// Returns `true` if `accessible` contains any path that is strictly inside
+/// `dir` (i.e. `dir` has at least one accessible descendant).
+fn has_accessible_descendant(dir: &Path, accessible: &HashSet<PathBuf>) -> bool {
+    accessible.iter().any(|a| a != dir && a.starts_with(dir))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Upper-layer stub population
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Pre-populate the overlayfs `upper_dir` with stub entries that make
+/// non-manifest content invisible to the sandboxed child process.
+///
+/// **Directories** with no accessible descendants receive `user.overlay.opaque=y`:
+/// the merged view shows an empty directory; any path within returns `ENOENT`.
+///
+/// **Non-manifest files** (kernel ≥ 6.7, `use_xwhiteout = true`): a zero-size
+/// regular file is created in `upper_dir` with `user.overlay.whiteout` set.
+/// `open()`/`stat()` on the file returns `ENOENT`.  The containing directory
+/// also gets `user.overlay.opaque=x` so the kernel hides the whiteout entry
+/// from `readdir` as well.
+///
+/// **Non-manifest files** (kernel < 6.7 fallback): an empty regular file is
+/// created — the child sees empty content rather than `ENOENT`.
+///
+/// Manifest files and directories within accessible subtrees are left untouched;
+/// the lower layer shows through for them.
+///
+/// `depth_limit` prevents runaway recursion on unusually deep directory trees.
+fn populate_upper_stubs(
+    real_dir: &Path,
+    upper_dir: &Path,
+    accessible: &HashSet<PathBuf>,
+    use_xwhiteout: bool,
+    depth_limit: u32,
+) -> std::io::Result<()> {
+    if depth_limit == 0 {
+        return Ok(());
+    }
+
+    let entries = match std::fs::read_dir(real_dir) {
+        Ok(e) => e,
+        Err(_) => return Ok(()), // unreadable dir — skip gracefully
+    };
+
+    let mut upper_has_xwhiteouts = false;
+
+    for entry in entries.flatten() {
+        let real_path = entry.path();
+        let name = entry.file_name();
+        let upper_path = upper_dir.join(&name);
+
+        let ft = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+
+        // Symlinks: skip — resolving them safely is complex and they are
+        // uncommon in the configs we target.
+        if ft.is_symlink() {
+            continue;
+        }
+
+        if ft.is_dir() {
+            // Is this directory explicitly accessible or inside an accessible subtree?
+            // If so, the lower layer shows through — don't create an upper entry.
+            if accessible.contains(&real_path) || is_in_accessible_subtree(&real_path, accessible) {
+                continue;
+            }
+
+            // Does this directory contain any accessible paths?
+            if has_accessible_descendant(&real_path, accessible) {
+                // Partially accessible: create the dir in upper (no xattr) and recurse.
+                let _ = std::fs::create_dir(&upper_path);
+                populate_upper_stubs(
+                    &real_path,
+                    &upper_path,
+                    accessible,
+                    use_xwhiteout,
+                    depth_limit - 1,
+                )?;
+            } else {
+                // No accessible descendants: make the directory opaque.
+                // The merged view shows an empty directory; contents return ENOENT.
+                let _ = std::fs::create_dir(&upper_path);
+                let _ = set_xattr(&upper_path, "user.overlay.opaque", b"y");
+            }
+        } else if ft.is_file() {
+            // Is this file accessible (explicitly listed or within an accessible subtree)?
+            if accessible.contains(&real_path) || is_in_accessible_subtree(&real_path, accessible) {
+                continue; // Lower shows through.
+            }
+
+            // Non-manifest file: hide it.
+            if use_xwhiteout {
+                // Zero-size file + user.overlay.whiteout → ENOENT on open/stat.
+                if std::fs::File::create(&upper_path).is_ok() {
+                    let _ = set_xattr(&upper_path, "user.overlay.whiteout", b"");
+                    upper_has_xwhiteouts = true;
+                }
+            } else {
+                // Kernel < 6.7 fallback: empty stub (empty content, not ENOENT).
+                let _ = std::fs::File::create(&upper_path);
+            }
+        }
+        // Sockets, FIFOs, device files: skip.
+    }
+
+    // Mark this directory as containing xwhiteout-format entries.
+    // The kernel uses this during readdir to hide the whiteout files from
+    // directory listings (requires kernel ≥ 6.7 + -o userxattr).
+    if upper_has_xwhiteouts {
+        let _ = set_xattr(upper_dir, "user.overlay.opaque", b"x");
+    }
+
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Public API
+// ─────────────────────────────────────────────────────────────────────────────
+
 /// Create staging directories for each unique parent directory of write-listed files.
 ///
 /// Call this from the **parent** process before `Command::spawn()`. The staging
@@ -61,13 +248,21 @@ pub struct OverlayHandle {
 /// Only parent directories that currently exist on disk get an overlay entry;
 /// non-existent parents are skipped.
 ///
+/// `accessible` is the set of paths (files and directories) that the sandboxed
+/// process is allowed to read — built from the `read`, `execute`, and `read_write`
+/// manifest expansions plus `workspace`, `data_dir`, configured mounts, and
+/// system paths.  Any file or directory in `real_dir` that is **not** covered by
+/// `accessible` will be stubbed out in `upper/` to prevent reads.
+///
 /// # Errors
 ///
 /// Returns an error if a staging directory cannot be created.
 pub fn prepare_overlay_dirs(
     write_files: &[PathBuf],
+    accessible: &HashSet<PathBuf>,
     pid: u32,
 ) -> std::io::Result<Vec<OverlayMount>> {
+    let use_xwhiteout = kernel_supports_xwhiteout();
     let mut seen: HashSet<PathBuf> = HashSet::new();
     let mut mounts = Vec::new();
     let mut idx = 0usize;
@@ -90,6 +285,10 @@ pub fn prepare_overlay_dirs(
         let work_dir = base_dir.join("work");
         std::fs::create_dir_all(&upper_dir)?;
         std::fs::create_dir_all(&work_dir)?;
+
+        // Pre-populate upper/ with stubs for non-manifest content.
+        // Depth limit of 32 prevents runaway on deeply nested home directories.
+        populate_upper_stubs(&parent, &upper_dir, accessible, use_xwhiteout, 32)?;
 
         mounts.push(OverlayMount { real_dir: parent, upper_dir, work_dir, base_dir });
         idx += 1;
@@ -132,8 +331,10 @@ pub unsafe fn mount_overlays(overlays: &[OverlayMount]) -> std::io::Result<()> {
             Ok(c) => c,
             Err(_) => continue,
         };
+        // userxattr: use user.overlay.* namespace for opaque/whiteout xattrs,
+        // which works in unprivileged user namespaces.
         let options =
-            format!("lowerdir={real_str},upperdir={upper_str},workdir={work_str}");
+            format!("lowerdir={real_str},upperdir={upper_str},workdir={work_str},userxattr");
         let options_c = match CString::new(options) {
             Ok(c) => c,
             Err(_) => continue,
