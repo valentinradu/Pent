@@ -154,6 +154,8 @@ fn rm_profile(global: bool, profiles: Vec<String>, cwd: &Path) -> Result<(), Cli
         removal.sandbox.paths.traversal.into_iter().collect();
     let rm_read: std::collections::HashSet<String> =
         removal.sandbox.paths.read.into_iter().collect();
+    let rm_execute: std::collections::HashSet<String> =
+        removal.sandbox.paths.execute.into_iter().collect();
     let rm_read_write: std::collections::HashSet<String> =
         removal.sandbox.paths.read_write.into_iter().collect();
 
@@ -171,6 +173,11 @@ fn rm_profile(global: bool, profiles: Vec<String>, cwd: &Path) -> Result<(), Cli
         .paths
         .read
         .retain(|p| !rm_read.contains(p));
+    config
+        .sandbox
+        .paths
+        .execute
+        .retain(|p| !rm_execute.contains(p));
     config
         .sandbox
         .paths

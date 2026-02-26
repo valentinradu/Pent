@@ -454,8 +454,7 @@ fn profile_config(p: Profile) -> HaltConfig {
                     read_write: if macos {
                         vec![
                             "~/.claude".to_string(),
-                            // macOS: SBPL is path-based, globs work fine.
-                            "~/.claude.json*".to_string(),
+                            "~/.claude.json".to_string(),
                             "~/.claude.lock".to_string(),
                             "~/.local/share/claude".to_string(),
                             // macOS user app data — Claude Code stores runtime
@@ -467,8 +466,6 @@ fn profile_config(p: Profile) -> HaltConfig {
                     } else {
                         vec![
                             "~/.claude".to_string(),
-                            // Linux: exact path required — overlayfs handles the
-                            // atomic write (create-temp → rename) transparently.
                             "~/.claude.json".to_string(),
                             "~/.claude.lock".to_string(),
                             "~/.local/share/claude".to_string(),
