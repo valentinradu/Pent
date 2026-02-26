@@ -465,6 +465,12 @@ pub fn exec_with_landlock(
 /// Uses `Command::pre_exec()` to apply Landlock and network isolation in the
 /// child process after fork but before exec. This restricts only the child.
 ///
+/// For write-listed file paths, overlayfs is mounted over their parent directories
+/// inside the child's mount namespace so that atomic writes (rename-based) go to
+/// the overlay upper layer. An inotify watcher in the parent flushes completed
+/// writes back to the real file inodes in-place, preserving the inodes that
+/// Landlock rules are bound to.
+///
 /// # Arguments
 /// * `config` - Sandbox configuration
 /// * `cmd` - Command to execute
@@ -473,7 +479,8 @@ pub fn exec_with_landlock(
 /// * `path_dirs` - PATH directories for ruleset
 ///
 /// # Returns
-/// Child process handle
+/// `(child_handle, overlay_handle)` — `overlay_handle` is `Some` when overlayfs
+/// is in use; pass it to [`super::linux_overlayfs::teardown`] after the child exits.
 ///
 /// # Errors
 /// * `SandboxUnavailable` - If Landlock unavailable
@@ -485,10 +492,11 @@ pub fn spawn_with_landlock(
     args: &[String],
     env: &std::collections::HashMap<String, String>,
     path_dirs: &[PathBuf],
-) -> Result<std::process::Child, SandboxError> {
+) -> Result<(std::process::Child, Option<super::linux_overlayfs::OverlayHandle>), SandboxError> {
     use landlock::{
         Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr, ABI,
     };
+    use std::collections::HashSet;
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
@@ -499,6 +507,41 @@ pub fn spawn_with_landlock(
     let paths = config.paths.clone();
     let path_dirs = path_dirs.to_vec();
     let network = config.network.clone();
+
+    // Identify write-listed file paths (as opposed to directories) and prepare
+    // overlayfs staging directories for them. Directories use regular Landlock
+    // write rules; files get inode-stable access via the overlayfs + inotify path.
+    let (_, _, _, rw_expanded) = config.paths.expand_paths();
+    let overlay_file_paths: Vec<PathBuf> = rw_expanded
+        .iter()
+        .filter_map(|(path, _)| {
+            // Include paths that are files, or don't exist yet but whose parent
+            // directory exists (will be created as a file on first write).
+            if path.is_file()
+                || (!path.exists()
+                    && path.parent().map_or(false, |p| p.is_dir()))
+            {
+                Some(path.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    let write_set: HashSet<PathBuf> = overlay_file_paths.iter().cloned().collect();
+
+    let pid = std::process::id();
+    let overlay_mounts =
+        super::linux_overlayfs::prepare_overlay_dirs(&overlay_file_paths, pid)
+            .map_err(SandboxError::SpawnFailed)?;
+
+    // Compute the set of parent directories covered by overlayfs (for Landlock rules).
+    let overlay_dirs: HashSet<PathBuf> =
+        overlay_mounts.iter().map(|m| m.real_dir.clone()).collect();
+
+    // Clone overlay data for capture into the pre_exec closure.
+    let overlay_mounts_pre = overlay_mounts.clone();
+    let write_set_pre = write_set.clone();
+    let overlay_dirs_pre = overlay_dirs.clone();
 
     // For ProxyOnly, create a named network namespace in the parent so the child
     // can join it via setns() in pre_exec. A named namespace survives the child's
@@ -585,7 +628,7 @@ pub fn spawn_with_landlock(
     command.stdout(Stdio::inherit());
     command.stderr(Stdio::inherit());
 
-    // pre_exec runs in child after fork, before exec
+    // pre_exec runs in child after fork, before exec.
     // SAFETY: Although we use heap allocations and file I/O here (which are not
     // strictly async-signal-safe), this is safe in practice because:
     // 1. We're in a single-threaded child process after fork
@@ -594,7 +637,45 @@ pub fn spawn_with_landlock(
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         command.pre_exec(move || {
-            // Build and apply Landlock in child process.
+            // ── Phase 1: Namespace and overlay setup ─────────────────────────
+            //
+            // When overlayfs is in use we need CLONE_NEWUSER + CLONE_NEWNS (and
+            // CLONE_NEWNET for local-network modes) in a single unshare call.
+            // For ProxyOnly, CLONE_NEWNET is handled separately via setns below.
+            let has_overlays = !overlay_mounts_pre.is_empty();
+
+            if has_overlays {
+                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+                let uid = libc::getuid();
+                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+                let gid = libc::getgid();
+
+                let mut flags = libc::CLONE_NEWUSER | libc::CLONE_NEWNS;
+                // Add CLONE_NEWNET for modes that don't use setns.
+                if netns_fd < 0 {
+                    match &network {
+                        NetworkMode::LocalhostOnly | NetworkMode::Blocked => {
+                            flags |= libc::CLONE_NEWNET;
+                        }
+                        _ => {}
+                    }
+                }
+                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+                let ret = libc::unshare(flags);
+                if ret != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+                setup_userns_mappings(uid, gid);
+
+                // Mount overlayfs inside the new mount namespace.
+                // SAFETY: we are in a single-threaded post-fork child that has
+                // just called unshare(CLONE_NEWUSER | CLONE_NEWNS).
+                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+                super::linux_overlayfs::mount_overlays(&overlay_mounts_pre)?;
+            }
+
+            // ── Phase 2: Landlock ─────────────────────────────────────────────
             let all_access = AccessFs::from_all(ABI::V4);
             let read_access = AccessFs::ReadFile | AccessFs::ReadDir;
             let execute_access = AccessFs::ReadFile | AccessFs::ReadDir | AccessFs::Execute;
@@ -634,7 +715,7 @@ pub fn spawn_with_landlock(
                 }
             }
 
-            // Add configured SandboxPaths (from profiles and TOML config)
+            // Add configured SandboxPaths (from profiles and TOML config).
             let traversal_access = AccessFs::ReadDir;
             let (traversal_paths, read_paths, execute_paths, rw_paths) = paths.expand_paths();
             for (path, _) in &traversal_paths {
@@ -646,8 +727,22 @@ pub fn spawn_with_landlock(
             for (path, _) in &execute_paths {
                 add_path(&mut ruleset, path, execute_access)?;
             }
+            // For rw_paths:
+            // - Paths covered by overlayfs (files in write_set_pre): skip; access
+            //   is granted at the parent directory level via the overlay_dirs rule.
+            // - Paths not covered (directories, non-overlay files): add directly.
             for (path, _) in &rw_paths {
+                if write_set_pre.contains(path) {
+                    continue; // covered by overlay parent-dir rule below
+                }
                 add_path(&mut ruleset, path, write_access)?;
+            }
+            // Overlay parent directories — grant full write access so the child
+            // can read/write through the overlayfs mount point. Inside the
+            // namespace, writes go to upper (tmpfs); the real filesystem only
+            // sees changes when the parent's watcher flushes write_set files.
+            for dir in &overlay_dirs_pre {
+                add_path(&mut ruleset, dir, write_access)?;
             }
 
             // Add PATH directories (binary dirs — read + execute)
@@ -675,22 +770,29 @@ pub fn spawn_with_landlock(
                 .restrict_self()
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
 
-            // Apply network isolation
+            // ── Phase 3: Network isolation ────────────────────────────────────
             if netns_fd >= 0 {
                 // ProxyOnly: join the named namespace created by the parent.
                 // SAFETY: netns_fd is a valid open fd to the named netns file.
-                // setns(CLONE_NEWNET) joins the network namespace; we are in a
-                // single-threaded post-fork child, so no other threads are affected.
                 // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                 let ret = libc::setns(netns_fd, libc::CLONE_NEWNET);
                 if ret != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
-                // SAFETY: bring_up_loopback uses ioctl in a post-fork child process.
-                // Single-threaded at this point; no locks are held from the parent.
                 // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                 bring_up_loopback();
+            } else if has_overlays {
+                // Namespace already created in Phase 1; just bring up loopback
+                // if needed. apply_network_isolation would call unshare again.
+                match &network {
+                    NetworkMode::LocalhostOnly | NetworkMode::ProxyOnly { .. } => {
+                        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+                        bring_up_loopback();
+                    }
+                    _ => {}
+                }
             } else {
+                // No overlays: use the existing path (handles unshare internally).
                 apply_network_isolation(&network)?;
             }
 
@@ -712,7 +814,16 @@ pub fn spawn_with_landlock(
         }
     }
 
-    result
+    let child = result?;
+
+    // Start the inotify watcher now that the child is running.
+    let overlay_handle = if overlay_mounts.is_empty() {
+        None
+    } else {
+        Some(super::linux_overlayfs::spawn_watcher(overlay_mounts, write_set))
+    };
+
+    Ok((child, overlay_handle))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -722,7 +833,7 @@ pub fn spawn_with_landlock(
     _args: &[String],
     _env: &std::collections::HashMap<String, String>,
     _path_dirs: &[PathBuf],
-) -> Result<std::process::Child, SandboxError> {
+) -> Result<(std::process::Child, Option<()>), SandboxError> {
     Err(SandboxError::UnsupportedPlatform)
 }
 
@@ -915,7 +1026,7 @@ mod tests {
 
         if check_available().is_ok() {
             match result {
-                Ok(mut child) => {
+                Ok((mut child, _overlay)) => {
                     let status = child.wait().expect("Failed to wait on child");
                     assert!(status.success(), "true command should succeed");
                 }
@@ -956,7 +1067,7 @@ mod tests {
 
         if check_available().is_ok() {
             match result {
-                Ok(mut child) => {
+                Ok((mut child, _overlay)) => {
                     let status = child.wait().expect("Failed to wait on child");
                     assert!(status.success());
                 }

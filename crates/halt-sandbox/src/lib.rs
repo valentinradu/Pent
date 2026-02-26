@@ -36,13 +36,28 @@ mod linux;
 #[cfg(target_os = "linux")]
 mod linux_netns;
 
+#[cfg(target_os = "linux")]
+mod linux_overlayfs;
+
 pub use config::{system_default_paths, SandboxConfig};
 pub use env::{build_env, resolve_path_dirs_from, resolve_path_directories};
 pub use halt_settings::{Mount, NetworkMode, SandboxPaths, SandboxSettings};
+#[cfg(target_os = "linux")]
+pub use linux_overlayfs::OverlayHandle;
 
 use std::convert::Infallible;
 use std::process::Child;
 use thiserror::Error;
+
+/// A sandboxed child process, optionally with an overlayfs handle.
+pub struct SandboxChild {
+    /// The child process handle.
+    pub child: Child,
+    /// Overlay handle for Linux (inotify watcher + in-place flush on exit).
+    /// Pass this to [`teardown_overlay`] after `child.wait()` returns.
+    #[cfg(target_os = "linux")]
+    pub overlay: Option<linux_overlayfs::OverlayHandle>,
+}
 
 /// Errors that can occur during sandbox operations.
 #[derive(Error, Debug)]
@@ -134,12 +149,16 @@ pub fn exec_sandboxed(
     }
 }
 
-/// Spawn a command in a sandbox, returning a `Child` handle.
+/// Spawn a command in a sandbox, returning a [`SandboxChild`] handle.
+///
+/// On Linux, the returned [`SandboxChild::overlay`] may contain an
+/// [`OverlayHandle`] for write-listed file paths. Pass it to [`teardown_overlay`]
+/// after `child.wait()` returns to flush writes and clean up.
 pub fn spawn_sandboxed(
     config: &SandboxConfig,
     cmd: &str,
     args: &[String],
-) -> Result<Child, SandboxError> {
+) -> Result<SandboxChild, SandboxError> {
     #[cfg(target_os = "macos")]
     {
         let profile = macos::generate_sbpl_profile(config)?;
@@ -170,13 +189,16 @@ pub fn spawn_sandboxed(
         } else {
             &config.env
         };
-        macos::spawn_with_sandbox(&profile, cmd, args, env, &config.cwd)
+        let child = macos::spawn_with_sandbox(&profile, cmd, args, env, &config.cwd)?;
+        Ok(SandboxChild { child })
     }
     #[cfg(target_os = "linux")]
     {
         let child_path = config.env.get("PATH").map_or("", |s| s.as_str());
         let path_dirs = resolve_path_dirs_from(child_path);
-        linux::spawn_with_landlock(config, cmd, args, &config.env, &path_dirs)
+        let (child, overlay) =
+            linux::spawn_with_landlock(config, cmd, args, &config.env, &path_dirs)?;
+        Ok(SandboxChild { child, overlay })
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
@@ -204,6 +226,22 @@ pub fn delete_sandbox_netns(pid: u32) -> Result<(), SandboxError> {
 #[cfg(not(target_os = "linux"))]
 pub fn delete_sandbox_netns(_pid: u32) -> Result<(), SandboxError> {
     Ok(())
+}
+
+/// Flush write-listed files from the overlay upper layer back to the real
+/// filesystem inodes and clean up staging directories.
+///
+/// Call this **after** `child.wait()` returns. The child's mount namespace
+/// (and all overlayfs mounts) are already destroyed at this point.
+///
+/// # Linux
+///
+/// Signals the inotify watcher thread to stop, joins it, performs a final
+/// flush of any writes not already caught by inotify, then removes the staging
+/// directories under `/tmp/halt-ovl-<pid>-N/`.
+#[cfg(target_os = "linux")]
+pub fn teardown_overlay(handle: OverlayHandle) {
+    linux_overlayfs::teardown(handle);
 }
 
 /// Check if sandboxing is available on this system.
@@ -295,8 +333,8 @@ mod tests {
         let result = spawn_sandboxed(&dirs.config, "/usr/bin/true", &[]);
 
         match result {
-            Ok(mut child) => {
-                let status = child.wait().expect("Failed to wait");
+            Ok(mut sc) => {
+                let status = sc.child.wait().expect("Failed to wait");
                 if !status.success() {
                     if status.code() == Some(71) {
                         return;
@@ -319,8 +357,8 @@ mod tests {
 
         if check_availability().is_ok() {
             match result {
-                Ok(mut child) => {
-                    let status = child.wait().expect("Failed to wait");
+                Ok(mut sc) => {
+                    let status = sc.child.wait().expect("Failed to wait");
                     assert!(status.success());
                 }
                 Err(SandboxError::SpawnFailed(err))
@@ -351,8 +389,8 @@ mod tests {
         args: &[&str],
     ) -> Result<Option<i32>, SandboxError> {
         let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-        let mut child = spawn_sandboxed(config, cmd, &args)?;
-        let status = child.wait().map_err(SandboxError::SpawnFailed)?;
+        let mut sandbox_child = spawn_sandboxed(config, cmd, &args)?;
+        let status = sandbox_child.child.wait().map_err(SandboxError::SpawnFailed)?;
         Ok(status.code())
     }
 

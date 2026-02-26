@@ -105,6 +105,30 @@ impl SandboxPaths {
         self
     }
 
+    /// Validate that no `read_write` entry ends with `*`.
+    ///
+    /// On Linux, `read_write` paths that name specific files are protected by
+    /// overlayfs so that atomic writes (create-temp → rename) preserve the real
+    /// file inode that Landlock is bound to. Glob patterns (`~/.claude.json*`)
+    /// are not supported for `read_write` because overlayfs requires exact paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string describing the first offending entry.
+    pub fn validate_no_rw_globs(&self) -> Result<(), String> {
+        for entry in &self.read_write {
+            if entry.ends_with('*') {
+                return Err(format!(
+                    "read_write path {:?} uses a glob ('*') which is not supported \
+                     on Linux (overlayfs requires exact paths); \
+                     remove the trailing '*' or use the exact filename",
+                    entry
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Expand each list into `PathBuf` values.
     ///
     /// Expand paths, resolving `~/` to the user's home directory.

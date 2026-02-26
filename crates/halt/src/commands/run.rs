@@ -8,7 +8,11 @@ use std::path::PathBuf;
 #[cfg(not(target_os = "macos"))]
 use halt_proxy::{ProxyConfig, ProxyHandle, ProxyServer};
 use halt_proxy::TraceEvent;
-use halt_sandbox::{build_env, check_availability, spawn_sandboxed, NetworkMode, SandboxConfig};
+use halt_sandbox::{
+    build_env, check_availability, spawn_sandboxed, NetworkMode, SandboxConfig,
+};
+#[cfg(target_os = "linux")]
+use halt_sandbox::teardown_overlay;
 use halt_settings::{ConfigLoader, HaltConfig};
 
 #[cfg(target_os = "macos")]
@@ -55,6 +59,11 @@ pub async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
         .proxy
         .domain_allowlist
         .extend(args.allow.iter().cloned());
+
+    // On Linux, read_write paths must be exact filenames — glob ('*') patterns
+    // are not supported because overlayfs requires specific paths to mount over.
+    #[cfg(target_os = "linux")]
+    config.sandbox.paths.validate_no_rw_globs().map_err(CliError::Other)?;
 
     // 3. Build env map
     let mut allowlist_keys: Vec<String> = Vec::new();
@@ -173,7 +182,10 @@ pub async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
         .ok_or_else(|| CliError::Other("command list is empty".to_string()))?;
     let cmd_args: Vec<String> = cmd_parts[1..].to_vec();
 
-    let mut child = spawn_sandboxed(&sandbox_cfg, cmd, &cmd_args)?;
+    let sandbox_child = spawn_sandboxed(&sandbox_cfg, cmd, &cmd_args)?;
+    let mut child = sandbox_child.child;
+    #[cfg(target_os = "linux")]
+    let overlay_handle = sandbox_child.overlay;
 
     // When running with a proxy, spawn a background task that warns if the
     // sandboxed process hasn't made any proxy connections after 8 seconds.
@@ -240,6 +252,14 @@ pub async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
     } else {
         child.wait()?
     };
+
+    // Flush overlayfs write-listed files back to real inodes and clean up
+    // staging directories. Must happen after child.wait() so the child's mount
+    // namespace is already destroyed and no writes are in flight.
+    #[cfg(target_os = "linux")]
+    if let Some(handle) = overlay_handle {
+        teardown_overlay(handle);
+    }
 
     // Clean up the named network namespace that was created for ProxyOnly mode.
     #[cfg(not(target_os = "macos"))]
