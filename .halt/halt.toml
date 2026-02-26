@@ -9,11 +9,9 @@ traversal = [
     "~/.agents",
 ]
 read = [
-    "~/.npm-global",
     "~/.bashrc",
     "~/.bash_profile",
     "~/.profile",
-    "~/.local/bin",
     "~/.npmrc",
     "~/.ssh/known_hosts",
     "~/.ssh/config",
@@ -25,13 +23,17 @@ read = [
     "~/.config/gh",
     "~/.agents/skills",
 ]
+execute = [
+    "~/.npm-global",
+    "~/.local/bin",
+]
 read_write = [
     "~/.gemini",
     "~/.npm",
     "~/.local/share/keyrings",
     "~/.local/share/kwalletd",
     "~/.claude",
-    "~/.claude.json*",
+    "~/.claude.json",
     "~/.claude.lock",
     "~/.local/share/claude",
     "~/.cache/claude",

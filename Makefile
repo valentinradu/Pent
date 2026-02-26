@@ -45,6 +45,9 @@ build-release:
 
 install:
 	cargo install --path crates/halt --force
+	@HALT_BIN="$${CARGO_HOME:-$$HOME/.cargo}/bin/halt"; \
+	setcap cap_net_admin=ep "$$HALT_BIN" 2>/dev/null || \
+		echo "note: setcap failed — run: sudo setcap cap_net_admin=ep $$HALT_BIN"
 
 test:
 	cargo test --workspace
