@@ -308,55 +308,6 @@ fn is_executable(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Execute a command under sandbox-exec, replacing current process.
-///
-/// # Arguments
-/// * `profile` - SBPL profile string
-/// * `cmd` - Command to execute
-/// * `args` - Command arguments
-/// * `env` - Environment variables
-/// * `cwd` - Working directory
-///
-/// # Errors
-/// Returns `SpawnFailed` if exec fails (only returns on error).
-#[cfg(target_os = "macos")]
-pub fn exec_with_sandbox(
-    profile: &str,
-    cmd: &str,
-    args: &[String],
-    env: &std::collections::HashMap<String, String>,
-    cwd: &Path,
-) -> Result<std::convert::Infallible, SandboxError> {
-    use std::os::unix::process::CommandExt;
-    use std::process::Command;
-
-    let mut command = Command::new("/usr/bin/sandbox-exec");
-    command.arg("-p");
-    command.arg(profile);
-    command.arg(cmd);
-    command.args(args);
-    command.current_dir(cwd);
-    command.env_clear();
-    for (key, value) in env {
-        command.env(key, value);
-    }
-
-    // exec() replaces current process - only returns on error
-    let err = command.exec();
-    Err(SandboxError::SpawnFailed(err))
-}
-
-#[cfg(not(target_os = "macos"))]
-pub fn exec_with_sandbox(
-    _profile: &str,
-    _cmd: &str,
-    _args: &[String],
-    _env: &std::collections::HashMap<String, String>,
-    _cwd: &Path,
-) -> Result<std::convert::Infallible, SandboxError> {
-    Err(SandboxError::UnsupportedPlatform)
-}
-
 /// Spawn a command under sandbox-exec, returning Child handle.
 ///
 /// # Arguments

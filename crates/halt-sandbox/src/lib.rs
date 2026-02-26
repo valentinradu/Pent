@@ -45,7 +45,6 @@ pub use halt_settings::{Mount, NetworkMode, SandboxPaths, SandboxSettings};
 #[cfg(target_os = "linux")]
 pub use linux_overlayfs::OverlayHandle;
 
-use std::convert::Infallible;
 use std::process::Child;
 use thiserror::Error;
 
@@ -85,68 +84,6 @@ pub enum SandboxError {
     /// Operation requires elevated privileges.
     #[error("Privilege required: {0}")]
     PrivilegeRequired(String),
-}
-
-/// Execute command in sandbox, replacing the current process.
-///
-/// Only returns on error (exec replaces the process on success).
-pub fn exec_sandboxed(
-    config: &SandboxConfig,
-    cmd: &str,
-    args: &[String],
-) -> Result<Infallible, SandboxError> {
-    #[cfg(target_os = "macos")]
-    {
-        let profile = macos::generate_sbpl_profile(config)?;
-        let env_with_proxy;
-        let env = if let NetworkMode::ProxyOnly { proxy_addr } = &config.network {
-            let port = proxy_addr.port();
-            let http_url = format!("http://127.0.0.1:{port}");
-            let socks_url = format!("socks5h://127.0.0.1:{port}");
-            let no_proxy = "localhost,127.0.0.1,::1";
-            let mut e = config.env.clone();
-            // HTTP/HTTPS via CONNECT tunnel — most Node.js/Python/Ruby clients honour these.
-            e.insert("HTTP_PROXY".to_string(), http_url.clone());
-            e.insert("HTTPS_PROXY".to_string(), http_url.clone());
-            e.insert("http_proxy".to_string(), http_url.clone());
-            e.insert("https_proxy".to_string(), http_url.clone());
-            // socks5h = hostname resolved by the proxy, so the sandboxed process
-            // never calls getaddrinfo for external hosts — DNS stays on the proxy side.
-            e.insert("ALL_PROXY".to_string(), socks_url.clone());
-            e.insert("all_proxy".to_string(), socks_url.clone());
-            e.insert("GRPC_PROXY".to_string(), socks_url.clone());
-            e.insert("grpc_proxy".to_string(), socks_url);
-            // Prevent proxy being used for loopback traffic.
-            e.insert("NO_PROXY".to_string(), no_proxy.to_string());
-            e.insert("no_proxy".to_string(), no_proxy.to_string());
-            // Route git-over-SSH through the SOCKS5 proxy (nc -X 5 = SOCKS5).
-            e.insert(
-                "GIT_SSH_COMMAND".to_string(),
-                format!("ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:{port} %h %p'"),
-            );
-            // Signal to the sandboxed process that it is running inside a proxy sandbox.
-            // Claude Code checks this flag to activate its own proxy-aware networking.
-            e.insert("SANDBOX_RUNTIME".to_string(), "1".to_string());
-            env_with_proxy = e;
-            &env_with_proxy
-        } else {
-            &config.env
-        };
-        macos::exec_with_sandbox(&profile, cmd, args, env, &config.cwd)
-    }
-    #[cfg(target_os = "linux")]
-    {
-        // Derive path_dirs from the child's PATH env, not the process's PATH.
-        // When running under sudo the process PATH is stripped; the child's env
-        // already has the user's full PATH (augmented by run.rs).
-        let child_path = config.env.get("PATH").map_or("", |s| s.as_str());
-        let path_dirs = resolve_path_dirs_from(child_path);
-        linux::exec_with_landlock(config, cmd, args, &config.env, &path_dirs)
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        Err(SandboxError::UnsupportedPlatform)
-    }
 }
 
 /// Spawn a command in a sandbox, returning a [`SandboxChild`] handle.
@@ -376,9 +313,7 @@ mod tests {
     // They are subprocess-based: the child is spawned with spawn_sandboxed and
     // the parent checks the exit code.
     //
-    // exec_with_landlock replaces the calling process so it cannot be tested in
-    // a unit test; it shares the same Landlock code path as spawn_with_landlock
-    // and is exercised end-to-end by the integration tests in halt/tests/.
+    // spawn_with_landlock is exercised end-to-end by the integration tests in halt/tests/.
     // =========================================================================
 
     /// Spawn a command inside the sandbox and return its exit code.

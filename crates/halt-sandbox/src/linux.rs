@@ -105,6 +105,7 @@ pub fn check_available() -> Result<(), SandboxError> {
 /// # Errors
 /// * `InvalidConfig` - If a required path cannot be opened
 #[cfg(target_os = "linux")]
+#[allow(dead_code)] // used in tests
 pub fn build_landlock_ruleset(
     config: &SandboxConfig,
     path_dirs: &[PathBuf],
@@ -227,6 +228,7 @@ pub fn build_landlock_ruleset(
 /// # Errors
 /// * `SandboxUnavailable` - If restrict_self fails
 #[cfg(target_os = "linux")]
+#[allow(dead_code)] // used in tests
 pub fn apply_landlock(ruleset: landlock::RulesetCreated) -> Result<(), SandboxError> {
     ruleset
         .restrict_self()
@@ -353,8 +355,8 @@ unsafe fn setup_userns_mappings(uid: u32, gid: u32) {
 ///
 /// Note: ProxyOnly mode uses a veth pair set up by the parent
 /// (`spawn_with_landlock`) and is handled via `setns` there, not here.
-/// When `apply_network_isolation` is called for ProxyOnly (e.g. from
-/// `exec_with_landlock`), it falls back to loopback-only isolation.
+/// When `apply_network_isolation` is called for ProxyOnly, it falls back
+/// to loopback-only isolation.
 ///
 /// # Errors
 /// Returns `io::Error` if unshare fails.  On systems with unprivileged user
@@ -402,62 +404,6 @@ fn apply_network_isolation(network: &NetworkMode) -> std::io::Result<()> {
         NetworkMode::Unrestricted => {}
     }
     Ok(())
-}
-
-/// Execute command with Landlock sandbox, replacing current process.
-///
-/// # Arguments
-/// * `config` - Sandbox configuration
-/// * `cmd` - Command to execute
-/// * `args` - Command arguments
-/// * `env` - Environment variables
-/// * `path_dirs` - PATH directories for ruleset
-///
-/// # Errors
-/// * `SandboxUnavailable` - If Landlock unavailable or apply fails
-/// * `NetworkSetupFailed` - If network namespace setup fails
-/// * `SpawnFailed` - If exec fails
-#[cfg(target_os = "linux")]
-pub fn exec_with_landlock(
-    config: &SandboxConfig,
-    cmd: &str,
-    args: &[String],
-    env: &std::collections::HashMap<String, String>,
-    path_dirs: &[PathBuf],
-) -> Result<std::convert::Infallible, SandboxError> {
-    use std::os::unix::process::CommandExt;
-    use std::process::Command;
-
-    // Build and apply Landlock ruleset
-    let ruleset = build_landlock_ruleset(config, path_dirs)?;
-    apply_landlock(ruleset)?;
-
-    // Apply network isolation
-    apply_network_isolation(&config.network).map_err(SandboxError::SpawnFailed)?;
-
-    // Build command
-    let mut command = Command::new(cmd);
-    command.args(args);
-    command.current_dir(&config.cwd);
-    command.env_clear();
-    for (key, value) in env {
-        command.env(key, value);
-    }
-
-    // exec() replaces current process - only returns on error
-    let err = command.exec();
-    Err(SandboxError::SpawnFailed(err))
-}
-
-#[cfg(not(target_os = "linux"))]
-pub fn exec_with_landlock(
-    _config: &SandboxConfig,
-    _cmd: &str,
-    _args: &[String],
-    _env: &std::collections::HashMap<String, String>,
-    _path_dirs: &[PathBuf],
-) -> Result<std::convert::Infallible, SandboxError> {
-    Err(SandboxError::UnsupportedPlatform)
 }
 
 /// Spawn command with Landlock sandbox using pre_exec.
@@ -996,13 +942,6 @@ mod tests {
     }
 
     // ========================================================================
-    // exec_with_landlock tests
-    // ========================================================================
-
-    // Note: exec_with_landlock replaces the process, can't test directly.
-    // Would need integration tests with fork.
-
-    // ========================================================================
     // spawn_with_landlock tests
     // ========================================================================
 
@@ -1103,5 +1042,83 @@ mod tests {
             // Should fail to spawn nonexistent command
             assert!(result.is_err());
         }
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(target_os = "linux")]
+    fn test_overlay_atomic_write_preserves_inode() {
+        // Verify that the overlayfs + inotify pipeline correctly:
+        //   1. lets the child atomically replace a write-listed file
+        //      (create-temp → rename), and
+        //   2. flushes the new content to the *real* inode so the inode
+        //      number is unchanged after teardown.
+        //
+        // The test only asserts inode-preservation when the overlay handle is
+        // `Some` (i.e. overlayfs mounted successfully). If the kernel lacks
+        // user namespaces or the overlayfs module, the handle will be `None`
+        // and the test exits without assertion failures.
+        if check_available().is_err() {
+            return;
+        }
+        use std::collections::HashMap;
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target.json");
+        std::fs::write(&target, r#"{"version":1}"#).unwrap();
+        let inode_before = std::fs::metadata(&target).unwrap().ino();
+
+        // A SandboxConfig that lists target.json in read_write.
+        let workspace = temp.path().to_path_buf();
+        let mut paths = SandboxPaths::default();
+        paths.read_write.push(target.to_str().unwrap().to_string());
+
+        let config = SandboxConfig::new(workspace.clone(), paths, workspace)
+            .with_data_dir(temp.path().to_path_buf())
+            .with_env(HashMap::new());
+
+        let path_dirs = vec![PathBuf::from("/bin"), PathBuf::from("/usr/bin")];
+
+        let new_content = r#"{"version":2}"#;
+        // Atomic write: write to a sibling tmp file then rename into place.
+        let tmp_path = temp.path().join("target.json.tmp");
+        let cmd = format!(
+            "printf '{}' > '{}' && mv '{}' '{}'",
+            new_content,
+            tmp_path.display(),
+            tmp_path.display(),
+            target.display(),
+        );
+
+        let result =
+            spawn_with_landlock(&config, "/bin/sh", &["-c".to_string(), cmd], &HashMap::new(), &path_dirs);
+
+        let (mut child, overlay_handle) = match result {
+            Err(SandboxError::SpawnFailed(e))
+                if e.kind() == std::io::ErrorKind::PermissionDenied =>
+            {
+                // Some CI/container environments deny pre_exec operations.
+                return;
+            }
+            Err(e) => panic!("spawn_with_landlock failed: {:?}", e),
+            Ok(pair) => pair,
+        };
+
+        let status = child.wait().expect("Failed to wait on child");
+
+        if let Some(handle) = overlay_handle {
+            // Flush upper-layer writes back to real inodes and clean up staging.
+            crate::linux_overlayfs::teardown(handle);
+
+            assert!(status.success(), "atomic write shell command should succeed");
+
+            let content = std::fs::read_to_string(&target).unwrap_or_default();
+            let inode_after = std::fs::metadata(&target).map(|m| m.ino()).unwrap_or(0);
+
+            assert_eq!(content, new_content, "overlayfs flush must write new content to real file");
+            assert_eq!(inode_before, inode_after, "real file inode must not change after overlayfs flush");
+        }
+        // If overlay_handle is None, overlayfs is unavailable; skip assertions.
     }
 }

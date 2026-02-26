@@ -20,7 +20,7 @@ halt/
     │       └── loader.rs         # ConfigLoader (global + project merge)
     ├── halt-sandbox/             # OS-level process sandboxing
     │   └── src/
-    │       ├── lib.rs            # spawn_sandboxed, exec_sandboxed, SandboxError
+    │       ├── lib.rs            # spawn_sandboxed, SandboxError
     │       ├── config.rs         # SandboxConfig builder
     │       ├── env.rs            # build_env, resolve_path_directories
     │       ├── macos.rs          # macOS Seatbelt (SBPL) backend
