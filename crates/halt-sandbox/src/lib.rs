@@ -226,6 +226,7 @@ pub fn check_availability() -> Result<(), SandboxError> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use tempfile::TempDir;
 
     #[test]
@@ -284,6 +285,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     #[cfg(target_os = "macos")]
     fn test_spawn_sandboxed_native_macos() {
         if check_availability().is_err() {
@@ -309,6 +311,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     #[cfg(target_os = "linux")]
     fn test_spawn_sandboxed_native_linux() {
         let dirs = make_test_config();
@@ -366,6 +369,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     #[cfg(target_os = "linux")]
     fn test_linux_landlock_workspace_file_readable() {
         // Verifies that spawn_with_landlock grants rw access to the workspace:
@@ -396,6 +400,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     #[cfg(target_os = "linux")]
     fn test_linux_landlock_sysfs_blocked() {
         // /sys is not in the allowed read set, so access must fail.
@@ -428,6 +433,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     #[cfg(target_os = "linux")]
     fn test_linux_landlock_network_blocked() {
         // In Blocked mode, spawn_with_landlock calls unshare(CLONE_NEWNET) in
@@ -467,6 +473,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     #[cfg(target_os = "linux")]
     fn test_linux_landlock_network_localhost_allows_loopback() {
         // In LocalhostOnly mode, loopback is brought up inside the new network

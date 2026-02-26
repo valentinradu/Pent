@@ -730,6 +730,7 @@ pub fn spawn_with_landlock(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use crate::SandboxPaths;
     use tempfile::TempDir;
 
@@ -895,6 +896,7 @@ mod tests {
     // ========================================================================
 
     #[test]
+    #[serial]
     #[cfg(target_os = "linux")]
     fn test_spawn_with_landlock_true_command() {
         use std::collections::HashMap;
@@ -929,6 +931,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     #[cfg(target_os = "linux")]
     fn test_spawn_with_landlock_echo_command() {
         use std::collections::HashMap;
@@ -969,6 +972,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     #[cfg(target_os = "linux")]
     fn test_spawn_with_landlock_nonexistent_command() {
         use std::collections::HashMap;
