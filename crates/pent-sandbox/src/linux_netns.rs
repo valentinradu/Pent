@@ -168,8 +168,9 @@ impl Drop for NetnsHandle {
                             // Check for capability errors
                             if err_str.contains("xtables.lock") || err_str.contains("Permission denied") {
                                 warn!(
-                                    "insufficient privileges to remove iptables rules. \
-                                     Run: sudo setcap cap_net_admin=ep $(which pent)"
+                                    "pent binary is missing CAP_NET_ADMIN capability. \
+                                     To fix: sudo setcap cap_net_admin=ep $(which pent) \
+                                     Or reinstall with: make install"
                                 );
                             }
                         } else {
@@ -445,8 +446,9 @@ pub fn create_netns(config: &NetnsConfig) -> Result<NetnsHandle, SandboxError> {
                         // Check for common capability errors and provide guidance
                         if err_str.contains("xtables.lock") || err_str.contains("Permission denied") {
                             warn!(
-                                "pent binary may be missing CAP_NET_ADMIN capability. \
-                                 Run: sudo setcap cap_net_admin=ep $(which pent)"
+                                "pent binary is missing CAP_NET_ADMIN capability. \
+                                 To fix: sudo setcap cap_net_admin=ep $(which pent) \
+                                 Or reinstall with: make install"
                             );
                         }
                         rule_errors = true;
