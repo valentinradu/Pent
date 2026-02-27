@@ -95,6 +95,10 @@ pub struct NetnsHandle {
 }
 
 impl NetnsHandle {
+    /// Close the namespace fd in the parent.
+    ///
+    /// Called by `linux.rs` right after `command.spawn()`. The child's copy
+    /// was already closed by O_CLOEXEC on exec.
     pub fn close_fd(&mut self) {
         if !self.fd_closed {
             // SAFETY: fd is a valid open file descriptor.
@@ -105,15 +109,15 @@ impl NetnsHandle {
     }
 
     fn release_anchor(&mut self) {
-        if self.done_write >= 0 {
+        let done_write = std::mem::replace(&mut self.done_write, -1);
+        if done_write >= 0 {
             // SAFETY: done_write is a valid pipe fd; closing it sends EOF to anchor.
             // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe {
-                libc::close(self.done_write);
+                libc::close(done_write);
                 let mut status = 0;
                 libc::waitpid(self.anchor_pid, &mut status, 0);
             }
-            self.done_write = -1;
         }
     }
 }
