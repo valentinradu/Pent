@@ -53,9 +53,9 @@ install:
 	read -r -p "Enable network proxying? [Y/n] " REPLY; \
 	case "$$REPLY" in \
 		[nN]*) \
-			echo "Skipped. To enable later: sudo setcap cap_net_admin=ep $$PENT_BIN" ;; \
+			echo "Skipped. To enable later: sudo setcap cap_net_admin=eip $$PENT_BIN" ;; \
 		*) \
-			sudo setcap cap_net_admin=ep "$$PENT_BIN" ;; \
+			sudo setcap cap_net_admin=eip "$$PENT_BIN" ;; \
 	esac
 
 test:

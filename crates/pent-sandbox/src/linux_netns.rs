@@ -168,8 +168,8 @@ impl Drop for NetnsHandle {
                             // Check for capability errors
                             if err_str.contains("xtables.lock") || err_str.contains("Permission denied") {
                                 warn!(
-                                    "pent binary is missing CAP_NET_ADMIN capability. \
-                                     To fix: sudo setcap cap_net_admin=ep $(which pent) \
+                                    "pent binary is missing CAP_NET_ADMIN capability or it's not set with inheritable flag. \
+                                     To fix: sudo setcap cap_net_admin=eip $(which pent) \
                                      Or reinstall with: make install"
                                 );
                             }
@@ -199,14 +199,15 @@ impl Drop for NetnsHandle {
 /// Called in a fork child (before exec) so that the exec'd binary
 /// inherits `CAP_NET_ADMIN` even if it has no file capabilities of its own.
 ///
-/// Requires `CAP_NET_ADMIN` already in the permitted/effective set (set on the
-/// `pent` binary via `setcap cap_net_admin=ep`).
+/// Requires `CAP_NET_ADMIN` in the permitted, effective, AND inheritable sets.
+/// Set on the `pent` binary via `setcap cap_net_admin=eip pent` (note: must include 'i' flag).
 ///
 /// # Note
 /// If this fails, it may be because:
-/// - pent binary is missing CAP_NET_ADMIN (run: `sudo setcap cap_net_admin=ep pent`)
-/// - Kernel doesn't support ambient capabilities (Linux 4.3+)
-/// - Already running as root (not needed in that case)
+/// - pent binary missing CAP_NET_ADMIN or lacking inheritable flag
+///   Run: `sudo setcap cap_net_admin=eip pent` (note the 'i' flag for inheritable)
+/// - Kernel doesn't support ambient capabilities (requires Linux 4.3+)
+/// - Already running as root (ambient caps not needed)
 pub(crate) fn raise_net_admin_ambient() -> std::io::Result<()> {
     const CAP_NET_ADMIN: u32 = 12;
     // _LINUX_CAPABILITY_VERSION_3 — two 32-bit data words, supports caps 0–63.
@@ -313,8 +314,15 @@ fn test_ambient_capability() -> Result<(), String> {
         if (data[0].effective & cap_bit) == 0 {
             return Err(format!(
                 "CAP_NET_ADMIN not in effective set (effective=0x{:x}, permitted=0x{:x}). \
-                 pent binary may lack CAP_NET_ADMIN capability.",
+                 Run: sudo setcap cap_net_admin=eip $(which pent)",
                 data[0].effective, data[0].permitted
+            ));
+        }
+        if (data[0].inheritable & cap_bit) == 0 {
+            return Err(format!(
+                "CAP_NET_ADMIN not in inheritable set (inheritable=0x{:x}). \
+                 Run: sudo setcap cap_net_admin=eip $(which pent) (note the 'i' flag)",
+                data[0].inheritable
             ));
         }
 
@@ -390,7 +398,8 @@ pub fn create_netns(config: &NetnsConfig) -> Result<NetnsHandle, SandboxError> {
     // Test if we can raise CAP_NET_ADMIN as ambient before attempting iptables
     if let Err(e) = test_ambient_capability() {
         warn!("capability test failed: {}", e);
-        warn!("DNS redirect rules may fail. Run: sudo setcap cap_net_admin=ep $(which pent)");
+        warn!("DNS redirect rules may fail. Run: sudo setcap cap_net_admin=eip $(which pent)");
+        warn!("Note: the 'i' flag (inheritable) is required for ambient capabilities to work");
     }
 
     let pid_str = config.name.strip_prefix("pent-").unwrap_or(&config.name);
@@ -513,8 +522,8 @@ pub fn create_netns(config: &NetnsConfig) -> Result<NetnsHandle, SandboxError> {
                         // Check for common capability errors and provide guidance
                         if err_str.contains("xtables.lock") || err_str.contains("Permission denied") {
                             warn!(
-                                "pent binary is missing CAP_NET_ADMIN capability. \
-                                 To fix: sudo setcap cap_net_admin=ep $(which pent) \
+                                "pent binary is missing CAP_NET_ADMIN capability or it's not set with inheritable flag. \
+                                 To fix: sudo setcap cap_net_admin=eip $(which pent) \
                                  Or reinstall with: make install"
                             );
                         }
