@@ -601,6 +601,70 @@ fn nft_find_iface_rule_handle(chain: &str, iface_keyword: &str, iface_name: &str
     None
 }
 
+/// Run `ip <args>` inside the network namespace identified by `ns_fd`.
+///
+/// Forks a helper process that calls `setns(ns_fd, CLONE_NEWNET)` then
+/// `execvp("ip", args)`. The parent waits and propagates non-zero exits as
+/// `NetworkSetupFailed`.
+///
+/// Requires `CAP_NET_ADMIN` in the initial user namespace (Linux 5.8+).
+pub fn run_ip_in_netns(ns_fd: libc::c_int, args: &[&str]) -> Result<(), SandboxError> {
+    use std::ffi::CString;
+
+    // SAFETY: fork() is always safe.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let pid = unsafe { libc::fork() };
+    match pid {
+        -1 => Err(SandboxError::NetworkSetupFailed(format!(
+            "fork failed: {}",
+            std::io::Error::last_os_error()
+        ))),
+        0 => {
+            // ── Helper child ──────────────────────────────────────────────────
+            // SAFETY: single-threaded child; setns/execvp/_exit are async-signal-safe.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            unsafe {
+                if libc::setns(ns_fd, libc::CLONE_NEWNET) != 0 {
+                    libc::_exit(1);
+                }
+            }
+
+            let ip_cstr = CString::new("ip").unwrap();
+            let mut c_args: Vec<CString> = vec![ip_cstr.clone()];
+            c_args.extend(args.iter().map(|a| CString::new(*a).unwrap()));
+            let mut ptrs: Vec<*const libc::c_char> =
+                c_args.iter().map(|a| a.as_ptr()).collect();
+            ptrs.push(std::ptr::null());
+
+            // SAFETY: execvp with valid null-terminated argv array.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            unsafe { libc::execvp(ip_cstr.as_ptr(), ptrs.as_ptr()) };
+            // SAFETY: _exit is always safe.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            unsafe { libc::_exit(127) };
+        }
+        child_pid => {
+            let mut status = 0;
+            // SAFETY: waitpid on a known child pid; WIFEXITED/WEXITSTATUS on the
+            // resulting status value are always safe.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            let (exited, code) = unsafe {
+                libc::waitpid(child_pid, &mut status, 0);
+                (libc::WIFEXITED(status), libc::WEXITSTATUS(status))
+            };
+
+            if !exited || code != 0 {
+                return Err(SandboxError::NetworkSetupFailed(format!(
+                    "ip {} failed (exit {})",
+                    args.join(" "),
+                    if exited { code } else { -1 }
+                )));
+            }
+            Ok(())
+        }
+    }
+}
+
 /// Delete a network namespace.
 ///
 /// Cleans up namespace and associated veth pair.
@@ -802,6 +866,7 @@ pub fn create_blocked_netns(name: &str) -> Result<(), SandboxError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     // ========================================================================
     // NetnsConfig::new tests
@@ -965,5 +1030,44 @@ mod tests {
             outer_cidr: "10.200.1.1/24".to_string(),
         };
         drop(handle); // must not panic or crash
+    }
+
+    #[test]
+    #[serial]
+    fn test_run_ip_in_netns_lo_show() {
+        // spawn_anchor to get a namespace, then verify we can run ip inside it.
+        // SAFETY: getuid/getgid are always safe to call.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let uid = unsafe { libc::getuid() };
+        // SAFETY: getuid/getgid are always safe to call.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let gid = unsafe { libc::getgid() };
+
+        let (anchor_pid, done_write) = spawn_anchor(uid, gid)
+            .expect("spawn_anchor failed");
+
+        let ns_path = std::ffi::CString::new(
+            format!("/proc/{}/ns/net", anchor_pid)
+        ).unwrap();
+        // SAFETY: open with valid CString path and standard flags.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let ns_fd = unsafe {
+            libc::open(ns_path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC)
+        };
+        assert!(ns_fd >= 0, "open ns_fd failed");
+
+        // `ip link show lo` must succeed inside the namespace
+        let result = run_ip_in_netns(ns_fd, &["link", "show", "lo"]);
+
+        // SAFETY: done_write/ns_fd are valid open fds; waitpid on a known child pid.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe {
+            libc::close(ns_fd);
+            libc::close(done_write);
+            let mut status = 0;
+            libc::waitpid(anchor_pid, &mut status, 0);
+        }
+
+        result.expect("run_ip_in_netns failed");
     }
 }
