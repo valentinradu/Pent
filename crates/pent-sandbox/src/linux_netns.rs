@@ -29,6 +29,7 @@
 
 use crate::SandboxError;
 use std::net::Ipv4Addr;
+use std::os::unix::process::CommandExt;
 
 /// Network namespace configuration.
 #[derive(Debug, Clone)]
@@ -317,6 +318,64 @@ pub fn spawn_anchor(uid: u32, gid: u32) -> Result<(libc::pid_t, libc::c_int), Sa
     }
 }
 
+/// Raise `CAP_NET_ADMIN` as an ambient capability in the calling process.
+///
+/// Called in a fork child (before exec) so that the exec'd `ip` binary
+/// inherits `CAP_NET_ADMIN` in its effective set, even though `ip` has no
+/// file capabilities of its own.
+///
+/// Requires `CAP_NET_ADMIN` already in the permitted set (set on the `pent`
+/// binary via `setcap cap_net_admin=ep`).
+fn raise_net_admin_ambient() -> std::io::Result<()> {
+    const CAP_NET_ADMIN: u32 = 12;
+    // _LINUX_CAPABILITY_VERSION_3 — two 32-bit data words, supports caps 0–63.
+    const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+    // PR_CAP_AMBIENT = 47, PR_CAP_AMBIENT_RAISE = 2 (not in libc crate).
+    const PR_CAP_AMBIENT: libc::c_int = 47;
+    const PR_CAP_AMBIENT_RAISE: libc::c_ulong = 2;
+
+    // Raw kernel structs for capget/capset (not exposed by the libc crate).
+    #[repr(C)]
+    struct CapHeader {
+        version: u32,
+        pid: libc::c_int,
+    }
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct CapData {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+
+    // SAFETY: capget/capset/prctl syscalls are safe with valid pointers;
+    // this runs in a single-threaded fork child before exec.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    unsafe {
+        let mut hdr = CapHeader { version: LINUX_CAPABILITY_VERSION_3, pid: 0 };
+        let mut data = [CapData { effective: 0, permitted: 0, inheritable: 0 }; 2];
+
+        if libc::syscall(libc::SYS_capget, &mut hdr as *mut _, data.as_mut_ptr()) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        // Add CAP_NET_ADMIN to the inheritable set — required before raising as ambient.
+        data[0].inheritable |= 1u32 << CAP_NET_ADMIN;
+        hdr.version = LINUX_CAPABILITY_VERSION_3;
+        hdr.pid = 0;
+
+        if libc::syscall(libc::SYS_capset, &mut hdr as *mut _, data.as_ptr()) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        // Raise CAP_NET_ADMIN as ambient so the exec'd binary inherits it.
+        if libc::prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, CAP_NET_ADMIN as libc::c_ulong, 0, 0) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
 /// Check if running with sufficient privileges for network namespaces.
 ///
 /// # Errors
@@ -392,7 +451,13 @@ pub fn create_netns(config: &NetnsConfig) -> Result<NetnsHandle, SandboxError> {
     let gid = unsafe { libc::getgid() };
 
     let run_ip = |args: &[&str]| -> Result<(), SandboxError> {
-        let output = Command::new("ip").args(args).output().map_err(|e| {
+        let mut cmd = Command::new("ip");
+        cmd.args(args);
+        // SAFETY: pre_exec runs in a single-threaded fork child before exec;
+        // raise_net_admin_ambient uses only async-signal-safe syscalls.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe { cmd.pre_exec(raise_net_admin_ambient) };
+        let output = cmd.output().map_err(|e| {
             SandboxError::NetworkSetupFailed(format!("failed to run ip: {}", e))
         })?;
         if !output.status.success() {
@@ -575,12 +640,19 @@ pub fn run_ip_in_netns(ns_fd: libc::c_int, args: &[&str]) -> Result<(), SandboxE
         ))),
         0 => {
             // ── Helper child ──────────────────────────────────────────────────
-            // SAFETY: single-threaded child; setns/execvp/_exit are async-signal-safe.
+            // SAFETY: single-threaded child; setns/_exit are async-signal-safe.
             // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe {
                 if libc::setns(ns_fd, libc::CLONE_NEWNET) != 0 {
                     libc::_exit(1);
                 }
+            }
+
+            // Raise CAP_NET_ADMIN as ambient so the exec'd ip binary inherits it.
+            if raise_net_admin_ambient().is_err() {
+                // SAFETY: _exit is always safe.
+                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+                unsafe { libc::_exit(1) };
             }
 
             let ip_cstr = CString::new("ip").unwrap();
