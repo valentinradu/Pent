@@ -238,20 +238,29 @@ pub fn spawn_anchor(uid: u32, gid: u32) -> Result<(libc::pid_t, libc::c_int), Sa
                 let setgroups_path = b"/proc/self/setgroups\0";
                 let fd = libc::open(setgroups_path.as_ptr().cast(), libc::O_WRONLY);
                 if fd >= 0 {
-                    libc::write(fd, b"deny".as_ptr().cast(), 4);
+                    let n = libc::write(fd, b"deny".as_ptr().cast(), 4);
                     libc::close(fd);
+                    if n < 0 {
+                        libc::_exit(1);
+                    }
                 }
                 let uid_map_path = b"/proc/self/uid_map\0";
                 let fd = libc::open(uid_map_path.as_ptr().cast(), libc::O_WRONLY);
                 if fd >= 0 {
-                    libc::write(fd, uid_map_str.as_ptr().cast(), uid_map_str.len());
+                    let n = libc::write(fd, uid_map_str.as_ptr().cast(), uid_map_str.len());
                     libc::close(fd);
+                    if n < 0 {
+                        libc::_exit(1);
+                    }
                 }
                 let gid_map_path = b"/proc/self/gid_map\0";
                 let fd = libc::open(gid_map_path.as_ptr().cast(), libc::O_WRONLY);
                 if fd >= 0 {
-                    libc::write(fd, gid_map_str.as_ptr().cast(), gid_map_str.len());
+                    let n = libc::write(fd, gid_map_str.as_ptr().cast(), gid_map_str.len());
                     libc::close(fd);
+                    if n < 0 {
+                        libc::_exit(1);
+                    }
                 }
             }
 
