@@ -158,15 +158,30 @@ impl Drop for NetnsHandle {
                     Ok(output) => {
                         if !output.status.success() {
                             let stderr = String::from_utf8_lossy(&output.stderr);
+                            let err_str = stderr.trim();
                             warn!(
                                 proto = proto,
-                                stderr = %stderr.trim(),
+                                veth = %self.veth_outer,
+                                stderr = %err_str,
                                 "could not remove iptables PREROUTING rule"
                             );
+                            // Check for capability errors
+                            if err_str.contains("xtables.lock") || err_str.contains("Permission denied") {
+                                warn!(
+                                    "insufficient privileges to remove iptables rules. \
+                                     Run: sudo setcap cap_net_admin=ep $(which pent)"
+                                );
+                            }
+                        } else {
+                            debug!(proto = proto, veth = %self.veth_outer, "iptables rule removed");
                         }
                     }
                     Err(e) => {
-                        warn!(error = %e, "could not run iptables to remove DNS redirect rule");
+                        warn!(
+                            error = %e,
+                            veth = %self.veth_outer,
+                            "could not run iptables to remove DNS redirect rule"
+                        );
                     }
                 }
             }
@@ -180,12 +195,17 @@ impl Drop for NetnsHandle {
 
 /// Raise `CAP_NET_ADMIN` as an ambient capability in the calling process.
 ///
-/// Called in a fork child (before exec) so that the exec'd `ip` binary
-/// inherits `CAP_NET_ADMIN` in its effective set, even though `ip` has no
-/// file capabilities of its own.
+/// Called in a fork child (before exec) so that the exec'd binary
+/// inherits `CAP_NET_ADMIN` even if it has no file capabilities of its own.
 ///
-/// Requires `CAP_NET_ADMIN` already in the permitted set (set on the `pent`
-/// binary via `setcap cap_net_admin=ep`).
+/// Requires `CAP_NET_ADMIN` already in the permitted/effective set (set on the
+/// `pent` binary via `setcap cap_net_admin=ep`).
+///
+/// # Note
+/// If this fails, it may be because:
+/// - pent binary is missing CAP_NET_ADMIN (run: `sudo setcap cap_net_admin=ep pent`)
+/// - Kernel doesn't support ambient capabilities (Linux 4.3+)
+/// - Already running as root (not needed in that case)
 pub(crate) fn raise_net_admin_ambient() -> std::io::Result<()> {
     const CAP_NET_ADMIN: u32 = 12;
     // _LINUX_CAPABILITY_VERSION_3 — two 32-bit data words, supports caps 0–63.
@@ -216,7 +236,10 @@ pub(crate) fn raise_net_admin_ambient() -> std::io::Result<()> {
         let mut data = [CapData { effective: 0, permitted: 0, inheritable: 0 }; 2];
 
         if libc::syscall(libc::SYS_capget, &mut hdr as *mut _, data.as_mut_ptr()) != 0 {
-            return Err(std::io::Error::last_os_error());
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "capget failed: unable to read capabilities",
+            ));
         }
 
         // Add CAP_NET_ADMIN to the inheritable set — required before raising as ambient.
@@ -225,12 +248,18 @@ pub(crate) fn raise_net_admin_ambient() -> std::io::Result<()> {
         hdr.pid = 0;
 
         if libc::syscall(libc::SYS_capset, &mut hdr as *mut _, data.as_ptr()) != 0 {
-            return Err(std::io::Error::last_os_error());
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "capset failed: unable to set inheritable capability (pent may lack CAP_NET_ADMIN)",
+            ));
         }
 
         // Raise CAP_NET_ADMIN as ambient so the exec'd binary inherits it.
         if libc::prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, CAP_NET_ADMIN as libc::c_ulong, 0, 0) != 0 {
-            return Err(std::io::Error::last_os_error());
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "prctl(CAP_AMBIENT_RAISE) failed: unable to raise ambient capability",
+            ));
         }
     }
     Ok(())
@@ -399,19 +428,30 @@ pub fn create_netns(config: &NetnsConfig) -> Result<NetnsHandle, SandboxError> {
                 "-p", proto, "--dport", "53",
                 "-j", "REDIRECT", "--to-port", &dns_port_str,
             ]);
+            // Raise CAP_NET_ADMIN before exec so iptables has permission to access xtables.lock.
             // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe { cmd.pre_exec(raise_net_admin_ambient) };
             match cmd.output() {
                 Ok(output) => {
                     if !output.status.success() {
                         let stderr = String::from_utf8_lossy(&output.stderr);
+                        let err_str = stderr.trim();
                         warn!(
                             proto = proto,
                             veth = %veth_outer,
-                            stderr = %stderr.trim(),
+                            stderr = %err_str,
                             "iptables PREROUTING REDIRECT rule failed"
                         );
+                        // Check for common capability errors and provide guidance
+                        if err_str.contains("xtables.lock") || err_str.contains("Permission denied") {
+                            warn!(
+                                "pent binary may be missing CAP_NET_ADMIN capability. \
+                                 Run: sudo setcap cap_net_admin=ep $(which pent)"
+                            );
+                        }
                         rule_errors = true;
+                    } else {
+                        debug!(proto = proto, veth = %veth_outer, "iptables rule added");
                     }
                 }
                 Err(e) => {
