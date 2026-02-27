@@ -225,6 +225,12 @@ pub fn spawn_anchor(uid: u32, gid: u32) -> Result<(libc::pid_t, libc::c_int), Sa
                 if libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) != 0 {
                     libc::_exit(1);
                 }
+
+                // unshare(CLONE_NEWUSER) marks the process non-dumpable, which
+                // causes ptrace_may_access() to deny the parent's open() of
+                // /proc/<anchor_pid>/ns/net. Restore dumpability so the parent
+                // can read our namespace fd.
+                libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0);
             }
 
             // Write uid/gid maps: map host uid/gid → 0 inside the new user ns.
