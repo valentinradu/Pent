@@ -608,6 +608,11 @@ fn nft_find_iface_rule_handle(chain: &str, iface_keyword: &str, iface_name: &str
 /// `NetworkSetupFailed`.
 ///
 /// Requires `CAP_NET_ADMIN` in the initial user namespace (Linux 5.8+).
+///
+/// # Errors
+/// Returns `NetworkSetupFailed` if `fork` fails, if `waitpid` fails, or if
+/// the `ip` child exits with a non-zero status (including exit 1 from `setns`
+/// failure and exit 127 from `execvp` failure).
 pub fn run_ip_in_netns(ns_fd: libc::c_int, args: &[&str]) -> Result<(), SandboxError> {
     use std::ffi::CString;
 
@@ -649,7 +654,13 @@ pub fn run_ip_in_netns(ns_fd: libc::c_int, args: &[&str]) -> Result<(), SandboxE
             // resulting status value are always safe.
             // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             let (exited, code) = unsafe {
-                libc::waitpid(child_pid, &mut status, 0);
+                let ret = libc::waitpid(child_pid, &mut status, 0);
+                if ret == -1 {
+                    return Err(SandboxError::NetworkSetupFailed(format!(
+                        "waitpid failed: {}",
+                        std::io::Error::last_os_error()
+                    )));
+                }
                 (libc::WIFEXITED(status), libc::WEXITSTATUS(status))
             };
 
