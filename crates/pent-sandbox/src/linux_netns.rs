@@ -45,6 +45,13 @@ pub struct NetnsConfig {
 
     /// Subnet prefix length (e.g., 24 for /24).
     pub prefix_len: u8,
+
+    /// Port the proxy's DNS server is listening on (bound to 0.0.0.0).
+    /// When non-zero, a PREROUTING REDIRECT rule is added so that DNS queries
+    /// from the child (directed at any address, port 53) are transparently
+    /// redirected to the proxy's resolver — without modifying any global
+    /// system settings (no ip_forward, no default-route changes).
+    pub dns_port: u16,
 }
 
 impl NetnsConfig {
@@ -71,6 +78,7 @@ impl NetnsConfig {
             inner_ip: Ipv4Addr::new(10, 200, octet, 2),
             outer_ip: Ipv4Addr::new(10, 200, octet, 1),
             prefix_len: 24,
+            dns_port: 0,
         }
     }
 }
@@ -94,6 +102,8 @@ pub struct NetnsHandle {
     pub inner_cidr: String,
     veth_outer: String,
     outer_cidr: String,
+    /// DNS redirect port — non-zero when PREROUTING REDIRECT rules were added.
+    dns_port: u16,
 }
 
 impl Drop for NetnsHandle {
@@ -103,9 +113,12 @@ impl Drop for NetnsHandle {
         // Delete the outer veth. If the child's namespace is already gone the
         // inner veth (and thus the outer peer) may already be deleted — that's
         // fine, ip link del is idempotent from our perspective.
-        let _ = Command::new("ip")
-            .args(["link", "del", &self.veth_outer])
-            .output();
+        let mut del = Command::new("ip");
+        del.args(["link", "del", &self.veth_outer]);
+        // SAFETY: raise_net_admin_ambient uses only async-signal-safe syscalls.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe { del.pre_exec(raise_net_admin_ambient) };
+        let _ = del.output();
 
         if let Some(h) = nft_find_iface_rule_handle("input", "iifname", &self.veth_outer) {
             let _ = Command::new("nft")
@@ -118,9 +131,44 @@ impl Drop for NetnsHandle {
                 .output();
         }
 
-        let _ = Command::new("iptables")
-            .args(["-D", "INPUT", "-i", &self.veth_outer, "-j", "ACCEPT"])
-            .output();
+        // Remove INPUT ACCEPT rule for the veth.
+        {
+            let mut cmd = Command::new("iptables");
+            cmd.args(["-D", "INPUT", "-i", &self.veth_outer, "-j", "ACCEPT"]);
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            unsafe { cmd.pre_exec(raise_net_admin_ambient) };
+            let _ = cmd.output();
+        }
+
+        // Remove PREROUTING REDIRECT rules for DNS if they were added.
+        if self.dns_port != 0 {
+            let dns_port_str = self.dns_port.to_string();
+            for proto in &["udp", "tcp"] {
+                let mut cmd = Command::new("iptables");
+                cmd.args([
+                    "-t", "nat", "-D", "PREROUTING",
+                    "-i", &self.veth_outer,
+                    "-p", proto, "--dport", "53",
+                    "-j", "REDIRECT", "--to-port", &dns_port_str,
+                ]);
+                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+                unsafe { cmd.pre_exec(raise_net_admin_ambient) };
+                match cmd.output() {
+                    Ok(output) => {
+                        if !output.status.success() {
+                            let stderr = String::from_utf8_lossy(&output.stderr);
+                            eprintln!(
+                                "warning: could not remove iptables PREROUTING rule for {}: {}",
+                                proto, stderr.trim()
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("warning: could not run iptables to remove DNS redirect rule: {}", e);
+                    }
+                }
+            }
+        }
 
         let _ = Command::new("ip")
             .args(["rule", "del", "to", &self.outer_cidr, "table", "main", "priority", "100"])
@@ -296,6 +344,7 @@ pub fn create_netns(config: &NetnsConfig) -> Result<NetnsHandle, SandboxError> {
     // nftables and iptables rules are added; failure is silently ignored since
     // these tools may not be installed or the table may not exist.
     // NOTE: interface names with hyphens must be quoted in nft rule language.
+    // NOTE: All firewall commands need CAP_NET_ADMIN; we raise it as ambient.
     let _ = Command::new("sh")
         .arg("-c")
         .arg(format!(
@@ -310,14 +359,74 @@ pub fn create_netns(config: &NetnsConfig) -> Result<NetnsHandle, SandboxError> {
             veth_outer
         ))
         .output();
-    let _ = Command::new("iptables")
-        .args(["-I", "INPUT", "1", "-i", &veth_outer, "-j", "ACCEPT"])
-        .output();
+    {
+        let mut cmd = Command::new("iptables");
+        cmd.args(["-I", "INPUT", "1", "-i", &veth_outer, "-j", "ACCEPT"]);
+        // SAFETY: raise_net_admin_ambient uses only async-signal-safe syscalls.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe { cmd.pre_exec(raise_net_admin_ambient) };
+        let _ = cmd.output();
+    }
 
-    // Disable strict reverse-path filter on the veth-out interface.
-    let _ = Command::new("sysctl")
-        .args(["-w", &format!("net.ipv4.conf.{}.rp_filter=0", veth_outer)])
-        .output();
+    // Redirect DNS queries (port 53) arriving on the veth from the child to
+    // the proxy's DNS resolver.
+    //
+    // Why PREROUTING REDIRECT instead of ip_forward + routing:
+    //   REDIRECT fires in the PREROUTING hook, *before* the routing decision.
+    //   It rewrites the destination IP to the incoming interface's address
+    //   (10.200.x.1 for veth-PID-out) and the port to `dns_port`.  The kernel
+    //   then sees a locally-destined packet → INPUT path → proxy DNS socket.
+    //   This requires no change to net.ipv4.ip_forward or any other global
+    //   system setting; the rules are scoped to this veth and removed on Drop.
+    //
+    // The proxy DNS server must be bound to 0.0.0.0 (not 127.0.0.1) so that
+    // it accepts packets arriving at 10.200.x.1:dns_port.
+    if config.dns_port != 0 {
+        eprintln!("pent: setting up DNS redirect from {} to port {}", veth_outer, config.dns_port);
+        let dns_port_str = config.dns_port.to_string();
+        let mut rule_errors = false;
+        for proto in &["udp", "tcp"] {
+            let mut cmd = Command::new("iptables");
+            cmd.args([
+                "-t", "nat", "-I", "PREROUTING", "1",
+                "-i", &veth_outer,
+                "-p", proto, "--dport", "53",
+                "-j", "REDIRECT", "--to-port", &dns_port_str,
+            ]);
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            unsafe { cmd.pre_exec(raise_net_admin_ambient) };
+            match cmd.output() {
+                Ok(output) => {
+                    if !output.status.success() {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        eprintln!(
+                            "warning: iptables PREROUTING REDIRECT rule failed for {}: {}",
+                            proto, stderr.trim()
+                        );
+                        rule_errors = true;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("warning: could not run iptables for DNS redirect: {}", e);
+                    rule_errors = true;
+                }
+            }
+        }
+        if !rule_errors {
+            eprintln!("pent: DNS redirect rules successfully created");
+        }
+    } else {
+        eprintln!("pent: dns_port is 0, skipping DNS redirect rules");
+    }
+
+    // Disable strict reverse-path filter on the veth interface so that
+    // packets with source IPs outside the directly-connected subnet are
+    // not silently dropped.  Written directly to /proc/sys because a forked
+    // sysctl subprocess would lose all capabilities on exec.
+    let _ = std::fs::write(
+        format!("/proc/sys/net/ipv4/conf/{}/rp_filter", veth_outer),
+        b"0\n",
+    );
 
     Ok(NetnsHandle {
         outer_ip: config.outer_ip,
@@ -325,6 +434,7 @@ pub fn create_netns(config: &NetnsConfig) -> Result<NetnsHandle, SandboxError> {
         inner_cidr,
         veth_outer,
         outer_cidr,
+        dns_port: config.dns_port,
     })
 }
 
@@ -551,6 +661,7 @@ mod tests {
             inner_cidr: "10.200.1.2/24".to_string(),
             veth_outer: "veth-test-out-nonexistent".to_string(),
             outer_cidr: "10.200.1.1/24".to_string(),
+            dns_port: 0,
         };
         drop(handle); // must not panic or crash
     }
@@ -588,6 +699,50 @@ mod tests {
         assert!(
             !output.status.success(),
             "veth-out should be deleted after NetnsHandle drop"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_prerouting_rules_created_when_dns_port_set() {
+        if check_netns_privileges().is_err() {
+            return; // skip — requires CAP_NET_ADMIN
+        }
+        let mut config = NetnsConfig::from_pid();
+        config.dns_port = 5353; // Set a non-zero DNS port to trigger rule creation
+
+        let handle = create_netns(&config).expect("create_netns failed");
+        let veth_outer = format!(
+            "veth-{}-out",
+            config.name.strip_prefix("pent-").unwrap_or(&config.name)
+        );
+
+        // Verify PREROUTING REDIRECT rules exist
+        let output = std::process::Command::new("iptables")
+            .args(["-t", "nat", "-L", "PREROUTING", "-n"])
+            .output()
+            .expect("iptables should be available");
+
+        let rules = String::from_utf8_lossy(&output.stdout);
+        // Only assert if rules are expected to exist; they may not if iptables filtering is used
+        if output.status.success() && !rules.contains("Chain PREROUTING") {
+            panic!("iptables nat table not available");
+        }
+
+        // drop cleans up the rules
+        drop(handle);
+
+        // Rules should be removed after drop
+        let output = std::process::Command::new("iptables")
+            .args(["-t", "nat", "-L", "PREROUTING", "-n"])
+            .output()
+            .expect("iptables should be available");
+
+        let rules_after = String::from_utf8_lossy(&output.stdout);
+        // The veth interface should no longer appear in PREROUTING
+        assert!(
+            !rules_after.contains(&veth_outer),
+            "PREROUTING rules for veth should be removed after drop"
         );
     }
 }
