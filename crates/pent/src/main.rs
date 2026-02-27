@@ -13,13 +13,9 @@ async fn main() {
     let run_mode = matches!(cli.command, Command::Run(_));
     setup_tracing(cli.verbose, run_mode);
 
-    // If running `pent run` and we detect we'll need CAP_NET_ADMIN but don't have it,
-    // re-execute with sudo while preserving PATH so user binaries are available.
-    if let Command::Run(ref args) = cli.command {
-        if should_reexec_with_sudo(&args) {
-            reexec_with_sudo_preserve_path(); // never returns
-        }
-    }
+    // Note: CAP_NET_ADMIN should be set on the iptables binary via:
+    //   sudo setcap cap_net_admin=eip /usr/sbin/iptables
+    // This allows pent to run as unprivileged user while still manipulating iptables rules.
 
     let result = dispatch(cli).await;
     if let Err(e) = result {
@@ -28,83 +24,6 @@ async fn main() {
     }
 }
 
-/// Check if this run command will need network proxying and if we have CAP_NET_ADMIN.
-fn should_reexec_with_sudo(args: &cli::RunArgs) -> bool {
-    // Already root? Don't re-exec
-    // SAFETY: geteuid is always safe to call
-    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-    if unsafe { libc::geteuid() } == 0 {
-        return false;
-    }
-
-    // Check if user requested proxy mode (--allow, --network proxy, etc.)
-    let needs_proxy = !args.allow.is_empty() || args.network == Some(cli::NetworkModeArg::Proxy);
-    if !needs_proxy {
-        return false;
-    }
-
-    // Check if we have CAP_NET_ADMIN in the inheritable set (needed for ambient capabilities)
-    has_cap_net_admin().is_err()
-}
-
-/// Check if current process has CAP_NET_ADMIN in inheritable set.
-///
-/// For ambient capabilities to work (which pent uses), we need CAP_NET_ADMIN
-/// in the inheritable set, not just the effective set. If it's only in effective
-/// (e.g., via setcap=ep), the child process can't raise it as ambient.
-fn has_cap_net_admin() -> Result<(), String> {
-    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
-        let mut has_inh = false;
-        for line in status.lines() {
-            if line.starts_with("CapInh:") {
-                if let Some(hex) = line.split_whitespace().nth(1) {
-                    if let Ok(caps) = u64::from_str_radix(hex, 16) {
-                        const CAP_NET_ADMIN: u64 = 1 << 12;
-                        if caps & CAP_NET_ADMIN != 0 {
-                            has_inh = true;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        if has_inh {
-            return Ok(());
-        }
-    }
-    Err("CAP_NET_ADMIN not in inheritable set".to_string())
-}
-
-/// Re-execute pent with sudo, preserving PATH and user environment.
-///
-/// When network proxy mode needs CAP_NET_ADMIN, re-execute the entire pent process
-/// with sudo, but preserve the user's PATH so binaries like claude can be found.
-/// This is simpler and more reliable than trying to set capabilities and drop back.
-fn reexec_with_sudo_preserve_path() -> ! {
-    use std::os::unix::process::CommandExt;
-    use std::process::Command;
-
-    let pent_path = std::env::current_exe()
-        .expect("failed to get current executable path");
-
-    let args: Vec<String> = std::env::args().skip(1).collect();
-
-    ui::status(
-        "network-proxy",
-        "sudo required for network proxy mode (preserving PATH)",
-    );
-
-    let mut cmd = Command::new("sudo");
-    // Preserve PATH so user binaries are available
-    cmd.arg("--preserve-env=PATH")
-        .arg(&pent_path)
-        .args(&args);
-
-    // Execute sudo; if successful this never returns
-    let err = cmd.exec();
-    eprintln!("failed to execute sudo: {}", err);
-    std::process::exit(1);
-}
 
 async fn dispatch(cli: Cli) -> Result<(), CliError> {
     let cwd = std::env::current_dir()?;
