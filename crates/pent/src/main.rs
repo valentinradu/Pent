@@ -57,23 +57,32 @@ fn should_reexec_with_sudo(args: &cli::RunArgs) -> bool {
     !has_cap
 }
 
-/// Check if current process has CAP_NET_ADMIN in effective set.
+/// Check if current process has CAP_NET_ADMIN in inheritable set.
+///
+/// For ambient capabilities to work (which pent uses), we need CAP_NET_ADMIN
+/// in the inheritable set, not just the effective set. If it's only in effective
+/// (e.g., via setcap=ep), the child process can't raise it as ambient.
 fn has_cap_net_admin() -> Result<(), String> {
     if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+        let mut has_inh = false;
         for line in status.lines() {
-            if line.starts_with("CapEff:") {
+            if line.starts_with("CapInh:") {
                 if let Some(hex) = line.split_whitespace().nth(1) {
                     if let Ok(caps) = u64::from_str_radix(hex, 16) {
                         const CAP_NET_ADMIN: u64 = 1 << 12;
                         if caps & CAP_NET_ADMIN != 0 {
-                            return Ok(());
+                            has_inh = true;
+                            break;
                         }
                     }
                 }
             }
         }
+        if has_inh {
+            return Ok(());
+        }
     }
-    Err("CAP_NET_ADMIN not available".to_string())
+    Err("CAP_NET_ADMIN not in inheritable set".to_string())
 }
 
 /// Re-execute pent with sudo, preserving all arguments.
