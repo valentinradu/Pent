@@ -190,7 +190,12 @@ pub fn spawn_anchor(uid: u32, gid: u32) -> Result<(libc::pid_t, libc::c_int), Sa
     let [ready_read, ready_write] = ready_pipe;
     let [done_read, done_write] = done_pipe;
 
-    // SAFETY: fork is always safe; child uses only async-signal-safe operations.
+    // Build map strings before fork so no heap allocation occurs in the child.
+    let uid_map_str = format!("0 {} 1\n", uid);
+    let gid_map_str = format!("0 {} 1\n", gid);
+
+    // SAFETY: fork() is always safe. The child branch uses only async-signal-safe
+    // operations and pre-fork-allocated stack buffers (uid_map_str, gid_map_str).
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let pid = unsafe { libc::fork() };
     match pid {
@@ -224,9 +229,31 @@ pub fn spawn_anchor(uid: u32, gid: u32) -> Result<(libc::pid_t, libc::c_int), Sa
 
             // Write uid/gid maps: map host uid/gid → 0 inside the new user ns.
             // "deny" setgroups is required before writing gid_map.
-            let _ = std::fs::write("/proc/self/setgroups", "deny");
-            let _ = std::fs::write("/proc/self/uid_map", format!("0 {} 1\n", uid));
-            let _ = std::fs::write("/proc/self/gid_map", format!("0 {} 1\n", gid));
+            // All writes use raw libc syscalls (async-signal-safe); strings were
+            // allocated before fork so no heap allocation occurs here.
+            // SAFETY: open/write/close are async-signal-safe; paths are null-terminated
+            // literals; uid_map_str/gid_map_str were allocated before fork.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            unsafe {
+                let setgroups_path = b"/proc/self/setgroups\0";
+                let fd = libc::open(setgroups_path.as_ptr().cast(), libc::O_WRONLY);
+                if fd >= 0 {
+                    libc::write(fd, b"deny".as_ptr().cast(), 4);
+                    libc::close(fd);
+                }
+                let uid_map_path = b"/proc/self/uid_map\0";
+                let fd = libc::open(uid_map_path.as_ptr().cast(), libc::O_WRONLY);
+                if fd >= 0 {
+                    libc::write(fd, uid_map_str.as_ptr().cast(), uid_map_str.len());
+                    libc::close(fd);
+                }
+                let gid_map_path = b"/proc/self/gid_map\0";
+                let fd = libc::open(gid_map_path.as_ptr().cast(), libc::O_WRONLY);
+                if fd >= 0 {
+                    libc::write(fd, gid_map_str.as_ptr().cast(), gid_map_str.len());
+                    libc::close(fd);
+                }
+            }
 
             // Signal ready, then block until parent closes done_write (EOF on done_read).
             // SAFETY: write/read/close/_exit are async-signal-safe.
@@ -879,7 +906,11 @@ mod tests {
 
     #[test]
     fn test_spawn_anchor_creates_isolated_namespace() {
+        // SAFETY: getuid/getgid are always safe to call.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let uid = unsafe { libc::getuid() };
+        // SAFETY: getgid is always safe to call.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let gid = unsafe { libc::getgid() };
 
         let (anchor_pid, done_write) = spawn_anchor(uid, gid)
@@ -899,6 +930,9 @@ mod tests {
         assert_ne!(self_ino, anchor_ino, "anchor should be in a different netns");
 
         // Signal anchor to exit and reap it
+        // SAFETY: done_write is a valid open pipe fd; closing it sends EOF to the
+        // anchor. waitpid on a valid child pid is always safe.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             libc::close(done_write);
             let mut status = 0;
