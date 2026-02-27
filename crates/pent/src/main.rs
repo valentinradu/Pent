@@ -13,11 +13,81 @@ async fn main() {
     let run_mode = matches!(cli.command, Command::Run(_));
     setup_tracing(cli.verbose, run_mode);
 
+    // If running `pent run` and we detect we'll need CAP_NET_ADMIN but don't have it,
+    // automatically re-execute with sudo before we start setting up sandboxing.
+    if let Command::Run(ref args) = cli.command {
+        if should_reexec_with_sudo(&args) {
+            reexec_with_sudo(); // never returns
+        }
+    }
+
     let result = dispatch(cli).await;
     if let Err(e) = result {
         ui::error(e);
         std::process::exit(1);
     }
+}
+
+/// Check if this run command will need network proxying and if we have CAP_NET_ADMIN.
+fn should_reexec_with_sudo(args: &cli::RunArgs) -> bool {
+    // Already root? Don't re-exec
+    // SAFETY: geteuid is always safe to call
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    if unsafe { libc::geteuid() } == 0 {
+        return false;
+    }
+
+    // Check if user requested proxy mode (--allow, --network proxy, etc.)
+    let needs_proxy = !args.allow.is_empty() || args.network == Some(cli::NetworkModeArg::Proxy);
+    if !needs_proxy {
+        return false;
+    }
+
+    // Check if we have CAP_NET_ADMIN
+    has_cap_net_admin().is_err()
+}
+
+/// Check if current process has CAP_NET_ADMIN in effective set.
+fn has_cap_net_admin() -> Result<(), String> {
+    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+        for line in status.lines() {
+            if line.starts_with("CapEff:") {
+                if let Some(hex) = line.split_whitespace().nth(1) {
+                    if let Ok(caps) = u64::from_str_radix(hex, 16) {
+                        const CAP_NET_ADMIN: u64 = 1 << 12;
+                        if caps & CAP_NET_ADMIN != 0 {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Err("CAP_NET_ADMIN not available".to_string())
+}
+
+/// Re-execute pent with sudo, preserving all arguments.
+fn reexec_with_sudo() -> ! {
+    use std::os::unix::process::CommandExt;
+    use std::process::Command;
+
+    let pent_path = std::env::current_exe()
+        .expect("failed to get current executable path");
+
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    ui::status(
+        "network-proxy",
+        "sudo required for CAP_NET_ADMIN; re-executing with elevated privileges",
+    );
+
+    let mut cmd = Command::new("sudo");
+    cmd.arg(&pent_path).args(&args);
+
+    // Execute sudo; if successful this never returns
+    let err = cmd.exec();
+    eprintln!("failed to execute sudo: {}", err);
+    std::process::exit(1);
 }
 
 async fn dispatch(cli: Cli) -> Result<(), CliError> {
