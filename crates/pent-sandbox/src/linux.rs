@@ -438,7 +438,7 @@ pub fn spawn_with_landlock(
     args: &[String],
     env: &std::collections::HashMap<String, String>,
     path_dirs: &[PathBuf],
-) -> Result<(std::process::Child, Option<super::linux_overlayfs::OverlayHandle>), SandboxError> {
+) -> Result<(std::process::Child, Option<super::linux_overlayfs::OverlayHandle>, Option<super::linux_netns::NetnsHandle>), SandboxError> {
     use landlock::{
         Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr, ABI,
     };
@@ -514,49 +514,27 @@ pub fn spawn_with_landlock(
     let write_set_pre = write_set.clone();
     let overlay_dirs_pre = overlay_dirs.clone();
 
-    // For ProxyOnly, create a named network namespace in the parent so the child
-    // can join it via setns() in pre_exec. A named namespace survives the child's
-    // exec and must be deleted by the caller after child.wait().
-    //
-    // The tuple holds (namespace_name, open_fd). The fd is O_CLOEXEC so it is
-    // automatically closed when the child calls exec(); the parent closes it
-    // explicitly after spawn() returns.
-    let proxy_netns: Option<(String, libc::c_int, std::net::Ipv4Addr)> =
+    // For ProxyOnly, create an anonymous network namespace via anchor process.
+    // create_netns() returns a NetnsHandle that owns the namespace fd (O_CLOEXEC)
+    // and cleans up firewall/routing rules on drop.
+    let mut proxy_netns: Option<super::linux_netns::NetnsHandle> =
         if let NetworkMode::ProxyOnly { .. } = &config.network {
             let ns_config = super::linux_netns::NetnsConfig::from_pid();
-            super::linux_netns::create_netns(&ns_config)?;
-
-            let netns_path = std::ffi::CString::new(format!("/var/run/netns/{}", ns_config.name))
-                .map_err(|e| {
-                SandboxError::NetworkSetupFailed(format!("invalid netns name: {}", e))
-            })?;
-            // SAFETY: netns_path is a valid NUL-terminated CString. O_CLOEXEC
-            // ensures the fd is closed on exec in the child; we close it in the
-            // parent explicitly after spawn().
-            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-            let fd = unsafe { libc::open(netns_path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
-            if fd < 0 {
-                return Err(SandboxError::NetworkSetupFailed(format!(
-                    "failed to open /var/run/netns/{}: {}",
-                    ns_config.name,
-                    std::io::Error::last_os_error()
-                )));
-            }
-
-            Some((ns_config.name, fd, ns_config.outer_ip))
+            Some(super::linux_netns::create_netns(&ns_config)?)
         } else {
             None
         };
 
     // fd value for the pre_exec closure (-1 when not ProxyOnly)
-    let netns_fd: libc::c_int = proxy_netns.as_ref().map_or(-1, |(_, fd, _)| *fd);
+    let netns_fd: libc::c_int = proxy_netns.as_ref().map_or(-1, |h| h.fd);
 
     // For ProxyOnly, inject proxy env vars pointing to the veth host-side IP so
     // the child can reach the proxy from inside the isolated namespace.
     let effective_env: std::collections::HashMap<String, String> =
-        if let (NetworkMode::ProxyOnly { proxy_addr }, Some((_, _, outer_ip))) =
+        if let (NetworkMode::ProxyOnly { proxy_addr }, Some(handle)) =
             (&config.network, &proxy_netns)
         {
+            let outer_ip = handle.outer_ip;
             let port = proxy_addr.port();
             let http_url = format!("http://{}:{}", outer_ip, port);
             // socks5h = hostname resolved by the proxy, so the sandboxed process
@@ -772,13 +750,14 @@ pub fn spawn_with_landlock(
 
     let result = command.spawn().map_err(SandboxError::SpawnFailed);
 
-    // Close the netns fd in the parent; the child's copy was closed by exec (O_CLOEXEC).
-    // On spawn failure, also clean up the named namespace so it doesn't leak.
-    if let Some((ns_name, fd, _)) = proxy_netns {
-        // SAFETY: fd is a valid open file descriptor obtained from libc::open above.
-        // The child's copy was closed by exec (O_CLOEXEC); we close the parent's copy here.
-        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-        unsafe { libc::close(fd) };
+    // Close the parent's copy of the netns fd — the child's copy was already
+    // closed by O_CLOEXEC on exec. The namespace stays alive while the child runs.
+    // On spawn failure, dropping proxy_netns triggers Drop cleanup.
+    if let Some(ref mut handle) = proxy_netns {
+        handle.close_fd();
+        if result.is_err() {
+            proxy_netns = None; // triggers Drop → cleans up firewall/routing rules
+        }
     }
 
     let child = result?;
@@ -790,7 +769,7 @@ pub fn spawn_with_landlock(
         Some(super::linux_overlayfs::spawn_watcher(overlay_mounts, write_set))
     };
 
-    Ok((child, overlay_handle))
+    Ok((child, overlay_handle, proxy_netns))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -986,7 +965,7 @@ mod tests {
 
         if check_available().is_ok() {
             match result {
-                Ok((mut child, _overlay)) => {
+                Ok((mut child, _overlay, _netns)) => {
                     let status = child.wait().expect("Failed to wait on child");
                     assert!(status.success(), "true command should succeed");
                 }
@@ -1027,7 +1006,7 @@ mod tests {
 
         if check_available().is_ok() {
             match result {
-                Ok((mut child, _overlay)) => {
+                Ok((mut child, _overlay, _netns)) => {
                     let status = child.wait().expect("Failed to wait on child");
                     assert!(status.success());
                 }
@@ -1115,7 +1094,7 @@ mod tests {
         let result =
             spawn_with_landlock(&config, "/bin/sh", &["-c".to_string(), cmd], &HashMap::new(), &path_dirs);
 
-        let (mut child, overlay_handle) = match result {
+        let (mut child, overlay_handle, _netns) = match result {
             Err(SandboxError::SpawnFailed(e))
                 if e.kind() == std::io::ErrorKind::PermissionDenied =>
             {

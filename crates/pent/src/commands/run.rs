@@ -161,9 +161,6 @@ pub async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
     // 5. Build SandboxConfig.
     // from_sandbox_settings merges user paths on top of system defaults and
     // handles mounts, replacing the previous manual path-extension loop.
-    #[cfg(not(target_os = "macos"))]
-    let needs_netns_cleanup = matches!(resolved_network, NetworkMode::ProxyOnly { .. });
-
     let mut sandbox_cfg = SandboxConfig::from_sandbox_settings(config.sandbox, cwd.clone(), cwd)
         .with_network(resolved_network)
         .with_env(env_map);
@@ -182,7 +179,7 @@ pub async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
         .ok_or_else(|| CliError::Other("command list is empty".to_string()))?;
     let cmd_args: Vec<String> = cmd_parts[1..].to_vec();
 
-    let sandbox_child = spawn_sandboxed(&sandbox_cfg, cmd, &cmd_args)?;
+    let mut sandbox_child = spawn_sandboxed(&sandbox_cfg, cmd, &cmd_args)?;
     let mut child = sandbox_child.child;
     #[cfg(target_os = "linux")]
     let overlay_handle = sandbox_child.overlay;
@@ -261,13 +258,9 @@ pub async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
         teardown_overlay(handle);
     }
 
-    // Clean up the named network namespace that was created for ProxyOnly mode.
-    #[cfg(not(target_os = "macos"))]
-    if needs_netns_cleanup {
-        if let Err(e) = pent_sandbox::delete_sandbox_netns(std::process::id()) {
-            ui::warn(format!("failed to delete network namespace: {e}"));
-        }
-    }
+    // Drop the netns handle — removes firewall/routing rules added during setup.
+    #[cfg(target_os = "linux")]
+    drop(sandbox_child.netns.take());
 
     #[cfg(not(target_os = "macos"))]
     if let Some(handle) = proxy_handle {

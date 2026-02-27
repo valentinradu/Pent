@@ -56,6 +56,10 @@ pub struct SandboxChild {
     /// Pass this to [`teardown_overlay`] after `child.wait()` returns.
     #[cfg(target_os = "linux")]
     pub overlay: Option<linux_overlayfs::OverlayHandle>,
+    /// Anonymous network namespace handle for ProxyOnly mode on Linux.
+    /// Dropping this cleans up firewall/routing rules added during setup.
+    #[cfg(target_os = "linux")]
+    pub netns: Option<linux_netns::NetnsHandle>,
 }
 
 /// Errors that can occur during sandbox operations.
@@ -133,9 +137,9 @@ pub fn spawn_sandboxed(
     {
         let child_path = config.env.get("PATH").map_or("", |s| s.as_str());
         let path_dirs = resolve_path_dirs_from(child_path);
-        let (child, overlay) =
+        let (child, overlay, netns) =
             linux::spawn_with_landlock(config, cmd, args, &config.env, &path_dirs)?;
-        Ok(SandboxChild { child, overlay })
+        Ok(SandboxChild { child, overlay, netns })
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
