@@ -154,9 +154,8 @@ pub fn spawn_sandboxed(
 /// Returns `NetworkSetupFailed` if the network namespace cannot be deleted.
 /// Non-Linux platforms always return `Ok(())`.
 #[cfg(target_os = "linux")]
-pub fn delete_sandbox_netns(pid: u32) -> Result<(), SandboxError> {
-    let name = format!("pent-{}", pid);
-    linux_netns::delete_netns(&name)
+pub fn delete_sandbox_netns(_pid: u32) -> Result<(), SandboxError> {
+    Ok(())
 }
 
 /// No-op on non-Linux platforms.

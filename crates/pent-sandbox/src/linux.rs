@@ -536,7 +536,6 @@ pub fn spawn_with_landlock(
             // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             let fd = unsafe { libc::open(netns_path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
             if fd < 0 {
-                let _ = super::linux_netns::delete_netns(&ns_config.name);
                 return Err(SandboxError::NetworkSetupFailed(format!(
                     "failed to open /var/run/netns/{}: {}",
                     ns_config.name,
@@ -780,9 +779,6 @@ pub fn spawn_with_landlock(
         // The child's copy was closed by exec (O_CLOEXEC); we close the parent's copy here.
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { libc::close(fd) };
-        if result.is_err() {
-            let _ = super::linux_netns::delete_netns(&ns_name);
-        }
     }
 
     let child = result?;
