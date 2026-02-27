@@ -524,19 +524,27 @@ async fn setup_proxy(
             ProxyConfig::try_from(&config.proxy).map_err(CliError::Other)?;
         proxy_config.violation_tx = violation_tx;
         // On Linux, ProxyOnly routes child traffic from a separate network
-        // namespace through a veth pair. The proxy must listen on all interfaces
-        // (0.0.0.0) because:
+        // namespace through a veth pair. Both the TCP proxy and DNS server must
+        // listen on all interfaces (0.0.0.0) because:
         //   1. The child's loopback is isolated from the parent's loopback.
         //   2. The veth outer interface (10.200.x.1) is created inside
         //      spawn_sandboxed *after* the proxy binds.
         //   3. A socket bound to 0.0.0.0 accepts connections on interfaces
         //      added after bind, so veth traffic arrives correctly.
+        //   4. The DNS server must also be reachable from the veth so that
+        //      DNS queries from the child namespace (redirected from port 53
+        //      via a PREROUTING rule) reach the proxy's resolver.
         #[cfg(target_os = "linux")]
         {
+            // Both the TCP proxy and DNS server must listen on all interfaces
+            // (0.0.0.0) so they are reachable from the veth outer IP (10.200.x.1).
+            // The child's loopback is isolated; only the veth reaches the host.
             proxy_config.proxy_bind_addr = "0.0.0.0:0".parse().expect("hardcoded addr");
+            proxy_config.dns_bind_addr = "0.0.0.0:0".parse().expect("hardcoded addr");
         }
         let handle = ProxyServer::new(proxy_config)?.start().await?;
         let proxy_addr = handle.proxy_addr();
+        let dns_port = handle.dns_addr().port();
         tracing::debug!(
             http_proxy = %format!("http://127.0.0.1:{}", proxy_addr.port()),
             socks5_proxy = %format!("socks5h://127.0.0.1:{}", proxy_addr.port()),
@@ -544,7 +552,7 @@ async fn setup_proxy(
             "proxy started (HTTP CONNECT + SOCKS5h on same port); DNS resolved server-side"
         );
         Ok(ProxySetup {
-            network: NetworkMode::ProxyOnly { proxy_addr },
+            network: NetworkMode::ProxyOnly { proxy_addr, dns_port },
             handle: Some(handle),
             event_rx,
         })

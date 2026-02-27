@@ -451,7 +451,7 @@ pub fn spawn_with_landlock(
     let data_dir = config.data_dir.clone();
     let mounts = config.mounts.clone();
     let paths = config.paths.clone();
-    let path_dirs = path_dirs.to_vec();
+    let mut path_dirs = path_dirs.to_vec();
     let network = config.network.clone();
 
     // Identify write-listed file paths (as opposed to directories) and prepare
@@ -518,8 +518,9 @@ pub fn spawn_with_landlock(
     // user+net namespace via unshare in pre_exec; the background thread moves the
     // inner veth into it once the child signals readiness via pipe.
     let mut proxy_netns: Option<super::linux_netns::NetnsHandle> =
-        if let NetworkMode::ProxyOnly { .. } = &config.network {
-            let ns_config = super::linux_netns::NetnsConfig::from_pid();
+        if let NetworkMode::ProxyOnly { dns_port, .. } = &config.network {
+            let mut ns_config = super::linux_netns::NetnsConfig::from_pid();
+            ns_config.dns_port = *dns_port;
             Some(super::linux_netns::create_netns(&ns_config)?)
         } else {
             None
@@ -567,7 +568,7 @@ pub fn spawn_with_landlock(
     // For ProxyOnly, inject proxy env vars pointing to the veth host-side IP so
     // the child can reach the proxy from inside the isolated namespace.
     let effective_env: std::collections::HashMap<String, String> =
-        if let (NetworkMode::ProxyOnly { proxy_addr }, Some(handle)) =
+        if let (NetworkMode::ProxyOnly { proxy_addr, .. }, Some(handle)) =
             (&config.network, &proxy_netns)
         {
             let outer_ip = handle.outer_ip;
@@ -618,6 +619,31 @@ pub fn spawn_with_landlock(
     // 1. We're in a single-threaded child process after fork
     // 2. No locks are held from the parent that could deadlock
     // 3. Modern Linux handles this correctly before exec
+    // Resolve the real path of cmd (following symlinks) and ensure its parent
+    // directory is in the Landlock execute rules.  Without this, a command that
+    // is a symlink (e.g. ~/.local/bin/claude -> ~/.local/share/claude/versions/X)
+    // would fail with EACCES because Landlock checks execute access on the
+    // *resolved* inode, not the symlink itself.
+    {
+        let cmd_path = if cmd.contains('/') {
+            PathBuf::from(cmd)
+        } else {
+            path_dirs
+                .iter()
+                .map(|d| d.join(cmd))
+                .find(|p| p.exists())
+                .unwrap_or_else(|| PathBuf::from(cmd))
+        };
+        if let Ok(real) = std::fs::canonicalize(&cmd_path) {
+            if let Some(parent) = real.parent() {
+                let parent_buf = parent.to_path_buf();
+                if !path_dirs.contains(&parent_buf) {
+                    path_dirs.push(parent_buf);
+                }
+            }
+        }
+    }
+
     // Clone strings that are used in BOTH the pre_exec closure and the
     // background thread (the closure moves them; the thread needs its own copy).
     let proxy_inner_veth_bg = proxy_inner_veth.clone();

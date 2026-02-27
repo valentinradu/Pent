@@ -56,11 +56,16 @@ pub enum NetworkMode {
     LocalhostOnly,
     /// Route all traffic through a local proxy at the given address.
     ///
-    /// `proxy_addr` is assigned at runtime when the proxy server starts;
-    /// it is not read from or written to config files.
+    /// `proxy_addr` and `dns_port` are assigned at runtime when the proxy
+    /// server starts; they are not read from or written to config files.
     ProxyOnly {
         #[serde(skip, default = "default_proxy_addr")]
         proxy_addr: std::net::SocketAddr,
+        /// Port the proxy's DNS server listens on (bound to 0.0.0.0).
+        /// Used to set up a PREROUTING REDIRECT rule that transparently
+        /// intercepts DNS queries from the child namespace.
+        #[serde(skip)]
+        dns_port: u16,
     },
     /// No network access at all.
     Blocked,
