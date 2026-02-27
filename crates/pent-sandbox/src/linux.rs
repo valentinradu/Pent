@@ -514,9 +514,9 @@ pub fn spawn_with_landlock(
     let write_set_pre = write_set.clone();
     let overlay_dirs_pre = overlay_dirs.clone();
 
-    // For ProxyOnly, create an anonymous network namespace via anchor process.
-    // create_netns() returns a NetnsHandle that owns the namespace fd (O_CLOEXEC)
-    // and cleans up firewall/routing rules on drop.
+    // For ProxyOnly, create the host-side veth pair. The child will create its own
+    // user+net namespace via unshare in pre_exec; the background thread moves the
+    // inner veth into it once the child signals readiness via pipe.
     let mut proxy_netns: Option<super::linux_netns::NetnsHandle> =
         if let NetworkMode::ProxyOnly { .. } = &config.network {
             let ns_config = super::linux_netns::NetnsConfig::from_pid();
@@ -525,9 +525,44 @@ pub fn spawn_with_landlock(
             None
         };
 
-    // fd values for the pre_exec closure (-1 when not ProxyOnly)
-    let netns_fd: libc::c_int = proxy_netns.as_ref().map_or(-1, |h| h.fd);
-    let netns_userns_fd: libc::c_int = proxy_netns.as_ref().map_or(-1, |h| h.userns_fd);
+    // Proxy data for the pre_exec closure and background thread.
+    let is_proxy = proxy_netns.is_some();
+    let proxy_inner_veth: String =
+        proxy_netns.as_ref().map_or(String::new(), |h| h.inner_veth.clone());
+    let proxy_inner_cidr: String =
+        proxy_netns.as_ref().map_or(String::new(), |h| h.inner_cidr.clone());
+    let proxy_gateway: String = proxy_netns
+        .as_ref()
+        .map_or(String::new(), |h| h.outer_ip.to_string());
+
+    // Pipe fds for pre_exec ↔ background-thread sync.  -1 when not ProxyOnly.
+    // ready_pipe: child writes its PID → parent reads it
+    // go_pipe:    parent writes go signal → child reads it
+    // Both ends are O_CLOEXEC so they're closed automatically when the child
+    // calls exec; the pre_exec hook closes them explicitly in the child.
+    let (proxy_ready_r, proxy_ready_w): (libc::c_int, libc::c_int);
+    let (proxy_go_r, proxy_go_w): (libc::c_int, libc::c_int);
+    if is_proxy {
+        let mut rp = [0i32; 2];
+        let mut gp = [0i32; 2];
+        // SAFETY: pipe2 is always safe to call.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe {
+            if libc::pipe2(rp.as_mut_ptr(), libc::O_CLOEXEC) != 0 {
+                return Err(SandboxError::SpawnFailed(std::io::Error::last_os_error()));
+            }
+            if libc::pipe2(gp.as_mut_ptr(), libc::O_CLOEXEC) != 0 {
+                libc::close(rp[0]);
+                libc::close(rp[1]);
+                return Err(SandboxError::SpawnFailed(std::io::Error::last_os_error()));
+            }
+        }
+        (proxy_ready_r, proxy_ready_w) = (rp[0], rp[1]);
+        (proxy_go_r, proxy_go_w) = (gp[0], gp[1]);
+    } else {
+        (proxy_ready_r, proxy_ready_w) = (-1, -1);
+        (proxy_go_r, proxy_go_w) = (-1, -1);
+    }
 
     // For ProxyOnly, inject proxy env vars pointing to the veth host-side IP so
     // the child can reach the proxy from inside the isolated namespace.
@@ -583,42 +618,18 @@ pub fn spawn_with_landlock(
     // 1. We're in a single-threaded child process after fork
     // 2. No locks are held from the parent that could deadlock
     // 3. Modern Linux handles this correctly before exec
+    // Clone strings that are used in BOTH the pre_exec closure and the
+    // background thread (the closure moves them; the thread needs its own copy).
+    let proxy_inner_veth_bg = proxy_inner_veth.clone();
+
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         command.pre_exec(move || {
-            // ── Phase 0: Join proxy network namespace ─────────────────────────
-            //
-            // The proxy network namespace is owned by the anchor's user namespace
-            // (created with CLONE_NEWUSER | CLONE_NEWNET). setns(CLONE_NEWNET)
-            // requires CAP_SYS_ADMIN in the owning user namespace. We don't have
-            // CAP_SYS_ADMIN in the initial user namespace, so we first join the
-            // anchor's user namespace (gaining full caps there as uid 0), then
-            // join the network namespace. This must happen before Phase 1's
-            // unshare(CLONE_NEWUSER) — once a new user namespace is created, the
-            // anchor's user namespace becomes an ancestor we can no longer join.
-            if netns_fd >= 0 {
-                // SAFETY: netns_userns_fd and netns_fd are valid open fds.
-                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-                if libc::setns(netns_userns_fd, libc::CLONE_NEWUSER) != 0 {
-                    return Err(std::io::Error::other(format!(
-                        "setns(userns) failed: {}",
-                        std::io::Error::last_os_error()
-                    )));
-                }
-                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-                if libc::setns(netns_fd, libc::CLONE_NEWNET) != 0 {
-                    return Err(std::io::Error::other(format!(
-                        "setns(netns) failed: {}",
-                        std::io::Error::last_os_error()
-                    )));
-                }
-            }
-
             // ── Phase 1: Namespace and overlay setup ─────────────────────────
             //
             // When overlayfs is in use we need CLONE_NEWUSER + CLONE_NEWNS (and
-            // CLONE_NEWNET for local-network modes) in a single unshare call.
-            // For ProxyOnly, Phase 0 already joined the network namespace.
+            // CLONE_NEWNET for network-isolating modes) in a single unshare call.
+            // ProxyOnly now creates its own user+net namespace here too.
             let has_overlays = !overlay_mounts_pre.is_empty();
 
             if has_overlays {
@@ -628,14 +639,13 @@ pub fn spawn_with_landlock(
                 let gid = libc::getgid();
 
                 let mut flags = libc::CLONE_NEWUSER | libc::CLONE_NEWNS;
-                // Add CLONE_NEWNET for modes that don't use setns.
-                if netns_fd < 0 {
-                    match &network {
-                        NetworkMode::LocalhostOnly | NetworkMode::Blocked => {
-                            flags |= libc::CLONE_NEWNET;
-                        }
-                        _ => {}
+                match &network {
+                    NetworkMode::LocalhostOnly
+                    | NetworkMode::Blocked
+                    | NetworkMode::ProxyOnly { .. } => {
+                        flags |= libc::CLONE_NEWNET;
                     }
+                    _ => {}
                 }
                 // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                 let ret = libc::unshare(flags);
@@ -650,6 +660,66 @@ pub fn spawn_with_landlock(
                 // just called unshare(CLONE_NEWUSER | CLONE_NEWNS).
                 // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                 super::linux_overlayfs::mount_overlays(&overlay_mounts_pre)?;
+            } else if proxy_ready_w >= 0 {
+                // ProxyOnly without overlays: unshare user+net namespace now so
+                // the pipe-sync below can configure the inner veth before Landlock.
+                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+                let uid = libc::getuid();
+                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+                let gid = libc::getgid();
+                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+                let ret = libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET);
+                if ret != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+                setup_userns_mappings(uid, gid);
+            }
+
+            // ── Phase 1.5: ProxyOnly pipe-sync and inner veth config ─────────
+            //
+            // The child has a fresh CLONE_NEWNET namespace (Phase 1 or the else-if
+            // above). Signal readiness to the parent background thread by writing
+            // our PID; the thread moves the inner veth here, then sends a go byte.
+            // We then configure the inner veth before Landlock is applied — after
+            // Landlock the ip binary would be inaccessible.
+            if proxy_ready_w >= 0 {
+                // Restore dumpability so the parent can open /proc/self if needed.
+                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+                libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0);
+
+                // Send our PID (4 bytes, native endian) to the background thread.
+                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+                let pid = libc::getpid();
+                let pid_bytes = pid.to_ne_bytes();
+                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+                libc::write(proxy_ready_w, pid_bytes.as_ptr().cast(), 4);
+                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+                libc::close(proxy_ready_w);
+
+                // Block until the background thread moves the inner veth in.
+                let mut buf = [0u8; 1];
+                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+                libc::read(proxy_go_r, buf.as_mut_ptr().cast(), 1);
+                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+                libc::close(proxy_go_r);
+
+                // Configure the inner veth inside our new network namespace.
+                // ip is still accessible here — Landlock hasn't been applied yet.
+                super::linux_netns::run_ip_local(&[
+                    "addr", "add", &proxy_inner_cidr, "dev", &proxy_inner_veth,
+                ])
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+                super::linux_netns::run_ip_local(&[
+                    "link", "set", &proxy_inner_veth, "up",
+                ])
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+                super::linux_netns::run_ip_local(&["link", "set", "lo", "up"])
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+                super::linux_netns::run_ip_local(&[
+                    "route", "add", "default", "via", &proxy_gateway,
+                ])
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
             }
 
             // ── Phase 2: Landlock ─────────────────────────────────────────────
@@ -748,22 +818,20 @@ pub fn spawn_with_landlock(
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
 
             // ── Phase 3: Network isolation ────────────────────────────────────
-            if netns_fd >= 0 {
-                // ProxyOnly: namespace was already joined in Phase 0.
-                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-                bring_up_loopback();
-            } else if has_overlays {
-                // Namespace already created in Phase 1; just bring up loopback
-                // if needed. apply_network_isolation would call unshare again.
+            if has_overlays || proxy_ready_w >= 0 {
+                // Namespace was already created in Phase 1 / Phase 1.5.
+                // ProxyOnly: veth + loopback already configured in Phase 1.5.
+                // LocalhostOnly / Blocked: just bring up loopback if needed.
                 match &network {
-                    NetworkMode::LocalhostOnly | NetworkMode::ProxyOnly { .. } => {
+                    NetworkMode::LocalhostOnly => {
                         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                         bring_up_loopback();
                     }
                     _ => {}
                 }
             } else {
-                // No overlays: use the existing path (handles unshare internally).
+                // No overlays and not ProxyOnly: apply_network_isolation handles
+                // unshare + loopback internally.
                 apply_network_isolation(&network)?;
             }
 
@@ -771,16 +839,73 @@ pub fn spawn_with_landlock(
         });
     }
 
+    // Spawn the background thread that moves the inner veth into the child's
+    // namespace. Must be launched BEFORE command.spawn() because the child's
+    // pre_exec will block on the go_pipe until the thread responds.
+    let bg_thread: Option<std::thread::JoinHandle<Result<(), SandboxError>>> = if is_proxy {
+        let inner_veth = proxy_inner_veth_bg;
+        let ready_r = proxy_ready_r;
+        let go_w = proxy_go_w;
+        Some(std::thread::spawn(move || {
+            // Read child PID (4 bytes, native endian) from ready pipe.
+            let mut pid_bytes = [0u8; 4];
+            // SAFETY: read on a valid pipe fd.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            let n = unsafe { libc::read(ready_r, pid_bytes.as_mut_ptr().cast(), 4) };
+            // SAFETY: close is always safe.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            unsafe { libc::close(ready_r) };
+            if n != 4 {
+                // SAFETY: close is always safe.
+                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+                unsafe { libc::close(go_w) };
+                return Err(SandboxError::NetworkSetupFailed(
+                    "child ready signal truncated".to_string(),
+                ));
+            }
+            let pid = i32::from_ne_bytes(pid_bytes);
+
+            // Move inner veth into the child's network namespace.
+            if let Err(e) = super::linux_netns::move_inner_veth_to_pid(&inner_veth, pid) {
+                // SAFETY: close is always safe.
+                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+                unsafe { libc::close(go_w) };
+                return Err(e);
+            }
+
+            // Signal child to proceed with inner veth configuration.
+            // SAFETY: write/close on valid pipe fds.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            unsafe {
+                libc::write(go_w, b"1".as_ptr().cast(), 1);
+                libc::close(go_w);
+            }
+            Ok(())
+        }))
+    } else {
+        None
+    };
+
     let result = command.spawn().map_err(SandboxError::SpawnFailed);
 
-    // Close the parent's copy of the netns fd — the child's copy was already
-    // closed by O_CLOEXEC on exec. The namespace stays alive while the child runs.
-    // On spawn failure, dropping proxy_netns triggers Drop cleanup.
-    if let Some(ref mut handle) = proxy_netns {
-        handle.close_fd();
-        if result.is_err() {
-            proxy_netns = None; // triggers Drop → cleans up firewall/routing rules
+    // Close the parent's copies of the child-side pipe ends.  The child's
+    // copies were already closed by O_CLOEXEC on exec.
+    if is_proxy {
+        // SAFETY: close is always safe.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe {
+            libc::close(proxy_ready_w);
+            libc::close(proxy_go_r);
         }
+    }
+
+    // Join background thread; propagate any error it encountered.
+    if let Some(thread) = bg_thread {
+        let _ = thread.join();
+    }
+
+    if result.is_err() {
+        proxy_netns = None; // triggers Drop → cleans up firewall/routing rules
     }
 
     let child = result?;
