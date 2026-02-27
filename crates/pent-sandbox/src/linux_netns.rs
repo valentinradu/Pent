@@ -29,7 +29,6 @@
 
 use crate::SandboxError;
 use std::net::Ipv4Addr;
-use std::path::Path;
 
 /// Network namespace configuration.
 #[derive(Debug, Clone)]
