@@ -199,16 +199,20 @@ impl Drop for NetnsHandle {
 /// Called in a fork child (before exec) so that the exec'd binary
 /// inherits `CAP_NET_ADMIN` even if it has no file capabilities of its own.
 ///
-/// Requires `CAP_NET_ADMIN` in the permitted, effective, AND inheritable sets.
+/// If running as root (UID 0), this is a no-op since root has all capabilities.
+/// Otherwise, requires `CAP_NET_ADMIN` in the permitted, effective, AND inheritable sets.
 /// Set on the `pent` binary via `setcap cap_net_admin=eip pent` (note: must include 'i' flag).
 ///
-/// # Note
-/// If this fails, it may be because:
-/// - pent binary missing CAP_NET_ADMIN or lacking inheritable flag
-///   Run: `sudo setcap cap_net_admin=eip pent` (note the 'i' flag for inheritable)
-/// - Kernel doesn't support ambient capabilities (requires Linux 4.3+)
-/// - Already running as root (ambient caps not needed)
+/// Typical usage: `pent run --allow domain --` automatically uses `sudo` when needed,
+/// which runs the entire process as root, so this function becomes a no-op.
 pub(crate) fn raise_net_admin_ambient() -> std::io::Result<()> {
+    // If running as root, we already have all capabilities; no need to do anything.
+    // SAFETY: geteuid is always safe to call.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    if unsafe { libc::geteuid() } == 0 {
+        return Ok(());
+    }
+
     const CAP_NET_ADMIN: u32 = 12;
     // _LINUX_CAPABILITY_VERSION_3 — two 32-bit data words, supports caps 0–63.
     const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
@@ -395,11 +399,17 @@ pub fn create_netns(config: &NetnsConfig) -> Result<NetnsHandle, SandboxError> {
 
     check_netns_privileges()?;
 
-    // Test if we can raise CAP_NET_ADMIN as ambient before attempting iptables
-    if let Err(e) = test_ambient_capability() {
-        warn!("capability test failed: {}", e);
-        warn!("DNS redirect rules may fail. Run: sudo setcap cap_net_admin=eip $(which pent)");
-        warn!("Note: the 'i' flag (inheritable) is required for ambient capabilities to work");
+    // Test if we can raise CAP_NET_ADMIN as ambient before attempting iptables.
+    // Skip this test if running as root (we have all capabilities anyway).
+    // SAFETY: geteuid is always safe to call.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let running_as_root = unsafe { libc::geteuid() } == 0;
+    if !running_as_root {
+        if let Err(e) = test_ambient_capability() {
+            warn!("capability test failed: {}", e);
+            warn!("DNS redirect rules may fail. Run: sudo setcap cap_net_admin=eip $(which pent)");
+            warn!("Note: the 'i' flag (inheritable) is required for ambient capabilities to work");
+        }
     }
 
     let pid_str = config.name.strip_prefix("pent-").unwrap_or(&config.name);
