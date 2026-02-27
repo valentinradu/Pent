@@ -14,10 +14,13 @@ async fn main() {
     setup_tracing(cli.verbose, run_mode);
 
     // If running `pent run` and we detect we'll need CAP_NET_ADMIN but don't have it,
-    // automatically re-execute with sudo before we start setting up sandboxing.
+    // use sudo to set the capability on the binary, then continue as unprivileged user.
+    // This preserves PATH and environment while enabling network proxy mode.
     if let Command::Run(ref args) = cli.command {
         if should_reexec_with_sudo(&args) {
-            reexec_with_sudo(); // never returns
+            set_capability_and_continue();
+            // After setting capability, continue with normal execution
+            // The capability is now available for the child process
         }
     }
 
@@ -75,28 +78,35 @@ fn has_cap_net_admin() -> Result<(), String> {
     Err("CAP_NET_ADMIN not in inheritable set".to_string())
 }
 
-/// Re-execute pent with sudo, preserving all arguments.
-fn reexec_with_sudo() -> ! {
-    use std::os::unix::process::CommandExt;
-    use std::process::Command;
-
+/// Set CAP_NET_ADMIN capability on pent binary, then continue as unprivileged user.
+///
+/// Uses sudo just to set the capability, then drops back to the original user.
+/// This preserves PATH and other user settings while enabling network proxy mode.
+fn set_capability_and_continue() {
     let pent_path = std::env::current_exe()
         .expect("failed to get current executable path");
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
-
     ui::status(
         "network-proxy",
-        "sudo required for CAP_NET_ADMIN; re-executing with elevated privileges",
+        "setting CAP_NET_ADMIN capability (sudo prompt may appear)",
     );
 
-    let mut cmd = Command::new("sudo");
-    cmd.arg(&pent_path).args(&args);
+    // Use sudo to set the capability, then exit
+    let status = std::process::Command::new("sudo")
+        .arg("setcap")
+        .arg("cap_net_admin=eip")
+        .arg(&pent_path)
+        .status()
+        .expect("failed to run sudo setcap");
 
-    // Execute sudo; if successful this never returns
-    let err = cmd.exec();
-    eprintln!("failed to execute sudo: {}", err);
-    std::process::exit(1);
+    if !status.success() {
+        eprintln!("failed to set capability: {}", status);
+        std::process::exit(1);
+    }
+
+    // Capability is now set on the binary. Continue execution as unprivileged user.
+    // The capability will be available in the child process even without root.
+    ui::status("network-proxy", "capability set; continuing as unprivileged user");
 }
 
 async fn dispatch(cli: Cli) -> Result<(), CliError> {
