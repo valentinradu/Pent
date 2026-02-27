@@ -46,8 +46,17 @@ build-release:
 install:
 	cargo install --path crates/pent --force
 	@PENT_BIN="$${CARGO_HOME:-$$HOME/.cargo}/bin/pent"; \
-	setcap cap_net_admin=ep "$$PENT_BIN" 2>/dev/null || \
-		echo "note: setcap failed — run: sudo setcap cap_net_admin=ep $$PENT_BIN"
+	echo ""; \
+	echo "pent needs cap_net_admin to transparently proxy network traffic."; \
+	echo "Your password will be used to run setcap on $$PENT_BIN."; \
+	echo "Skip this if you only need filesystem sandboxing (proxy mode won't work)."; \
+	read -r -p "Enable network proxying? [Y/n] " REPLY; \
+	case "$$REPLY" in \
+		[nN]*) \
+			echo "Skipped. To enable later: sudo setcap cap_net_admin=ep $$PENT_BIN" ;; \
+		*) \
+			sudo setcap cap_net_admin=ep "$$PENT_BIN" ;; \
+	esac
 
 test:
 	cargo test --workspace
