@@ -351,11 +351,16 @@ pub unsafe fn mount_overlays(overlays: &[OverlayMount]) -> std::io::Result<()> {
 
         if ret != 0 {
             let err = std::io::Error::last_os_error();
-            // Non-fatal: overlayfs module not loaded, or unprivileged user
-            // namespaces disabled. Skip gracefully — sandbox runs without inode
-            // protection for this directory.
+            // Non-fatal: overlayfs module not loaded, unprivileged user
+            // namespaces disabled, or filesystem/LSM doesn't allow the mount.
+            // Skip gracefully — sandbox runs without inode protection for this
+            // directory. EACCES can occur when the filesystem doesn't support
+            // user xattrs or when an LSM (AppArmor etc.) denies the mount.
             match err.raw_os_error() {
-                Some(libc::ENODEV) | Some(libc::ENOSYS) | Some(libc::EPERM) => continue,
+                Some(libc::ENODEV)
+                | Some(libc::ENOSYS)
+                | Some(libc::EPERM)
+                | Some(libc::EACCES) => continue,
                 _ => return Err(err),
             }
         }
