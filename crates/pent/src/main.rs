@@ -34,17 +34,27 @@ fn should_reexec_with_sudo(args: &cli::RunArgs) -> bool {
     // SAFETY: geteuid is always safe to call
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     if unsafe { libc::geteuid() } == 0 {
+        eprintln!("[debug] Already running as root, no sudo needed");
         return false;
     }
 
     // Check if user requested proxy mode (--allow, --network proxy, etc.)
-    let needs_proxy = !args.allow.is_empty() || args.network == Some(cli::NetworkModeArg::Proxy);
+    let has_allow = !args.allow.is_empty();
+    let is_proxy_network = args.network == Some(cli::NetworkModeArg::Proxy);
+    let needs_proxy = has_allow || is_proxy_network;
+
+    eprintln!("[debug] has_allow={}, is_proxy_network={}, needs_proxy={}", has_allow, is_proxy_network, needs_proxy);
+
     if !needs_proxy {
+        eprintln!("[debug] Not in proxy mode, no sudo needed");
         return false;
     }
 
     // Check if we have CAP_NET_ADMIN
-    has_cap_net_admin().is_err()
+    let has_cap = has_cap_net_admin().is_ok();
+    eprintln!("[debug] has_cap_net_admin={}", has_cap);
+
+    !has_cap
 }
 
 /// Check if current process has CAP_NET_ADMIN in effective set.
