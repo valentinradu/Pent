@@ -150,6 +150,132 @@ impl Drop for NetnsHandle {
     }
 }
 
+/// Fork an "anchor" process that creates an anonymous network namespace.
+///
+/// The anchor calls `unshare(CLONE_NEWUSER | CLONE_NEWNET)` (unprivileged),
+/// writes uid/gid maps, signals readiness, then blocks until the write end of
+/// the done-pipe is closed.
+///
+/// Returns `(anchor_pid, done_pipe_write_fd)`. The caller must:
+/// 1. Open `/proc/{anchor_pid}/ns/net` to obtain the namespace fd.
+/// 2. Do all veth setup using `anchor_pid` as the netns target.
+/// 3. Close `done_pipe_write_fd` (and `waitpid`) to release the anchor.
+///
+/// # Errors
+/// Returns `NetworkSetupFailed` if `fork`, `pipe2`, or `unshare` fail.
+pub fn spawn_anchor(uid: u32, gid: u32) -> Result<(libc::pid_t, libc::c_int), SandboxError> {
+    // ready_pipe[0]=read  ready_pipe[1]=write  (anchor → parent)
+    // done_pipe[0]=read   done_pipe[1]=write   (parent → anchor, via EOF)
+    let mut ready_pipe = [0i32; 2];
+    let mut done_pipe = [0i32; 2];
+    // SAFETY: pipe2 is always safe to call.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    unsafe {
+        if libc::pipe2(ready_pipe.as_mut_ptr(), libc::O_CLOEXEC) != 0 {
+            return Err(SandboxError::NetworkSetupFailed(format!(
+                "pipe2 failed: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        if libc::pipe2(done_pipe.as_mut_ptr(), libc::O_CLOEXEC) != 0 {
+            libc::close(ready_pipe[0]);
+            libc::close(ready_pipe[1]);
+            return Err(SandboxError::NetworkSetupFailed(format!(
+                "pipe2 failed: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+    }
+
+    let [ready_read, ready_write] = ready_pipe;
+    let [done_read, done_write] = done_pipe;
+
+    // SAFETY: fork is always safe; child uses only async-signal-safe operations.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let pid = unsafe { libc::fork() };
+    match pid {
+        -1 => {
+            // SAFETY: close is always safe.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            unsafe {
+                libc::close(ready_read);
+                libc::close(ready_write);
+                libc::close(done_read);
+                libc::close(done_write);
+            }
+            Err(SandboxError::NetworkSetupFailed(format!(
+                "fork failed: {}",
+                std::io::Error::last_os_error()
+            )))
+        }
+        0 => {
+            // ── Anchor child ──────────────────────────────────────────────────
+            // SAFETY: child is single-threaded; all ops are async-signal-safe.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            unsafe {
+                libc::close(ready_read);
+                libc::close(done_write);
+
+                // Create new user + network namespace (completely unprivileged).
+                if libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) != 0 {
+                    libc::_exit(1);
+                }
+            }
+
+            // Write uid/gid maps: map host uid/gid → 0 inside the new user ns.
+            // "deny" setgroups is required before writing gid_map.
+            let _ = std::fs::write("/proc/self/setgroups", "deny");
+            let _ = std::fs::write("/proc/self/uid_map", format!("0 {} 1\n", uid));
+            let _ = std::fs::write("/proc/self/gid_map", format!("0 {} 1\n", gid));
+
+            // Signal ready, then block until parent closes done_write (EOF on done_read).
+            // SAFETY: write/read/close/_exit are async-signal-safe.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            unsafe {
+                libc::write(ready_write, b"1".as_ptr().cast(), 1);
+                libc::close(ready_write);
+                let mut buf = [0u8; 1];
+                libc::read(done_read, buf.as_mut_ptr().cast(), 1);
+                libc::_exit(0);
+            }
+        }
+        anchor_pid => {
+            // ── Parent ────────────────────────────────────────────────────────
+            // SAFETY: close is always safe.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            unsafe {
+                libc::close(ready_write);
+                libc::close(done_read);
+            }
+
+            // Wait for the anchor's ready signal.
+            let mut buf = [0u8; 1];
+            // SAFETY: read on a valid pipe fd.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            let n = unsafe { libc::read(ready_read, buf.as_mut_ptr().cast(), 1) };
+            // SAFETY: close is always safe.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            unsafe { libc::close(ready_read) };
+
+            if n <= 0 {
+                // Anchor failed; reap it.
+                // SAFETY: close/waitpid are always safe.
+                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+                unsafe {
+                    libc::close(done_write);
+                    let mut status = 0;
+                    libc::waitpid(anchor_pid, &mut status, 0);
+                }
+                return Err(SandboxError::NetworkSetupFailed(
+                    "anchor process failed to create network namespace".to_string(),
+                ));
+            }
+
+            Ok((anchor_pid, done_write))
+        }
+    }
+}
+
 /// Check if running with sufficient privileges for network namespaces.
 ///
 /// # Errors
@@ -750,6 +876,37 @@ mod tests {
     // ========================================================================
     // NetnsHandle tests
     // ========================================================================
+
+    #[test]
+    fn test_spawn_anchor_creates_isolated_namespace() {
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+
+        let (anchor_pid, done_write) = spawn_anchor(uid, gid)
+            .expect("spawn_anchor failed");
+
+        // The anchor's /proc entry must exist
+        let anchor_ns_path = format!("/proc/{}/ns/net", anchor_pid);
+        assert!(
+            std::path::Path::new(&anchor_ns_path).exists(),
+            "anchor /proc entry missing"
+        );
+
+        // The anchor must be in a *different* network namespace from us
+        use std::os::linux::fs::MetadataExt;
+        let self_ino = std::fs::metadata("/proc/self/ns/net").unwrap().st_ino();
+        let anchor_ino = std::fs::metadata(&anchor_ns_path).unwrap().st_ino();
+        assert_ne!(self_ino, anchor_ino, "anchor should be in a different netns");
+
+        // Signal anchor to exit and reap it
+        unsafe {
+            libc::close(done_write);
+            let mut status = 0;
+            libc::waitpid(anchor_pid, &mut status, 0);
+            assert!(libc::WIFEXITED(status));
+            assert_eq!(libc::WEXITSTATUS(status), 0);
+        }
+    }
 
     #[test]
     fn test_netns_handle_drop_is_idempotent() {
