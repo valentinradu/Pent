@@ -525,8 +525,9 @@ pub fn spawn_with_landlock(
             None
         };
 
-    // fd value for the pre_exec closure (-1 when not ProxyOnly)
+    // fd values for the pre_exec closure (-1 when not ProxyOnly)
     let netns_fd: libc::c_int = proxy_netns.as_ref().map_or(-1, |h| h.fd);
+    let netns_userns_fd: libc::c_int = proxy_netns.as_ref().map_or(-1, |h| h.userns_fd);
 
     // For ProxyOnly, inject proxy env vars pointing to the veth host-side IP so
     // the child can reach the proxy from inside the isolated namespace.
@@ -585,11 +586,39 @@ pub fn spawn_with_landlock(
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         command.pre_exec(move || {
+            // ── Phase 0: Join proxy network namespace ─────────────────────────
+            //
+            // The proxy network namespace is owned by the anchor's user namespace
+            // (created with CLONE_NEWUSER | CLONE_NEWNET). setns(CLONE_NEWNET)
+            // requires CAP_SYS_ADMIN in the owning user namespace. We don't have
+            // CAP_SYS_ADMIN in the initial user namespace, so we first join the
+            // anchor's user namespace (gaining full caps there as uid 0), then
+            // join the network namespace. This must happen before Phase 1's
+            // unshare(CLONE_NEWUSER) — once a new user namespace is created, the
+            // anchor's user namespace becomes an ancestor we can no longer join.
+            if netns_fd >= 0 {
+                // SAFETY: netns_userns_fd and netns_fd are valid open fds.
+                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+                if libc::setns(netns_userns_fd, libc::CLONE_NEWUSER) != 0 {
+                    return Err(std::io::Error::other(format!(
+                        "setns(userns) failed: {}",
+                        std::io::Error::last_os_error()
+                    )));
+                }
+                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+                if libc::setns(netns_fd, libc::CLONE_NEWNET) != 0 {
+                    return Err(std::io::Error::other(format!(
+                        "setns(netns) failed: {}",
+                        std::io::Error::last_os_error()
+                    )));
+                }
+            }
+
             // ── Phase 1: Namespace and overlay setup ─────────────────────────
             //
             // When overlayfs is in use we need CLONE_NEWUSER + CLONE_NEWNS (and
             // CLONE_NEWNET for local-network modes) in a single unshare call.
-            // For ProxyOnly, CLONE_NEWNET is handled separately via setns below.
+            // For ProxyOnly, Phase 0 already joined the network namespace.
             let has_overlays = !overlay_mounts_pre.is_empty();
 
             if has_overlays {
@@ -720,13 +749,7 @@ pub fn spawn_with_landlock(
 
             // ── Phase 3: Network isolation ────────────────────────────────────
             if netns_fd >= 0 {
-                // ProxyOnly: join the named namespace created by the parent.
-                // SAFETY: netns_fd is a valid open fd to the named netns file.
-                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-                let ret = libc::setns(netns_fd, libc::CLONE_NEWNET);
-                if ret != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
+                // ProxyOnly: namespace was already joined in Phase 0.
                 // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                 bring_up_loopback();
             } else if has_overlays {

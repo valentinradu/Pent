@@ -85,6 +85,11 @@ pub struct NetnsHandle {
     /// Namespace fd (O_RDONLY | O_CLOEXEC). The child closes it on exec;
     /// the parent closes it explicitly via `close_fd()` after spawn.
     pub fd: libc::c_int,
+    /// User namespace fd (O_RDONLY | O_CLOEXEC). Kept alive so that the
+    /// anchor's user namespace (which owns the network namespace) persists
+    /// until after `spawn()`. The pre_exec child joins this user namespace
+    /// before joining the network namespace. Closed alongside `fd`.
+    pub userns_fd: libc::c_int,
     /// Host-side veth IP — injected into the child's env as HTTP_PROXY etc.
     pub outer_ip: std::net::Ipv4Addr,
     fd_closed: bool,
@@ -101,9 +106,12 @@ impl NetnsHandle {
     /// was already closed by O_CLOEXEC on exec.
     pub fn close_fd(&mut self) {
         if !self.fd_closed {
-            // SAFETY: fd is a valid open file descriptor.
+            // SAFETY: fd and userns_fd are valid open file descriptors.
             // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-            unsafe { libc::close(self.fd) };
+            unsafe {
+                libc::close(self.fd);
+                libc::close(self.userns_fd);
+            }
             self.fd_closed = true;
         }
     }
@@ -545,6 +553,7 @@ pub fn create_netns(config: &NetnsConfig) -> Result<NetnsHandle, SandboxError> {
 
     let mut handle = NetnsHandle {
         fd: ns_fd,
+        userns_fd,
         outer_ip: config.outer_ip,
         fd_closed: false,
         anchor_pid,
@@ -599,10 +608,8 @@ pub fn create_netns(config: &NetnsConfig) -> Result<NetnsHandle, SandboxError> {
     run_ip_in_netns(userns_fd, ns_fd, &["link", "set", "lo", "up"])?;
     run_ip_in_netns(userns_fd, ns_fd, &["route", "add", "default", "via", &gateway])?;
 
-    // userns_fd was only needed during setup; close it now.
-    // SAFETY: userns_fd is a valid open fd obtained above.
-    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-    unsafe { libc::close(userns_fd) };
+    // userns_fd is stored in the handle and kept open until close_fd() after
+    // spawn, so that the anchor's user namespace persists for pre_exec setns.
 
     // Anchor's job is done; release it. The namespace stays alive via ns_fd.
     handle.release_anchor();
