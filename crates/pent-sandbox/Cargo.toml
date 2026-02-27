@@ -9,6 +9,7 @@ description = "OS-level process sandboxing (filesystem + network containment)"
 [dependencies]
 pent-settings = { path = "../pent-settings" }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 dirs = "5"
 libc = "0.2"
 

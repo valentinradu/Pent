@@ -30,6 +30,7 @@
 use crate::SandboxError;
 use std::net::Ipv4Addr;
 use std::os::unix::process::CommandExt;
+use tracing::{debug, warn};
 
 /// Network namespace configuration.
 #[derive(Debug, Clone)]
@@ -157,14 +158,15 @@ impl Drop for NetnsHandle {
                     Ok(output) => {
                         if !output.status.success() {
                             let stderr = String::from_utf8_lossy(&output.stderr);
-                            eprintln!(
-                                "warning: could not remove iptables PREROUTING rule for {}: {}",
-                                proto, stderr.trim()
+                            warn!(
+                                proto = proto,
+                                stderr = %stderr.trim(),
+                                "could not remove iptables PREROUTING rule"
                             );
                         }
                     }
                     Err(e) => {
-                        eprintln!("warning: could not run iptables to remove DNS redirect rule: {}", e);
+                        warn!(error = %e, "could not run iptables to remove DNS redirect rule");
                     }
                 }
             }
@@ -382,7 +384,11 @@ pub fn create_netns(config: &NetnsConfig) -> Result<NetnsHandle, SandboxError> {
     // The proxy DNS server must be bound to 0.0.0.0 (not 127.0.0.1) so that
     // it accepts packets arriving at 10.200.x.1:dns_port.
     if config.dns_port != 0 {
-        eprintln!("pent: setting up DNS redirect from {} to port {}", veth_outer, config.dns_port);
+        debug!(
+            veth = %veth_outer,
+            dns_port = config.dns_port,
+            "setting up DNS PREROUTING REDIRECT rules"
+        );
         let dns_port_str = config.dns_port.to_string();
         let mut rule_errors = false;
         for proto in &["udp", "tcp"] {
@@ -399,24 +405,30 @@ pub fn create_netns(config: &NetnsConfig) -> Result<NetnsHandle, SandboxError> {
                 Ok(output) => {
                     if !output.status.success() {
                         let stderr = String::from_utf8_lossy(&output.stderr);
-                        eprintln!(
-                            "warning: iptables PREROUTING REDIRECT rule failed for {}: {}",
-                            proto, stderr.trim()
+                        warn!(
+                            proto = proto,
+                            veth = %veth_outer,
+                            stderr = %stderr.trim(),
+                            "iptables PREROUTING REDIRECT rule failed"
                         );
                         rule_errors = true;
                     }
                 }
                 Err(e) => {
-                    eprintln!("warning: could not run iptables for DNS redirect: {}", e);
+                    warn!(
+                        error = %e,
+                        veth = %veth_outer,
+                        "could not run iptables for DNS redirect"
+                    );
                     rule_errors = true;
                 }
             }
         }
         if !rule_errors {
-            eprintln!("pent: DNS redirect rules successfully created");
+            debug!(veth = %veth_outer, "DNS redirect rules successfully created");
         }
     } else {
-        eprintln!("pent: dns_port is 0, skipping DNS redirect rules");
+        debug!("dns_port is 0, skipping DNS redirect rules");
     }
 
     // Disable strict reverse-path filter on the veth interface so that
