@@ -237,32 +237,93 @@ pub(crate) fn raise_net_admin_ambient() -> std::io::Result<()> {
         let mut data = [CapData { effective: 0, permitted: 0, inheritable: 0 }; 2];
 
         if libc::syscall(libc::SYS_capget, &mut hdr as *mut _, data.as_mut_ptr()) != 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "capget failed: unable to read capabilities",
-            ));
+            let errno = std::io::Error::last_os_error();
+            // Write to stderr since logging from pre_exec doesn't work
+            let msg = format!("capget failed: {}\n", errno);
+            libc::write(libc::STDERR_FILENO, msg.as_ptr() as *const libc::c_void, msg.len());
+            return Err(errno);
+        }
+
+        // Check if CAP_NET_ADMIN is already in the effective set
+        let cap_bit = 1u32 << CAP_NET_ADMIN;
+        if (data[0].effective & cap_bit) == 0 {
+            let msg = format!(
+                "CAP_NET_ADMIN not in effective set (effective=0x{:x}, permitted=0x{:x})\n",
+                data[0].effective, data[0].permitted
+            );
+            libc::write(libc::STDERR_FILENO, msg.as_ptr() as *const libc::c_void, msg.len());
         }
 
         // Add CAP_NET_ADMIN to the inheritable set — required before raising as ambient.
-        data[0].inheritable |= 1u32 << CAP_NET_ADMIN;
+        data[0].inheritable |= cap_bit;
         hdr.version = LINUX_CAPABILITY_VERSION_3;
         hdr.pid = 0;
 
         if libc::syscall(libc::SYS_capset, &mut hdr as *mut _, data.as_ptr()) != 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "capset failed: unable to set inheritable capability (pent may lack CAP_NET_ADMIN)",
-            ));
+            let errno = std::io::Error::last_os_error();
+            let msg = format!("capset failed: {}\n", errno);
+            libc::write(libc::STDERR_FILENO, msg.as_ptr() as *const libc::c_void, msg.len());
+            return Err(errno);
         }
 
         // Raise CAP_NET_ADMIN as ambient so the exec'd binary inherits it.
         if libc::prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, CAP_NET_ADMIN as libc::c_ulong, 0, 0) != 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "prctl(CAP_AMBIENT_RAISE) failed: unable to raise ambient capability",
-            ));
+            let errno = std::io::Error::last_os_error();
+            let msg = format!("prctl(CAP_AMBIENT_RAISE) failed: {}\n", errno);
+            libc::write(libc::STDERR_FILENO, msg.as_ptr() as *const libc::c_void, msg.len());
+            return Err(errno);
         }
     }
+    Ok(())
+}
+
+/// Test if we can raise CAP_NET_ADMIN as ambient.
+///
+/// This is called early to diagnose capability issues before iptables fails.
+fn test_ambient_capability() -> Result<(), String> {
+    const CAP_NET_ADMIN: u32 = 12;
+    const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+    const PR_CAP_AMBIENT: libc::c_int = 47;
+    const PR_CAP_AMBIENT_RAISE: libc::c_ulong = 2;
+
+    #[repr(C)]
+    struct CapHeader {
+        version: u32,
+        pid: libc::c_int,
+    }
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct CapData {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+
+    // SAFETY: capget syscall is safe with valid pointers.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    unsafe {
+        let mut hdr = CapHeader { version: LINUX_CAPABILITY_VERSION_3, pid: 0 };
+        let mut data = [CapData { effective: 0, permitted: 0, inheritable: 0 }; 2];
+
+        if libc::syscall(libc::SYS_capget, &mut hdr as *mut _, data.as_mut_ptr()) != 0 {
+            return Err("capget failed".to_string());
+        }
+
+        let cap_bit = 1u32 << CAP_NET_ADMIN;
+        if (data[0].effective & cap_bit) == 0 {
+            return Err(format!(
+                "CAP_NET_ADMIN not in effective set (effective=0x{:x}, permitted=0x{:x}). \
+                 pent binary may lack CAP_NET_ADMIN capability.",
+                data[0].effective, data[0].permitted
+            ));
+        }
+
+        // Try to raise as ambient to verify it works
+        if libc::prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, CAP_NET_ADMIN as libc::c_ulong, 0, 0) != 0 {
+            return Err("prctl(CAP_AMBIENT_RAISE) failed: ambient capabilities may not be supported".to_string());
+        }
+    }
+
     Ok(())
 }
 
@@ -325,6 +386,12 @@ pub fn create_netns(config: &NetnsConfig) -> Result<NetnsHandle, SandboxError> {
     use std::process::Command;
 
     check_netns_privileges()?;
+
+    // Test if we can raise CAP_NET_ADMIN as ambient before attempting iptables
+    if let Err(e) = test_ambient_capability() {
+        warn!("capability test failed: {}", e);
+        warn!("DNS redirect rules may fail. Run: sudo setcap cap_net_admin=ep $(which pent)");
+    }
 
     let pid_str = config.name.strip_prefix("pent-").unwrap_or(&config.name);
     let veth_inner = format!("veth-{}-in", pid_str);
