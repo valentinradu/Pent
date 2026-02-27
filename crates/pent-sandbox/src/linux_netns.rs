@@ -75,6 +75,77 @@ impl NetnsConfig {
     }
 }
 
+/// Handle to an anonymous network namespace for ProxyOnly sandbox mode.
+///
+/// Dropping the handle removes firewall/routing rules added during setup.
+/// The namespace fd is closed via `close_fd()` (called by `linux.rs` after
+/// `spawn()`) and again in `drop` if not already closed. The veth pair
+/// auto-deletes when the namespace is released.
+pub struct NetnsHandle {
+    /// Namespace fd (O_RDONLY | O_CLOEXEC). The child closes it on exec;
+    /// the parent closes it explicitly via `close_fd()` after spawn.
+    pub fd: libc::c_int,
+    /// Host-side veth IP — injected into the child's env as HTTP_PROXY etc.
+    pub outer_ip: std::net::Ipv4Addr,
+    fd_closed: bool,
+    anchor_pid: libc::pid_t,
+    done_write: libc::c_int, // -1 when already released
+    veth_outer: String,
+    outer_cidr: String,
+}
+
+impl NetnsHandle {
+    pub fn close_fd(&mut self) {
+        if !self.fd_closed {
+            // SAFETY: fd is a valid open file descriptor.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            unsafe { libc::close(self.fd) };
+            self.fd_closed = true;
+        }
+    }
+
+    fn release_anchor(&mut self) {
+        if self.done_write >= 0 {
+            // SAFETY: done_write is a valid pipe fd; closing it sends EOF to anchor.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            unsafe {
+                libc::close(self.done_write);
+                let mut status = 0;
+                libc::waitpid(self.anchor_pid, &mut status, 0);
+            }
+            self.done_write = -1;
+        }
+    }
+}
+
+impl Drop for NetnsHandle {
+    fn drop(&mut self) {
+        use std::process::Command;
+
+        self.release_anchor();
+        self.close_fd();
+
+        if let Some(h) = nft_find_iface_rule_handle("input", "iifname", &self.veth_outer) {
+            let _ = Command::new("nft")
+                .args(["delete", "rule", "inet", "filter", "input", "handle", &h.to_string()])
+                .output();
+        }
+        if let Some(h) = nft_find_iface_rule_handle("output", "oifname", &self.veth_outer) {
+            let _ = Command::new("nft")
+                .args(["delete", "rule", "inet", "filter", "output", "handle", &h.to_string()])
+                .output();
+        }
+
+        let _ = Command::new("iptables")
+            .args(["-D", "INPUT", "-i", &self.veth_outer, "-j", "ACCEPT"])
+            .output();
+
+        let _ = Command::new("ip")
+            .args(["rule", "del", "to", &self.outer_cidr, "table", "main", "priority", "100"])
+            .output();
+    }
+}
+
 /// Check if running with sufficient privileges for network namespaces.
 ///
 /// # Errors
@@ -670,5 +741,25 @@ mod tests {
             let result = create_blocked_netns("pent-test-blocked");
             assert!(result.is_err());
         }
+    }
+
+    // ========================================================================
+    // NetnsHandle tests
+    // ========================================================================
+
+    #[test]
+    fn test_netns_handle_drop_is_idempotent() {
+        // A handle with sentinel values should not panic when dropped.
+        // Tests that the Drop impl guards against double-close.
+        let handle = NetnsHandle {
+            fd: -1,
+            outer_ip: std::net::Ipv4Addr::new(10, 200, 1, 1),
+            fd_closed: true,   // already closed — must not close again
+            anchor_pid: -1,
+            done_write: -1,    // already released — must not close again
+            veth_outer: "veth-test-out".to_string(),
+            outer_cidr: "10.200.1.1/24".to_string(),
+        };
+        drop(handle); // must not panic or crash
     }
 }
