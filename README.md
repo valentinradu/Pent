@@ -9,7 +9,7 @@ Wrap AI coding agents, or any process, in a lightweight containment layer that r
 # @npm also adds @node (a filesystem-only profile) as a dependency.
 pent config add --global @claude @gh @npm @cargo @pip @gem @go @git
 
-# Run — every invocation. pent reads the config written above and enforces it:
+# Run — every invocation. Pent reads the config written above and enforces it:
 # only the listed domains resolve, only the listed paths are accessible.
 pent run -- claude
 
@@ -23,11 +23,11 @@ pent config rm  --global @keychain   # revoke it
 
 ---
 
-## What pent does
+## What Pent does
 
 Pent launches a child process inside a sandbox with two complementary controls:
 
-1. **Filesystem isolation** — the child can only read and write the paths you allow.
+1. **Filesystem isolation** — the child can only read and write the paths you allow. On Linux, directories containing writable files are additionally shadowed with overlayfs so that non-whitelisted sibling files are hidden and any writes to them are discarded when the session ends.
 2. **Network isolation** — the child's outbound traffic is gated by a built-in proxy that enforces a domain allowlist.
 
 These two layers work together. Even if a rogue process manipulates its environment variables or tries to exfiltrate data through a side channel, it cannot reach a domain that is not on the allowlist, and it cannot read files outside the permitted paths.
@@ -40,7 +40,7 @@ These two layers work together. Even if a rogue process manipulates its environm
 
 A persistent or sufficiently sophisticated process can likely escape the sandbox. macOS Seatbelt and Linux Landlock are not designed to contain root processes, and there are known bypass classes for both mechanisms. The built-in proxy is also process-level, not kernel-level.
 
-Use pent to add a reasonable guard-rail around AI coding agents operating on your workstation — not as a substitute for proper network segmentation, least-privilege service accounts, or other security controls.
+Use Pent to add a reasonable guard-rail around AI coding agents operating on your workstation — not as a substitute for proper network segmentation, least-privilege service accounts, or other security controls.
 
 ---
 
@@ -48,7 +48,7 @@ Use pent to add a reasonable guard-rail around AI coding agents operating on you
 
 ### macOS — Seatbelt (sandbox-exec + SBPL)
 
-On macOS, pent generates a [Sandbox Profile Language (SBPL)](https://reverse.put.as/wp-content/uploads/2011/09/Apple-Sandbox-Guide-v1.0.pdf) policy and launches the child process via `sandbox-exec`. The generated profile:
+On macOS, Pent generates a [Sandbox Profile Language (SBPL)](https://reverse.put.as/wp-content/uploads/2011/09/Apple-Sandbox-Guide-v1.0.pdf) policy and launches the child process via `sandbox-exec`. The generated profile:
 
 - Allows all actions by default.
 - Denies `file-read-data` (file content reads) globally, then re-allows it only for permitted paths.
@@ -57,11 +57,15 @@ On macOS, pent generates a [Sandbox Profile Language (SBPL)](https://reverse.put
 
 **Network containment is not enforced on macOS.** See [Platform limitations](#platform-limitations) below.
 
-### Linux — Landlock + network namespaces
+### Linux — Landlock + overlayfs + network namespaces
 
-On Linux, pent uses two mechanisms:
+On Linux, Pent uses three mechanisms:
 
 - **Landlock LSM** restricts filesystem access. The child process is confined to the paths you configure using the kernel's Landlock security module. Requires kernel ≥ 5.13 (Landlock ABI v1); full ruleset support requires ≥ 5.19 (ABI v2).
+- **Overlayfs shadowing** protects the parent directories of `read_write` files (e.g. `~` when `~/.claude.json` is listed). Instead of granting the child process write access to the real directory, Pent mounts an overlayfs on it inside the child's private mount namespace:
+  - Files and directories not in the configured paths are **hidden** — they appear empty or return `ENOENT`. The child can write to them freely (writes land in a temporary upper layer), but can never read back any real content from them.
+  - Files in `read_write` are visible and writable. Writes go to the upper layer first; Pent's inotify watcher flushes them back to the real inodes in-place (preserving inode numbers so Landlock rules stay valid).
+  - When the child process exits the overlay is discarded. Any write to a non-whitelisted path disappears with it.
 - **Network namespaces** (`unshare(CLONE_NEWNET)`) isolate the child's network stack. For `proxy_only` mode, the proxy listens on the loopback interface of the parent namespace and a `veth` pair bridges traffic from the child's namespace to the proxy. For `blocked` mode, the child gets a fresh namespace with no external connectivity.
 
 ### Built-in proxy
@@ -83,7 +87,7 @@ The proxy binds only to loopback and is not reachable from the network.
 
 The root cause is architectural: macOS has no per-process network namespace primitive available to unprivileged processes.
 
-**On Linux**, `unshare(CLONE_NEWNET)` creates an isolated network stack for the child process. All outbound traffic — regardless of language runtime, proxy awareness, or binary signing — must pass through pent's proxy via a veth pair. Network policy is enforced at the kernel level.
+**On Linux**, `unshare(CLONE_NEWNET)` creates an isolated network stack for the child process. All outbound traffic — regardless of language runtime, proxy awareness, or binary signing — must pass through Pent's proxy via a veth pair. Network policy is enforced at the kernel level.
 
 **On macOS**, the only available mechanisms are:
 
@@ -93,9 +97,9 @@ The root cause is architectural: macOS has no per-process network namespace prim
 | `pf` packet filter | Redirects TCP at the kernel | Requires root; rules are system-wide, not per-process |
 | Network Extension / `NETransparentProxyProvider` | System-level proxy | Requires an entitlement Apple must grant; intended for VPN/MDM tools |
 
-On macOS, pent provides **filesystem isolation only**. Domain allowlists in your config are still written and read correctly — they simply have no enforcement effect when running on macOS.
+On macOS, Pent provides **filesystem isolation only**. Domain allowlists in your config are still written and read correctly — they simply have no enforcement effect when running on macOS.
 
-**For network containment on macOS**, run pent inside a Linux VM or container:
+**For network containment on macOS**, run Pent inside a Linux VM or container:
 
 ```bash
 # Build and run the Linux e2e suite (requires Docker)
@@ -256,7 +260,7 @@ Profiles are an optional convenience — named sets of domains and filesystem pa
 | `@keychain` | — | ~/Library/Keychains (macOS), ~/.local/share/keyrings, ~/.local/share/kwalletd, ~/.password-store (Linux) | — | — |
 | `@base` | — | shell init files (~/.zshrc, ~/.bashrc, etc.) | ~/.local/bin (+ /usr/libexec/path_helper on macOS) | — |
 
-When you add a profile its dependencies are added automatically. When you remove a profile, pent warns if a dependent profile is still active.
+When you add a profile its dependencies are added automatically. When you remove a profile, Pent warns if a dependent profile is still active.
 
 ```bash
 # Add profiles (@npm also adds @node automatically)
@@ -352,7 +356,7 @@ On **macOS**, filesystem denials from Seatbelt are captured via the system's `lo
 ### Workflow
 
 ```bash
-# 1. Start the app under pent with tracing enabled.
+# 1. Start the app under Pent with tracing enabled.
 pent run --trace -- claude
 
 # 2. Use the app normally, then exit it.
@@ -373,7 +377,7 @@ pent: fix: add "registry.npmjs.org" to [proxy.domain_allowlist] in your pent con
 pent: [allowed] network: connection to "api.anthropic.com" allowed
 ```
 
-Each `[denied]` entry shows exactly which path or domain was blocked and the one-line config change needed to allow it. Apply the fixes to your pent config (or use `pent config add @npm` etc. if a matching profile exists), then re-run normally.
+Each `[denied]` entry shows exactly which path or domain was blocked and the one-line config change needed to allow it. Apply the fixes to your Pent config (or use `pent config add @npm` etc. if a matching profile exists), then re-run normally.
 
 `--trace` is compatible with `--network proxy` and any explicit `--allow` or `--read`/`--write` flags.
 
