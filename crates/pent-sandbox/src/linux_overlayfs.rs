@@ -59,6 +59,10 @@ pub struct OverlayHandle {
     thread: Option<std::thread::JoinHandle<()>>,
     overlays: Vec<OverlayMount>,
     write_set: HashSet<PathBuf>,
+    /// Directories from `read_write` config entries (as opposed to individual
+    /// files).  All files created or modified inside these directories during
+    /// the sandbox session should be flushed back to the real filesystem.
+    rw_dirs: HashSet<PathBuf>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -498,28 +502,86 @@ fn flush_file(upper_path: &Path, real_path: &Path) -> std::io::Result<()> {
 
 /// Start the inotify watcher thread.
 ///
-/// Watches each `upper_dir` in `overlays` for `IN_CLOSE_WRITE` and `IN_MOVED_TO`
-/// events. When a file matching an entry in `write_set` appears, it is flushed
-/// to the corresponding real path in-place, preserving the real inode.
+/// Watches each `upper_dir` in `overlays` (recursively) for `IN_CLOSE_WRITE`,
+/// `IN_MOVED_TO`, and `IN_CREATE` events.  A file is flushed to the real
+/// filesystem when it matches an entry in `write_set` OR lives inside a
+/// directory listed in `rw_dirs`.
+///
+/// `rw_dirs` should contain every directory-type path from the `read_write`
+/// config — i.e. all entries that `is_dir()` at spawn time.  All files created
+/// or modified inside those directories during the session are flushed back.
 ///
 /// Returns an [`OverlayHandle`] that must be passed to [`teardown`] after the
 /// sandboxed child process exits.
 pub fn spawn_watcher(
     overlays: Vec<OverlayMount>,
     write_set: HashSet<PathBuf>,
+    rw_dirs: HashSet<PathBuf>,
 ) -> OverlayHandle {
     let (shutdown_tx, shutdown_rx) = std::sync::mpsc::sync_channel::<()>(1);
     let overlays_thread = overlays.clone();
     let write_set_thread = write_set.clone();
+    let rw_dirs_thread = rw_dirs.clone();
     let thread = std::thread::spawn(move || {
-        run_watcher(overlays_thread, write_set_thread, shutdown_rx);
+        run_watcher(overlays_thread, write_set_thread, rw_dirs_thread, shutdown_rx);
     });
-    OverlayHandle { shutdown_tx, thread: Some(thread), overlays, write_set }
+    OverlayHandle { shutdown_tx, thread: Some(thread), overlays, write_set, rw_dirs }
+}
+
+/// Add an inotify watch on `upper_dir` and recurse into all existing
+/// subdirectories (up to `depth` levels).  Each watch descriptor is mapped to
+/// the corresponding `(upper_dir, real_dir)` pair so that event filenames can
+/// be resolved to both their upper-layer and real-filesystem paths.
+fn add_inotify_watches(
+    inotify_fd: libc::c_int,
+    upper_dir: &Path,
+    real_dir: &Path,
+    wd_map: &mut HashMap<libc::c_int, (PathBuf, PathBuf)>,
+    depth: u32,
+) {
+    use std::os::unix::ffi::OsStrExt;
+    let path_c = match CString::new(upper_dir.as_os_str().as_bytes()) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let wd = unsafe {
+        libc::inotify_add_watch(
+            inotify_fd,
+            path_c.as_ptr(),
+            libc::IN_CLOSE_WRITE | libc::IN_MOVED_TO | libc::IN_CREATE,
+        )
+    };
+    if wd >= 0 {
+        wd_map.insert(wd, (upper_dir.to_path_buf(), real_dir.to_path_buf()));
+    }
+
+    if depth == 0 {
+        return;
+    }
+
+    let entries = match std::fs::read_dir(upper_dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+            let name = entry.file_name();
+            add_inotify_watches(
+                inotify_fd,
+                &upper_dir.join(&name),
+                &real_dir.join(&name),
+                wd_map,
+                depth - 1,
+            );
+        }
+    }
 }
 
 fn run_watcher(
     overlays: Vec<OverlayMount>,
     write_set: HashSet<PathBuf>,
+    rw_dirs: HashSet<PathBuf>,
     shutdown_rx: std::sync::mpsc::Receiver<()>,
 ) {
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
@@ -530,24 +592,12 @@ fn run_watcher(
         return;
     }
 
-    // Map watch descriptor → overlay index.
-    let mut wd_map: HashMap<libc::c_int, usize> = HashMap::new();
-    for (i, overlay) in overlays.iter().enumerate() {
-        let path = match CString::new(overlay.upper_dir.to_str().unwrap_or("")) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-        let wd = unsafe {
-            libc::inotify_add_watch(
-                inotify_fd,
-                path.as_ptr(),
-                libc::IN_CLOSE_WRITE | libc::IN_MOVED_TO,
-            )
-        };
-        if wd >= 0 {
-            wd_map.insert(wd, i);
-        }
+    // Map watch descriptor → (upper_dir, real_dir).  Covers both the overlay
+    // root and any subdirectories added recursively at startup or at runtime
+    // when the sandbox creates new directories.
+    let mut wd_map: HashMap<libc::c_int, (PathBuf, PathBuf)> = HashMap::new();
+    for overlay in &overlays {
+        add_inotify_watches(inotify_fd, &overlay.upper_dir, &overlay.real_dir, &mut wd_map, 8);
     }
 
     let event_hdr = std::mem::size_of::<libc::inotify_event>();
@@ -595,15 +645,25 @@ fn run_watcher(
             let filename = std::str::from_utf8(&name_bytes[..name_end]).unwrap_or("");
 
             if !filename.is_empty() {
-                if let Some(&oi) = wd_map.get(&event.wd) {
-                    let overlay = &overlays[oi];
-                    let upper_file = overlay.upper_dir.join(filename);
-                    let real_file = overlay.real_dir.join(filename);
-                    if write_set.contains(&real_file)
-                        && upper_file.is_file()
-                        && !is_overlay_whiteout(&upper_file)
-                    {
-                        let _ = flush_file(&upper_file, &real_file);
+                if let Some((upper_dir, real_dir)) = wd_map.get(&event.wd).cloned() {
+                    let upper_path = upper_dir.join(filename);
+                    let real_path = real_dir.join(filename);
+
+                    if (event.mask & libc::IN_ISDIR) != 0 {
+                        // The sandbox created or renamed a directory into place.
+                        // Add a watch so we catch writes to files inside it.
+                        if (event.mask & (libc::IN_CREATE | libc::IN_MOVED_TO)) != 0 {
+                            add_inotify_watches(inotify_fd, &upper_path, &real_path, &mut wd_map, 4);
+                        }
+                    } else {
+                        // File write/rename event: flush if in write_set or under an rw_dir.
+                        let under_rw = rw_dirs.iter().any(|d| real_path.starts_with(d));
+                        if (write_set.contains(&real_path) || under_rw)
+                            && upper_path.is_file()
+                            && !is_overlay_whiteout(&upper_path)
+                        {
+                            let _ = flush_file(&upper_path, &real_path);
+                        }
                     }
                 }
             }
@@ -616,15 +676,31 @@ fn run_watcher(
     unsafe { libc::close(inotify_fd) };
 }
 
-fn final_flush_overlay(overlay: &OverlayMount, write_set: &HashSet<PathBuf>) {
-    flush_upper_recursive(&overlay.upper_dir, &overlay.real_dir, write_set);
+fn final_flush_overlay(
+    overlay: &OverlayMount,
+    write_set: &HashSet<PathBuf>,
+    rw_dirs: &HashSet<PathBuf>,
+) {
+    flush_upper_recursive(&overlay.upper_dir, &overlay.real_dir, write_set, rw_dirs);
 }
 
-/// Recursively walk the upper layer and flush write-set files back to the
-/// real filesystem.  Needed because nested overlay dirs are collapsed into
-/// the outermost ancestor's overlay, placing files in subdirectories of
-/// `upper/` rather than as direct children.
-fn flush_upper_recursive(upper_dir: &Path, real_dir: &Path, write_set: &HashSet<PathBuf>) {
+/// Recursively walk the upper layer and flush files back to the real filesystem.
+///
+/// A file in the upper layer is flushed when its real path is either:
+/// - Listed in `write_set` (an individual file from the `read_write` config), or
+/// - Inside a directory in `rw_dirs` (a directory from the `read_write` config).
+///
+/// Overlay whiteout entries (deleted files) are skipped — flushing them would
+/// truncate the real file to zero bytes.
+///
+/// New directories created by the sandbox process are created on the real
+/// filesystem as needed before their contents are flushed.
+fn flush_upper_recursive(
+    upper_dir: &Path,
+    real_dir: &Path,
+    write_set: &HashSet<PathBuf>,
+    rw_dirs: &HashSet<PathBuf>,
+) {
     let entries = match std::fs::read_dir(upper_dir) {
         Ok(e) => e,
         Err(_) => return,
@@ -636,11 +712,27 @@ fn flush_upper_recursive(upper_dir: &Path, real_dir: &Path, write_set: &HashSet<
             // Skip overlay whiteout entries: they are zero-size files with the
             // user.overlay.whiteout xattr that represent deletions inside the
             // sandbox.  Flushing them would truncate the real file to zero bytes.
-            if write_set.contains(&real_path) && !is_overlay_whiteout(&upper_path) {
+            let under_rw = rw_dirs.iter().any(|d| real_path.starts_with(d));
+            if (write_set.contains(&real_path) || under_rw)
+                && !is_overlay_whiteout(&upper_path)
+            {
+                // Ensure the parent directory exists on the real filesystem.
+                // The sandbox may have created new subdirectories under an rw_dir.
+                if let Some(parent) = real_path.parent() {
+                    if !parent.exists() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                }
                 let _ = flush_file(&upper_path, &real_path);
             }
         } else if upper_path.is_dir() {
-            flush_upper_recursive(&upper_path, &real_path, write_set);
+            // If this directory is new (doesn't exist on the real FS) and is
+            // inside an rw_dir, create it so files within can be flushed.
+            let under_rw = rw_dirs.iter().any(|d| real_path.starts_with(d) || *d == real_path);
+            if under_rw && !real_path.exists() {
+                let _ = std::fs::create_dir_all(&real_path);
+            }
+            flush_upper_recursive(&upper_path, &real_path, write_set, rw_dirs);
         }
     }
 }
@@ -652,7 +744,7 @@ fn flush_upper_recursive(upper_dir: &Path, real_dir: &Path, write_set: &HashSet<
 /// exits; this function only handles staging directory cleanup and ensures any
 /// writes not caught by inotify are flushed to the real inodes.
 pub fn teardown(handle: OverlayHandle) {
-    let OverlayHandle { shutdown_tx, mut thread, overlays, write_set } = handle;
+    let OverlayHandle { shutdown_tx, mut thread, overlays, write_set, rw_dirs } = handle;
     let _ = shutdown_tx.send(());
     if let Some(t) = thread.take() {
         let _ = t.join();
@@ -660,7 +752,7 @@ pub fn teardown(handle: OverlayHandle) {
     // Final flush: catch any writes that arrived between the last inotify event
     // delivery and process exit.
     for overlay in &overlays {
-        final_flush_overlay(overlay, &write_set);
+        final_flush_overlay(overlay, &write_set, &rw_dirs);
     }
     // Clean up staging directories. Overlayfs mounts are already gone —
     // they existed only inside the child's mount namespace.

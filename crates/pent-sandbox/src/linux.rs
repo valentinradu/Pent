@@ -475,6 +475,13 @@ pub fn spawn_with_landlock(
         .collect();
     let write_set: HashSet<PathBuf> = overlay_file_paths.iter().cloned().collect();
 
+    // Directory-type read_write entries: all files created or modified inside
+    // these directories during the session should be flushed back to the real FS.
+    let rw_dirs: HashSet<PathBuf> = rw_expanded
+        .iter()
+        .filter_map(|(path, _)| if path.is_dir() { Some(path.clone()) } else { None })
+        .collect();
+
     // Build the set of paths the sandboxed process is allowed to read.
     // Traversal-only paths are intentionally excluded (ReadDir but not ReadFile).
     let mut accessible: HashSet<PathBuf> = HashSet::new();
@@ -1024,7 +1031,7 @@ pub fn spawn_with_landlock(
     let overlay_handle = if overlay_mounts.is_empty() {
         None
     } else {
-        Some(super::linux_overlayfs::spawn_watcher(overlay_mounts, write_set))
+        Some(super::linux_overlayfs::spawn_watcher(overlay_mounts, write_set, rw_dirs))
     };
 
     Ok((child, overlay_handle, proxy_netns))
