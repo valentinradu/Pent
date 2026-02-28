@@ -1309,6 +1309,286 @@ mod tests {
         }
     }
 
+    // ========================================================================
+    // Overlay flush correctness tests
+    //
+    // These tests verify that writes made inside the sandbox are flushed back
+    // to the real filesystem on teardown.  All tests use /tmp (always rw, no
+    // network required) and fall back gracefully when overlayfs is unavailable.
+    // ========================================================================
+
+    /// Helper: spawn a sandboxed shell command with the given read_write paths
+    /// and return (child, overlay_handle).  Falls back gracefully when the
+    /// kernel does not support user namespaces or overlayfs.
+    #[cfg(target_os = "linux")]
+    fn spawn_rw(
+        workspace: &std::path::Path,
+        rw_paths: &[&str],
+        cmd: &str,
+    ) -> Option<(std::process::Child, Option<crate::linux_overlayfs::OverlayHandle>)> {
+        use std::collections::HashMap;
+
+        if check_available().is_err() {
+            return None;
+        }
+
+        let mut paths = SandboxPaths::default();
+        for p in rw_paths {
+            paths.read_write.push((*p).to_string());
+        }
+
+        let config = SandboxConfig::new(workspace.to_path_buf(), paths, workspace.to_path_buf())
+            .with_data_dir(workspace.to_path_buf())
+            .with_env(HashMap::new());
+
+        let path_dirs = vec![PathBuf::from("/bin"), PathBuf::from("/usr/bin")];
+
+        match spawn_with_landlock(&config, "/bin/sh", &["-c".to_string(), cmd.to_string()], &HashMap::new(), &path_dirs) {
+            Ok((child, handle, _netns)) => Some((child, handle)),
+            Err(SandboxError::SpawnFailed(e)) if e.kind() == std::io::ErrorKind::PermissionDenied => None,
+            Err(e) => panic!("spawn_with_landlock failed: {:?}", e),
+        }
+    }
+
+    /// Run `spawn_rw`, wait for the child, call teardown, then return whether
+    /// the overlay was active (Some handle → true, None → false).
+    #[cfg(target_os = "linux")]
+    fn run_sandboxed_rw(workspace: &std::path::Path, rw_paths: &[&str], cmd: &str) -> bool {
+        let Some((mut child, overlay_handle)) = spawn_rw(workspace, rw_paths, cmd) else {
+            return false;
+        };
+        let status = child.wait().expect("wait failed");
+        assert!(status.success(), "sandboxed command failed: {cmd}");
+        if let Some(handle) = overlay_handle {
+            crate::linux_overlayfs::teardown(handle);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Modify an existing file that is listed directly in read_write (file-level
+    /// entry).  This is the original write_set path.
+    #[test]
+    #[serial]
+    #[cfg(target_os = "linux")]
+    fn test_overlay_flush_direct_file_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("config.json");
+        std::fs::write(&target, r#"{"v":1}"#).unwrap();
+
+        let active = run_sandboxed_rw(
+            temp.path(),
+            &[target.to_str().unwrap()],
+            &format!("printf '{{\"v\":2}}' > '{}'", target.display()),
+        );
+        if !active { return; }
+
+        let content = std::fs::read_to_string(&target).unwrap();
+        assert_eq!(content, r#"{"v":2}"#, "direct file-level write_set entry must be flushed");
+    }
+
+    /// Modify a file inside a directory listed in read_write (directory-level
+    /// entry — the rw_dirs path that was broken before this fix).
+    #[test]
+    #[serial]
+    #[cfg(target_os = "linux")]
+    fn test_overlay_flush_file_inside_rw_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("mydir");
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("settings.json");
+        std::fs::write(&target, r#"{"v":1}"#).unwrap();
+
+        let active = run_sandboxed_rw(
+            temp.path(),
+            &[dir.to_str().unwrap()],   // directory, not file
+            &format!("printf '{{\"v\":2}}' > '{}'", target.display()),
+        );
+        if !active { return; }
+
+        let content = std::fs::read_to_string(&target).unwrap();
+        assert_eq!(content, r#"{"v":2}"#, "file inside rw_dir must be flushed");
+    }
+
+    /// Modify multiple files inside the same rw directory in one session.
+    #[test]
+    #[serial]
+    #[cfg(target_os = "linux")]
+    fn test_overlay_flush_multiple_files_in_rw_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("store");
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.txt");
+        let b = dir.join("b.txt");
+        std::fs::write(&a, "old-a").unwrap();
+        std::fs::write(&b, "old-b").unwrap();
+
+        let cmd = format!(
+            "printf 'new-a' > '{}' && printf 'new-b' > '{}'",
+            a.display(), b.display()
+        );
+        let active = run_sandboxed_rw(temp.path(), &[dir.to_str().unwrap()], &cmd);
+        if !active { return; }
+
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "new-a", "a.txt must be flushed");
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "new-b", "b.txt must be flushed");
+    }
+
+    /// Create a new file inside an rw directory (file did not exist at spawn time).
+    #[test]
+    #[serial]
+    #[cfg(target_os = "linux")]
+    fn test_overlay_flush_newly_created_file_in_rw_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("newdir");
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("created.txt");
+        assert!(!target.exists());
+
+        let active = run_sandboxed_rw(
+            temp.path(),
+            &[dir.to_str().unwrap()],
+            &format!("printf 'hello' > '{}'", target.display()),
+        );
+        if !active { return; }
+
+        assert!(target.exists(), "newly created file must exist on real FS after teardown");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "hello");
+    }
+
+    /// Create a new subdirectory and file inside an rw directory.
+    /// The subdirectory did not exist at spawn time.
+    #[test]
+    #[serial]
+    #[cfg(target_os = "linux")]
+    fn test_overlay_flush_file_in_new_subdir() {
+        let temp = tempfile::tempdir().unwrap();
+        let rw_dir = temp.path().join("data");
+        std::fs::create_dir_all(&rw_dir).unwrap();
+        // subdir does NOT exist at spawn time
+        let subdir = rw_dir.join("projects").join("alpha");
+        let target = subdir.join("state.json");
+
+        let cmd = format!(
+            "mkdir -p '{}' && printf '{{\"ok\":true}}' > '{}'",
+            subdir.display(), target.display()
+        );
+        let active = run_sandboxed_rw(temp.path(), &[rw_dir.to_str().unwrap()], &cmd);
+        if !active { return; }
+
+        assert!(subdir.exists(), "new subdirectory must exist on real FS after teardown");
+        assert!(target.exists(), "file in new subdir must be flushed to real FS");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), r#"{"ok":true}"#);
+    }
+
+    /// Atomic write (write-to-tmp then rename) inside an rw directory.
+    #[test]
+    #[serial]
+    #[cfg(target_os = "linux")]
+    fn test_overlay_flush_atomic_write_in_rw_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("cfg");
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("config.toml");
+        std::fs::write(&target, "version = 1").unwrap();
+        let tmp = dir.join("config.toml.tmp");
+
+        let cmd = format!(
+            "printf 'version = 2' > '{}' && mv '{}' '{}'",
+            tmp.display(), tmp.display(), target.display()
+        );
+        let active = run_sandboxed_rw(temp.path(), &[dir.to_str().unwrap()], &cmd);
+        if !active { return; }
+
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "version = 2",
+            "atomic write (tmp→rename) in rw_dir must be flushed");
+    }
+
+    /// Mix of a direct file entry and a directory entry in the same session.
+    #[test]
+    #[serial]
+    #[cfg(target_os = "linux")]
+    fn test_overlay_flush_mixed_file_and_dir_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let file_entry = temp.path().join("config.json");
+        let dir_entry = temp.path().join("cache");
+        std::fs::write(&file_entry, "old").unwrap();
+        std::fs::create_dir_all(&dir_entry).unwrap();
+        let cache_file = dir_entry.join("data.bin");
+        std::fs::write(&cache_file, "stale").unwrap();
+
+        let cmd = format!(
+            "printf 'new' > '{}' && printf 'fresh' > '{}'",
+            file_entry.display(), cache_file.display()
+        );
+        let active = run_sandboxed_rw(
+            temp.path(),
+            &[file_entry.to_str().unwrap(), dir_entry.to_str().unwrap()],
+            &cmd,
+        );
+        if !active { return; }
+
+        assert_eq!(std::fs::read_to_string(&file_entry).unwrap(), "new",
+            "direct file entry must be flushed");
+        assert_eq!(std::fs::read_to_string(&cache_file).unwrap(), "fresh",
+            "file inside directory entry must be flushed");
+    }
+
+    /// Append to an existing file inside an rw directory.
+    #[test]
+    #[serial]
+    #[cfg(target_os = "linux")]
+    fn test_overlay_flush_append_to_file_in_rw_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("logs");
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("app.log");
+        std::fs::write(&target, "line1\n").unwrap();
+
+        let active = run_sandboxed_rw(
+            temp.path(),
+            &[dir.to_str().unwrap()],
+            &format!("printf 'line2\\n' >> '{}'", target.display()),
+        );
+        if !active { return; }
+
+        let content = std::fs::read_to_string(&target).unwrap();
+        assert_eq!(content, "line1\nline2\n", "appended content must be flushed");
+    }
+
+    /// Files in a directory NOT in read_write must NOT be flushed to the real FS.
+    #[test]
+    #[serial]
+    #[cfg(target_os = "linux")]
+    fn test_overlay_no_flush_for_non_rw_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let rw_dir = temp.path().join("allowed");
+        let other_dir = temp.path().join("forbidden");
+        std::fs::create_dir_all(&rw_dir).unwrap();
+        std::fs::create_dir_all(&other_dir).unwrap();
+
+        // Create a file in both dirs so we have real inodes in both.
+        let allowed_file = rw_dir.join("ok.txt");
+        let forbidden_file = other_dir.join("secret.txt");
+        std::fs::write(&allowed_file, "original-allowed").unwrap();
+        std::fs::write(&forbidden_file, "original-secret").unwrap();
+
+        // The sandbox only gets read_write on rw_dir, not other_dir.
+        // Writing to other_dir from the sandbox should not touch the real file.
+        let cmd = format!(
+            "printf 'modified-allowed' > '{}'; printf 'should-not-persist' > '{}' 2>/dev/null; true",
+            allowed_file.display(), forbidden_file.display()
+        );
+        let active = run_sandboxed_rw(temp.path(), &[rw_dir.to_str().unwrap()], &cmd);
+        if !active { return; }
+
+        assert_eq!(std::fs::read_to_string(&allowed_file).unwrap(), "modified-allowed",
+            "rw_dir file must be flushed");
+        assert_eq!(std::fs::read_to_string(&forbidden_file).unwrap(), "original-secret",
+            "non-rw_dir file must NOT be modified on real FS");
+    }
+
     #[test]
     #[serial]
     #[cfg(target_os = "linux")]
