@@ -519,9 +519,8 @@ pub fn spawn_with_landlock(
     // inner veth into it once the child signals readiness via pipe.
     let mut proxy_netns: Option<super::linux_netns::NetnsHandle> =
         if let NetworkMode::ProxyOnly { dns_port, .. } = &config.network {
-            let mut ns_config = super::linux_netns::NetnsConfig::from_pid();
-            ns_config.dns_port = *dns_port;
-            Some(super::linux_netns::create_netns(&ns_config)?)
+            let ns_config = super::linux_netns::NetnsConfig::from_pid();
+            Some(super::linux_netns::create_netns(&ns_config, *dns_port)?)
         } else {
             None
         };
@@ -687,14 +686,19 @@ pub fn spawn_with_landlock(
                 // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                 super::linux_overlayfs::mount_overlays(&overlay_mounts_pre)?;
             } else if proxy_ready_w >= 0 {
-                // ProxyOnly without overlays: unshare user+net namespace now so
-                // the pipe-sync below can configure the inner veth before Landlock.
+                // ProxyOnly without overlays: unshare user+net+mount namespace.
+                // CLONE_NEWNS is required so that:
+                //   1. We can mount a tmpfs on /run for the iptables lock file.
+                //   2. We can bind-mount a custom /etc/resolv.conf.
+                // Both are scoped to this mount namespace and invisible to the host.
                 // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                 let uid = libc::getuid();
                 // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                 let gid = libc::getgid();
                 // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-                let ret = libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET);
+                let ret = libc::unshare(
+                    libc::CLONE_NEWUSER | libc::CLONE_NEWNET | libc::CLONE_NEWNS,
+                );
                 if ret != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
@@ -746,6 +750,17 @@ pub fn spawn_with_landlock(
                     "route", "add", "default", "via", &proxy_gateway,
                 ])
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+                // ── resolv.conf inside child namespace ────────────────────────
+                // Point /etc/resolv.conf at the host-side veth IP (outer_ip).
+                // DNS queries to port 53 on that IP are intercepted by the
+                // host-side nft PREROUTING rule (created in create_netns) and
+                // redirected to the proxy's DNS server port.
+                if let NetworkMode::ProxyOnly { dns_port, .. } = &network {
+                    if *dns_port != 0 {
+                        super::linux_netns::setup_child_dns(&proxy_gateway, *dns_port);
+                    }
+                }
             }
 
             // ── Phase 2: Landlock ─────────────────────────────────────────────
@@ -814,6 +829,8 @@ pub fn spawn_with_landlock(
             // can read/write through the overlayfs mount point. Inside the
             // namespace, writes go to upper (tmpfs); the real filesystem only
             // sees changes when the parent's watcher flushes write_set files.
+            // The overlay's opaque/whiteout stubs protect non-manifest content;
+            // if the mount failed, pre_exec already returned an error above.
             for dir in &overlay_dirs_pre {
                 add_path(&mut ruleset, dir, write_access)?;
             }

@@ -52,7 +52,6 @@ pub enum NetworkMode {
     /// Unrestricted network access.
     Unrestricted,
     /// Only loopback (127.0.0.1 / ::1) is reachable.
-    #[default]
     LocalhostOnly,
     /// Route all traffic through a local proxy at the given address.
     ///
@@ -68,6 +67,7 @@ pub enum NetworkMode {
         dns_port: u16,
     },
     /// No network access at all.
+    #[default]
     Blocked,
 }
 

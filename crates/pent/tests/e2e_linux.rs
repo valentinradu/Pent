@@ -41,10 +41,11 @@ mod linux {
     /// RAII guard: adds uid-restricted routing tables at priority 9990 on
     /// construction, removes them on drop.
     ///
-    /// On systems with uid-based VPN routing (e.g. Tailscale MagicDNS via
-    /// table 52 with uid 1000) those tables are invisible to root.  We
-    /// temporarily inject `from all lookup <table> priority 9990` for each
-    /// non-system table so the pent proxy can reach the name servers.
+    /// On systems with uid-based policy routing (e.g. VPN or tunnel software
+    /// that installs routes only visible to the owning uid) those tables are
+    /// invisible to root.  We temporarily inject
+    /// `from all lookup <table> priority 9990` for each non-system table so
+    /// the pent proxy can reach the name servers.
     struct RoutingGuard(Vec<u32>);
 
     impl RoutingGuard {

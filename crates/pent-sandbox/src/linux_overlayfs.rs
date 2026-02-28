@@ -173,9 +173,22 @@ fn populate_upper_stubs(
             Err(_) => continue,
         };
 
-        // Symlinks: skip — resolving them safely is complex and they are
-        // uncommon in the configs we target.
         if ft.is_symlink() {
+            // Symlinks that point into an accessible subtree pass through.
+            // All others get a whiteout/stub so the child cannot follow them
+            // into non-manifest content.
+            if accessible.contains(&real_path) || is_in_accessible_subtree(&real_path, accessible) {
+                continue; // accessible symlink — lower shows through
+            }
+            if use_xwhiteout {
+                if std::fs::File::create(&upper_path).is_ok() {
+                    let _ = set_xattr(&upper_path, "user.overlay.whiteout", b"");
+                    upper_has_xwhiteouts = true;
+                }
+            } else {
+                // Kernel < 6.7: empty file stub shadows the symlink.
+                let _ = std::fs::File::create(&upper_path);
+            }
             continue;
         }
 
@@ -299,16 +312,19 @@ pub fn prepare_overlay_dirs(
 
 /// Mount overlayfs for each entry in `overlays`.
 ///
+/// All mount failures are fatal.  If the overlayfs cannot be established for
+/// any directory, an error is returned immediately and the spawn must be
+/// aborted.  Silently degrading to a sandbox without overlayfs protection
+/// would leave the broad `write_access` Landlock rule (covering the entire
+/// parent directory) in place without the overlay's opaque stubs to limit
+/// what content the child can actually reach — a security violation.
+///
 /// # Safety
 ///
 /// Must be called in a post-fork, single-threaded child process that has already
 /// called `unshare(CLONE_NEWUSER | CLONE_NEWNS)` and written the UID/GID mappings.
 /// These mounts exist **only** in the child's mount namespace; the parent process
 /// sees the original directories untouched.
-///
-/// If overlayfs is unavailable (kernel module not loaded) or a mount fails for a
-/// non-fatal reason (`ENODEV`, `ENOSYS`, `EPERM`), the error is silently ignored
-/// and the sandbox continues without inode protection for that directory.
 pub unsafe fn mount_overlays(overlays: &[OverlayMount]) -> std::io::Result<()> {
     for overlay in overlays {
         if !overlay.real_dir.is_dir() {
@@ -350,19 +366,10 @@ pub unsafe fn mount_overlays(overlays: &[OverlayMount]) -> std::io::Result<()> {
         );
 
         if ret != 0 {
-            let err = std::io::Error::last_os_error();
-            // Non-fatal: overlayfs module not loaded, unprivileged user
-            // namespaces disabled, or filesystem/LSM doesn't allow the mount.
-            // Skip gracefully — sandbox runs without inode protection for this
-            // directory. EACCES can occur when the filesystem doesn't support
-            // user xattrs or when an LSM (AppArmor etc.) denies the mount.
-            match err.raw_os_error() {
-                Some(libc::ENODEV)
-                | Some(libc::ENOSYS)
-                | Some(libc::EPERM)
-                | Some(libc::EACCES) => continue,
-                _ => return Err(err),
-            }
+            // All failures are fatal. Without the overlay, the broad write_access
+            // Landlock rule on the parent directory would grant ReadFile access
+            // to all siblings of the write-listed files — a security violation.
+            return Err(std::io::Error::last_os_error());
         }
     }
     Ok(())

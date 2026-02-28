@@ -13,9 +13,9 @@ async fn main() {
     let run_mode = matches!(cli.command, Command::Run(_));
     setup_tracing(cli.verbose, run_mode);
 
-    // Note: CAP_NET_ADMIN should be set on the iptables binary via:
-    //   sudo setcap cap_net_admin=eip /usr/sbin/iptables
-    // This allows pent to run as unprivileged user while still manipulating iptables rules.
+    // Note: CAP_NET_ADMIN should be set on the pent binary via:
+    //   sudo setcap cap_net_admin=eip $(which pent)
+    // This allows pent to create veth pairs for network proxying without sudo.
 
     let result = dispatch(cli).await;
     if let Err(e) = result {

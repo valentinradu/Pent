@@ -45,18 +45,19 @@ build-release:
 
 install:
 	cargo install --path crates/pent --force
-	@echo ""; \
-	echo "pent uses iptables for network proxying, which requires CAP_NET_ADMIN."; \
-	echo "This capability must be set once on your system's iptables binary."; \
-	echo "Your password will be used to run setcap on /usr/sbin/iptables."; \
+	@PENT_BIN=$$(which pent); \
+	echo ""; \
+	echo "pent uses veth pairs for network proxying, which requires CAP_NET_ADMIN."; \
+	echo "This capability must be set once on the pent binary."; \
+	echo "Your password will be used to run setcap on $$PENT_BIN."; \
 	echo "Skip this if you only need filesystem sandboxing (proxy mode won't work)."; \
 	read -r -p "Enable network proxying? [Y/n] " REPLY; \
 	case "$$REPLY" in \
 		[nN]*) \
-			echo "Skipped. To enable later: sudo setcap cap_net_admin=eip /usr/sbin/iptables" ;; \
+			echo "Skipped. To enable later: sudo setcap cap_net_admin=eip $$PENT_BIN" ;; \
 		*) \
-			sudo setcap cap_net_admin=eip /usr/sbin/iptables && \
-			echo "Successfully set CAP_NET_ADMIN on /usr/sbin/iptables" ;; \
+			sudo setcap cap_net_admin=eip "$$PENT_BIN" && \
+			echo "Successfully set CAP_NET_ADMIN on $$PENT_BIN" ;; \
 	esac
 
 test:

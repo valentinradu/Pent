@@ -73,7 +73,7 @@ pub struct SandboxConfig {
 }
 
 impl SandboxConfig {
-    /// Create a new sandbox config with default network mode (`LocalhostOnly`).
+    /// Create a new sandbox config with default network mode (`Blocked`).
     ///
     /// # Arguments
     /// * `workspace` - Workspace directory (read-write)
@@ -147,7 +147,7 @@ mod tests {
         );
 
         assert_eq!(config.workspace, PathBuf::from("/workspace"));
-        assert_eq!(config.network, NetworkMode::LocalhostOnly);
+        assert_eq!(config.network, NetworkMode::Blocked);
     }
 
     #[test]

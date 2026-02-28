@@ -30,7 +30,6 @@
 use crate::SandboxError;
 use std::net::Ipv4Addr;
 use std::os::unix::process::CommandExt;
-use tracing::{debug, warn};
 
 /// Network namespace configuration.
 #[derive(Debug, Clone)]
@@ -46,13 +45,6 @@ pub struct NetnsConfig {
 
     /// Subnet prefix length (e.g., 24 for /24).
     pub prefix_len: u8,
-
-    /// Port the proxy's DNS server is listening on (bound to 0.0.0.0).
-    /// When non-zero, a PREROUTING REDIRECT rule is added so that DNS queries
-    /// from the child (directed at any address, port 53) are transparently
-    /// redirected to the proxy's resolver — without modifying any global
-    /// system settings (no ip_forward, no default-route changes).
-    pub dns_port: u16,
 }
 
 impl NetnsConfig {
@@ -79,7 +71,6 @@ impl NetnsConfig {
             inner_ip: Ipv4Addr::new(10, 200, octet, 2),
             outer_ip: Ipv4Addr::new(10, 200, octet, 1),
             prefix_len: 24,
-            dns_port: 0,
         }
     }
 }
@@ -103,13 +94,28 @@ pub struct NetnsHandle {
     pub inner_cidr: String,
     veth_outer: String,
     outer_cidr: String,
-    /// DNS redirect port — non-zero when PREROUTING REDIRECT rules were added.
-    dns_port: u16,
+    /// Name of the per-instance nft table used for DNS PREROUTING redirect
+    /// (e.g. "pent_dns_12345"). Empty if DNS redirect was not set up.
+    nft_dns_table: String,
 }
 
 impl Drop for NetnsHandle {
     fn drop(&mut self) {
         use std::process::Command;
+
+        let log_cleanup = |label: &str, result: std::io::Result<std::process::Output>| {
+            match result {
+                Ok(out) if !out.status.success() => {
+                    tracing::debug!(
+                        cmd = label,
+                        stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+                        "cleanup command failed (may be expected if resource already removed)"
+                    );
+                }
+                Err(e) => tracing::warn!(cmd = label, err = %e, "failed to run cleanup command"),
+                _ => {}
+            }
+        };
 
         // Delete the outer veth. If the child's namespace is already gone the
         // inner veth (and thus the outer peer) may already be deleted — that's
@@ -119,17 +125,21 @@ impl Drop for NetnsHandle {
         // SAFETY: raise_net_admin_ambient uses only async-signal-safe syscalls.
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { del.pre_exec(raise_net_admin_ambient) };
-        let _ = del.output();
+        log_cleanup("ip link del", del.output());
 
         if let Some(h) = nft_find_iface_rule_handle("input", "iifname", &self.veth_outer) {
-            let _ = Command::new("nft")
-                .args(["delete", "rule", "inet", "filter", "input", "handle", &h.to_string()])
-                .output();
+            let mut cmd = Command::new("nft");
+            cmd.args(["delete", "rule", "inet", "filter", "input", "handle", &h.to_string()]);
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            unsafe { cmd.pre_exec(raise_net_admin_ambient) };
+            log_cleanup("nft delete rule input", cmd.output());
         }
         if let Some(h) = nft_find_iface_rule_handle("output", "oifname", &self.veth_outer) {
-            let _ = Command::new("nft")
-                .args(["delete", "rule", "inet", "filter", "output", "handle", &h.to_string()])
-                .output();
+            let mut cmd = Command::new("nft");
+            cmd.args(["delete", "rule", "inet", "filter", "output", "handle", &h.to_string()]);
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            unsafe { cmd.pre_exec(raise_net_admin_ambient) };
+            log_cleanup("nft delete rule output", cmd.output());
         }
 
         // Remove INPUT ACCEPT rule for the veth.
@@ -138,59 +148,27 @@ impl Drop for NetnsHandle {
             cmd.args(["-D", "INPUT", "-i", &self.veth_outer, "-j", "ACCEPT"]);
             // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe { cmd.pre_exec(raise_net_admin_ambient) };
-            let _ = cmd.output();
+            log_cleanup("iptables -D INPUT", cmd.output());
         }
 
-        // Remove PREROUTING REDIRECT rules for DNS if they were added.
-        if self.dns_port != 0 {
-            let dns_port_str = self.dns_port.to_string();
-            for proto in &["udp", "tcp"] {
-                let mut cmd = Command::new("iptables");
-                cmd.args([
-                    "-t", "nat", "-D", "PREROUTING",
-                    "-i", &self.veth_outer,
-                    "-p", proto, "--dport", "53",
-                    "-j", "REDIRECT", "--to-port", &dns_port_str,
-                ]);
-                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-                unsafe { cmd.pre_exec(raise_net_admin_ambient) };
-                match cmd.output() {
-                    Ok(output) => {
-                        if !output.status.success() {
-                            let stderr = String::from_utf8_lossy(&output.stderr);
-                            let err_str = stderr.trim();
-                            warn!(
-                                proto = proto,
-                                veth = %self.veth_outer,
-                                stderr = %err_str,
-                                "could not remove iptables PREROUTING rule"
-                            );
-                            // Check for capability errors
-                            if err_str.contains("xtables.lock") || err_str.contains("Permission denied") {
-                                warn!(
-                                    "pent binary is missing CAP_NET_ADMIN capability or it's not set with inheritable flag. \
-                                     To fix: sudo setcap cap_net_admin=eip $(which pent) \
-                                     Or reinstall with: make install"
-                                );
-                            }
-                        } else {
-                            debug!(proto = proto, veth = %self.veth_outer, "iptables rule removed");
-                        }
-                    }
-                    Err(e) => {
-                        warn!(
-                            error = %e,
-                            veth = %self.veth_outer,
-                            "could not run iptables to remove DNS redirect rule"
-                        );
-                    }
-                }
-            }
+        // Remove policy routing rule that bypasses VPN/tunnel policy routes for
+        // the veth subnet.
+        {
+            let mut cmd = Command::new("ip");
+            cmd.args(["rule", "del", "to", &self.outer_cidr, "table", "main", "priority", "100"]);
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            unsafe { cmd.pre_exec(raise_net_admin_ambient) };
+            log_cleanup("ip rule del", cmd.output());
         }
 
-        let _ = Command::new("ip")
-            .args(["rule", "del", "to", &self.outer_cidr, "table", "main", "priority", "100"])
-            .output();
+        // Delete the per-instance nft DNS redirect table.
+        if !self.nft_dns_table.is_empty() {
+            let mut cmd = Command::new("nft");
+            cmd.args(["delete", "table", "ip", &self.nft_dns_table]);
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            unsafe { cmd.pre_exec(raise_net_admin_ambient) };
+            log_cleanup("nft delete table dns", cmd.output());
+        }
     }
 }
 
@@ -282,63 +260,6 @@ pub(crate) fn raise_net_admin_ambient() -> std::io::Result<()> {
     Ok(())
 }
 
-/// Test if we can raise CAP_NET_ADMIN as ambient.
-///
-/// This is called early to diagnose capability issues before iptables fails.
-fn test_ambient_capability() -> Result<(), String> {
-    const CAP_NET_ADMIN: u32 = 12;
-    const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
-    const PR_CAP_AMBIENT: libc::c_int = 47;
-    const PR_CAP_AMBIENT_RAISE: libc::c_ulong = 2;
-
-    #[repr(C)]
-    struct CapHeader {
-        version: u32,
-        pid: libc::c_int,
-    }
-    #[repr(C)]
-    #[derive(Copy, Clone)]
-    struct CapData {
-        effective: u32,
-        permitted: u32,
-        inheritable: u32,
-    }
-
-    // SAFETY: capget syscall is safe with valid pointers.
-    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-    unsafe {
-        let mut hdr = CapHeader { version: LINUX_CAPABILITY_VERSION_3, pid: 0 };
-        let mut data = [CapData { effective: 0, permitted: 0, inheritable: 0 }; 2];
-
-        if libc::syscall(libc::SYS_capget, &mut hdr as *mut _, data.as_mut_ptr()) != 0 {
-            return Err("capget failed".to_string());
-        }
-
-        let cap_bit = 1u32 << CAP_NET_ADMIN;
-        if (data[0].effective & cap_bit) == 0 {
-            return Err(format!(
-                "CAP_NET_ADMIN not in effective set (effective=0x{:x}, permitted=0x{:x}). \
-                 Run: sudo setcap cap_net_admin=eip $(which pent)",
-                data[0].effective, data[0].permitted
-            ));
-        }
-        if (data[0].inheritable & cap_bit) == 0 {
-            return Err(format!(
-                "CAP_NET_ADMIN not in inheritable set (inheritable=0x{:x}). \
-                 Run: sudo setcap cap_net_admin=eip $(which pent) (note the 'i' flag)",
-                data[0].inheritable
-            ));
-        }
-
-        // Try to raise as ambient to verify it works
-        if libc::prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, CAP_NET_ADMIN as libc::c_ulong, 0, 0) != 0 {
-            return Err("prctl(CAP_AMBIENT_RAISE) failed: ambient capabilities may not be supported".to_string());
-        }
-    }
-
-    Ok(())
-}
-
 /// Check if running with sufficient privileges for network namespaces.
 ///
 /// # Errors
@@ -373,9 +294,9 @@ pub fn check_netns_privileges() -> Result<(), SandboxError> {
     }
 
     Err(SandboxError::PrivilegeRequired(
-        "ProxyOnly mode on Linux requires CAP_NET_ADMIN to create the veth bridge \
+        "ProxyOnly mode on Linux requires CAP_NET_ADMIN to create the veth pair \
          between the sandbox and the proxy. \
-         Run: sudo setcap cap_net_admin=ep $(which pent)\n\
+         Run: sudo setcap cap_net_admin=eip $(which pent)\n\
          Or use --network localhost/blocked which do not require elevated privileges.".to_string()
     ))
 }
@@ -389,28 +310,21 @@ pub fn check_netns_privileges() -> Result<(), SandboxError> {
 /// `move_inner_veth_to_pid`. The child configures its end via `run_ip_local`
 /// while still inside pre_exec (before Landlock is applied).
 ///
+/// `dns_port` is the port of the proxy's DNS server (bound on 0.0.0.0). If
+/// non-zero, a per-instance nft PREROUTING REDIRECT table is created so that
+/// DNS queries (UDP/TCP port 53) arriving from the child on the outer veth are
+/// redirected to the proxy DNS server. This runs in the initial user namespace
+/// with ambient `CAP_NET_ADMIN`, so nft NAT works correctly.
+///
 /// Dropping the handle removes firewall/routing rules and the outer veth.
 ///
 /// # Errors
 /// * `PrivilegeRequired` — if `CAP_NET_ADMIN` is absent
 /// * `NetworkSetupFailed` — if any setup step fails
-pub fn create_netns(config: &NetnsConfig) -> Result<NetnsHandle, SandboxError> {
+pub fn create_netns(config: &NetnsConfig, dns_port: u16) -> Result<NetnsHandle, SandboxError> {
     use std::process::Command;
 
     check_netns_privileges()?;
-
-    // Test if we can raise CAP_NET_ADMIN as ambient before attempting iptables.
-    // Skip this test if running as root (we have all capabilities anyway).
-    // SAFETY: geteuid is always safe to call.
-    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-    let running_as_root = unsafe { libc::geteuid() } == 0;
-    if !running_as_root {
-        if let Err(e) = test_ambient_capability() {
-            warn!("capability test failed: {}", e);
-            warn!("DNS redirect rules may fail. Run: sudo setcap cap_net_admin=eip $(which pent)");
-            warn!("Note: the 'i' flag (inheritable) is required for ambient capabilities to work");
-        }
-    }
 
     let pid_str = config.name.strip_prefix("pent-").unwrap_or(&config.name);
     let veth_inner = format!("veth-{}-in", pid_str);
@@ -439,6 +353,27 @@ pub fn create_netns(config: &NetnsConfig) -> Result<NetnsHandle, SandboxError> {
         Ok(())
     };
 
+    let run_nft = |args: &[&str]| -> Result<(), SandboxError> {
+        let mut cmd = Command::new("nft");
+        cmd.args(args);
+        // SAFETY: pre_exec runs in a single-threaded fork child before exec;
+        // raise_net_admin_ambient uses only async-signal-safe syscalls.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe { cmd.pre_exec(raise_net_admin_ambient) };
+        let output = cmd.output().map_err(|e| {
+            SandboxError::NetworkSetupFailed(format!("failed to run nft: {}", e))
+        })?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(SandboxError::NetworkSetupFailed(format!(
+                "nft {} failed: {}",
+                args.join(" "),
+                stderr.trim()
+            )));
+        }
+        Ok(())
+    };
+
     // Create veth pair. Both ends start in the host namespace; the background
     // thread moves veth_inner to the child after it unshares.
     run_ip(&["link", "add", &veth_inner, "type", "veth", "peer", "name", &veth_outer])?;
@@ -453,120 +388,126 @@ pub fn create_netns(config: &NetnsConfig) -> Result<NetnsHandle, SandboxError> {
     }
 
     // Add a policy routing rule so that packets destined for the veth subnet
-    // are routed via the main table, bypassing any VPN policy routing rules.
-    let _ = Command::new("ip")
-        .args(["rule", "add", "to", &outer_cidr, "table", "main", "priority", "100"])
-        .output();
+    // are always routed via the main table. Without this, policy routing rules
+    // from VPNs, tunnels, or other tools (e.g. a default-route override with
+    // high priority) might route return traffic for the child through the wrong
+    // interface, causing the proxy ↔ child TCP connections to fail.
+    {
+        let mut cmd = Command::new("ip");
+        cmd.args(["rule", "add", "to", &outer_cidr, "table", "main", "priority", "100"]);
+        // SAFETY: raise_net_admin_ambient uses only async-signal-safe syscalls.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe { cmd.pre_exec(raise_net_admin_ambient) };
+        match cmd.output() {
+            Ok(out) if !out.status.success() => tracing::debug!(
+                stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+                "ip rule add for veth subnet failed; proxy connections may fail if \
+                 high-priority policy routing overrides the main table for this subnet"
+            ),
+            Err(e) => tracing::debug!(err = %e, "failed to run ip rule add"),
+            _ => {}
+        }
+    }
 
     // Allow traffic through the veth interface in the host firewall.
-    // nftables and iptables rules are added; failure is silently ignored since
-    // these tools may not be installed or the table may not exist.
-    // NOTE: interface names with hyphens must be quoted in nft rule language.
+    // nftables and iptables rules are added as a best-effort; failure is logged
+    // at debug level since these tools may not be installed or the default
+    // filter table may not exist on this system.
     // NOTE: All firewall commands need CAP_NET_ADMIN; we raise it as ambient.
-    let _ = Command::new("sh")
-        .arg("-c")
-        .arg(format!(
-            "nft insert rule inet filter input iifname '{}' accept",
-            veth_outer
-        ))
-        .output();
-    let _ = Command::new("sh")
-        .arg("-c")
-        .arg(format!(
-            "nft insert rule inet filter output oifname '{}' accept",
-            veth_outer
-        ))
-        .output();
+    {
+        let mut cmd = Command::new("nft");
+        cmd.args(["insert", "rule", "inet", "filter", "input",
+            &format!("iifname \"{}\" accept", veth_outer)]);
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe { cmd.pre_exec(raise_net_admin_ambient) };
+        match cmd.output() {
+            Ok(out) if !out.status.success() => tracing::debug!(
+                stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+                "nft insert rule input failed (no inet filter table?)"
+            ),
+            Err(e) => tracing::debug!(err = %e, "failed to run nft insert rule input"),
+            _ => {}
+        }
+    }
+    {
+        let mut cmd = Command::new("nft");
+        cmd.args(["insert", "rule", "inet", "filter", "output",
+            &format!("oifname \"{}\" accept", veth_outer)]);
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe { cmd.pre_exec(raise_net_admin_ambient) };
+        match cmd.output() {
+            Ok(out) if !out.status.success() => tracing::debug!(
+                stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+                "nft insert rule output failed (no inet filter table?)"
+            ),
+            Err(e) => tracing::debug!(err = %e, "failed to run nft insert rule output"),
+            _ => {}
+        }
+    }
     {
         let mut cmd = Command::new("iptables");
         cmd.args(["-I", "INPUT", "1", "-i", &veth_outer, "-j", "ACCEPT"]);
         // SAFETY: raise_net_admin_ambient uses only async-signal-safe syscalls.
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { cmd.pre_exec(raise_net_admin_ambient) };
-        let _ = cmd.output();
+        match cmd.output() {
+            Ok(out) if !out.status.success() => tracing::debug!(
+                stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+                "iptables -I INPUT failed"
+            ),
+            Err(e) => tracing::debug!(err = %e, "failed to run iptables -I INPUT"),
+            _ => {}
+        }
     }
 
-    // Redirect DNS queries (port 53) arriving on the veth from the child to
-    // the proxy's DNS resolver.
+    // Set up a per-instance nft PREROUTING DNAT table to redirect DNS queries
+    // (port 53) arriving from the child on the outer veth to the proxy's DNS
+    // server at outer_ip:dns_port.
     //
-    // Why PREROUTING REDIRECT instead of ip_forward + routing:
-    //   REDIRECT fires in the PREROUTING hook, *before* the routing decision.
-    //   It rewrites the destination IP to the incoming interface's address
-    //   (10.200.x.1 for veth-PID-out) and the port to `dns_port`.  The kernel
-    //   then sees a locally-destined packet → INPUT path → proxy DNS socket.
-    //   This requires no change to net.ipv4.ip_forward or any other global
-    //   system setting; the rules are scoped to this veth and removed on Drop.
+    // This runs in the initial user namespace with ambient CAP_NET_ADMIN so
+    // nft NAT operations succeed (unlike child-side NAT which requires
+    // initial-namespace privileges and always fails in a user namespace).
     //
-    // The proxy DNS server must be bound to 0.0.0.0 (not 127.0.0.1) so that
-    // it accepts packets arriving at 10.200.x.1:dns_port.
-    if config.dns_port != 0 {
-        debug!(
-            veth = %veth_outer,
-            dns_port = config.dns_port,
-            "setting up DNS PREROUTING REDIRECT rules"
-        );
-        let dns_port_str = config.dns_port.to_string();
-        let mut rule_errors = false;
-        for proto in &["udp", "tcp"] {
-            let mut cmd = Command::new("iptables");
-            cmd.args([
-                "-t", "nat", "-I", "PREROUTING", "1",
-                "-i", &veth_outer,
-                "-p", proto, "--dport", "53",
-                "-j", "REDIRECT", "--to-port", &dns_port_str,
-            ]);
-            // Raise CAP_NET_ADMIN before exec so iptables has permission to access xtables.lock.
-            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-            unsafe { cmd.pre_exec(raise_net_admin_ambient) };
-            match cmd.output() {
-                Ok(output) => {
-                    if !output.status.success() {
-                        let stderr = String::from_utf8_lossy(&output.stderr);
-                        let err_str = stderr.trim();
-                        warn!(
-                            proto = proto,
-                            veth = %veth_outer,
-                            stderr = %err_str,
-                            "iptables PREROUTING REDIRECT rule failed"
-                        );
-                        // Check for common capability errors and provide guidance
-                        if err_str.contains("xtables.lock") || err_str.contains("Permission denied") {
-                            warn!(
-                                "pent binary is missing CAP_NET_ADMIN capability or it's not set with inheritable flag. \
-                                 To fix: sudo setcap cap_net_admin=eip $(which pent) \
-                                 Or reinstall with: make install"
-                            );
-                        }
-                        rule_errors = true;
-                    } else {
-                        debug!(proto = proto, veth = %veth_outer, "iptables rule added");
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        error = %e,
-                        veth = %veth_outer,
-                        "could not run iptables for DNS redirect"
-                    );
-                    rule_errors = true;
-                }
+    // When the child sends a DNS query to outer_ip:53, the PREROUTING hook
+    // fires before the routing decision and rewrites the destination port to
+    // dns_port. The kernel then routes the packet locally to the proxy's DNS
+    // socket. No ip_forward changes are needed.
+    let nft_dns_table = if dns_port != 0 {
+        let table = format!("pent_dns_{}", pid_str);
+        let result = (|| -> Result<(), SandboxError> {
+            run_nft(&["add", "table", "ip", &table])?;
+            run_nft(&[
+                "add", "chain", "ip", &table, "prerouting",
+                "{ type nat hook prerouting priority -100 ; }",
+            ])?;
+            for proto in &["udp", "tcp"] {
+                let rule = format!(
+                    "iifname \"{}\" {} dport 53 dnat to {}:{}",
+                    veth_outer, proto, config.outer_ip, dns_port
+                );
+                run_nft(&["add", "rule", "ip", &table, "prerouting", &rule])?;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => table,
+            Err(e) => {
+                tracing::warn!(
+                    "DNS redirect via nft failed; non-proxy-aware DNS may not work: {}",
+                    e
+                );
+                // Best-effort cleanup of the partially-created table.
+                let mut cmd = Command::new("nft");
+                cmd.args(["delete", "table", "ip", &table]);
+                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+                unsafe { cmd.pre_exec(raise_net_admin_ambient) };
+                let _ = cmd.output();
+                String::new()
             }
         }
-        if !rule_errors {
-            debug!(veth = %veth_outer, "DNS redirect rules successfully created");
-        }
     } else {
-        debug!("dns_port is 0, skipping DNS redirect rules");
-    }
-
-    // Disable strict reverse-path filter on the veth interface so that
-    // packets with source IPs outside the directly-connected subnet are
-    // not silently dropped.  Written directly to /proc/sys because a forked
-    // sysctl subprocess would lose all capabilities on exec.
-    let _ = std::fs::write(
-        format!("/proc/sys/net/ipv4/conf/{}/rp_filter", veth_outer),
-        b"0\n",
-    );
+        String::new()
+    };
 
     Ok(NetnsHandle {
         outer_ip: config.outer_ip,
@@ -574,7 +515,7 @@ pub fn create_netns(config: &NetnsConfig) -> Result<NetnsHandle, SandboxError> {
         inner_cidr,
         veth_outer,
         outer_cidr,
-        dns_port: config.dns_port,
+        nft_dns_table,
     })
 }
 
@@ -587,10 +528,11 @@ pub fn create_netns(config: &NetnsConfig) -> Result<NetnsHandle, SandboxError> {
 fn nft_find_iface_rule_handle(chain: &str, iface_keyword: &str, iface_name: &str) -> Option<u64> {
     use std::process::Command;
 
-    let output = Command::new("nft")
-        .args(["-a", "list", "chain", "inet", "filter", chain])
-        .output()
-        .ok()?;
+    let mut cmd = Command::new("nft");
+    cmd.args(["-a", "list", "chain", "inet", "filter", chain]);
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    unsafe { cmd.pre_exec(raise_net_admin_ambient) };
+    let output = cmd.output().ok()?;
 
     if !output.status.success() {
         return None;
@@ -677,6 +619,147 @@ pub(crate) fn run_ip_local(args: &[&str]) -> Result<(), SandboxError> {
                 )));
             }
             Ok(())
+        }
+    }
+}
+
+
+/// Set up resolv.conf inside the child's own network namespace.
+///
+/// Must be called from the child's pre_exec hook, after the child has called
+/// `unshare(CLONE_NEWUSER | CLONE_NEWNET | CLONE_NEWNS)` and configured its
+/// veth/loopback/routes, but before Landlock is applied.
+///
+/// # What this does
+///
+/// 1. Makes the mount tree private (MS_REC|MS_PRIVATE) so we can mount inside
+///    the user namespace without EPERM.
+/// 2. Mounts a fresh tmpfs on `/run` to give us a writable scratch space
+///    invisible to the host.
+/// 3. Writes `nameserver <outer_ip>` to `/etc/resolv.conf` so that the child's
+///    libc resolver sends DNS queries to the proxy's outer veth IP (port 53).
+///    DNS PREROUTING rules set up on the host side (in `create_netns`) redirect
+///    those port-53 packets to the proxy's DNS server port.
+///
+/// Failures are silently ignored — proxy-aware apps use SOCKS5h (hostname
+/// resolved server-side) and are unaffected. Non-proxy-aware apps benefit from
+/// the resolv.conf + host-side PREROUTING redirect.
+pub(crate) fn setup_child_dns(outer_ip: &str, _dns_port: u16) {
+    // ── 0. Make mount tree private ───────────────────────────────────────────
+    // After unshare(CLONE_NEWNS), mounts inherited from the parent are "slaves"
+    // (they receive propagation from the parent but don't propagate back).
+    // On modern kernels you cannot mount on top of a slave subtree from inside
+    // a user namespace without first making it private — the kernel refuses with
+    // EPERM.  Making the entire tree private (MS_REC | MS_PRIVATE) severs all
+    // propagation and lets us freely mount inside our namespace.
+    // SAFETY: mount(2) is always safe with valid pointers.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let ret = unsafe {
+        libc::mount(
+            b"none\0".as_ptr().cast::<libc::c_char>(),
+            b"/\0".as_ptr().cast::<libc::c_char>(),
+            std::ptr::null(),
+            libc::MS_REC | libc::MS_PRIVATE,
+            std::ptr::null(),
+        )
+    };
+    if ret != 0 {
+        // SAFETY: write(2) is async-signal-safe.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe {
+            let msg = b"pent: mount --make-rprivate / failed; tmpfs/resolv.conf may not work\n";
+            libc::write(libc::STDERR_FILENO, msg.as_ptr().cast(), msg.len());
+        }
+    }
+
+    // ── 1. Mount tmpfs on /run ───────────────────────────────────────────────
+    // The host's /run is root-owned so an unprivileged user can't write to it.
+    // Mounting a fresh tmpfs here (inside CLONE_NEWNS) gives us a writable
+    // /run that is invisible to the host.
+    // SAFETY: mount(2) is always safe with valid pointers.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let ret = unsafe {
+        libc::mount(
+            b"tmpfs\0".as_ptr().cast::<libc::c_char>(),
+            b"/run\0".as_ptr().cast::<libc::c_char>(),
+            b"tmpfs\0".as_ptr().cast::<libc::c_char>(),
+            libc::MS_NOSUID | libc::MS_NODEV,
+            std::ptr::null(),
+        )
+    };
+    if ret != 0 {
+        // SAFETY: write(2) is async-signal-safe.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe {
+            let msg = b"pent: mount tmpfs /run failed; resolv.conf setup may not work\n";
+            libc::write(libc::STDERR_FILENO, msg.as_ptr().cast(), msg.len());
+        }
+    }
+
+    // ── 2. Resolv.conf ───────────────────────────────────────────────────────
+    // Point the resolver at outer_ip (the host-side veth IP). DNS queries to
+    // port 53 on that IP are intercepted by the host-side nft PREROUTING rule
+    // (set up in create_netns) and redirected to the proxy's DNS server port.
+    let resolv_content = format!("nameserver {}\n", outer_ip);
+    setup_child_resolv_conf(&resolv_content);
+}
+
+/// Write a custom resolv.conf pointing at the proxy and make it visible.
+///
+/// Handles three cases:
+/// - `/etc/resolv.conf` is a regular file → bind-mount our file over it.
+/// - `/etc/resolv.conf` is a symlink into `/run/` → create the target path
+///   inside the (now-tmpfs) `/run` and write our file there directly.
+/// - Anything else → best-effort bind-mount; errors silently ignored.
+fn setup_child_resolv_conf(content: &str) {
+    let src = "/run/pent-resolv.conf";
+    if let Err(e) = std::fs::write(src, content) {
+        eprintln!("pent: write {src}: {e}");
+    }
+
+    // Check whether /etc/resolv.conf is a symlink.
+    if let Ok(target) = std::fs::read_link("/etc/resolv.conf") {
+        let abs_target = if target.is_absolute() {
+            target
+        } else {
+            std::path::PathBuf::from("/etc").join(target)
+        };
+        // If the symlink target is under /run (e.g. systemd-resolved), create
+        // the path inside our tmpfs and write our resolv.conf there.
+        if abs_target.starts_with("/run") {
+            if let Some(parent) = abs_target.parent() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    eprintln!("pent: mkdir {}: {e}", parent.display());
+                }
+            }
+            if let Err(e) = std::fs::write(&abs_target, content) {
+                eprintln!("pent: write {}: {e}", abs_target.display());
+            }
+            return;
+        }
+        // Symlink points elsewhere — fall through to bind-mount attempt.
+    }
+
+    // Regular file (or symlink pointing outside /run): bind-mount our temp
+    // file over /etc/resolv.conf.  MS_BIND follows symlinks for the target,
+    // so this also works for symlinks to non-/run paths when the target exists.
+    // SAFETY: mount(2) with valid pointers.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let ret = unsafe {
+        libc::mount(
+            b"/run/pent-resolv.conf\0".as_ptr().cast::<libc::c_char>(),
+            b"/etc/resolv.conf\0".as_ptr().cast::<libc::c_char>(),
+            std::ptr::null(),
+            libc::MS_BIND,
+            std::ptr::null(),
+        )
+    };
+    if ret != 0 {
+        // SAFETY: write(2) is async-signal-safe.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe {
+            let msg = b"pent: bind-mount /etc/resolv.conf failed; DNS may not work\n";
+            libc::write(libc::STDERR_FILENO, msg.as_ptr().cast(), msg.len());
         }
     }
 }
@@ -781,7 +864,7 @@ mod tests {
     fn test_create_netns_requires_privileges() {
         if check_netns_privileges().is_err() {
             let config = NetnsConfig::new();
-            let result = create_netns(&config);
+            let result = create_netns(&config, 0);
             // Should fail without privileges
             assert!(result.is_err());
         }
@@ -801,7 +884,7 @@ mod tests {
             inner_cidr: "10.200.1.2/24".to_string(),
             veth_outer: "veth-test-out-nonexistent".to_string(),
             outer_cidr: "10.200.1.1/24".to_string(),
-            dns_port: 0,
+            nft_dns_table: "".to_string(),
         };
         drop(handle); // must not panic or crash
     }
@@ -813,7 +896,7 @@ mod tests {
             return; // skip — requires CAP_NET_ADMIN
         }
         let config = NetnsConfig::from_pid();
-        let handle = create_netns(&config).expect("create_netns failed");
+        let handle = create_netns(&config, 0).expect("create_netns failed");
 
         // outer_ip must match config
         assert_eq!(handle.outer_ip, config.outer_ip);
@@ -842,47 +925,4 @@ mod tests {
         );
     }
 
-    #[test]
-    #[serial]
-    fn test_prerouting_rules_created_when_dns_port_set() {
-        if check_netns_privileges().is_err() {
-            return; // skip — requires CAP_NET_ADMIN
-        }
-        let mut config = NetnsConfig::from_pid();
-        config.dns_port = 5353; // Set a non-zero DNS port to trigger rule creation
-
-        let handle = create_netns(&config).expect("create_netns failed");
-        let veth_outer = format!(
-            "veth-{}-out",
-            config.name.strip_prefix("pent-").unwrap_or(&config.name)
-        );
-
-        // Verify PREROUTING REDIRECT rules exist
-        let output = std::process::Command::new("iptables")
-            .args(["-t", "nat", "-L", "PREROUTING", "-n"])
-            .output()
-            .expect("iptables should be available");
-
-        let rules = String::from_utf8_lossy(&output.stdout);
-        // Only assert if rules are expected to exist; they may not if iptables filtering is used
-        if output.status.success() && !rules.contains("Chain PREROUTING") {
-            panic!("iptables nat table not available");
-        }
-
-        // drop cleans up the rules
-        drop(handle);
-
-        // Rules should be removed after drop
-        let output = std::process::Command::new("iptables")
-            .args(["-t", "nat", "-L", "PREROUTING", "-n"])
-            .output()
-            .expect("iptables should be available");
-
-        let rules_after = String::from_utf8_lossy(&output.stdout);
-        // The veth interface should no longer appear in PREROUTING
-        assert!(
-            !rules_after.contains(&veth_outer),
-            "PREROUTING rules for veth should be removed after drop"
-        );
-    }
 }

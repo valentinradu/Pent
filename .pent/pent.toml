@@ -24,11 +24,10 @@ read = [
     "~/.agents/skills",
 ]
 execute = [
-    "~/.npm-global",
     "~/.local/bin",
+    "~/.npm-global",
 ]
 read_write = [
-    "~/.gemini",
     "~/.npm",
     "~/.local/share/keyrings",
     "~/.local/share/kwalletd",
@@ -38,15 +37,11 @@ read_write = [
     "~/.local/share/claude",
     "~/.cache/claude",
     "~/.codex",
+    "~/.gemini",
 ]
 
 [proxy]
 domain_allowlist = [
-    "generativelanguage.googleapis.com",
-    "aiplatform.googleapis.com",
-    "cloudresourcemanager.googleapis.com",
-    "oauth2.googleapis.com",
-    "accounts.google.com",
     "registry.npmjs.org",
     "*.npmjs.org",
     "api.anthropic.com",
@@ -59,4 +54,9 @@ domain_allowlist = [
     "codeload.github.com",
     "api.openai.com",
     "*.openai.com",
+    "generativelanguage.googleapis.com",
+    "aiplatform.googleapis.com",
+    "cloudresourcemanager.googleapis.com",
+    "oauth2.googleapis.com",
+    "accounts.google.com",
 ]

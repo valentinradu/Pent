@@ -141,7 +141,7 @@ pub async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
                     .sandbox
                     .network
                     .clone()
-                    .unwrap_or(NetworkMode::LocalhostOnly)
+                    .unwrap_or(NetworkMode::Blocked)
                 {
                     NetworkMode::ProxyOnly { .. } => NetworkMode::Unrestricted,
                     other => other,
@@ -516,7 +516,7 @@ async fn setup_proxy(
             .sandbox
             .network
             .clone()
-            .unwrap_or(NetworkMode::LocalhostOnly),
+            .unwrap_or(NetworkMode::Blocked),
     };
 
     if wants_proxy {
