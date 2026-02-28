@@ -632,9 +632,12 @@ pub(crate) fn run_ip_local(args: &[&str]) -> Result<(), SandboxError> {
 ///
 /// # What this does
 ///
-/// 1. Mounts a fresh tmpfs on `/run` to give us a writable scratch space
+/// 1. Makes the mount tree private (MS_REC|MS_PRIVATE) so subsequent mounts
+///    don't propagate back to the host.  Must be called AFTER overlayfs mounts
+///    (making the tree private before overlayfs causes EACCES on some kernels).
+/// 2. Mounts a fresh tmpfs on `/run` to give us a writable scratch space
 ///    invisible to the host.
-/// 2. Writes `nameserver <outer_ip>` to `/etc/resolv.conf` so that the child's
+/// 3. Writes `nameserver <outer_ip>` to `/etc/resolv.conf` so that the child's
 ///    libc resolver sends DNS queries to the proxy's outer veth IP (port 53).
 ///    DNS PREROUTING rules set up on the host side (in `create_netns`) redirect
 ///    those port-53 packets to the proxy's DNS server port.
@@ -643,8 +646,33 @@ pub(crate) fn run_ip_local(args: &[&str]) -> Result<(), SandboxError> {
 /// resolved server-side) and are unaffected. Non-proxy-aware apps benefit from
 /// the resolv.conf + host-side PREROUTING redirect.
 pub(crate) fn setup_child_dns(outer_ip: &str, _dns_port: u16) {
-    // NOTE: mount --make-rprivate / is already done in spawn_with_landlock
-    // (Phase 1) right after unshare(CLONE_NEWNS) + setup_userns_mappings.
+    // ── 0. Make mount tree private ───────────────────────────────────────────
+    // After unshare(CLONE_NEWNS), inherited mounts are "slaves".  We must
+    // make the tree private before mounting tmpfs on /run or bind-mounting
+    // resolv.conf, otherwise the kernel refuses with EPERM.
+    //
+    // IMPORTANT: this must happen AFTER mount_overlays (if any).  Making the
+    // tree private before overlayfs causes EACCES on the overlay mount itself
+    // (confirmed on kernel 6.18.9 with btrfs lower + tmpfs upper).
+    // SAFETY: mount(2) is always safe with valid pointers.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let ret = unsafe {
+        libc::mount(
+            b"none\0".as_ptr().cast::<libc::c_char>(),
+            b"/\0".as_ptr().cast::<libc::c_char>(),
+            std::ptr::null(),
+            libc::MS_REC | libc::MS_PRIVATE,
+            std::ptr::null(),
+        )
+    };
+    if ret != 0 {
+        // SAFETY: write(2) is async-signal-safe.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe {
+            let msg = b"pent: mount --make-rprivate / failed; tmpfs/resolv.conf may not work\n";
+            libc::write(libc::STDERR_FILENO, msg.as_ptr().cast(), msg.len());
+        }
+    }
 
     // ── 1. Mount tmpfs on /run ───────────────────────────────────────────────
     // The host's /run is root-owned so an unprivileged user can't write to it.
