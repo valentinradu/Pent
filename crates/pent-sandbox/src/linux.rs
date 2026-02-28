@@ -650,6 +650,45 @@ pub fn spawn_with_landlock(
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         command.pre_exec(move || {
+            // ── Phase 0: Clear inheritable capabilities ───────────────────────
+            //
+            // Linux ≥ 5.11 rejects unshare(CLONE_NEWUSER) with EACCES when the
+            // calling process has a non-empty inheritable capability set, to
+            // prevent privilege escalation (the caps would become full caps in
+            // the new user namespace).
+            //
+            // The pent binary carries cap_net_admin=eip on disk (for veth
+            // setup), so pent's forked children inherit cap_net_admin — and any
+            // caps that were already in the parent shell's inheritable set
+            // (e.g. cap_wake_alarm from a systemd session) — into their own
+            // inheritable sets.
+            //
+            // Clearing the inheritable set here, before any unshare(), lets the
+            // user-namespace creation succeed.  We do NOT need the inheritable
+            // set for anything inside pre_exec: once we're uid 0 inside the new
+            // user namespace (via setup_userns_mappings), we have all
+            // capabilities within that namespace without needing them inherited.
+            //
+            // Uses _LINUX_CAPABILITY_VERSION_3 (0x20080522) — the only version
+            // that supports two 32-bit words (bits 0-63), which is what we need
+            // to cover cap_net_admin (bit 12) and the full 64-cap range.
+            {
+                #[repr(C)]
+                struct CapHeader { version: u32, pid: i32 }
+                #[repr(C)]
+                #[derive(Copy, Clone)]
+                struct CapData { effective: u32, permitted: u32, inheritable: u32 }
+                const CAP_V3: u32 = 0x20080522;
+                let mut hdr = CapHeader { version: CAP_V3, pid: 0 };
+                let mut data = [CapData { effective: 0, permitted: 0, inheritable: 0 }; 2];
+                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+                libc::syscall(libc::SYS_capget, &mut hdr as *mut CapHeader, data.as_mut_ptr());
+                data[0].inheritable = 0;
+                data[1].inheritable = 0;
+                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+                libc::syscall(libc::SYS_capset, &mut hdr as *mut CapHeader, data.as_ptr());
+            }
+
             // ── Phase 1: Namespace and overlay setup ─────────────────────────
             //
             // When overlayfs is in use we need CLONE_NEWUSER + CLONE_NEWNS (and

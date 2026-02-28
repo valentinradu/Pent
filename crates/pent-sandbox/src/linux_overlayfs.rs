@@ -369,7 +369,17 @@ pub unsafe fn mount_overlays(overlays: &[OverlayMount]) -> std::io::Result<()> {
             // All failures are fatal. Without the overlay, the broad write_access
             // Landlock rule on the parent directory would grant ReadFile access
             // to all siblings of the write-listed files — a security violation.
-            return Err(std::io::Error::last_os_error());
+            let errno = std::io::Error::last_os_error();
+            return Err(std::io::Error::other(format!(
+                "overlayfs mount on '{real_str}' failed: {errno}\n\
+                 hint: pent requires unprivileged overlayfs mounts.\n\
+                 Check that user namespaces are enabled:\n\
+                   sysctl kernel.unprivileged_userns_clone   # must be 1\n\
+                   sysctl user.max_user_namespaces           # must be > 0\n\
+                 If an AppArmor/LSM profile is blocking overlay mounts,\n\
+                 add the pent binary to an appropriate profile or run:\n\
+                   sudo sysctl -w kernel.apparmor_restrict_unprivileged_unconfined=0"
+            )));
         }
     }
     Ok(())
