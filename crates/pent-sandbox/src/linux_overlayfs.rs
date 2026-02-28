@@ -654,6 +654,11 @@ fn run_watcher(
                         // Add a watch so we catch writes to files inside it.
                         if (event.mask & (libc::IN_CREATE | libc::IN_MOVED_TO)) != 0 {
                             add_inotify_watches(inotify_fd, &upper_path, &real_path, &mut wd_map, 4);
+                            // Flush any files already present in the new directory.
+                            // This handles the race where IN_CLOSE_WRITE fires for a
+                            // file written immediately after mkdir — before our watcher
+                            // thread woke up and added the watch on the new directory.
+                            flush_upper_recursive(&upper_path, &real_path, &write_set, &rw_dirs);
                         }
                     } else {
                         // File write/rename event: flush if in write_set or under an rw_dir.
@@ -662,6 +667,14 @@ fn run_watcher(
                             && upper_path.is_file()
                             && !is_overlay_whiteout(&upper_path)
                         {
+                            // Ensure parent directory exists on real FS.
+                            // The sandbox may have created new subdirectories under
+                            // an rw_dir; without this, flush_file returns ENOENT.
+                            if let Some(parent) = real_path.parent() {
+                                if !parent.exists() {
+                                    let _ = std::fs::create_dir_all(parent);
+                                }
+                            }
                             let _ = flush_file(&upper_path, &real_path);
                         }
                     }

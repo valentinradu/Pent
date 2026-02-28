@@ -1328,6 +1328,109 @@ mod tests {
     }
 
     // ========================================================================
+    // Live inotify flush test (writes flushed mid-session, not just at exit)
+    //
+    // This is the scenario that matters for long-running apps like Claude:
+    // writes happen throughout the session and must reach the real FS as they
+    // occur (inotify path), not only when the process exits (teardown flush).
+    // ========================================================================
+
+    /// Spawn a long-running process that writes files in phases separated by
+    /// sleeps, and verify that each write reaches the real filesystem while
+    /// the process is still running (inotify live-flush), not only at teardown.
+    ///
+    /// This reproduces the "files are gone when I leave the sandbox" failure
+    /// mode: if only the teardown flush worked, the files would appear at exit
+    /// but not during the session — but since we check mid-session they would
+    /// be missing here if the live path is broken.
+    #[test]
+    #[serial]
+    #[cfg(target_os = "linux")]
+    fn test_overlay_live_flush_during_long_running_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let rw_dir = temp.path().join("data");
+        std::fs::create_dir_all(&rw_dir).unwrap();
+
+        // Marker files the sandbox will create at different phases.
+        let file_a = rw_dir.join("phase_a.txt");
+        let file_b = rw_dir.join("sub").join("phase_b.txt");
+
+        // Flag files must be inside rw_dir so they are under an rw_dirs entry
+        // and get live-flushed to the real FS (the parent polls the real path).
+        let flag_a = rw_dir.join("flag_a");
+        let flag_b = rw_dir.join("flag_b");
+
+        // The shell script:
+        //  1. Write phase_a.txt, signal flag_a
+        //  2. Sleep briefly
+        //  3. Create sub/, write phase_b.txt, signal flag_b
+        //  4. Sleep briefly so the parent can check before exit
+        let cmd = format!(
+            "printf 'content-a' > '{file_a}' && touch '{flag_a}' && \
+             sleep 0.2 && \
+             mkdir -p '{subdir}' && printf 'content-b' > '{file_b}' && touch '{flag_b}' && \
+             sleep 0.5",
+            file_a = file_a.display(),
+            flag_a = flag_a.display(),
+            subdir = rw_dir.join("sub").display(),
+            file_b = file_b.display(),
+            flag_b = flag_b.display(),
+        );
+
+        let Some((mut child, overlay_handle)) = spawn_rw(temp.path(), &[rw_dir.to_str().unwrap()], &cmd) else {
+            return; // overlayfs unavailable
+        };
+        let Some(handle) = overlay_handle else {
+            child.wait().ok();
+            return; // overlay not active, skip
+        };
+
+        // Wait for the sandbox to write phase_a (flag_a appears).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !flag_a.exists() {
+            assert!(std::time::Instant::now() < deadline, "timed out waiting for flag_a");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        // Give the inotify watcher time to pick up the event (polls at 50 ms).
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // Phase A: file_a must be on the real FS NOW — process still running.
+        assert!(
+            file_a.exists(),
+            "live inotify flush failed: file_a not on real FS while sandbox is still running"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file_a).unwrap_or_default(),
+            "content-a",
+            "file_a content wrong after live flush"
+        );
+
+        // Wait for phase_b.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !flag_b.exists() {
+            assert!(std::time::Instant::now() < deadline, "timed out waiting for flag_b");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // Phase B: nested file in a new subdir must also be on real FS mid-session.
+        assert!(
+            file_b.exists(),
+            "live inotify flush failed: file_b (nested) not on real FS while sandbox is still running"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file_b).unwrap_or_default(),
+            "content-b",
+            "file_b content wrong after live flush"
+        );
+
+        let status = child.wait().expect("wait failed");
+        crate::linux_overlayfs::teardown(handle);
+        assert!(status.success());
+    }
+
+    // ========================================================================
     // Overlay flush correctness tests
     //
     // These tests verify that writes made inside the sandbox are flushed back
@@ -1338,6 +1441,18 @@ mod tests {
     /// Helper: spawn a sandboxed shell command with the given read_write paths
     /// and return (child, overlay_handle).  Falls back gracefully when the
     /// kernel does not support user namespaces or overlayfs.
+    ///
+    /// The overlay subsystem is only activated when `read_write` contains at
+    /// least one **file** entry (or a path that does not yet exist but whose
+    /// parent does — treated as a future file).  A config that lists only
+    /// directories produces no overlay and the handle will be `None`.
+    ///
+    /// To ensure the overlay is always active, this helper adds a sentinel
+    /// file (`workspace/.pent_sentinel`) to the `read_write` list.  Because
+    /// the sentinel lives in `workspace`, the overlay is mounted on `workspace`
+    /// itself — which is also the root of every `rw_paths` directory used in
+    /// these tests.  All rw directories therefore fall inside the overlay and
+    /// are covered by the `rw_dirs` flush path.
     #[cfg(target_os = "linux")]
     fn spawn_rw(
         workspace: &std::path::Path,
@@ -1354,6 +1469,12 @@ mod tests {
         for p in rw_paths {
             paths.read_write.push((*p).to_string());
         }
+        // Add a sentinel file entry so the overlay is always mounted on
+        // `workspace`.  Without at least one file-type entry the overlay is
+        // never created and all directory-based flush tests would skip.
+        let sentinel = workspace.join(".pent_sentinel");
+        std::fs::write(&sentinel, "sentinel").ok();
+        paths.read_write.push(sentinel.to_str().unwrap().to_string());
 
         let config = SandboxConfig::new(workspace.to_path_buf(), paths, workspace.to_path_buf())
             .with_data_dir(workspace.to_path_buf())
