@@ -280,19 +280,41 @@ pub fn prepare_overlay_dirs(
     let mut mounts = Vec::new();
     let mut idx = 0usize;
 
+    // First pass: collect unique parent directories.
+    let mut parents: Vec<PathBuf> = Vec::new();
     for file_path in write_files {
         let parent = match file_path.parent() {
             Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
             _ => continue,
         };
-        // Only create overlays for directories that already exist.
         if !parent.is_dir() {
             continue;
         }
         if !seen.insert(parent.clone()) {
-            continue; // already seen this parent
+            continue;
         }
+        parents.push(parent);
+    }
 
+    // Sort shortest-first so ancestor directories come before descendants.
+    parents.sort_by_key(|p| p.as_os_str().len());
+
+    // Second pass: skip directories already covered by an ancestor overlay.
+    // After mounting overlayfs on `~`, paths like `~/.local/share` resolve
+    // through that overlay.  Trying to mount a second overlayfs on a path
+    // inside an existing overlay fails with EACCES in user namespaces.
+    // The ancestor's populate_upper_stubs already handles visibility of
+    // files under the nested directory via the accessible set.
+    let mut overlay_roots: Vec<PathBuf> = Vec::new();
+    for parent in &parents {
+        let dominated = overlay_roots.iter().any(|root| parent.starts_with(root));
+        if dominated {
+            continue; // covered by an ancestor overlay
+        }
+        overlay_roots.push(parent.clone());
+    }
+
+    for parent in &overlay_roots {
         let base_dir = PathBuf::from(format!("/tmp/pent-ovl-{}-{}", pid, idx));
         let upper_dir = base_dir.join("upper");
         let work_dir = base_dir.join("work");
@@ -301,9 +323,9 @@ pub fn prepare_overlay_dirs(
 
         // Pre-populate upper/ with stubs for non-manifest content.
         // Depth limit of 32 prevents runaway on deeply nested home directories.
-        populate_upper_stubs(&parent, &upper_dir, accessible, use_xwhiteout, 32)?;
+        populate_upper_stubs(parent, &upper_dir, accessible, use_xwhiteout, 32)?;
 
-        mounts.push(OverlayMount { real_dir: parent, upper_dir, work_dir, base_dir });
+        mounts.push(OverlayMount { real_dir: parent.clone(), upper_dir, work_dir, base_dir });
         idx += 1;
     }
 
@@ -531,18 +553,27 @@ fn run_watcher(
 }
 
 fn final_flush_overlay(overlay: &OverlayMount, write_set: &HashSet<PathBuf>) {
-    let entries = match std::fs::read_dir(&overlay.upper_dir) {
+    flush_upper_recursive(&overlay.upper_dir, &overlay.real_dir, write_set);
+}
+
+/// Recursively walk the upper layer and flush write-set files back to the
+/// real filesystem.  Needed because nested overlay dirs are collapsed into
+/// the outermost ancestor's overlay, placing files in subdirectories of
+/// `upper/` rather than as direct children.
+fn flush_upper_recursive(upper_dir: &Path, real_dir: &Path, write_set: &HashSet<PathBuf>) {
+    let entries = match std::fs::read_dir(upper_dir) {
         Ok(e) => e,
         Err(_) => return,
     };
     for entry in entries.flatten() {
-        let upper_file = entry.path();
-        if !upper_file.is_file() {
-            continue;
-        }
-        let real_file = overlay.real_dir.join(entry.file_name());
-        if write_set.contains(&real_file) {
-            let _ = flush_file(&upper_file, &real_file);
+        let upper_path = entry.path();
+        let real_path = real_dir.join(entry.file_name());
+        if upper_path.is_file() {
+            if write_set.contains(&real_path) {
+                let _ = flush_file(&upper_path, &real_path);
+            }
+        } else if upper_path.is_dir() {
+            flush_upper_recursive(&upper_path, &real_path, write_set);
         }
     }
 }
