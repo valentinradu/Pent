@@ -477,9 +477,27 @@ pub fn spawn_with_landlock(
 
     // Directory-type read_write entries: all files created or modified inside
     // these directories during the session should be flushed back to the real FS.
+    //
+    // Include paths that are currently directories AND paths that don't exist
+    // yet but whose parent does — those might be created as directories by the
+    // sandboxed process (e.g. ~/.cache/claude that doesn't exist at spawn time).
+    // Paths that are already files are excluded (they're handled by write_set).
     let rw_dirs: HashSet<PathBuf> = rw_expanded
         .iter()
-        .filter_map(|(path, _)| if path.is_dir() { Some(path.clone()) } else { None })
+        .filter_map(|(path, _)| {
+            if path.is_dir() {
+                Some(path.clone())
+            } else if !path.is_file()
+                && !path.exists()
+                && path.parent().map_or(false, |p| p.is_dir())
+            {
+                // Non-existent entry with an existing parent: include so that
+                // if the sandbox creates it as a directory, its contents are flushed.
+                Some(path.clone())
+            } else {
+                None
+            }
+        })
         .collect();
 
     // Build the set of paths the sandboxed process is allowed to read.
@@ -1555,6 +1573,30 @@ mod tests {
 
         let content = std::fs::read_to_string(&target).unwrap();
         assert_eq!(content, "line1\nline2\n", "appended content must be flushed");
+    }
+
+    /// A read_write path that does not exist at spawn time and is created as a
+    /// directory by the sandbox process.  Its contents must be flushed.
+    #[test]
+    #[serial]
+    #[cfg(target_os = "linux")]
+    fn test_overlay_flush_nonexistent_rw_path_created_as_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        // rw_dir does NOT exist at spawn time — it will be created by the sandbox.
+        let rw_dir = temp.path().join("cache");
+        assert!(!rw_dir.exists());
+        let target = rw_dir.join("state.json");
+
+        let cmd = format!(
+            "mkdir -p '{}' && printf '{{\"ok\":true}}' > '{}'",
+            rw_dir.display(), target.display()
+        );
+        let active = run_sandboxed_rw(temp.path(), &[rw_dir.to_str().unwrap()], &cmd);
+        if !active { return; }
+
+        assert!(rw_dir.exists(), "directory created by sandbox must exist on real FS");
+        assert!(target.exists(), "file inside newly-created rw dir must be flushed");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), r#"{"ok":true}"#);
     }
 
     /// Files in a directory NOT in read_write must NOT be flushed to the real FS.
