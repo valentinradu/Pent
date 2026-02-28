@@ -719,6 +719,26 @@ pub fn spawn_with_landlock(
                 // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                 setup_userns_mappings(uid, gid);
 
+                // Make the mount tree private before any mounts.
+                //
+                // After unshare(CLONE_NEWNS), mounts inherited from the parent
+                // are "slaves" — the kernel refuses to mount on top of a slave
+                // subtree from inside a user namespace (EPERM).  Making the
+                // entire tree recursively private severs propagation and lets
+                // us mount overlayfs (and later tmpfs/bind-mounts) freely.
+                // This only affects the child's mount namespace.
+                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+                let ret = libc::mount(
+                    b"none\0".as_ptr().cast::<libc::c_char>(),
+                    b"/\0".as_ptr().cast::<libc::c_char>(),
+                    std::ptr::null(),
+                    libc::MS_REC | libc::MS_PRIVATE,
+                    std::ptr::null(),
+                );
+                if ret != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+
                 // Mount overlayfs inside the new mount namespace.
                 // SAFETY: we are in a single-threaded post-fork child that has
                 // just called unshare(CLONE_NEWUSER | CLONE_NEWNS).
@@ -743,6 +763,20 @@ pub fn spawn_with_landlock(
                 }
                 // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                 setup_userns_mappings(uid, gid);
+
+                // Make the mount tree private so we can mount tmpfs/bind
+                // inside this namespace (same rationale as the overlay branch).
+                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+                let ret = libc::mount(
+                    b"none\0".as_ptr().cast::<libc::c_char>(),
+                    b"/\0".as_ptr().cast::<libc::c_char>(),
+                    std::ptr::null(),
+                    libc::MS_REC | libc::MS_PRIVATE,
+                    std::ptr::null(),
+                );
+                if ret != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
             }
 
             // ── Phase 1.5: ProxyOnly pipe-sync and inner veth config ─────────

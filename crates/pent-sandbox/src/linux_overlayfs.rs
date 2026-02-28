@@ -369,17 +369,27 @@ pub unsafe fn mount_overlays(overlays: &[OverlayMount]) -> std::io::Result<()> {
             // All failures are fatal. Without the overlay, the broad write_access
             // Landlock rule on the parent directory would grant ReadFile access
             // to all siblings of the write-listed files — a security violation.
+            //
+            // IMPORTANT: We must return std::io::Error::last_os_error() (not
+            // io::Error::other()) because Rust's pre_exec error pipe only
+            // forwards raw_os_error(). Custom errors (raw_os_error() == None)
+            // are replaced with EINVAL by the stdlib, hiding the real errno.
+            // Write the diagnostic to stderr directly instead.
             let errno = std::io::Error::last_os_error();
-            return Err(std::io::Error::other(format!(
-                "overlayfs mount on '{real_str}' failed: {errno}\n\
-                 hint: pent requires unprivileged overlayfs mounts.\n\
-                 Check that user namespaces are enabled:\n\
-                   sysctl kernel.unprivileged_userns_clone   # must be 1\n\
-                   sysctl user.max_user_namespaces           # must be > 0\n\
-                 If an AppArmor/LSM profile is blocking overlay mounts,\n\
-                 add the pent binary to an appropriate profile or run:\n\
-                   sudo sysctl -w kernel.apparmor_restrict_unprivileged_unconfined=0"
-            )));
+            let msg = format!(
+                "pent: overlayfs mount on '{}' failed: {}\n\
+                 pent: hint: check sysctl kernel.unprivileged_userns_clone=1,\n\
+                 pent:       user.max_user_namespaces > 0,\n\
+                 pent:       and no AppArmor/LSM profile blocking overlay mounts.\n",
+                real_str, errno
+            );
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            libc::write(
+                libc::STDERR_FILENO,
+                msg.as_ptr() as *const libc::c_void,
+                msg.len(),
+            );
+            return Err(errno);
         }
     }
     Ok(())
