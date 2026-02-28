@@ -652,28 +652,34 @@ pub fn spawn_with_landlock(
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         command.pre_exec(move || {
-            // ── Phase 0: Clear inheritable capabilities ───────────────────────
+            // ── Phase 0: Fix dumpable bit and drop inheritable capabilities ──
             //
-            // Linux ≥ 5.11 rejects unshare(CLONE_NEWUSER) with EACCES when the
-            // calling process has a non-empty inheritable capability set, to
-            // prevent privilege escalation (the caps would become full caps in
-            // the new user namespace).
+            // The pent binary carries cap_net_admin=eip on disk (file caps).
+            // Executing a binary with file capabilities has two side-effects
+            // that break user-namespace setup:
             //
-            // The pent binary carries cap_net_admin=eip on disk (for veth
-            // setup), so pent's forked children inherit cap_net_admin — and any
-            // caps that were already in the parent shell's inheritable set
-            // (e.g. cap_wake_alarm from a systemd session) — into their own
-            // inheritable sets.
+            // Problem 1 — non-dumpable process (EACCES on /proc/self/uid_map):
+            //   The kernel marks any process with elevated file capabilities as
+            //   "not dumpable" (PR_GET_DUMPABLE → 0).  Non-dumpable processes
+            //   have their /proc/[pid]/ files owned by root:root in the initial
+            //   user namespace.  After unshare(CLONE_NEWUSER) but before uid_map
+            //   is written, the process appears as uid 65534 (overflowuid) inside
+            //   the new namespace.  Opening /proc/self/{uid_map,gid_map,setgroups}
+            //   for writing then fails with EACCES (owned by root, we're nobody).
+            //   Fix: prctl(PR_SET_DUMPABLE, 1) restores /proc ownership to our
+            //   real uid, making those files writable again after unshare.
             //
-            // Clearing the inheritable set here, before any unshare(), lets the
-            // user-namespace creation succeed.  We do NOT need the inheritable
-            // set for anything inside pre_exec: once we're uid 0 inside the new
-            // user namespace (via setup_userns_mappings), we have all
-            // capabilities within that namespace without needing them inherited.
-            //
-            // Uses _LINUX_CAPABILITY_VERSION_3 (0x20080522) — the only version
-            // that supports two 32-bit words (bits 0-63), which is what we need
-            // to cover cap_net_admin (bit 12) and the full 64-cap range.
+            // Problem 2 — non-empty inheritable set (EACCES from unshare):
+            //   Linux ≥ 5.11 rejects unshare(CLONE_NEWUSER) when the calling
+            //   process has a non-empty inheritable capability set.
+            //   Fix: capset to zero the inheritable words before unshare.
+            //   (effective and permitted are fine; they don't trigger this check,
+            //   and we need them cleared only to the extent the dumpable fix above
+            //   handles uid_map — which it does independently.)
+            {
+                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+                libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0);
+            }
             {
                 #[repr(C)]
                 struct CapHeader { version: u32, pid: i32 }
