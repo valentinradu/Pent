@@ -1475,6 +1475,32 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "hello");
     }
 
+    /// Edit an existing file that is deeply nested inside an rw directory.
+    /// All parent directories exist at spawn time.
+    #[test]
+    #[serial]
+    #[cfg(target_os = "linux")]
+    fn test_overlay_flush_deeply_nested_existing_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let rw_dir = temp.path().join("store");
+        // Pre-create the full hierarchy before spawning.
+        let deep = rw_dir.join("a").join("b").join("c");
+        std::fs::create_dir_all(&deep).unwrap();
+        let target = deep.join("state.json");
+        std::fs::write(&target, r#"{"v":1}"#).unwrap();
+
+        let active = run_sandboxed_rw(
+            temp.path(),
+            &[rw_dir.to_str().unwrap()],
+            &format!("printf '{{\"v\":2}}' > '{}'", target.display()),
+        );
+        if !active { return; }
+
+        let content = std::fs::read_to_string(&target).unwrap();
+        assert_eq!(content, r#"{"v":2}"#,
+            "deeply nested existing file must be flushed to real FS");
+    }
+
     /// Create a new subdirectory and file inside an rw directory.
     /// The subdirectory did not exist at spawn time.
     #[test]
