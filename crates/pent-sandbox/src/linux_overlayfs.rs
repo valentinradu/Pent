@@ -270,12 +270,17 @@ fn populate_upper_stubs(
 /// # Errors
 ///
 /// Returns an error if a staging directory cannot be created.
+/// Compute overlay mount plans for write-listed files.
+///
+/// Only determines which directories need overlays and what paths to use.
+/// Upper/work directory creation and stub population are deferred to
+/// [`setup_overlay_dirs`], which runs inside the child's user namespace
+/// after `unshare(CLONE_NEWUSER | CLONE_NEWNS)` — matching the execution
+/// context that the kernel expects for user-namespace overlay mounts.
 pub fn prepare_overlay_dirs(
     write_files: &[PathBuf],
-    accessible: &HashSet<PathBuf>,
     pid: u32,
 ) -> std::io::Result<Vec<OverlayMount>> {
-    let use_xwhiteout = kernel_supports_xwhiteout();
     let mut seen: HashSet<PathBuf> = HashSet::new();
     let mut mounts = Vec::new();
     let mut idx = 0usize;
@@ -318,18 +323,46 @@ pub fn prepare_overlay_dirs(
         let base_dir = PathBuf::from(format!("/tmp/pent-ovl-{}-{}", pid, idx));
         let upper_dir = base_dir.join("upper");
         let work_dir = base_dir.join("work");
-        std::fs::create_dir_all(&upper_dir)?;
-        std::fs::create_dir_all(&work_dir)?;
-
-        // Pre-populate upper/ with stubs for non-manifest content.
-        // Depth limit of 32 prevents runaway on deeply nested home directories.
-        populate_upper_stubs(parent, &upper_dir, accessible, use_xwhiteout, 32)?;
-
+        // Directories are NOT created here; setup_overlay_dirs does that
+        // inside the child's user namespace after unshare.
         mounts.push(OverlayMount { real_dir: parent.clone(), upper_dir, work_dir, base_dir });
         idx += 1;
     }
 
     Ok(mounts)
+}
+
+/// Create upper/work directories and populate content stubs.
+///
+/// Must be called in the child's `pre_exec` hook, **after**
+/// `unshare(CLONE_NEWUSER | CLONE_NEWNS)` and UID/GID mapping, and **before**
+/// [`mount_overlays`].  Running inside the user namespace ensures the
+/// directories and their xattrs are created in the same security context as
+/// the overlay mount itself, which is required on kernels ≥ 5.11.
+///
+/// Any leftover staging directories from a previous crashed run (same PID
+/// reuse) are removed first to guarantee a clean upper and work directory.
+pub fn setup_overlay_dirs(
+    overlays: &[OverlayMount],
+    accessible: &HashSet<PathBuf>,
+) -> std::io::Result<()> {
+    let use_xwhiteout = kernel_supports_xwhiteout();
+    for overlay in overlays {
+        // Remove any leftovers from a previous crashed run with the same PID.
+        let _ = std::fs::remove_dir_all(&overlay.base_dir);
+        std::fs::create_dir_all(&overlay.upper_dir)?;
+        std::fs::create_dir_all(&overlay.work_dir)?;
+        // Pre-populate upper/ with stubs for non-manifest content.
+        // Depth limit of 32 prevents runaway on deeply nested home directories.
+        populate_upper_stubs(
+            &overlay.real_dir,
+            &overlay.upper_dir,
+            accessible,
+            use_xwhiteout,
+            32,
+        )?;
+    }
+    Ok(())
 }
 
 /// Mount overlayfs for each entry in `overlays`.

@@ -502,7 +502,7 @@ pub fn spawn_with_landlock(
 
     let pid = std::process::id();
     let overlay_mounts =
-        super::linux_overlayfs::prepare_overlay_dirs(&overlay_file_paths, &accessible, pid)
+        super::linux_overlayfs::prepare_overlay_dirs(&overlay_file_paths, pid)
             .map_err(SandboxError::SpawnFailed)?;
 
     // Compute the set of parent directories covered by overlayfs (for Landlock rules).
@@ -513,6 +513,8 @@ pub fn spawn_with_landlock(
     let overlay_mounts_pre = overlay_mounts.clone();
     let write_set_pre = write_set.clone();
     let overlay_dirs_pre = overlay_dirs.clone();
+    // accessible is passed to setup_overlay_dirs (runs in pre_exec after unshare).
+    let accessible_pre = accessible;
 
     // For ProxyOnly, create the host-side veth pair. The child will create its own
     // user+net namespace via unshare in pre_exec; the background thread moves the
@@ -718,6 +720,17 @@ pub fn spawn_with_landlock(
                 }
                 // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                 setup_userns_mappings(uid, gid);
+
+                // Create upper/work dirs and populate stubs from inside the
+                // user namespace.  This must happen after unshare + userns
+                // mappings so the kernel sees the directories as created in
+                // the same security context as the overlay mount.  Doing this
+                // in the parent process (before fork) causes EACCES on the
+                // overlay mount on kernel 6.18 with btrfs lower.
+                super::linux_overlayfs::setup_overlay_dirs(
+                    &overlay_mounts_pre,
+                    &accessible_pre,
+                )?;
 
                 // Mount overlayfs inside the new mount namespace.
                 // SAFETY: we are in a single-threaded post-fork child that has
