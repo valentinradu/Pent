@@ -87,8 +87,36 @@ fn kernel_supports_xwhiteout() -> bool {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// xattr helper
+// xattr helpers
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Returns `true` if `path` is an overlayfs whiteout entry (userxattr mode).
+///
+/// In `-o userxattr` mode the kernel represents whiteouts as zero-size regular
+/// files with the `user.overlay.whiteout` extended attribute.  Flushing such a
+/// file back to the real filesystem would truncate the real file to zero bytes,
+/// which is never the intent — whiteouts are overlay-internal bookkeeping.
+fn is_overlay_whiteout(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let path_c = match CString::new(path.as_os_str().as_bytes()) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let name_c = match CString::new("user.overlay.whiteout") {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let ret = unsafe {
+        libc::getxattr(
+            path_c.as_ptr(),
+            name_c.as_ptr(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    ret >= 0
+}
 
 /// Set an extended attribute on `path`.
 fn set_xattr(path: &Path, name: &str, value: &[u8]) -> std::io::Result<()> {
@@ -571,7 +599,10 @@ fn run_watcher(
                     let overlay = &overlays[oi];
                     let upper_file = overlay.upper_dir.join(filename);
                     let real_file = overlay.real_dir.join(filename);
-                    if write_set.contains(&real_file) && upper_file.is_file() {
+                    if write_set.contains(&real_file)
+                        && upper_file.is_file()
+                        && !is_overlay_whiteout(&upper_file)
+                    {
                         let _ = flush_file(&upper_file, &real_file);
                     }
                 }
@@ -602,7 +633,10 @@ fn flush_upper_recursive(upper_dir: &Path, real_dir: &Path, write_set: &HashSet<
         let upper_path = entry.path();
         let real_path = real_dir.join(entry.file_name());
         if upper_path.is_file() {
-            if write_set.contains(&real_path) {
+            // Skip overlay whiteout entries: they are zero-size files with the
+            // user.overlay.whiteout xattr that represent deletions inside the
+            // sandbox.  Flushing them would truncate the real file to zero bytes.
+            if write_set.contains(&real_path) && !is_overlay_whiteout(&upper_path) {
                 let _ = flush_file(&upper_path, &real_path);
             }
         } else if upper_path.is_dir() {
