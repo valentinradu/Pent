@@ -3,7 +3,7 @@ extern crate libc;
 
 use std::collections::HashMap;
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[cfg(not(target_os = "macos"))]
 use pent_proxy::{ProxyConfig, ProxyHandle, ProxyServer};
@@ -22,133 +22,14 @@ use crate::error::CliError;
 use crate::ui;
 
 pub async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
-    // 1. Load and merge config.
-    // --no-config skips global/project config files but --config <extra> still applies.
-    let mut config = if args.no_config {
-        PentConfig::default()
-    } else {
-        ConfigLoader::load(&cwd)?
-    };
-    if let Some(ref extra) = args.extra_config {
-        let extra_cfg = PentConfig::load(extra)?;
-        config = config.merge(extra_cfg);
-    }
-
-    // 2. Merge CLI overrides into config
-    config.sandbox.paths.traversal.extend(
-        args.traverse
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned()),
-    );
-    config
-        .sandbox
-        .paths
-        .read
-        .extend(args.read.iter().map(|p| p.to_string_lossy().into_owned()));
-    config
-        .sandbox
-        .paths
-        .read_write
-        .extend(args.write.iter().map(|p| p.to_string_lossy().into_owned()));
-    config
-        .sandbox
-        .paths
-        .execute
-        .extend(args.execute.iter().map(|p| p.to_string_lossy().into_owned()));
-    config
-        .proxy
-        .domain_allowlist
-        .extend(args.allow.iter().cloned());
-
-    // On Linux, read_write paths must be exact filenames — glob ('*') patterns
-    // are not supported because overlayfs requires specific paths to mount over.
-    #[cfg(target_os = "linux")]
-    config.sandbox.paths.validate_no_rw_globs().map_err(CliError::Other)?;
-
-    // 3. Build env map
-    let mut allowlist_keys: Vec<String> = Vec::new();
-    let mut explicit_env: Vec<(String, String)> = Vec::new();
-    for entry in &args.env {
-        if let Some(eq) = entry.find('=') {
-            let key = entry[..eq].to_string();
-            let value = entry[eq + 1..].to_string();
-            allowlist_keys.push(key.clone());
-            explicit_env.push((key, value));
-        } else {
-            allowlist_keys.push(entry.clone());
-        }
-    }
-    let mut env_map: HashMap<String, String> = build_env(&allowlist_keys);
-    for (k, v) in explicit_env {
-        env_map.insert(k, v);
-    }
-    // 4. Open violations log when tracing.
-    let trace_log_path: Option<PathBuf> = if args.trace {
-        let pent_dir = cwd.join(".pent");
-        match std::fs::create_dir_all(&pent_dir) {
-            Ok(()) => {
-                let log_path = pent_dir.join("trace.log");
-                // Truncate/create fresh for this run.
-                match std::fs::File::create(&log_path) {
-                    Ok(_) => {
-                        ui::status("tracing", log_path.display());
-                        Some(log_path)
-                    }
-                    Err(e) => {
-                        ui::warn(format!("could not create trace log: {e}"));
-                        None
-                    }
-                }
-            }
-            Err(e) => {
-                ui::warn(format!("could not create .pent directory: {e}"));
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    // 5. Resolve network mode.
-    //
-    // macOS — proxy-based network enforcement is not available (no per-process
-    // network namespaces; DYLD_INSERT_LIBRARIES is unreliable across Go binaries
-    // and hardened-runtime binaries). Any flag or config that would normally
-    // start the proxy (--allow, --network proxy, domain_allowlist) silently
-    // degrades to Unrestricted so the process is not blocked. Only explicit
-    // --network localhost/blocked/unrestricted take effect.
-    // See AGENTS.md for the full explanation.
-    //
-    // non-macOS — start the proxy when needed for enforcement.
+    let mut config = load_config(&args, &cwd)?;
+    apply_cli_overrides(&mut config, &args)?;
+    let env_map = build_run_env(&args.env);
+    let trace_log_path = open_trace_log(args.trace, &cwd);
 
     // ── macOS path ────────────────────────────────────────────────────────────
     #[cfg(target_os = "macos")]
-    let resolved_network: NetworkMode = {
-        let proxy_requested = args.network == Some(NetworkModeArg::Proxy)
-            || !config.proxy.domain_allowlist.is_empty()
-            || matches!(config.sandbox.network, Some(NetworkMode::ProxyOnly { .. }));
-        if proxy_requested {
-            // Proxy enforcement is unavailable; degrade silently so the process
-            // is not blocked from making external connections.
-            NetworkMode::Unrestricted
-        } else {
-            match args.network {
-                // Proxy already handled above via proxy_requested.
-                Some(NetworkModeArg::Unrestricted | NetworkModeArg::Proxy) => NetworkMode::Unrestricted,
-                Some(NetworkModeArg::Localhost) => NetworkMode::LocalhostOnly,
-                Some(NetworkModeArg::Blocked) => NetworkMode::Blocked,
-                None => match config
-                    .sandbox
-                    .network
-                    .clone()
-                    .unwrap_or(NetworkMode::Blocked)
-                {
-                    NetworkMode::ProxyOnly { .. } => NetworkMode::Unrestricted,
-                    other => other,
-                },
-            }
-        }
-    };
+    let resolved_network: NetworkMode = resolve_macos_network(&args, &config);
 
     // ── non-macOS path ────────────────────────────────────────────────────────
     #[cfg(not(target_os = "macos"))]
@@ -158,7 +39,7 @@ pub async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
         event_rx: violation_rx,
     } = setup_proxy(&config, args.network, args.trace).await?;
 
-    // 5. Build SandboxConfig.
+    // Build SandboxConfig.
     // from_sandbox_settings merges user paths on top of system defaults and
     // handles mounts, replacing the previous manual path-extension loop.
     let mut sandbox_cfg = SandboxConfig::from_sandbox_settings(config.sandbox, cwd.clone(), cwd)
@@ -172,7 +53,6 @@ pub async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
     // Validate sandbox availability before spawning
     check_availability()?;
 
-    // 6. Spawn and wait
     let cmd_parts = &args.command;
     let cmd = cmd_parts
         .first()
@@ -180,7 +60,7 @@ pub async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
     let cmd_args: Vec<String> = cmd_parts[1..].to_vec();
 
     let mut sandbox_child = spawn_sandboxed(&sandbox_cfg, cmd, &cmd_args)?;
-    let mut child = sandbox_child.child;
+    let child = sandbox_child.child;
     #[cfg(target_os = "linux")]
     let overlay_handle = sandbox_child.overlay;
 
@@ -218,37 +98,7 @@ pub async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
     // non-macOS: in trace mode, stream proxy events (violations and granted
     // access) to the log while the child runs to completion.
     #[cfg(not(target_os = "macos"))]
-    let exit_status = if let Some(mut event_rx) = violation_rx {
-        let (done_tx, mut done_rx) = tokio::sync::oneshot::channel::<std::process::ExitStatus>();
-        std::thread::spawn(move || {
-            let status = child.wait().unwrap_or_else(|_| {
-                std::process::Command::new("true").status().unwrap()
-            });
-            let _ = done_tx.send(status);
-        });
-
-        loop {
-            tokio::select! {
-                biased;
-                Some(event) = event_rx.recv() => {
-                    if let Some(ref p) = trace_log_path {
-                        log_trace_event(p, event);
-                    }
-                }
-                Ok(status) = &mut done_rx => {
-                    // Drain any in-flight events before returning.
-                    while let Ok(ev) = event_rx.try_recv() {
-                        if let Some(ref p) = trace_log_path {
-                            log_trace_event(p, ev);
-                        }
-                    }
-                    break status;
-                }
-            }
-        }
-    } else {
-        child.wait()?
-    };
+    let exit_status = wait_child_with_events(child, violation_rx, trace_log_path).await;
 
     // Flush overlayfs write-listed files back to real inodes and clean up
     // staging directories. Must happen after child.wait() so the child's mount
@@ -280,6 +130,185 @@ pub async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
     }
 
     std::process::exit(exit_status.code().unwrap_or(1));
+}
+
+/// Load and merge config.
+/// `--no-config` skips global/project config files but `--config <extra>` still applies.
+fn load_config(args: &RunArgs, cwd: &Path) -> Result<PentConfig, CliError> {
+    let mut config = if args.no_config {
+        PentConfig::default()
+    } else {
+        ConfigLoader::load(cwd)?
+    };
+    if let Some(ref extra) = args.extra_config {
+        let extra_cfg = PentConfig::load(extra)?;
+        config = config.merge(extra_cfg);
+    }
+    Ok(config)
+}
+
+/// Merge CLI flag overrides into the loaded config.
+fn apply_cli_overrides(config: &mut PentConfig, args: &RunArgs) -> Result<(), CliError> {
+    config.sandbox.paths.traversal.extend(
+        args.traverse
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned()),
+    );
+    config
+        .sandbox
+        .paths
+        .read
+        .extend(args.read.iter().map(|p| p.to_string_lossy().into_owned()));
+    config
+        .sandbox
+        .paths
+        .read_write
+        .extend(args.write.iter().map(|p| p.to_string_lossy().into_owned()));
+    config
+        .sandbox
+        .paths
+        .execute
+        .extend(args.execute.iter().map(|p| p.to_string_lossy().into_owned()));
+    config
+        .proxy
+        .domain_allowlist
+        .extend(args.allow.iter().cloned());
+
+    // On Linux, read_write paths must be exact filenames — glob ('*') patterns
+    // are not supported because overlayfs requires specific paths to mount over.
+    #[cfg(target_os = "linux")]
+    config.sandbox.paths.validate_no_rw_globs().map_err(CliError::Other)?;
+
+    Ok(())
+}
+
+/// Parse `KEY=VALUE` and bare `KEY` env entries; return a merged env map.
+fn build_run_env(args_env: &[String]) -> HashMap<String, String> {
+    let mut allowlist_keys: Vec<String> = Vec::new();
+    let mut explicit_env: Vec<(String, String)> = Vec::new();
+    for entry in args_env {
+        if let Some(eq) = entry.find('=') {
+            let key = entry[..eq].to_string();
+            let value = entry[eq + 1..].to_string();
+            allowlist_keys.push(key.clone());
+            explicit_env.push((key, value));
+        } else {
+            allowlist_keys.push(entry.clone());
+        }
+    }
+    let mut env_map: HashMap<String, String> = build_env(&allowlist_keys);
+    for (k, v) in explicit_env {
+        env_map.insert(k, v);
+    }
+    env_map
+}
+
+/// Create `.pent/trace.log` when `trace` is true; emit warnings on failure.
+fn open_trace_log(trace: bool, cwd: &Path) -> Option<PathBuf> {
+    if !trace {
+        return None;
+    }
+    let pent_dir = cwd.join(".pent");
+    match std::fs::create_dir_all(&pent_dir) {
+        Ok(()) => {
+            let log_path = pent_dir.join("trace.log");
+            match std::fs::File::create(&log_path) {
+                Ok(_) => {
+                    ui::status("tracing", log_path.display());
+                    Some(log_path)
+                }
+                Err(e) => {
+                    ui::warn(format!("could not create trace log: {e}"));
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            ui::warn(format!("could not create .pent directory: {e}"));
+            None
+        }
+    }
+}
+
+/// macOS proxy-degradation logic.
+///
+/// Proxy-based network enforcement is not available on macOS (no per-process
+/// network namespaces; `DYLD_INSERT_LIBRARIES` is unreliable across Go binaries
+/// and hardened-runtime binaries). Any flag or config that would normally start
+/// the proxy (`--allow`, `--network proxy`, `domain_allowlist`) silently
+/// degrades to `Unrestricted` so the process is not blocked. Only explicit
+/// `--network localhost/blocked/unrestricted` take effect.
+#[cfg(target_os = "macos")]
+fn resolve_macos_network(args: &RunArgs, config: &PentConfig) -> NetworkMode {
+    let proxy_requested = args.network == Some(NetworkModeArg::Proxy)
+        || !config.proxy.domain_allowlist.is_empty()
+        || matches!(config.sandbox.network, Some(NetworkMode::ProxyOnly { .. }));
+    if proxy_requested {
+        // Proxy enforcement is unavailable; degrade silently so the process
+        // is not blocked from making external connections.
+        NetworkMode::Unrestricted
+    } else {
+        match args.network {
+            // Proxy already handled above via proxy_requested.
+            Some(NetworkModeArg::Unrestricted | NetworkModeArg::Proxy) => NetworkMode::Unrestricted,
+            Some(NetworkModeArg::Localhost) => NetworkMode::LocalhostOnly,
+            Some(NetworkModeArg::Blocked) => NetworkMode::Blocked,
+            None => match config
+                .sandbox
+                .network
+                .clone()
+                .unwrap_or(NetworkMode::Blocked)
+            {
+                NetworkMode::ProxyOnly { .. } => NetworkMode::Unrestricted,
+                other => other,
+            },
+        }
+    }
+}
+
+/// Wait for `child` to exit, streaming proxy trace events to the log in parallel.
+///
+/// When `violation_rx` is `Some`, events are drained from the channel while the
+/// child runs; when `None` the child is awaited directly.
+#[cfg(not(target_os = "macos"))]
+async fn wait_child_with_events(
+    mut child: std::process::Child,
+    violation_rx: Option<tokio::sync::mpsc::UnboundedReceiver<TraceEvent>>,
+    trace_log_path: Option<PathBuf>,
+) -> std::process::ExitStatus {
+    if let Some(mut event_rx) = violation_rx {
+        let (done_tx, mut done_rx) = tokio::sync::oneshot::channel::<std::process::ExitStatus>();
+        std::thread::spawn(move || {
+            let status = child.wait().unwrap_or_else(|_| {
+                std::process::Command::new("true").status().unwrap()
+            });
+            let _ = done_tx.send(status);
+        });
+
+        loop {
+            tokio::select! {
+                biased;
+                Some(event) = event_rx.recv() => {
+                    if let Some(ref p) = trace_log_path {
+                        log_trace_event(p, event);
+                    }
+                }
+                Ok(status) = &mut done_rx => {
+                    // Drain any in-flight events before returning.
+                    while let Ok(ev) = event_rx.try_recv() {
+                        if let Some(ref p) = trace_log_path {
+                            log_trace_event(p, ev);
+                        }
+                    }
+                    break status;
+                }
+            }
+        }
+    } else {
+        child.wait().unwrap_or_else(|_| {
+            std::process::Command::new("true").status().unwrap()
+        })
+    }
 }
 
 /// Runs the child to completion, streaming every sandboxd event for the child
@@ -509,8 +538,8 @@ async fn setup_proxy(
 
     let base_network: NetworkMode = match network_arg {
         Some(NetworkModeArg::Unrestricted) => NetworkMode::Unrestricted,
-        Some(NetworkModeArg::Localhost) => NetworkMode::LocalhostOnly,
-        Some(NetworkModeArg::Proxy) => NetworkMode::LocalhostOnly, // overridden below when proxy starts
+        // Proxy arm is overridden below when the proxy actually starts.
+        Some(NetworkModeArg::Localhost | NetworkModeArg::Proxy) => NetworkMode::LocalhostOnly,
         Some(NetworkModeArg::Blocked) => NetworkMode::Blocked,
         None => config
             .sandbox
