@@ -482,7 +482,7 @@ pub fn spawn_with_landlock(
     // yet but whose parent does — those might be created as directories by the
     // sandboxed process (e.g. ~/.cache/claude that doesn't exist at spawn time).
     // Paths that are already files are excluded (they're handled by write_set).
-    let rw_dirs: HashSet<PathBuf> = rw_expanded
+    let mut rw_dirs: HashSet<PathBuf> = rw_expanded
         .iter()
         .filter_map(|(path, _)| {
             if path.is_dir() {
@@ -499,6 +499,15 @@ pub fn spawn_with_landlock(
             }
         })
         .collect();
+
+    // The workspace and data_dir receive write access via Landlock and are
+    // always flushed back to the real filesystem.  They may fall inside an
+    // overlayfs mount (e.g. the home-dir overlay triggered by ~/.claude.json
+    // being in read_write); without this, every file the sandboxed agent
+    // writes in the workspace goes to the upper layer and is silently
+    // discarded on session exit.
+    rw_dirs.insert(config.workspace.clone());
+    rw_dirs.insert(config.data_dir.clone());
 
     // Build the set of paths the sandboxed process is allowed to read.
     // Traversal-only paths are intentionally excluded (ReadDir but not ReadFile).
@@ -1506,6 +1515,80 @@ mod tests {
         }
     }
 
+    /// Reproduce the real Claude-session failure mode:
+    ///
+    /// In a typical Claude session `~/.claude.json` is in `read_write` (file),
+    /// which causes the overlay to be mounted on `~`.  The workspace
+    /// `~/projects/myrepo` is under `~`, so all its writes go to the upper
+    /// layer.  But the workspace was NOT in `rw_dirs`, so those writes were
+    /// never flushed — every edit Claude made disappeared on session exit.
+    ///
+    /// This test fails before the fix (workspace added to rw_dirs) and passes
+    /// after it.
+    #[test]
+    #[serial]
+    #[cfg(target_os = "linux")]
+    fn test_overlay_flush_workspace_under_home_overlay() {
+        use std::collections::HashMap;
+
+        if check_available().is_err() {
+            return;
+        }
+
+        // fake_home/ mimics ~/.  fake_home/workspace/ mimics ~/projects/myrepo.
+        let fake_home = tempfile::tempdir().unwrap();
+        let workspace = fake_home.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        // Pre-create a source file the sandbox will edit.
+        let src_dir = workspace.join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let target = src_dir.join("main.rs");
+        std::fs::write(&target, "fn main() {}").unwrap();
+
+        // Only the dot-file at home level is in read_write — this triggers the
+        // overlay on fake_home/, the same as ~/.claude.json does in production.
+        let dot_file = fake_home.path().join(".app.json");
+        std::fs::write(&dot_file, "{}").unwrap();
+
+        let mut paths = SandboxPaths::default();
+        paths.read_write.push(dot_file.to_str().unwrap().to_string());
+        // workspace is intentionally NOT in read_write — it's the workspace arg.
+
+        let config = SandboxConfig::new(workspace.clone(), paths, workspace.clone())
+            .with_data_dir(workspace.clone())
+            .with_env(HashMap::new());
+
+        let path_dirs = vec![PathBuf::from("/bin"), PathBuf::from("/usr/bin")];
+        let cmd = format!("printf 'fn main() {{ println!(\"hi\"); }}' > '{}'", target.display());
+
+        let result = spawn_with_landlock(
+            &config, "/bin/sh", &["-c".to_string(), cmd], &HashMap::new(), &path_dirs,
+        );
+
+        let (mut child, overlay_handle, _netns) = match result {
+            Ok(r) => r,
+            Err(SandboxError::SpawnFailed(e)) if e.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(e) => panic!("spawn_with_landlock failed: {e:?}"),
+        };
+
+        let Some(handle) = overlay_handle else {
+            child.wait().ok();
+            return; // no overlay active
+        };
+
+        let status = child.wait().expect("wait failed");
+        assert!(status.success(), "sandboxed command failed");
+        crate::linux_overlayfs::teardown(handle);
+
+        let content = std::fs::read_to_string(&target).unwrap_or_default();
+        assert_eq!(
+            content, "fn main() { println!(\"hi\"); }",
+            "workspace file edited inside sandbox must be flushed to real FS \
+             (overlay mounted on parent dir, workspace not in read_write)"
+        );
+    }
+
     /// Modify an existing file that is listed directly in read_write (file-level
     /// entry).  This is the original write_set path.
     #[test]
@@ -1746,36 +1829,81 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&target).unwrap(), r#"{"ok":true}"#);
     }
 
-    /// Files in a directory NOT in read_write must NOT be flushed to the real FS.
+    /// Files outside both the workspace and all read_write directories must NOT
+    /// be flushed to the real FS.  The overlay covers the entire parent
+    /// directory, so writes from the sandbox land in the upper layer, but the
+    /// flush logic only persists files that are in `write_set` or `rw_dirs`
+    /// (which includes the workspace).  Files in a sibling directory that is
+    /// neither the workspace nor an explicit rw path are protected on two
+    /// levels: Landlock denies the write entirely, and even if a write somehow
+    /// reached the upper layer, the flush condition would not match.
     #[test]
     #[serial]
     #[cfg(target_os = "linux")]
     fn test_overlay_no_flush_for_non_rw_dir() {
-        let temp = tempfile::tempdir().unwrap();
-        let rw_dir = temp.path().join("allowed");
-        let other_dir = temp.path().join("forbidden");
-        std::fs::create_dir_all(&rw_dir).unwrap();
-        std::fs::create_dir_all(&other_dir).unwrap();
+        use std::collections::HashMap;
 
-        // Create a file in both dirs so we have real inodes in both.
-        let allowed_file = rw_dir.join("ok.txt");
-        let forbidden_file = other_dir.join("secret.txt");
-        std::fs::write(&allowed_file, "original-allowed").unwrap();
-        std::fs::write(&forbidden_file, "original-secret").unwrap();
+        if check_available().is_err() {
+            return;
+        }
 
-        // The sandbox only gets read_write on rw_dir, not other_dir.
-        // Writing to other_dir from the sandbox should not touch the real file.
+        // base/ is the overlay root (triggered by base/.sentinel file entry).
+        // workspace/ is the workspace — its contents ARE flushed.
+        // sibling/ is a sibling directory outside the workspace — writes are
+        // blocked by Landlock and must not be flushed.
+        let base = tempfile::tempdir().unwrap();
+        let workspace = base.path().join("workspace");
+        let sibling = base.path().join("sibling");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+
+        let ws_file = workspace.join("ok.txt");
+        let sibling_file = sibling.join("secret.txt");
+        std::fs::write(&ws_file, "original-ws").unwrap();
+        std::fs::write(&sibling_file, "original-sibling").unwrap();
+
+        // Sentinel in base/ triggers overlay on base/ (covering both workspace/
+        // and sibling/).
+        let sentinel = base.path().join(".sentinel");
+        std::fs::write(&sentinel, "s").unwrap();
+
+        let mut paths = SandboxPaths::default();
+        paths.read_write.push(sentinel.to_str().unwrap().to_string());
+        // workspace is NOT in read_write but is the workspace arg — it gets
+        // added to rw_dirs automatically and its files are flushed.
+
+        let config = SandboxConfig::new(workspace.clone(), paths, workspace.clone())
+            .with_data_dir(workspace.clone())
+            .with_env(HashMap::new());
+        let path_dirs = vec![PathBuf::from("/bin"), PathBuf::from("/usr/bin")];
+
+        // The sandbox can write to workspace (Landlock allows it) but not to
+        // sibling (Landlock denies it — the write fails silently).
         let cmd = format!(
-            "printf 'modified-allowed' > '{}'; printf 'should-not-persist' > '{}' 2>/dev/null; true",
-            allowed_file.display(), forbidden_file.display()
+            "printf 'modified-ws' > '{}'; printf 'should-not-persist' > '{}' 2>/dev/null; true",
+            ws_file.display(), sibling_file.display()
         );
-        let active = run_sandboxed_rw(temp.path(), &[rw_dir.to_str().unwrap()], &cmd);
-        if !active { return; }
 
-        assert_eq!(std::fs::read_to_string(&allowed_file).unwrap(), "modified-allowed",
-            "rw_dir file must be flushed");
-        assert_eq!(std::fs::read_to_string(&forbidden_file).unwrap(), "original-secret",
-            "non-rw_dir file must NOT be modified on real FS");
+        let result = spawn_with_landlock(
+            &config, "/bin/sh", &["-c".to_string(), cmd], &HashMap::new(), &path_dirs,
+        );
+        let (mut child, overlay_handle, _netns) = match result {
+            Ok(r) => r,
+            Err(SandboxError::SpawnFailed(e)) if e.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(e) => panic!("spawn_with_landlock failed: {e:?}"),
+        };
+        let Some(handle) = overlay_handle else {
+            child.wait().ok();
+            return;
+        };
+        let status = child.wait().expect("wait failed");
+        assert!(status.success());
+        crate::linux_overlayfs::teardown(handle);
+
+        assert_eq!(std::fs::read_to_string(&ws_file).unwrap(), "modified-ws",
+            "workspace file must be flushed");
+        assert_eq!(std::fs::read_to_string(&sibling_file).unwrap(), "original-sibling",
+            "file outside workspace and rw_dirs must NOT be modified on real FS");
     }
 
     #[test]
