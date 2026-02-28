@@ -246,7 +246,7 @@ Profiles are an optional convenience — named sets of domains and filesystem pa
 |---------|---------|------------|---------------|------------|
 | `@claude` | api.anthropic.com, statsig.anthropic.com, sentry.io | — | — | `@node`, `@ssh` |
 | `@codex` | api.openai.com, *.openai.com | — | — | `@node` |
-| `@gemini` | generativelanguage.googleapis.com, aiplatform.googleapis.com, cloudresourcemanager.googleapis.com, oauth2.googleapis.com, accounts.google.com | — | ~/.npm-global | `@node` |
+| `@gemini` | generativelanguage.googleapis.com, aiplatform.googleapis.com, cloudresourcemanager.googleapis.com, oauth2.googleapis.com, accounts.google.com, cloudcode-pa.googleapis.com, play.googleapis.com | — | ~/.npm-global | `@node` |
 | `@gh` | github.com, *.github.com, raw.githubusercontent.com, objects.githubusercontent.com, codeload.github.com, api.github.com | ~/.config/gh | — | `@ssh` |
 | `@ssh` | — | ~/.ssh/known_hosts, ~/.ssh/config | — | — |
 | `@npm` | registry.npmjs.org, *.npmjs.org | ~/.npm | — | `@node` |

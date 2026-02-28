@@ -507,6 +507,8 @@ fn profile_config(p: Profile) -> PentConfig {
                     "cloudresourcemanager.googleapis.com".to_string(),
                     "oauth2.googleapis.com".to_string(),
                     "accounts.google.com".to_string(),
+                    "cloudcode-pa.googleapis.com".to_string(),
+                    "play.googleapis.com".to_string(),
                 ],
                 ..Default::default()
             },
