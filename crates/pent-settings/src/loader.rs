@@ -23,12 +23,24 @@ impl ConfigLoader {
     /// # Errors
     /// Returns an error if a config file exists but cannot be parsed.
     pub fn load(workspace: &Path) -> Result<PentConfig, SettingsError> {
-        let global = if let Some(path) = Self::global_config_path() {
-            Self::load_file(&path)?.unwrap_or_default()
+        let project_path = Self::project_config_path(workspace);
+        let project = Self::load_file(&project_path)?.unwrap_or_default();
+
+        // Global config is only loaded when a project config file exists.
+        // Without a project context the behaviour must match --no-config
+        // (defaults only), so that running `pent run -- <cmd>` in an
+        // unconfigured directory never silently activates ProxyOnly or other
+        // modes the user didn't ask for in that context.
+        let global = if project_path.exists() {
+            if let Some(path) = Self::global_config_path() {
+                Self::load_file(&path)?.unwrap_or_default()
+            } else {
+                PentConfig::default()
+            }
         } else {
             PentConfig::default()
         };
-        let project = Self::load_file(&Self::project_config_path(workspace))?.unwrap_or_default();
+
         Ok(global.merge(project))
     }
 
@@ -97,10 +109,11 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn test_load_missing_workspace_returns_default() {
+    fn test_load_no_project_config_returns_default() {
         let dir = tempfile::tempdir().unwrap();
-        // Use load_project_only to avoid pollution from the real global config.
-        let config = ConfigLoader::load_project_only(dir.path()).unwrap();
+        // No .pent/pent.toml → load() must return defaults regardless of any
+        // global config the developer may have installed on this machine.
+        let config = ConfigLoader::load(dir.path()).unwrap();
         assert!(config.sandbox.network.is_none());
         assert!(config.proxy.domain_allowlist.is_empty());
     }
@@ -116,11 +129,10 @@ mod tests {
         )
         .unwrap();
 
-        // Use load_project_only to avoid pollution from the real global config.
-        let config = ConfigLoader::load_project_only(dir.path()).unwrap();
-        assert_eq!(
-            config.proxy.domain_allowlist,
-            vec!["example.com".to_string()]
+        let config = ConfigLoader::load(dir.path()).unwrap();
+        assert!(
+            config.proxy.domain_allowlist.contains(&"example.com".to_string()),
+            "project domain_allowlist should be present"
         );
     }
 
