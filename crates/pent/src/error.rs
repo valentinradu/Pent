@@ -1,6 +1,6 @@
-#![allow(unreachable_pub)]
+
 #[derive(Debug, thiserror::Error)]
-pub enum CliError {
+pub(crate) enum CliError {
     #[error("{0}")]
     Sandbox(#[from] pent_sandbox::SandboxError),
 

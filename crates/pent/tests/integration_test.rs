@@ -1168,7 +1168,6 @@ mod no_hang {
     /// Spawn `pent` with a PTY.  `agent_home` is the temp HOME that contains the
     /// agent's config (written by `setup_agent_config`).  The real HOME is still
     /// inherited so binaries can find their modules (e.g. ~/.npm-global, ~/.local).
-    #[allow(clippy::cast_sign_loss)]
     fn spawn_with_pty(
         dir: &Path,
         agent_home: &Path,

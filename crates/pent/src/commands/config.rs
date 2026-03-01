@@ -1,4 +1,4 @@
-#![allow(unreachable_pub)]
+
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -25,7 +25,7 @@ fn resolve_config_path(global: bool, cwd: &Path) -> Result<PathBuf, CliError> {
 }
 
 #[allow(clippy::needless_pass_by_value)] // PathBuf taken for ergonomics
-pub fn config(args: crate::cli::ConfigArgs, cwd: PathBuf) -> Result<(), CliError> {
+pub(crate) fn config(args: crate::cli::ConfigArgs, cwd: PathBuf) -> Result<(), CliError> {
     match args.subcommand {
         ConfigSubcommand::Init { global } => init(global, &cwd),
         ConfigSubcommand::Show { format } => show(format, &cwd),

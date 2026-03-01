@@ -1,4 +1,4 @@
-#![allow(unreachable_pub)]
+
 #[cfg(unix)]
 extern crate libc;
 
@@ -23,7 +23,7 @@ use crate::error::CliError;
 use crate::ui;
 
 #[allow(clippy::too_many_lines)]
-pub async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
+pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
     #[cfg(target_os = "macos")]
     if args.no_sandbox {
         return Err(CliError::Other(

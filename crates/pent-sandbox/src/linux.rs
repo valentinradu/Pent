@@ -42,9 +42,9 @@
 use crate::{NetworkMode, SandboxConfig, SandboxError};
 use std::path::{Path, PathBuf};
 
+#[cfg(test)]
 /// Minimum required Landlock ABI version.
 /// ABI v4 requires kernel 5.19+.
-#[allow(dead_code)]
 pub const MIN_LANDLOCK_ABI: i32 = 4;
 
 /// System paths to allow read access (libraries, config, etc.)
@@ -110,10 +110,9 @@ pub fn check_available() -> Result<(), SandboxError> {
 
     // Try to create a minimal ruleset — succeeds only if the kernel supports ABI v4.
     let all_access = AccessFs::from_all(ABI::V4);
-    #[allow(clippy::redundant_closure_for_method_calls)]
     Ruleset::default()
         .handle_access(all_access)
-        .and_then(|r| r.create())
+        .and_then(Ruleset::create)
         .map(|_| ())
         .map_err(|_| SandboxError::SandboxUnavailable {
             reason: "Landlock ABI v4 not available".to_string(),
@@ -147,8 +146,7 @@ pub fn check_available() -> Result<(), SandboxError> {
 ///
 /// # Errors
 /// * `InvalidConfig` - If a required path cannot be opened
-#[cfg(target_os = "linux")]
-#[allow(dead_code)] // used in tests
+#[cfg(all(target_os = "linux", test))]
 pub fn build_landlock_ruleset(
     config: &SandboxConfig,
     path_dirs: &[PathBuf],
@@ -270,8 +268,7 @@ pub fn build_landlock_ruleset(
 ///
 /// # Errors
 /// * `SandboxUnavailable` - If `restrict_self` fails
-#[cfg(target_os = "linux")]
-#[allow(dead_code)] // used in tests
+#[cfg(all(target_os = "linux", test))]
 pub fn apply_landlock(ruleset: landlock::RulesetCreated) -> Result<(), SandboxError> {
     ruleset
         .restrict_self()

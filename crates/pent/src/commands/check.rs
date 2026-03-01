@@ -1,4 +1,4 @@
-#![allow(unreachable_pub)]
+
 use std::path::PathBuf;
 
 use pent_proxy::{ProxyConfig, ProxyServer};
@@ -8,7 +8,7 @@ use pent_settings::ConfigLoader;
 use crate::error::CliError;
 use crate::ui;
 
-pub async fn check(cwd: PathBuf) -> Result<(), CliError> {
+pub(crate) async fn check(cwd: PathBuf) -> Result<(), CliError> {
     let mut all_ok = true;
 
     // 1. Platform info

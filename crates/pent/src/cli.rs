@@ -1,4 +1,4 @@
-#![allow(unreachable_pub)]
+
 use std::path::PathBuf;
 
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
@@ -8,7 +8,7 @@ use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
     name = "pent",
     about = "Run processes under filesystem and network containment"
 )]
-pub struct Cli {
+pub(crate) struct Cli {
     /// Increase log verbosity (-v, -vv, -vvv)
     #[arg(short, long, action = ArgAction::Count, global = true)]
     pub verbose: u8,
@@ -18,7 +18,7 @@ pub struct Cli {
 }
 
 #[derive(Subcommand)]
-pub enum Command {
+pub(crate) enum Command {
     /// Run a command inside the sandbox
     Run(RunArgs),
     /// Check that sandboxing and proxy are available on this system
@@ -28,7 +28,7 @@ pub enum Command {
 }
 
 #[derive(Args)]
-pub struct RunArgs {
+pub(crate) struct RunArgs {
     /// Network containment mode
     #[arg(long, value_enum)]
     pub network: Option<NetworkModeArg>,
@@ -88,7 +88,7 @@ pub struct RunArgs {
 }
 
 #[derive(ValueEnum, Clone, Copy, PartialEq, Eq)]
-pub enum NetworkModeArg {
+pub(crate) enum NetworkModeArg {
     Unrestricted,
     Localhost,
     Proxy,
@@ -96,13 +96,13 @@ pub enum NetworkModeArg {
 }
 
 #[derive(Args)]
-pub struct ConfigArgs {
+pub(crate) struct ConfigArgs {
     #[command(subcommand)]
     pub subcommand: ConfigSubcommand,
 }
 
 #[derive(Subcommand)]
-pub enum ConfigSubcommand {
+pub(crate) enum ConfigSubcommand {
     /// Write a starter config file
     Init {
         #[arg(long)]
@@ -136,7 +136,7 @@ pub enum ConfigSubcommand {
 }
 
 #[derive(ValueEnum, Clone, Copy)]
-pub enum OutputFormat {
+pub(crate) enum OutputFormat {
     Toml,
     Json,
 }

@@ -696,19 +696,17 @@ impl TcpProxy {
 }
 
 /// SOCKS5 reply codes.
-// All RFC 1928 SOCKS5 reply codes are defined for completeness; not all are used in the
-// current implementation but are present for reference and future use.
-#[allow(dead_code)]
 mod socks5 {
     pub(super) const SUCCEEDED: u8 = 0x00;
     pub(super) const GENERAL_FAILURE: u8 = 0x01;
     pub(super) const CONNECTION_NOT_ALLOWED: u8 = 0x02;
-    pub(super) const NETWORK_UNREACHABLE: u8 = 0x03;
-    pub(super) const HOST_UNREACHABLE: u8 = 0x04;
     pub(super) const CONNECTION_REFUSED: u8 = 0x05;
-    pub(super) const TTL_EXPIRED: u8 = 0x06;
+    #[cfg(test)]
+    pub(super) const NETWORK_UNREACHABLE: u8 = 0x03;
+    #[cfg(test)]
+    pub(super) const HOST_UNREACHABLE: u8 = 0x04;
+    #[cfg(test)]
     pub(super) const COMMAND_NOT_SUPPORTED: u8 = 0x07;
-    pub(super) const ADDRESS_TYPE_NOT_SUPPORTED: u8 = 0x08;
 }
 
 #[cfg(test)]

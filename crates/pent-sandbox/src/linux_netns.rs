@@ -49,16 +49,6 @@ pub struct NetnsConfig {
 }
 
 impl NetnsConfig {
-    /// Create a network namespace config derived from the current process PID.
-    ///
-    /// The PID is used to derive both the namespace name (`pent-{pid}`) and
-    /// the IP range (`10.200.{pid % 256}.0/24`). Using the PID ensures that
-    /// each pent invocation gets a unique namespace name and IP range.
-    #[allow(dead_code)]
-    pub fn new() -> Self {
-        Self::from_pid()
-    }
-
     /// Create a network namespace config using the current process PID.
     ///
     /// PIDs are unique among running processes, so each pent invocation gets
@@ -817,7 +807,7 @@ mod tests {
 
     #[test]
     fn test_netns_config_name_format() {
-        let config = NetnsConfig::new();
+        let config = NetnsConfig::from_pid();
         assert!(config.name.starts_with("pent-"));
         let pid = std::process::id().to_string();
         assert!(config.name.contains(&pid));
@@ -825,7 +815,7 @@ mod tests {
 
     #[test]
     fn test_netns_config_ip_range() {
-        let config = NetnsConfig::new();
+        let config = NetnsConfig::from_pid();
         // Inner IP should be 10.200.x.2
         assert_eq!(config.inner_ip.octets()[0], 10);
         assert_eq!(config.inner_ip.octets()[1], 200);
@@ -839,7 +829,7 @@ mod tests {
 
     #[test]
     fn test_netns_config_prefix_len() {
-        let config = NetnsConfig::new();
+        let config = NetnsConfig::from_pid();
         assert_eq!(config.prefix_len, 24);
     }
 
@@ -868,7 +858,7 @@ mod tests {
     #[test]
     fn test_create_netns_requires_privileges() {
         if check_netns_privileges().is_err() {
-            let config = NetnsConfig::new();
+            let config = NetnsConfig::from_pid();
             let result = create_netns(&config, 0);
             // Should fail without privileges
             assert!(result.is_err());
