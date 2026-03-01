@@ -948,3 +948,225 @@ fn test_config_rm_output_shows_file_path() {
     );
 }
 
+// ============================================================================
+// L. Run — no-hang smoke tests (Linux only, no root required)
+//
+// Each test spawns `pent run -- <binary>` and asserts the process exits within
+// a short deadline.  A hung process fails the test with "timeout expired".
+// The tests cover two cases the user reported:
+//   • System binaries (e.g. /usr/bin/true, /usr/bin/curl) — known to work.
+//   • User-local binaries (e.g. ~/.local/bin/claude) — known to hang.
+// ============================================================================
+
+#[cfg(target_os = "linux")]
+mod no_hang {
+    use super::*;
+    use std::io::Read as _;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    /// Spawn `pent` with `args` in `dir`; kill it if it has not exited after
+    /// `timeout_secs`.  Returns `(finished_before_deadline, stderr_text)`.
+    ///
+    /// stdout is discarded (Stdio::null) — we only capture stderr for
+    /// diagnostics.  stderr is drained in a background thread so the child
+    /// can never block on a full pipe.
+    fn pent_timeout(dir: &Path, args: &[&str], timeout_secs: u64) -> (bool, String) {
+        let mut child = Command::new(PENT)
+            .args(args)
+            .current_dir(dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|e| panic!("failed to spawn pent: {e}"));
+
+        let mut stderr_pipe = child.stderr.take().unwrap();
+        let (err_tx, err_rx) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            let mut buf = String::new();
+            stderr_pipe.read_to_string(&mut buf).ok();
+            let _ = err_tx.send(buf);
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+        let exited = loop {
+            match child.try_wait().expect("try_wait failed") {
+                Some(_) => break true,
+                None if Instant::now() >= deadline => {
+                    child.kill().ok();
+                    child.wait().ok();
+                    break false;
+                }
+                None => std::thread::sleep(Duration::from_millis(50)),
+            }
+        };
+
+        let stderr = err_rx.recv_timeout(Duration::from_secs(1)).unwrap_or_default();
+        (exited, stderr)
+    }
+
+    /// Find `name` via `which`; fall back to `~/.local/bin/<name>`.
+    fn detect_binary(name: &str) -> Option<std::path::PathBuf> {
+        if let Ok(out) = Command::new("which").arg(name).output() {
+            if out.status.success() {
+                let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !p.is_empty() {
+                    return Some(std::path::PathBuf::from(p));
+                }
+            }
+        }
+        let home = std::env::var("HOME").ok()?;
+        let candidate = std::path::PathBuf::from(home).join(".local/bin").join(name);
+        candidate.exists().then_some(candidate)
+    }
+
+    // ── baseline: system binaries ─────────────────────────────────────────────
+
+    /// /usr/bin/true: the simplest possible exit.  Should always finish in <2s.
+    #[test]
+    fn system_true_exits_quickly() {
+        let dir = TempDir::new().unwrap();
+        let (ok, stderr) = pent_timeout(
+            dir.path(),
+            &["run", "--no-config", "--", "/usr/bin/true"],
+            2,
+        );
+        assert!(ok, "pent run -- /usr/bin/true timed out (2s)\nstderr:\n{stderr}");
+    }
+
+    /// Same as above but with explicit --network blocked (the default).
+    #[test]
+    fn system_true_blocked_network_exits_quickly() {
+        let dir = TempDir::new().unwrap();
+        let (ok, stderr) = pent_timeout(
+            dir.path(),
+            &["run", "--no-config", "--network", "blocked", "--", "/usr/bin/true"],
+            2,
+        );
+        assert!(ok, "pent run --network blocked -- /usr/bin/true timed out (2s)\nstderr:\n{stderr}");
+    }
+
+    /// /usr/bin/curl --version: a real binary that reads shared libs from /usr/lib.
+    #[test]
+    fn system_curl_version_exits_quickly() {
+        if !std::path::Path::new("/usr/bin/curl").exists() {
+            println!("SKIP: /usr/bin/curl not found");
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        let (ok, stderr) = pent_timeout(
+            dir.path(),
+            &["run", "--no-config", "--", "/usr/bin/curl", "--version"],
+            2,
+        );
+        assert!(ok, "pent run -- curl --version timed out (2s)\nstderr:\n{stderr}");
+    }
+
+    // ── local binaries: --version flag ────────────────────────────────────────
+    //
+    // A binary that honours --version prints a short string and exits 0.
+    // With --no-config the sandbox uses default paths only; the binary's parent
+    // dir is automatically added to the execute set by pent (EACCES fix).
+
+    fn assert_version_exits_quickly(name: &str) {
+        let Some(bin) = detect_binary(name) else {
+            println!("SKIP: {name} not found in PATH or ~/.local/bin");
+            return;
+        };
+        let bin_s = bin.to_str().unwrap();
+        let dir = TempDir::new().unwrap();
+        let (ok, stderr) = pent_timeout(
+            dir.path(),
+            &["run", "--no-config", "--", bin_s, "--version"],
+            2,
+        );
+        assert!(ok, "pent run -- {name} --version timed out (2s)\nstderr:\n{stderr}");
+    }
+
+    #[test]
+    fn claude_version_exits_quickly() { assert_version_exits_quickly("claude"); }
+    #[test]
+    fn codex_version_exits_quickly()  { assert_version_exits_quickly("codex"); }
+    #[test]
+    fn gemini_version_exits_quickly() { assert_version_exits_quickly("gemini"); }
+
+    // ── local binaries: no args, no TTY ──────────────────────────────────────
+    //
+    // When stdin is not a terminal most interactive CLIs print something like
+    // "not a terminal" and exit within milliseconds.  A hang here means the
+    // binary (or a library it calls) is blocking on something the sandbox
+    // denies rather than failing fast.
+
+    fn assert_no_tty_exits_quickly(name: &str) {
+        let Some(bin) = detect_binary(name) else {
+            println!("SKIP: {name} not found in PATH or ~/.local/bin");
+            return;
+        };
+        let bin_s = bin.to_str().unwrap();
+        let dir = TempDir::new().unwrap();
+        let (ok, stderr) = pent_timeout(
+            dir.path(),
+            &["run", "--no-config", "--", bin_s],
+            2,
+        );
+        assert!(
+            ok,
+            "pent run -- {name} (no args, stdin=null) timed out (2s)\n\
+             hint: the binary did not detect 'not a tty' and exit — \
+             it may be blocking on a sandboxed resource\nstderr:\n{stderr}",
+        );
+    }
+
+    #[test]
+    fn claude_no_tty_exits_quickly() { assert_no_tty_exits_quickly("claude"); }
+    #[test]
+    fn codex_no_tty_exits_quickly()  { assert_no_tty_exits_quickly("codex"); }
+    #[test]
+    fn gemini_no_tty_exits_quickly() { assert_no_tty_exits_quickly("gemini"); }
+
+    // ── with-config: project pent.toml sets domain_allowlist → ProxyOnly ─────
+    //
+    // When a domain_allowlist is present pent starts a proxy and creates a veth
+    // pair.  Verify that even in proxy mode a fast-exiting binary terminates
+    // promptly.  This is the scenario that previously caused hangs when pent was
+    // run from a directory that loaded a config with an allowlist.
+
+    fn assert_proxy_mode_exits_quickly(name: &str) {
+        let Some(bin) = detect_binary(name) else {
+            println!("SKIP: {name} not found in PATH or ~/.local/bin");
+            return;
+        };
+        let bin_s = bin.to_str().unwrap();
+
+        // Create a project dir with a pent.toml that has a domain_allowlist.
+        let dir = TempDir::new().unwrap();
+        let dot_pent = dir.path().join(".pent");
+        fs::create_dir_all(&dot_pent).unwrap();
+        fs::write(
+            dot_pent.join("pent.toml"),
+            "[proxy]\ndomain_allowlist = [\"api.anthropic.com\"]\n",
+        )
+        .unwrap();
+
+        let (ok, stderr) = pent_timeout(
+            dir.path(),
+            &["run", "--", bin_s, "--version"],
+            5,  // proxy + veth setup may take ~1s; allow 5s total
+        );
+        assert!(
+            ok,
+            "pent run (proxy mode) -- {name} --version timed out (5s)\n\
+             hint: pent may be hanging in veth/nft setup or the child is \
+             not routing through the proxy\nstderr:\n{stderr}",
+        );
+    }
+
+    #[test]
+    fn claude_proxy_mode_exits_quickly() { assert_proxy_mode_exits_quickly("claude"); }
+    #[test]
+    fn codex_proxy_mode_exits_quickly()  { assert_proxy_mode_exits_quickly("codex"); }
+    #[test]
+    fn gemini_proxy_mode_exits_quickly() { assert_proxy_mode_exits_quickly("gemini"); }
+}
+
