@@ -112,7 +112,7 @@ fn sandboxed_run(workspace: &Path, extra_args: &[String], cmd_args: &[&str]) -> 
 }
 
 /// A path in the user's home directory that is guaranteed to be
-/// outside the sandbox defaults (system_defaults gives no access to $HOME).
+/// outside the sandbox defaults (`system_defaults` gives no access to `$HOME`).
 ///
 /// $HOME is typically /Users/<username> on macOS — not under /tmp, not
 /// under /usr/lib, and not under $TMPDIR (which is /var/folders/…/T/).

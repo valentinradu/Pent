@@ -97,6 +97,7 @@ impl TcpProxy {
     }
 
     /// Get current connection count.
+    #[must_use]
     pub fn connection_count(&self) -> usize {
         self.connection_count
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -166,7 +167,7 @@ impl TcpProxy {
             let connection_count = Arc::clone(&self.connection_count);
 
             tokio::spawn(async move {
-                let proxy = TcpProxy {
+                let proxy = Self {
                     config,
                     state,
                     connection_count: Arc::clone(&connection_count),
@@ -249,7 +250,7 @@ impl TcpProxy {
 
         if n < 10 {
             client
-                .write_all(&self.build_socks5_error(socks5::GENERAL_FAILURE))
+                .write_all(&Self::build_socks5_error(socks5::GENERAL_FAILURE))
                 .await
                 .ok();
             return Err(ProxyError::Internal("SOCKS5 request too short".to_string()));
@@ -261,7 +262,7 @@ impl TcpProxy {
             Ok(d) => d,
             Err(e) => {
                 client
-                    .write_all(&self.build_socks5_error(socks5::CONNECTION_NOT_ALLOWED))
+                    .write_all(&Self::build_socks5_error(socks5::CONNECTION_NOT_ALLOWED))
                     .await
                     .ok();
                 return Err(e);
@@ -272,7 +273,7 @@ impl TcpProxy {
         if request[3] != 0x03 {
             if let Err(e) = self.verify_destination(&dest) {
                 client
-                    .write_all(&self.build_socks5_error(socks5::CONNECTION_NOT_ALLOWED))
+                    .write_all(&Self::build_socks5_error(socks5::CONNECTION_NOT_ALLOWED))
                     .await
                     .ok();
                 return Err(e);
@@ -286,7 +287,7 @@ impl TcpProxy {
                     ProxyError::TcpConnection { .. } => socks5::CONNECTION_REFUSED,
                     _ => socks5::GENERAL_FAILURE,
                 };
-                client.write_all(&self.build_socks5_error(code)).await.ok();
+                client.write_all(&Self::build_socks5_error(code)).await.ok();
                 return Err(e);
             }
         };
@@ -298,7 +299,7 @@ impl TcpProxy {
         });
 
         client
-            .write_all(&self.build_socks5_response(local_addr))
+            .write_all(&Self::build_socks5_response(local_addr))
             .await
             .map_err(|e| ProxyError::Internal(format!("Failed to send SOCKS5 success: {e}")))?;
 
@@ -338,7 +339,7 @@ impl TcpProxy {
             .map_err(|_| ProxyError::Internal("HTTP CONNECT: non-UTF8 request".to_string()))?;
         let first_line = header.lines().next().unwrap_or("");
 
-        let (host, port) = self.parse_http_connect_target(first_line)?;
+        let (host, port) = Self::parse_http_connect_target(first_line)?;
         let domain_lower = host.to_lowercase();
 
         // Check allowlist.
@@ -387,7 +388,7 @@ impl TcpProxy {
     }
 
     /// Parse "CONNECT host:port HTTP/1.x" into `(host, port)`.
-    fn parse_http_connect_target<'a>(&self, line: &'a str) -> Result<(&'a str, u16)> {
+    fn parse_http_connect_target(line: &str) -> Result<(&str, u16)> {
         // Format: CONNECT <host>:<port> HTTP/1.x
         let mut parts = line.split_whitespace();
         let method = parts.next().unwrap_or("");
@@ -476,8 +477,7 @@ impl TcpProxy {
     fn verify_destination(&self, dest: &SocketAddr) -> Result<String> {
         self.state.lookup_resolved(&dest.ip()).ok_or_else(|| {
             let msg = format!(
-                "network: direct connection to {} blocked — IP not resolved through proxy DNS",
-                dest
+                "network: direct connection to {dest} blocked — IP not resolved through proxy DNS"
             );
             self.state.report_violation(msg.clone());
             ProxyError::DomainBlocked { domain: msg }
@@ -544,6 +544,7 @@ impl TcpProxy {
 
         match result {
             Ok((r1, r2)) => {
+                #[allow(clippy::tuple_array_conversions)]
                 for r in [r1, r2] {
                     match r {
                         Ok(_) => {}
@@ -553,7 +554,7 @@ impl TcpProxy {
                         {
                             // Normal connection close
                         }
-                        Err(e) => return Err(ProxyError::Internal(format!("Relay error: {}", e))),
+                        Err(e) => return Err(ProxyError::Internal(format!("Relay error: {e}"))),
                     }
                 }
                 Ok(())
@@ -623,8 +624,7 @@ impl TcpProxy {
                     .map_err(|_| ProxyError::Internal("Invalid domain encoding".to_string()))?;
                 {
                     let msg = format!(
-                        "network: direct connection to domain \"{}\" blocked — must resolve through proxy DNS",
-                        domain
+                        "network: direct connection to domain \"{domain}\" blocked — must resolve through proxy DNS"
                     );
                     self.state.report_violation(msg.clone());
                     Err(ProxyError::DomainBlocked { domain: msg })
@@ -642,8 +642,7 @@ impl TcpProxy {
                 Ok(SocketAddr::new(std::net::IpAddr::V6(ip), port))
             }
             _ => Err(ProxyError::Internal(format!(
-                "Unknown address type: {}",
-                atyp
+                "Unknown address type: {atyp}"
             ))),
         }
     }
@@ -652,7 +651,7 @@ impl TcpProxy {
     ///
     /// # Arguments
     /// * `bound_addr` - Local address bound for the connection
-    fn build_socks5_response(&self, bound_addr: SocketAddr) -> Vec<u8> {
+    fn build_socks5_response(bound_addr: SocketAddr) -> Vec<u8> {
         // SOCKS5 reply format:
         // +----+-----+-------+------+----------+----------+
         // |VER | REP |  RSV  | ATYP | BND.ADDR | BND.PORT |
@@ -683,7 +682,7 @@ impl TcpProxy {
     ///
     /// # Arguments
     /// * `code` - SOCKS5 error code
-    fn build_socks5_error(&self, code: u8) -> Vec<u8> {
+    fn build_socks5_error(code: u8) -> Vec<u8> {
         // Reply with error code and dummy address (0.0.0.0:0)
         vec![
             0x05, // Version
@@ -701,18 +700,19 @@ impl TcpProxy {
 // current implementation but are present for reference and future use.
 #[allow(dead_code)]
 mod socks5 {
-    pub const SUCCEEDED: u8 = 0x00;
-    pub const GENERAL_FAILURE: u8 = 0x01;
-    pub const CONNECTION_NOT_ALLOWED: u8 = 0x02;
-    pub const NETWORK_UNREACHABLE: u8 = 0x03;
-    pub const HOST_UNREACHABLE: u8 = 0x04;
-    pub const CONNECTION_REFUSED: u8 = 0x05;
-    pub const TTL_EXPIRED: u8 = 0x06;
-    pub const COMMAND_NOT_SUPPORTED: u8 = 0x07;
-    pub const ADDRESS_TYPE_NOT_SUPPORTED: u8 = 0x08;
+    pub(super) const SUCCEEDED: u8 = 0x00;
+    pub(super) const GENERAL_FAILURE: u8 = 0x01;
+    pub(super) const CONNECTION_NOT_ALLOWED: u8 = 0x02;
+    pub(super) const NETWORK_UNREACHABLE: u8 = 0x03;
+    pub(super) const HOST_UNREACHABLE: u8 = 0x04;
+    pub(super) const CONNECTION_REFUSED: u8 = 0x05;
+    pub(super) const TTL_EXPIRED: u8 = 0x06;
+    pub(super) const COMMAND_NOT_SUPPORTED: u8 = 0x07;
+    pub(super) const ADDRESS_TYPE_NOT_SUPPORTED: u8 = 0x08;
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_statements)] // use statements in test fns after let bindings
 mod tests {
     use super::*;
 
@@ -880,7 +880,9 @@ mod tests {
         let resolved = ResolvedAddress {
             domain: "example.com".to_string(),
             addresses: vec![ip],
-            expires_at: std::time::Instant::now() - std::time::Duration::from_secs(1),
+            expires_at: std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(1))
+                .unwrap(),
         };
         state.cache.insert(resolved);
         let proxy = TcpProxy::new(TcpProxyConfig::default(), state).unwrap();
@@ -1148,6 +1150,7 @@ mod tests {
         // SOCKS5 CONNECT request with domain: ATYP=3
         let mut request = vec![0x05, 0x01, 0x00, 0x03];
         let domain = b"example.com";
+        #[allow(clippy::cast_possible_truncation)]
         request.push(domain.len() as u8);
         request.extend_from_slice(domain);
         request.extend_from_slice(&[0x01, 0xBB]); // Port 443
@@ -1206,10 +1209,10 @@ mod tests {
     fn test_socks5_response_success() {
         use crate::SharedState;
         let state = Arc::new(SharedState::new(vec![]));
-        let proxy = TcpProxy::new(TcpProxyConfig::default(), state).unwrap();
+        let _proxy = TcpProxy::new(TcpProxyConfig::default(), state).unwrap();
 
         let bound_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
-        let response = proxy.build_socks5_response(bound_addr);
+        let response = TcpProxy::build_socks5_response(bound_addr);
 
         // Check SOCKS5 response format
         assert_eq!(response[0], 0x05); // VER
@@ -1224,16 +1227,16 @@ mod tests {
     fn test_socks5_response_error_codes() {
         use crate::SharedState;
         let state = Arc::new(SharedState::new(vec![]));
-        let proxy = TcpProxy::new(TcpProxyConfig::default(), state).unwrap();
+        let _proxy = TcpProxy::new(TcpProxyConfig::default(), state).unwrap();
 
-        let response = proxy.build_socks5_error(socks5::CONNECTION_REFUSED);
+        let response = TcpProxy::build_socks5_error(socks5::CONNECTION_REFUSED);
         assert_eq!(response[0], 0x05); // VER
         assert_eq!(response[1], socks5::CONNECTION_REFUSED); // REP
 
-        let response = proxy.build_socks5_error(socks5::HOST_UNREACHABLE);
+        let response = TcpProxy::build_socks5_error(socks5::HOST_UNREACHABLE);
         assert_eq!(response[1], socks5::HOST_UNREACHABLE);
 
-        let response = proxy.build_socks5_error(socks5::COMMAND_NOT_SUPPORTED);
+        let response = TcpProxy::build_socks5_error(socks5::COMMAND_NOT_SUPPORTED);
         assert_eq!(response[1], socks5::COMMAND_NOT_SUPPORTED);
     }
 
@@ -1342,6 +1345,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // 1MB of data
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let large_data: Vec<u8> = (0..1_000_000).map(|i| (i % 256) as u8).collect();
 
         let mut client = tokio::net::TcpStream::connect(config.bind_addr)
@@ -1875,7 +1879,7 @@ mod tests {
 
     /// This test verifies that the connection counter is safely shared with spawned tasks.
     /// Previously, the implementation used a raw pointer which could cause use-after-free
-    /// if run() was aborted. Now it uses Arc<AtomicUsize> for safe sharing.
+    /// if `run()` was aborted. Now it uses `Arc<AtomicUsize>` for safe sharing.
     ///
     /// The test verifies that:
     /// 1. Connections can be established while the proxy runs

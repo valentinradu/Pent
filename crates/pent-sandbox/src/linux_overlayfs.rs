@@ -1,4 +1,5 @@
 //! Overlayfs-based file shadowing for write-listed files on Linux.
+#![allow(unreachable_pub)]
 //!
 //! # Problem
 //!
@@ -42,6 +43,7 @@ use std::path::{Path, PathBuf};
 
 /// One overlayfs mount — one per unique parent directory of write-listed files.
 #[derive(Clone)]
+#[allow(clippy::struct_field_names)] // _dir suffix is meaningful here
 pub struct OverlayMount {
     /// Real parent directory. Overlayfs is mounted here inside the child namespace.
     pub real_dir: PathBuf,
@@ -78,7 +80,7 @@ fn kernel_supports_xwhiteout() -> bool {
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let mut uts: libc::utsname = unsafe { std::mem::zeroed() };
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-    if unsafe { libc::uname(&mut uts) } != 0 {
+    if unsafe { libc::uname(&raw mut uts) } != 0 {
         return false;
     }
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
@@ -102,14 +104,8 @@ fn kernel_supports_xwhiteout() -> bool {
 /// which is never the intent — whiteouts are overlay-internal bookkeeping.
 fn is_overlay_whiteout(path: &Path) -> bool {
     use std::os::unix::ffi::OsStrExt;
-    let path_c = match CString::new(path.as_os_str().as_bytes()) {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    let name_c = match CString::new("user.overlay.whiteout") {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
+    let Ok(path_c) = CString::new(path.as_os_str().as_bytes()) else { return false };
+    let Ok(name_c) = CString::new("user.overlay.whiteout") else { return false };
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let ret = unsafe {
         libc::getxattr(
@@ -131,7 +127,7 @@ fn set_xattr(path: &Path, name: &str, value: &[u8]) -> std::io::Result<()> {
     let ptr = if value.is_empty() {
         std::ptr::null()
     } else {
-        value.as_ptr() as *const libc::c_void
+        value.as_ptr().cast::<libc::c_void>()
     };
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let ret = unsafe { libc::setxattr(path_c.as_ptr(), name_c.as_ptr(), ptr, value.len(), 0) };
@@ -188,10 +184,7 @@ fn populate_upper_stubs(
         return Ok(());
     }
 
-    let entries = match std::fs::read_dir(real_dir) {
-        Ok(e) => e,
-        Err(_) => return Ok(()), // unreadable dir — skip gracefully
-    };
+    let Ok(entries) = std::fs::read_dir(real_dir) else { return Ok(()) }; // unreadable dir — skip gracefully
 
     let mut upper_has_xwhiteouts = false;
 
@@ -200,10 +193,7 @@ fn populate_upper_stubs(
         let name = entry.file_name();
         let upper_path = upper_dir.join(&name);
 
-        let ft = match entry.file_type() {
-            Ok(ft) => ft,
-            Err(_) => continue,
-        };
+        let Ok(ft) = entry.file_type() else { continue };
 
         if ft.is_symlink() {
             // Symlinks that point into an accessible subtree pass through.
@@ -232,9 +222,9 @@ fn populate_upper_stubs(
             }
 
             // Does this directory contain any accessible paths?
+            let _ = std::fs::create_dir(&upper_path);
             if has_accessible_descendant(&real_path, accessible) {
-                // Partially accessible: create the dir in upper (no xattr) and recurse.
-                let _ = std::fs::create_dir(&upper_path);
+                // Partially accessible: recurse (no opaque xattr).
                 populate_upper_stubs(
                     &real_path,
                     &upper_path,
@@ -245,7 +235,6 @@ fn populate_upper_stubs(
             } else {
                 // No accessible descendants: make the directory opaque.
                 // The merged view shows an empty directory; contents return ENOENT.
-                let _ = std::fs::create_dir(&upper_path);
                 let _ = set_xattr(&upper_path, "user.overlay.opaque", b"y");
             }
         } else if ft.is_file() {
@@ -312,7 +301,7 @@ fn populate_upper_stubs(
 pub fn prepare_overlay_dirs(
     write_files: &[PathBuf],
     pid: u32,
-) -> std::io::Result<Vec<OverlayMount>> {
+) -> Vec<OverlayMount> {
     let mut seen: HashSet<PathBuf> = HashSet::new();
     let mut mounts = Vec::new();
     let mut idx = 0usize;
@@ -352,7 +341,7 @@ pub fn prepare_overlay_dirs(
     }
 
     for parent in &overlay_roots {
-        let base_dir = PathBuf::from(format!("/tmp/pent-ovl-{}-{}", pid, idx));
+        let base_dir = PathBuf::from(format!("/tmp/pent-ovl-{pid}-{idx}"));
         let upper_dir = base_dir.join("upper");
         let work_dir = base_dir.join("work");
         // Directories are NOT created here; setup_overlay_dirs does that
@@ -361,7 +350,7 @@ pub fn prepare_overlay_dirs(
         idx += 1;
     }
 
-    Ok(mounts)
+    mounts
 }
 
 /// Create upper/work directories and populate content stubs.
@@ -417,39 +406,24 @@ pub unsafe fn mount_overlays(overlays: &[OverlayMount]) -> std::io::Result<()> {
         if !overlay.real_dir.is_dir() {
             continue;
         }
-        let real_str = match overlay.real_dir.to_str() {
-            Some(s) => s,
-            None => continue,
-        };
-        let upper_str = match overlay.upper_dir.to_str() {
-            Some(s) => s,
-            None => continue,
-        };
-        let work_str = match overlay.work_dir.to_str() {
-            Some(s) => s,
-            None => continue,
-        };
+        let Some(real_str) = overlay.real_dir.to_str() else { continue };
+        let Some(upper_str) = overlay.upper_dir.to_str() else { continue };
+        let Some(work_str) = overlay.work_dir.to_str() else { continue };
 
-        let target = match CString::new(real_str) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
+        let Ok(target) = CString::new(real_str) else { continue };
         // userxattr: use user.overlay.* namespace for opaque/whiteout xattrs,
         // which works in unprivileged user namespaces.
         let options =
             format!("lowerdir={real_str},upperdir={upper_str},workdir={work_str},userxattr");
-        let options_c = match CString::new(options) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
+        let Ok(options_c) = CString::new(options) else { continue };
 
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let ret = libc::mount(
-            b"overlay\0".as_ptr() as *const libc::c_char,
+            c"overlay".as_ptr(),
             target.as_ptr(),
-            b"overlay\0".as_ptr() as *const libc::c_char,
+            c"overlay".as_ptr(),
             0,
-            options_c.as_ptr() as *const libc::c_void,
+            options_c.as_ptr().cast::<libc::c_void>(),
         );
 
         if ret != 0 {
@@ -464,16 +438,15 @@ pub unsafe fn mount_overlays(overlays: &[OverlayMount]) -> std::io::Result<()> {
             // Write the diagnostic to stderr directly instead.
             let errno = std::io::Error::last_os_error();
             let msg = format!(
-                "pent: overlayfs mount on '{}' failed: {}\n\
+                "pent: overlayfs mount on '{real_str}' failed: {errno}\n\
                  pent: hint: check sysctl kernel.unprivileged_userns_clone=1,\n\
                  pent:       user.max_user_namespaces > 0,\n\
-                 pent:       and no AppArmor/LSM profile blocking overlay mounts.\n",
-                real_str, errno
+                 pent:       and no AppArmor/LSM profile blocking overlay mounts.\n"
             );
             // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             libc::write(
                 libc::STDERR_FILENO,
-                msg.as_ptr() as *const libc::c_void,
+                msg.as_ptr().cast::<libc::c_void>(),
                 msg.len(),
             );
             return Err(errno);
@@ -540,10 +513,7 @@ fn add_inotify_watches(
     depth: u32,
 ) {
     use std::os::unix::ffi::OsStrExt;
-    let path_c = match CString::new(upper_dir.as_os_str().as_bytes()) {
-        Ok(p) => p,
-        Err(_) => return,
-    };
+    let Ok(path_c) = CString::new(upper_dir.as_os_str().as_bytes()) else { return };
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let wd = unsafe {
         libc::inotify_add_watch(
@@ -560,10 +530,7 @@ fn add_inotify_watches(
         return;
     }
 
-    let entries = match std::fs::read_dir(upper_dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
+    let Ok(entries) = std::fs::read_dir(upper_dir) else { return };
     for entry in entries.flatten() {
         if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
             let name = entry.file_name();
@@ -578,6 +545,7 @@ fn add_inotify_watches(
     }
 }
 
+#[allow(clippy::needless_pass_by_value)] // Vec/HashSet/Receiver must be owned for thread
 fn run_watcher(
     overlays: Vec<OverlayMount>,
     write_set: HashSet<PathBuf>,
@@ -612,27 +580,28 @@ fn run_watcher(
         let mut pfd =
             libc::pollfd { fd: inotify_fd, events: libc::POLLIN, revents: 0 };
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-        let ret = unsafe { libc::poll(&mut pfd as *mut _, 1, 50 /* ms */) };
+        let ret = unsafe { libc::poll(&raw mut pfd, 1, 50 /* ms */) };
         if ret <= 0 || (pfd.revents & libc::POLLIN) == 0 {
             continue;
         }
 
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let n = unsafe {
-            libc::read(inotify_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+            libc::read(inotify_fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len())
         };
         if n <= 0 {
             continue;
         }
 
-        let n = n as usize;
+        let n = n.cast_unsigned();
         let mut offset = 0usize;
 
         while offset + event_hdr <= n {
             // SAFETY: verified there are at least event_hdr bytes at offset.
             // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            #[allow(clippy::cast_ptr_alignment)] // inotify buffer is properly aligned
             let event =
-                unsafe { &*(buf.as_ptr().add(offset) as *const libc::inotify_event) };
+                unsafe { &*(buf.as_ptr().add(offset).cast::<libc::inotify_event>()) };
             let name_len = event.len as usize;
             if offset + event_hdr + name_len > n {
                 break;
@@ -714,10 +683,7 @@ fn flush_upper_recursive(
     write_set: &HashSet<PathBuf>,
     rw_dirs: &HashSet<PathBuf>,
 ) {
-    let entries = match std::fs::read_dir(upper_dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
+    let Ok(entries) = std::fs::read_dir(upper_dir) else { return };
     for entry in entries.flatten() {
         let upper_path = entry.path();
         let real_path = real_dir.join(entry.file_name());

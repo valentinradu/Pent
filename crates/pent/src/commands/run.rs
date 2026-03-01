@@ -1,3 +1,4 @@
+#![allow(unreachable_pub)]
 #[cfg(unix)]
 extern crate libc;
 

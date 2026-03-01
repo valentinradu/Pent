@@ -34,15 +34,16 @@ const SAFE_ENV_PREFIXES: &[&str] = &[
 /// Build filtered environment from current env + allowlist.
 ///
 /// Includes:
-/// - SAFE_ENV_VARS (PATH, HOME, USER, SHELL, TERM, etc.)
-/// - Variables matching SAFE_ENV_PREFIXES (LC_*, XDG_*)
+/// - `SAFE_ENV_VARS` (PATH, HOME, USER, SHELL, TERM, etc.)
+/// - Variables matching `SAFE_ENV_PREFIXES` (LC_*, XDG_*)
 /// - Variables explicitly in the allowlist
 ///
 /// # Arguments
 /// * `env_allowlist` - Additional variable names to include
 ///
 /// # Returns
-/// HashMap of filtered environment variables
+/// `HashMap` of filtered environment variables
+#[must_use]
 pub fn build_env(env_allowlist: &[String]) -> HashMap<String, String> {
     std::env::vars()
         .filter(|(key, _)| {
@@ -73,16 +74,17 @@ pub fn build_env(env_allowlist: &[String]) -> HashMap<String, String> {
 /// * `path_str` - A colon-separated (Unix) or semicolon-separated (Windows) PATH string
 ///
 /// # Returns
-/// Vec of existing PATH directories as PathBuf
+/// Vec of existing PATH directories as `PathBuf`
+#[cfg(unix)]
+const PATH_SEP: char = ':';
+#[cfg(windows)]
+const PATH_SEP: char = ';';
+
+#[must_use]
 pub fn resolve_path_dirs_from(path_str: &str) -> Vec<PathBuf> {
     if path_str.is_empty() {
         return Vec::new();
     }
-
-    #[cfg(unix)]
-    const PATH_SEP: char = ':';
-    #[cfg(windows)]
-    const PATH_SEP: char = ';';
 
     path_str
         .split(PATH_SEP)
@@ -95,6 +97,7 @@ pub fn resolve_path_dirs_from(path_str: &str) -> Vec<PathBuf> {
 /// Resolve PATH directories from the current process's PATH environment variable.
 ///
 /// Convenience wrapper around [`resolve_path_dirs_from`].
+#[must_use]
 pub fn resolve_path_directories() -> Vec<PathBuf> {
     resolve_path_dirs_from(&std::env::var("PATH").unwrap_or_default())
 }
@@ -203,7 +206,7 @@ mod tests {
         let dirs = resolve_path_directories();
         // All returned dirs should exist
         for dir in &dirs {
-            assert!(dir.exists(), "{:?} should exist", dir);
+            assert!(dir.exists(), "{dir:?} should exist");
         }
     }
 

@@ -73,6 +73,10 @@ impl DnsServerConfig {
     ///
     /// Reads `/etc/resolv.conf` on Linux/macOS if no explicit upstream is set.
     /// Falls back to well-known public DNS if system config is unavailable.
+    ///
+    /// # Panics
+    /// Never panics in practice; the hardcoded fallback addresses are valid.
+    #[must_use]
     pub fn get_upstream(&self) -> Vec<SocketAddr> {
         if let Some(ref upstream) = self.upstream {
             return upstream.clone();
@@ -144,6 +148,7 @@ impl DnsServer {
     /// # Errors
     /// Currently infallible; always returns `Ok`. The `Result` return type
     /// is present for forward compatibility.
+    #[allow(clippy::missing_const_for_fn)] // Arc<T> cannot be used in const fn yet
     pub fn new(config: DnsServerConfig, state: Arc<SharedState>) -> Result<Self> {
         Ok(Self { config, state })
     }
@@ -201,7 +206,7 @@ impl DnsServer {
                     debug!(error = %e, "DNS query handling error");
                     // Send SERVFAIL response on error; if this send fails the client will
                     // time out naturally, so the error is intentionally discarded.
-                    let response = self.build_servfail_response(query);
+                    let response = Self::build_servfail_response(query);
                     let _ = socket.send_to(&response, src).await;
                 }
             }
@@ -209,7 +214,7 @@ impl DnsServer {
     }
 
     /// Build a SERVFAIL response for internal errors.
-    fn build_servfail_response(&self, query: &[u8]) -> Vec<u8> {
+    fn build_servfail_response(query: &[u8]) -> Vec<u8> {
         if query.len() < 12 {
             return vec![0; 12]; // Minimal response
         }
@@ -252,23 +257,19 @@ impl DnsServer {
         }
 
         // Parse domain name from question section
-        let domain = match Self::parse_domain_from_query(query) {
-            Some(d) => d,
-            None => {
-                return Err(ProxyError::Internal(
-                    "Failed to parse DNS query".to_string(),
-                ))
-            }
+        let Some(domain) = Self::parse_domain_from_query(query) else {
+            return Err(ProxyError::Internal(
+                "Failed to parse DNS query".to_string(),
+            ));
         };
 
         // Check domain against allowlist (case-insensitive)
         let domain_lower = domain.to_lowercase();
         if !self.state.is_allowed(&domain_lower) {
             self.state.report_violation(format!(
-                "network: DNS query for \"{}\" blocked — domain not in allowlist",
-                domain_lower
+                "network: DNS query for \"{domain_lower}\" blocked — domain not in allowlist"
             ));
-            return Ok(self.build_nxdomain_response(query));
+            return Ok(Self::build_nxdomain_response(query));
         }
 
         // Resolve via upstream DNS
@@ -283,7 +284,9 @@ impl DnsServer {
         self.state.insert_resolved(resolved);
 
         // Build response with resolved addresses
-        Ok(self.build_response(query, &addresses, self.config.ttl.as_secs() as u32))
+        #[allow(clippy::cast_possible_truncation)] // TTL is always a small number of seconds
+        let ttl = self.config.ttl.as_secs() as u32;
+        Ok(Self::build_response(query, &addresses, ttl))
     }
 
     /// Parse the domain name from a DNS query packet.
@@ -400,10 +403,7 @@ impl DnsServer {
             let query = Self::build_dns_query(domain, record_type);
 
             for upstream in &upstreams {
-                let socket = match UdpSocket::bind("0.0.0.0:0").await {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                };
+                let Ok(socket) = UdpSocket::bind("0.0.0.0:0").await else { continue };
 
                 if socket.connect(upstream).await.is_err() {
                     continue;
@@ -446,8 +446,9 @@ impl DnsServer {
         query.extend_from_slice(&[0x00, 0x00]); // NSCOUNT: 0
         query.extend_from_slice(&[0x00, 0x00]); // ARCOUNT: 0
 
-        // Question: domain name
+        // Question: domain name (DNS labels are at most 63 bytes)
         for label in domain.split('.') {
+            #[allow(clippy::cast_possible_truncation)]
             query.push(label.len() as u8);
             query.extend_from_slice(label.as_bytes());
         }
@@ -559,7 +560,7 @@ impl DnsServer {
     ///
     /// # Arguments
     /// * `query` - The original query (for copying ID and question)
-    fn build_nxdomain_response(&self, query: &[u8]) -> Vec<u8> {
+    fn build_nxdomain_response(query: &[u8]) -> Vec<u8> {
         if query.len() < 12 {
             return vec![0; 12]; // Minimal response
         }
@@ -613,7 +614,7 @@ impl DnsServer {
     /// * `query` - The original query
     /// * `addresses` - Resolved IP addresses to include
     /// * `ttl` - TTL for the response records
-    fn build_response(&self, query: &[u8], addresses: &[std::net::IpAddr], ttl: u32) -> Vec<u8> {
+    fn build_response(query: &[u8], addresses: &[std::net::IpAddr], ttl: u32) -> Vec<u8> {
         if query.len() < 12 {
             return vec![0; 12];
         }
@@ -629,7 +630,8 @@ impl DnsServer {
 
         // QDCOUNT: 1 (from query)
         response.extend_from_slice(&query[4..6]);
-        // ANCOUNT: number of addresses
+        // ANCOUNT: number of addresses (max 65535, always safe)
+        #[allow(clippy::cast_possible_truncation)]
         let ancount = addresses.len() as u16;
         response.extend_from_slice(&ancount.to_be_bytes());
         // NSCOUNT: 0
@@ -946,17 +948,12 @@ mod tests {
     #[test]
 
     fn test_build_nxdomain_response_preserves_query_id() {
-        use crate::SharedState;
-        let state = Arc::new(SharedState::new(vec![]));
-        let config = DnsServerConfig::default();
-        let server = DnsServer::new(config, state).unwrap();
-
         // Query with ID 0x1234
         let mut query = build_test_dns_query("test.com", 1);
         query[0] = 0x12;
         query[1] = 0x34;
 
-        let response = server.build_nxdomain_response(&query);
+        let response = DnsServer::build_nxdomain_response(&query);
 
         // Response ID should match query ID
         assert_eq!(response[0], 0x12);
@@ -966,13 +963,8 @@ mod tests {
     #[test]
 
     fn test_build_nxdomain_response_has_correct_rcode() {
-        use crate::SharedState;
-        let state = Arc::new(SharedState::new(vec![]));
-        let config = DnsServerConfig::default();
-        let server = DnsServer::new(config, state).unwrap();
-
         let query = build_test_dns_query("test.com", 1);
-        let response = server.build_nxdomain_response(&query);
+        let response = DnsServer::build_nxdomain_response(&query);
 
         // RCODE is in the lower 4 bits of byte 3
         let rcode = response[3] & 0x0F;
@@ -982,15 +974,10 @@ mod tests {
     #[test]
 
     fn test_build_response_includes_all_addresses() {
-        use crate::SharedState;
-        let state = Arc::new(SharedState::new(vec![]));
-        let config = DnsServerConfig::default();
-        let server = DnsServer::new(config, state).unwrap();
-
         let query = build_test_dns_query("test.com", 1);
         let addresses: Vec<std::net::IpAddr> =
             vec!["1.2.3.4".parse().unwrap(), "5.6.7.8".parse().unwrap()];
-        let response = server.build_response(&query, &addresses, 300);
+        let response = DnsServer::build_response(&query, &addresses, 300);
 
         // Answer count should be 2
         let answer_count = u16::from_be_bytes([response[6], response[7]]);
@@ -1000,14 +987,9 @@ mod tests {
     #[test]
 
     fn test_build_response_sets_correct_ttl() {
-        use crate::SharedState;
-        let state = Arc::new(SharedState::new(vec![]));
-        let config = DnsServerConfig::default();
-        let server = DnsServer::new(config, state).unwrap();
-
         let query = build_test_dns_query("test.com", 1);
         let addresses: Vec<std::net::IpAddr> = vec!["1.2.3.4".parse().unwrap()];
-        let response = server.build_response(&query, &addresses, 600);
+        let response = DnsServer::build_response(&query, &addresses, 600);
 
         // TTL is 4 bytes in the answer section
         // Find answer section and verify TTL = 600
@@ -1017,14 +999,9 @@ mod tests {
     #[test]
 
     fn test_build_response_preserves_query_question() {
-        use crate::SharedState;
-        let state = Arc::new(SharedState::new(vec![]));
-        let config = DnsServerConfig::default();
-        let server = DnsServer::new(config, state).unwrap();
-
         let query = build_test_dns_query("test.com", 1);
         let addresses: Vec<std::net::IpAddr> = vec!["1.2.3.4".parse().unwrap()];
-        let response = server.build_response(&query, &addresses, 300);
+        let response = DnsServer::build_response(&query, &addresses, 300);
 
         // Question count should be 1
         let question_count = u16::from_be_bytes([response[4], response[5]]);
@@ -1238,7 +1215,7 @@ mod tests {
         // Max label is 63 chars, max domain is 253 chars
         // This tests long domain parsing, not resolution
         let long_label = "a".repeat(63);
-        let domain = format!("{}.example.com", long_label);
+        let domain = format!("{long_label}.example.com");
         let state = Arc::new(SharedState::new(vec![])); // Empty allowlist - test parsing only
         let config = DnsServerConfig::default();
         let server = DnsServer::new(config, state).unwrap();
@@ -1435,6 +1412,7 @@ mod tests {
 
         // Question section
         for label in domain.split('.') {
+            #[allow(clippy::cast_possible_truncation)]
             query.push(label.len() as u8);
             query.extend_from_slice(label.as_bytes());
         }

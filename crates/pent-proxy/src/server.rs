@@ -98,6 +98,7 @@ impl ProxyConfig {
     /// - Common: `*.github.com`, `*.githubusercontent.com`, `pypi.org`, `npmjs.org`
     ///
     ///
+    #[must_use]
     pub fn with_allowlist(domains: Vec<String>) -> Self {
         Self {
             domain_allowlist: domains,
@@ -128,11 +129,11 @@ pub struct ProxyHandle {
 
 impl ProxyHandle {
     /// Check if the server is still running.
+    #[must_use]
     pub fn is_running(&self) -> bool {
         self.join_handle
             .as_ref()
-            .map(|h| !h.is_finished())
-            .unwrap_or(false)
+            .is_some_and(|h| !h.is_finished())
     }
 
     /// Shut down the proxy server gracefully.
@@ -146,25 +147,14 @@ impl ProxyHandle {
     /// within 2 seconds it is left to finish on its own (not aborted).
     pub async fn shutdown(mut self) -> Result<()> {
         // Send shutdown signal - this triggers the tokio::select! in the server task
-        let signal_sent = if let Some(tx) = self.shutdown_tx.take() {
-            tx.send(()).is_ok()
-        } else {
-            false
-        };
+        let signal_sent = self.shutdown_tx.take().is_some_and(|tx| tx.send(()).is_ok());
 
         // Wait for server task to complete
         if let Some(handle) = self.join_handle.take() {
             if signal_sent {
                 // Give the task time to respond to shutdown signal
-                match tokio::time::timeout(std::time::Duration::from_secs(2), handle).await {
-                    Ok(Ok(_)) => {}                      // Task completed successfully
-                    Ok(Err(e)) if e.is_cancelled() => {} // Task was cancelled, that's fine
-                    Ok(Err(_)) => {}                     // Task panicked, already logged
-                    Err(_) => {
-                        // Timeout - task didn't respond, this shouldn't happen
-                        // but we don't abort as the task will eventually stop
-                    }
-                }
+                // Task completed, was cancelled, panicked, or timed out — all ok.
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
             } else {
                 // Shutdown signal couldn't be sent, abort the task
                 handle.abort();
@@ -175,16 +165,19 @@ impl ProxyHandle {
     }
 
     /// Get the DNS server bind address.
-    pub fn dns_addr(&self) -> SocketAddr {
+    #[must_use]
+    pub const fn dns_addr(&self) -> SocketAddr {
         self.dns_bind_addr
     }
 
     /// Get the TCP proxy bind address.
-    pub fn proxy_addr(&self) -> SocketAddr {
+    #[must_use]
+    pub const fn proxy_addr(&self) -> SocketAddr {
         self.proxy_bind_addr
     }
 
     /// Get the current domain allowlist.
+    #[must_use]
     pub fn allowlist(&self) -> Vec<String> {
         self.state.allowlist()
     }
@@ -195,6 +188,7 @@ impl ProxyHandle {
     /// has been running for several seconds suggests the process is not routing
     /// traffic through the proxy (i.e. it does not honour `HTTP_PROXY` /
     /// `ALL_PROXY`).
+    #[must_use]
     pub fn connections_accepted(&self) -> u64 {
         self.state
             .connections_accepted
@@ -203,6 +197,7 @@ impl ProxyHandle {
 
     /// Return a cloned Arc to the connections-accepted counter so callers can
     /// pass it into spawned tasks without keeping the full handle alive.
+    #[must_use]
     pub fn connections_accepted_ref(&self) -> Arc<std::sync::atomic::AtomicU64> {
         Arc::clone(&self.state.connections_accepted)
     }
@@ -360,6 +355,7 @@ impl ProxyServer {
     }
 
     /// Get the current domain allowlist.
+    #[must_use]
     pub fn allowlist(&self) -> Vec<String> {
         self.state.allowlist()
     }
@@ -407,6 +403,7 @@ impl TryFrom<&pent_settings::ProxySettings> for ProxyConfig {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_statements)] // use statements inside test fns after skip_if_no_bind!()
 mod tests {
     use super::*;
 

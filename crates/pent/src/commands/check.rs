@@ -1,3 +1,4 @@
+#![allow(unreachable_pub)]
 use std::path::PathBuf;
 
 use pent_proxy::{ProxyConfig, ProxyServer};

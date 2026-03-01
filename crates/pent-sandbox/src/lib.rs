@@ -58,7 +58,7 @@ pub struct SandboxChild {
     /// Pass this to [`teardown_overlay`] after `child.wait()` returns.
     #[cfg(target_os = "linux")]
     pub overlay: Option<linux_overlayfs::OverlayHandle>,
-    /// Anonymous network namespace handle for ProxyOnly mode on Linux.
+    /// Anonymous network namespace handle for `ProxyOnly` mode on Linux.
     /// Dropping this cleans up firewall/routing rules added during setup.
     #[cfg(target_os = "linux")]
     pub netns: Option<linux_netns::NetnsHandle>,
@@ -97,6 +97,9 @@ pub enum SandboxError {
 /// On Linux, the returned [`SandboxChild::overlay`] may contain an
 /// [`OverlayHandle`] for write-listed file paths. Pass it to [`teardown_overlay`]
 /// after `child.wait()` returns to flush writes and clean up.
+///
+/// # Errors
+/// Returns a [`SandboxError`] if the sandbox cannot be set up or the process cannot be spawned.
 pub fn spawn_sandboxed(
     config: &SandboxConfig,
     cmd: &str,
@@ -160,13 +163,13 @@ pub fn spawn_sandboxed(
 /// Returns `NetworkSetupFailed` if the network namespace cannot be deleted.
 /// Non-Linux platforms always return `Ok(())`.
 #[cfg(target_os = "linux")]
-pub fn delete_sandbox_netns(_pid: u32) -> Result<(), SandboxError> {
+pub const fn delete_sandbox_netns(_pid: u32) -> Result<(), SandboxError> {
     Ok(())
 }
 
 /// No-op on non-Linux platforms.
 #[cfg(not(target_os = "linux"))]
-pub fn delete_sandbox_netns(_pid: u32) -> Result<(), SandboxError> {
+pub const fn delete_sandbox_netns(_pid: u32) -> Result<(), SandboxError> {
     Ok(())
 }
 
@@ -187,6 +190,9 @@ pub fn teardown_overlay(handle: OverlayHandle) {
 }
 
 /// Check if sandboxing is available on this system.
+///
+/// # Errors
+/// Returns a [`SandboxError`] if sandboxing is not available or not properly configured.
 pub fn check_availability() -> Result<(), SandboxError> {
     #[cfg(target_os = "macos")]
     {
@@ -286,7 +292,7 @@ mod tests {
             }
             Err(SandboxError::SpawnFailed(err))
                 if err.kind() == std::io::ErrorKind::PermissionDenied => {}
-            Err(e) => panic!("spawn_sandboxed failed: {:?}", e),
+            Err(e) => panic!("spawn_sandboxed failed: {e:?}"),
         }
     }
 
@@ -305,7 +311,7 @@ mod tests {
                 }
                 Err(SandboxError::SpawnFailed(err))
                     if err.kind() == std::io::ErrorKind::PermissionDenied => {}
-                Err(e) => panic!("spawn_sandboxed failed: {:?}", e),
+                Err(e) => panic!("spawn_sandboxed failed: {e:?}"),
             }
         }
     }
@@ -328,7 +334,7 @@ mod tests {
         cmd: &str,
         args: &[&str],
     ) -> Result<Option<i32>, SandboxError> {
-        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        let args: Vec<String> = args.iter().map(std::string::ToString::to_string).collect();
         let mut sandbox_child = spawn_sandboxed(config, cmd, &args)?;
         let status = sandbox_child.child.wait().map_err(SandboxError::SpawnFailed)?;
         Ok(status.code())
@@ -368,7 +374,7 @@ mod tests {
             {
                 return;
             }
-            Err(e) => panic!("spawn_sandboxed failed: {:?}", e),
+            Err(e) => panic!("spawn_sandboxed failed: {e:?}"),
         };
         assert_eq!(
             code,
@@ -402,7 +408,7 @@ mod tests {
             {
                 return;
             }
-            Err(e) => panic!("spawn_sandboxed failed: {:?}", e),
+            Err(e) => panic!("spawn_sandboxed failed: {e:?}"),
         };
         assert!(
             code != Some(0),
@@ -442,7 +448,7 @@ mod tests {
             {
                 return;
             }
-            Err(e) => panic!("spawn_sandboxed failed: {:?}", e),
+            Err(e) => panic!("spawn_sandboxed failed: {e:?}"),
         };
         assert!(
             code != Some(0),
@@ -482,7 +488,7 @@ mod tests {
             {
                 return;
             }
-            Err(e) => panic!("spawn_sandboxed failed: {:?}", e),
+            Err(e) => panic!("spawn_sandboxed failed: {e:?}"),
         };
         // The child exits non-zero (ECONNREFUSED), but it must exit — not hang.
         // A hang or ENETUNREACH exit would indicate the loopback interface is down.

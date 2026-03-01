@@ -1,4 +1,9 @@
 //! Linux sandbox implementation using Landlock LSM.
+// Items in this private module use `pub` so they are accessible through
+// `super::linux::*` within the crate.  The `unreachable_pub` lint is
+// suppressed because the lint fires on `pub` items in a private module even
+// when those items are accessed crate-internally.
+#![allow(unreachable_pub)]
 //!
 //! Uses Landlock for filesystem access control. Requires kernel 5.19+ (ABI v4).
 //!
@@ -28,7 +33,7 @@
 //!   +-- Allow /proc (ro)
 //! ```
 //!
-//! # pre_exec for spawn_sandboxed
+//! # `pre_exec` for `spawn_sandboxed`
 //!
 //! Landlock restricts the current process. For `spawn_sandboxed`,
 //! we use `Command::pre_exec()` to apply Landlock in the child
@@ -64,6 +69,7 @@ const DEVICE_PATHS: &[&str] = &["/dev", "/proc"];
 /// by the filesystem trace watcher (`--no-sandbox --trace`) to determine which
 /// file opens would have been denied by the sandbox policy.
 #[cfg(target_os = "linux")]
+#[must_use]
 pub fn compute_accessible_set(
     config: &SandboxConfig,
     path_dirs: &[PathBuf],
@@ -104,6 +110,7 @@ pub fn check_available() -> Result<(), SandboxError> {
 
     // Try to create a minimal ruleset — succeeds only if the kernel supports ABI v4.
     let all_access = AccessFs::from_all(ABI::V4);
+    #[allow(clippy::redundant_closure_for_method_calls)]
     Ruleset::default()
         .handle_access(all_access)
         .and_then(|r| r.create())
@@ -123,7 +130,7 @@ pub fn check_available() -> Result<(), SandboxError> {
 ///
 /// Creates deny-all baseline with explicit allows for:
 /// - Workspace directory (rw)
-/// - data_dir directory (rw)
+/// - `data_dir` directory (rw)
 /// - Mount paths (ro or rw per config)
 /// - PATH directories (ro+exec)
 /// - System libraries /usr/lib, /lib, /lib64 (ro)
@@ -136,7 +143,7 @@ pub fn check_available() -> Result<(), SandboxError> {
 /// * `path_dirs` - PATH directories to allow
 ///
 /// # Returns
-/// Landlock RulesetCreated ready to be applied
+/// Landlock `RulesetCreated` ready to be applied
 ///
 /// # Errors
 /// * `InvalidConfig` - If a required path cannot be opened
@@ -165,9 +172,9 @@ pub fn build_landlock_ruleset(
     // Create ruleset with deny-all baseline
     let mut ruleset = Ruleset::default()
         .handle_access(all_access)
-        .map_err(|e| SandboxError::InvalidConfig(format!("Failed to create ruleset: {}", e)))?
+        .map_err(|e| SandboxError::InvalidConfig(format!("Failed to create ruleset: {e}")))?
         .create()
-        .map_err(|e| SandboxError::InvalidConfig(format!("Failed to create ruleset: {}", e)))?;
+        .map_err(|e| SandboxError::InvalidConfig(format!("Failed to create ruleset: {e}")))?;
 
     // Helper to add path rule, skipping non-existent paths
     let add_path =
@@ -176,12 +183,12 @@ pub fn build_landlock_ruleset(
                 return Ok(()); // Skip non-existent paths
             }
             let fd = PathFd::new(path).map_err(|e| {
-                SandboxError::InvalidConfig(format!("Failed to open path {:?}: {}", path, e))
+                SandboxError::InvalidConfig(format!("Failed to open path {}: {e}", path.display()))
             })?;
             ruleset
                 .add_rule(PathBeneath::new(fd, access))
                 .map_err(|e| {
-                    SandboxError::InvalidConfig(format!("Failed to add rule for {:?}: {}", path, e))
+                    SandboxError::InvalidConfig(format!("Failed to add rule for {}: {e}", path.display()))
                 })?;
             Ok(())
         };
@@ -262,14 +269,14 @@ pub fn build_landlock_ruleset(
 /// * `ruleset` - The ruleset to apply
 ///
 /// # Errors
-/// * `SandboxUnavailable` - If restrict_self fails
+/// * `SandboxUnavailable` - If `restrict_self` fails
 #[cfg(target_os = "linux")]
 #[allow(dead_code)] // used in tests
 pub fn apply_landlock(ruleset: landlock::RulesetCreated) -> Result<(), SandboxError> {
     ruleset
         .restrict_self()
         .map_err(|e| SandboxError::SandboxUnavailable {
-            reason: format!("Failed to apply Landlock: {}", e),
+            reason: format!("Failed to apply Landlock: {e}"),
             remediation: "Check kernel support and permissions".to_string(),
         })?;
 
@@ -288,7 +295,7 @@ pub fn apply_landlock(_ruleset: ()) -> Result<(), SandboxError> {
 /// available for `LocalhostOnly` and `ProxyOnly` modes.
 ///
 /// # Safety
-/// Caller must be in a post-fork, pre-exec context (pre_exec hook) or
+/// Caller must be in a post-fork, pre-exec context (`pre_exec` hook) or
 /// equivalent single-threaded environment. Uses raw ioctl syscalls.
 #[cfg(target_os = "linux")]
 unsafe fn bring_up_loopback() {
@@ -320,13 +327,13 @@ unsafe fn bring_up_loopback() {
     libc::ioctl(
         sock,
         libc::SIOCGIFFLAGS as _,
-        &mut req as *mut IfReq as *mut libc::c_void,
+        std::ptr::addr_of_mut!(req).cast::<libc::c_void>(),
     );
     req.ifr_flags |= IFF_UP;
     libc::ioctl(
         sock,
         libc::SIOCSIFFLAGS as _,
-        &mut req as *mut IfReq as *mut libc::c_void,
+        std::ptr::addr_of_mut!(req).cast::<libc::c_void>(),
     );
     libc::close(sock);
 }
@@ -348,36 +355,36 @@ unsafe fn setup_userns_mappings(uid: u32, gid: u32) {
     // Kernels >= 3.19 require "deny" in setgroups before writing gid_map
     // when the caller is unprivileged.
     let fd = libc::open(
-        b"/proc/self/setgroups\0".as_ptr() as *const libc::c_char,
+        c"/proc/self/setgroups".as_ptr(),
         libc::O_WRONLY | libc::O_CLOEXEC,
     );
     if fd >= 0 {
         let deny = b"deny";
-        libc::write(fd, deny.as_ptr() as *const libc::c_void, deny.len());
+        libc::write(fd, deny.as_ptr().cast::<libc::c_void>(), deny.len());
         libc::close(fd);
     }
 
     // Map host GID → 0 inside namespace.
     let gid_map = format!("0 {gid} 1\n");
     let fd = libc::open(
-        b"/proc/self/gid_map\0".as_ptr() as *const libc::c_char,
+        c"/proc/self/gid_map".as_ptr(),
         libc::O_WRONLY | libc::O_CLOEXEC,
     );
     if fd >= 0 {
         let b = gid_map.as_bytes();
-        libc::write(fd, b.as_ptr() as *const libc::c_void, b.len());
+        libc::write(fd, b.as_ptr().cast::<libc::c_void>(), b.len());
         libc::close(fd);
     }
 
     // Map host UID → 0 inside namespace.
     let uid_map = format!("0 {uid} 1\n");
     let fd = libc::open(
-        b"/proc/self/uid_map\0".as_ptr() as *const libc::c_char,
+        c"/proc/self/uid_map".as_ptr(),
         libc::O_WRONLY | libc::O_CLOEXEC,
     );
     if fd >= 0 {
         let b = uid_map.as_bytes();
-        libc::write(fd, b.as_ptr() as *const libc::c_void, b.len());
+        libc::write(fd, b.as_ptr().cast::<libc::c_void>(), b.len());
         libc::close(fd);
     }
 }
@@ -389,9 +396,9 @@ unsafe fn setup_userns_mappings(uid: u32, gid: u32) {
 /// Arch, etc.). The user namespace maps the caller's UID/GID to 0 inside,
 /// which grants `CAP_NET_ADMIN` within the namespace for loopback setup.
 ///
-/// Note: ProxyOnly mode uses a veth pair set up by the parent
+/// Note: `ProxyOnly` mode uses a veth pair set up by the parent
 /// (`spawn_with_landlock`) and is handled via `setns` there, not here.
-/// When `apply_network_isolation` is called for ProxyOnly, it falls back
+/// When `apply_network_isolation` is called for `ProxyOnly`, it falls back
 /// to loopback-only isolation.
 ///
 /// # Errors
@@ -442,7 +449,7 @@ fn apply_network_isolation(network: &NetworkMode) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Spawn command with Landlock sandbox using pre_exec.
+/// Spawn command with Landlock sandbox using `pre_exec`.
 ///
 /// Uses `Command::pre_exec()` to apply Landlock and network isolation in the
 /// child process after fork but before exec. This restricts only the child.
@@ -468,6 +475,7 @@ fn apply_network_isolation(network: &NetworkMode) -> std::io::Result<()> {
 /// * `SandboxUnavailable` - If Landlock unavailable
 /// * `SpawnFailed` - If spawn fails
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_lines)]
 pub fn spawn_with_landlock(
     config: &SandboxConfig,
     cmd: &str,
@@ -502,7 +510,7 @@ pub fn spawn_with_landlock(
             // directory exists (will be created as a file on first write).
             if path.is_file()
                 || (!path.exists()
-                    && path.parent().map_or(false, |p| p.is_dir()))
+                    && path.parent().is_some_and(std::path::Path::is_dir))
             {
                 Some(path.clone())
             } else {
@@ -526,7 +534,7 @@ pub fn spawn_with_landlock(
                 Some(path.clone())
             } else if !path.is_file()
                 && !path.exists()
-                && path.parent().map_or(false, |p| p.is_dir())
+                && path.parent().is_some_and(std::path::Path::is_dir)
             {
                 // Non-existent entry with an existing parent: include so that
                 // if the sandbox creates it as a directory, its contents are flushed.
@@ -567,7 +575,7 @@ pub fn spawn_with_landlock(
     for dev_path in DEVICE_PATHS {
         accessible.insert(PathBuf::from(dev_path));
     }
-    for path_dir in path_dirs.iter() {
+    for path_dir in &path_dirs {
         accessible.insert(path_dir.clone());
     }
 
@@ -577,7 +585,6 @@ pub fn spawn_with_landlock(
         Vec::new()
     } else {
         super::linux_overlayfs::prepare_overlay_dirs(&overlay_file_paths, pid)
-            .map_err(SandboxError::SpawnFailed)?
     };
 
     // Compute the set of parent directories covered by overlayfs (for Landlock rules).
@@ -587,7 +594,7 @@ pub fn spawn_with_landlock(
     // Clone overlay data for capture into the pre_exec closure.
     let overlay_mounts_pre = overlay_mounts.clone();
     let write_set_pre = write_set.clone();
-    let overlay_dirs_pre = overlay_dirs.clone();
+    let overlay_dirs_pre = overlay_dirs;
     // accessible is passed to setup_overlay_dirs (runs in pre_exec after unshare).
     let accessible_pre = accessible;
 
@@ -634,8 +641,10 @@ pub fn spawn_with_landlock(
                 return Err(SandboxError::SpawnFailed(std::io::Error::last_os_error()));
             }
         }
-        (proxy_ready_r, proxy_ready_w) = (rp[0], rp[1]);
-        (proxy_go_r, proxy_go_w) = (gp[0], gp[1]);
+        proxy_ready_r = rp[0];
+        proxy_ready_w = rp[1];
+        proxy_go_r = gp[0];
+        proxy_go_w = gp[1];
     } else {
         (proxy_ready_r, proxy_ready_w) = (-1, -1);
         (proxy_go_r, proxy_go_w) = (-1, -1);
@@ -649,16 +658,16 @@ pub fn spawn_with_landlock(
         {
             let outer_ip = handle.outer_ip;
             let port = proxy_addr.port();
-            let http_url = format!("http://{}:{}", outer_ip, port);
+            let http_url = format!("http://{outer_ip}:{port}");
             // socks5h = hostname resolved by the proxy, so the sandboxed process
             // never calls getaddrinfo for external hosts — DNS stays on the proxy side.
-            let socks_url = format!("socks5h://{}:{}", outer_ip, port);
+            let socks_url = format!("socks5h://{outer_ip}:{port}");
             let no_proxy = "localhost,127.0.0.1,::1";
             let mut e = env.clone();
             e.insert("HTTP_PROXY".to_string(), http_url.clone());
             e.insert("HTTPS_PROXY".to_string(), http_url.clone());
             e.insert("http_proxy".to_string(), http_url.clone());
-            e.insert("https_proxy".to_string(), http_url.clone());
+            e.insert("https_proxy".to_string(), http_url);
             e.insert("ALL_PROXY".to_string(), socks_url.clone());
             e.insert("all_proxy".to_string(), socks_url.clone());
             e.insert("GRPC_PROXY".to_string(), socks_url.clone());
@@ -668,7 +677,7 @@ pub fn spawn_with_landlock(
             // Route git-over-SSH through the SOCKS5 proxy (nc -X 5 = SOCKS5).
             e.insert(
                 "GIT_SSH_COMMAND".to_string(),
-                format!("ssh -o ProxyCommand='nc -X 5 -x {}:{} %h %p'", outer_ip, port),
+                format!("ssh -o ProxyCommand='nc -X 5 -x {outer_ip}:{port} %h %p'"),
             );
             // Signal to the sandboxed process that it is running inside a proxy sandbox.
             // Claude Code checks this flag to activate its own proxy-aware networking.
@@ -761,15 +770,15 @@ pub fn spawn_with_landlock(
                 #[repr(C)]
                 #[derive(Copy, Clone)]
                 struct CapData { effective: u32, permitted: u32, inheritable: u32 }
-                const CAP_V3: u32 = 0x20080522;
+                const CAP_V3: u32 = 0x2008_0522;
                 let mut hdr = CapHeader { version: CAP_V3, pid: 0 };
                 let mut data = [CapData { effective: 0, permitted: 0, inheritable: 0 }; 2];
                 // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-                libc::syscall(libc::SYS_capget, &mut hdr as *mut CapHeader, data.as_mut_ptr());
+                libc::syscall(libc::SYS_capget, &raw mut hdr, data.as_mut_ptr());
                 data[0].inheritable = 0;
                 data[1].inheritable = 0;
                 // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-                libc::syscall(libc::SYS_capset, &mut hdr as *mut CapHeader, data.as_ptr());
+                libc::syscall(libc::SYS_capset, &raw mut hdr, data.as_ptr());
             }
 
             // ── Phase 1: Namespace and overlay setup ─────────────────────────
@@ -793,7 +802,7 @@ pub fn spawn_with_landlock(
                     | NetworkMode::ProxyOnly { .. } => {
                         flags |= libc::CLONE_NEWNET;
                     }
-                    _ => {}
+                    NetworkMode::Unrestricted => {}
                 }
                 // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                 let ret = libc::unshare(flags);
@@ -1011,12 +1020,9 @@ pub fn spawn_with_landlock(
                 // Namespace was already created in Phase 1 / Phase 1.5.
                 // ProxyOnly: veth + loopback already configured in Phase 1.5.
                 // LocalhostOnly / Blocked: just bring up loopback if needed.
-                match &network {
-                    NetworkMode::LocalhostOnly => {
-                        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-                        bring_up_loopback();
-                    }
-                    _ => {}
+                if network == NetworkMode::LocalhostOnly {
+                    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+                    bring_up_loopback();
                 }
             } else {
                 // No overlays and not ProxyOnly: apply_network_isolation handles
@@ -1294,7 +1300,7 @@ mod tests {
             SandboxPaths::default(),
             dirs.workspace.clone(),
         )
-        .with_data_dir(dirs.data_dir.clone());
+        .with_data_dir(dirs.data_dir);
         let path_dirs = vec![PathBuf::from("/usr/bin"), PathBuf::from("/bin")];
         let env = HashMap::new();
 
@@ -1312,7 +1318,7 @@ mod tests {
                     // Some CI/container environments expose Landlock but deny
                     // applying it in pre_exec.
                 }
-                Err(e) => panic!("spawn_with_landlock failed: {:?}", e),
+                Err(e) => panic!("spawn_with_landlock failed: {e:?}"),
             }
         }
     }
@@ -1329,7 +1335,7 @@ mod tests {
             SandboxPaths::default(),
             dirs.workspace.clone(),
         )
-        .with_data_dir(dirs.data_dir.clone());
+        .with_data_dir(dirs.data_dir);
         let path_dirs = vec![PathBuf::from("/usr/bin"), PathBuf::from("/bin")];
         let env = HashMap::new();
 
@@ -1353,7 +1359,7 @@ mod tests {
                     // Some CI/container environments expose Landlock but deny
                     // applying it in pre_exec.
                 }
-                Err(e) => panic!("spawn_with_landlock failed: {:?}", e),
+                Err(e) => panic!("spawn_with_landlock failed: {e:?}"),
             }
         }
     }
@@ -1370,7 +1376,7 @@ mod tests {
             SandboxPaths::default(),
             dirs.workspace.clone(),
         )
-        .with_data_dir(dirs.data_dir.clone());
+        .with_data_dir(dirs.data_dir);
         let env = HashMap::new();
 
         let result = spawn_with_landlock(&config, "/nonexistent/command/12345", &[], &env, &[]);
@@ -1492,8 +1498,8 @@ mod tests {
     // network required) and fall back gracefully when overlayfs is unavailable.
     // ========================================================================
 
-    /// Helper: spawn a sandboxed shell command with the given read_write paths
-    /// and return (child, overlay_handle).  Falls back gracefully when the
+    /// Helper: spawn a sandboxed shell command with the given `read_write` paths
+    /// and return `(child, overlay_handle)`.  Falls back gracefully when the
     /// kernel does not support user namespaces or overlayfs.
     ///
     /// The overlay subsystem is only activated when `read_write` contains at
@@ -1539,12 +1545,12 @@ mod tests {
         match spawn_with_landlock(&config, "/bin/sh", &["-c".to_string(), cmd.to_string()], &HashMap::new(), &path_dirs) {
             Ok((child, handle, _netns)) => Some((child, handle)),
             Err(SandboxError::SpawnFailed(e)) if e.kind() == std::io::ErrorKind::PermissionDenied => None,
-            Err(e) => panic!("spawn_with_landlock failed: {:?}", e),
+            Err(e) => panic!("spawn_with_landlock failed: {e:?}"),
         }
     }
 
     /// Run `spawn_rw`, wait for the child, call teardown, then return whether
-    /// the overlay was active (Some handle → true, None → false).
+    /// the overlay was active (`Some` handle → true, `None` → false).
     #[cfg(target_os = "linux")]
     fn run_sandboxed_rw(workspace: &std::path::Path, rw_paths: &[&str], cmd: &str) -> bool {
         let Some((mut child, overlay_handle)) = spawn_rw(workspace, rw_paths, cmd) else {
@@ -1552,12 +1558,10 @@ mod tests {
         };
         let status = child.wait().expect("wait failed");
         assert!(status.success(), "sandboxed command failed: {cmd}");
-        if let Some(handle) = overlay_handle {
+        overlay_handle.is_some_and(|handle| {
             crate::linux_overlayfs::teardown(handle);
             true
-        } else {
-            false
-        }
+        })
     }
 
     /// Reproduce the real Claude-session failure mode:
@@ -1568,7 +1572,7 @@ mod tests {
     /// layer.  But the workspace was NOT in `rw_dirs`, so those writes were
     /// never flushed — every edit Claude made disappeared on session exit.
     ///
-    /// This test fails before the fix (workspace added to rw_dirs) and passes
+    /// This test fails before the fix (workspace added to `rw_dirs`) and passes
     /// after it.
     #[test]
     #[serial]
@@ -1601,7 +1605,7 @@ mod tests {
         // workspace is intentionally NOT in read_write — it's the workspace arg.
 
         let config = SandboxConfig::new(workspace.clone(), paths, workspace.clone())
-            .with_data_dir(workspace.clone())
+            .with_data_dir(workspace)
             .with_env(HashMap::new());
 
         let path_dirs = vec![PathBuf::from("/bin"), PathBuf::from("/usr/bin")];
@@ -1634,8 +1638,8 @@ mod tests {
         );
     }
 
-    /// Modify an existing file that is listed directly in read_write (file-level
-    /// entry).  This is the original write_set path.
+    /// Modify an existing file that is listed directly in `read_write` (file-level
+    /// entry).  This is the original `write_set` path.
     #[test]
     #[serial]
     #[cfg(target_os = "linux")]
@@ -1655,8 +1659,8 @@ mod tests {
         assert_eq!(content, r#"{"v":2}"#, "direct file-level write_set entry must be flushed");
     }
 
-    /// Modify a file inside a directory listed in read_write (directory-level
-    /// entry — the rw_dirs path that was broken before this fix).
+    /// Modify a file inside a directory listed in `read_write` (directory-level
+    /// entry — the `rw_dirs` path that was broken before this fix).
     #[test]
     #[serial]
     #[cfg(target_os = "linux")]
@@ -1850,7 +1854,7 @@ mod tests {
         assert_eq!(content, "line1\nline2\n", "appended content must be flushed");
     }
 
-    /// A read_write path that does not exist at spawn time and is created as a
+    /// A `read_write` path that does not exist at spawn time and is created as a
     /// directory by the sandbox process.  Its contents must be flushed.
     #[test]
     #[serial]
@@ -1874,7 +1878,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&target).unwrap(), r#"{"ok":true}"#);
     }
 
-    /// Files outside both the workspace and all read_write directories must NOT
+    /// Files outside both the workspace and all `read_write` directories must NOT
     /// be flushed to the real FS.  The overlay covers the entire parent
     /// directory, so writes from the sandbox land in the upper layer, but the
     /// flush logic only persists files that are in `write_set` or `rw_dirs`
@@ -1918,7 +1922,7 @@ mod tests {
         // added to rw_dirs automatically and its files are flushed.
 
         let config = SandboxConfig::new(workspace.clone(), paths, workspace.clone())
-            .with_data_dir(workspace.clone())
+            .with_data_dir(workspace)
             .with_env(HashMap::new());
         let path_dirs = vec![PathBuf::from("/bin"), PathBuf::from("/usr/bin")];
 
@@ -1965,11 +1969,11 @@ mod tests {
         // `Some` (i.e. overlayfs mounted successfully). If the kernel lacks
         // user namespaces or the overlayfs module, the handle will be `None`
         // and the test exits without assertion failures.
+        use std::collections::HashMap;
+        use std::os::unix::fs::MetadataExt;
         if check_available().is_err() {
             return;
         }
-        use std::collections::HashMap;
-        use std::os::unix::fs::MetadataExt;
 
         let temp = tempfile::tempdir().unwrap();
         let target = temp.path().join("target.json");
@@ -2008,7 +2012,7 @@ mod tests {
                 // Some CI/container environments deny pre_exec operations.
                 return;
             }
-            Err(e) => panic!("spawn_with_landlock failed: {:?}", e),
+            Err(e) => panic!("spawn_with_landlock failed: {e:?}"),
             Ok(pair) => pair,
         };
 

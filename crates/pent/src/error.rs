@@ -1,3 +1,4 @@
+#![allow(unreachable_pub)]
 #[derive(Debug, thiserror::Error)]
 pub enum CliError {
     #[error("{0}")]

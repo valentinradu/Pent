@@ -30,7 +30,7 @@ async fn dispatch(cli: Cli) -> Result<(), CliError> {
     match cli.command {
         Command::Run(args) => commands::run::run(args, cwd).await,
         Command::Check => commands::check::check(cwd).await,
-        Command::Config(args) => commands::config::config(args, cwd).await,
+        Command::Config(args) => commands::config::config(args, cwd),
     }
 }
 

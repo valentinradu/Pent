@@ -1,3 +1,4 @@
+#![allow(unreachable_pub)]
 /// User-facing output helpers.
 ///
 /// All output goes to stderr so stdout stays clean for piped data

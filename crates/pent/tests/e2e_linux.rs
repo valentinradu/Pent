@@ -5,7 +5,7 @@
 //!
 //! # Requirements
 //!
-//! Network namespace creation requires root or CAP_NET_ADMIN.  Run with:
+//! Network namespace creation requires root or `CAP_NET_ADMIN`.  Run with:
 //!
 //! ```
 //! sudo -E cargo test --test e2e_linux -- --nocapture
@@ -32,8 +32,7 @@ mod linux {
             .ok()
             .and_then(|o| String::from_utf8(o.stdout).ok())
             .and_then(|s| s.trim().parse::<u32>().ok())
-            .map(|uid| uid == 0)
-            .unwrap_or(false)
+            .is_some_and(|uid| uid == 0)
     }
 
     // ── routing guard ────────────────────────────────────────────────────────
@@ -84,7 +83,7 @@ mod linux {
                     }
                 }
             }
-            RoutingGuard(added)
+            Self(added)
         }
     }
 
@@ -160,7 +159,7 @@ mod linux {
     // ── config setup ─────────────────────────────────────────────────────────
 
     /// Create a temp $HOME, run `pent config add --global @{agent}`, and return
-    /// the TempDir (keep alive) and the resulting config file path.
+    /// the `TempDir` (keep alive) and the resulting config file path.
     ///
     /// On Linux `dirs::config_dir()` = `~/.config`, so the config lands at
     /// `$HOME/.config/pent/pent.toml`.
@@ -267,7 +266,7 @@ mod linux {
             return;
         }
 
-        let _lock = NETWORK_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = NETWORK_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _routing = RoutingGuard::install();
 
         let configs = TempDir::new().unwrap();

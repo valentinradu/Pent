@@ -37,11 +37,13 @@ impl ConfigLoader {
     /// Returns `None` if the user's config directory cannot be determined
     /// (e.g., `$HOME` is unset). Callers should treat `None` as "no global
     /// config" rather than falling back to a relative path.
+    #[must_use]
     pub fn global_config_path() -> Option<PathBuf> {
         Self::global_config_dir().map(|d| d.join("pent.toml"))
     }
 
     /// Absolute path to the project config file for the given workspace.
+    #[must_use]
     pub fn project_config_path(workspace: &Path) -> PathBuf {
         Self::project_config_dir(workspace).join("pent.toml")
     }

@@ -1,4 +1,5 @@
 //! Domain allowlist filtering with wildcard support.
+#![allow(unreachable_pub)]
 //!
 //! Matches domains against a configured allowlist. Supports:
 //! - Exact matches: `api.anthropic.com`
@@ -36,16 +37,18 @@ pub enum DomainMatch {
 
 impl DomainMatch {
     /// Returns `true` if the domain is allowed (exact or wildcard match).
-    pub fn is_allowed(&self) -> bool {
-        !matches!(self, DomainMatch::Blocked)
+    #[must_use]
+    pub const fn is_allowed(&self) -> bool {
+        !matches!(self, Self::Blocked)
     }
 
     /// Returns the matched domain if allowed.
+    #[must_use]
     pub fn domain(&self) -> Option<&str> {
         match self {
-            DomainMatch::Exact(d) => Some(d),
-            DomainMatch::Wildcard { domain, .. } => Some(domain),
-            DomainMatch::Blocked => None,
+            Self::Exact(d) => Some(d),
+            Self::Wildcard { domain, .. } => Some(domain),
+            Self::Blocked => None,
         }
     }
 }
@@ -133,31 +136,29 @@ impl DomainPattern {
                     !normalized.contains('.')
                 } else {
                     // *.example.com matches sub.example.com but not a.b.example.com
-                    if let Some(rest) = normalized.strip_suffix(suffix) {
-                        !rest.is_empty() && !rest.contains('.')
-                    } else {
-                        false
-                    }
+                    normalized
+                        .strip_suffix(suffix.as_str())
+                        .is_some_and(|rest| !rest.is_empty() && !rest.contains('.'))
                 }
             }
             PatternKind::MultiWildcard { suffix } => {
                 // **.example.com matches any subdomain depth
-                if let Some(rest) = normalized.strip_suffix(suffix) {
-                    !rest.is_empty()
-                } else {
-                    false
-                }
+                normalized
+                    .strip_suffix(suffix.as_str())
+                    .is_some_and(|rest| !rest.is_empty())
             }
         }
     }
 
     /// Get the original pattern string.
+    #[must_use]
     pub fn pattern(&self) -> &str {
         &self.pattern
     }
 
     /// Returns true if this is an exact match pattern.
-    pub fn is_exact(&self) -> bool {
+    #[must_use]
+    pub const fn is_exact(&self) -> bool {
         matches!(self.kind, PatternKind::Exact)
     }
 }
@@ -182,12 +183,13 @@ impl DomainFilter {
     ///
     /// # Example
     /// ```ignore
-    /// let filter = DomainFilter::new(vec![
+    /// let filter = DomainFilter::new(&[
     ///     "api.anthropic.com".to_string(),
     ///     "*.github.com".to_string(),
     /// ]);
     /// ```
-    pub fn new(allowlist: Vec<String>) -> Self {
+    #[must_use]
+    pub fn new(allowlist: &[String]) -> Self {
         let patterns: Vec<DomainPattern> =
             allowlist.iter().map(|s| DomainPattern::parse(s)).collect();
 
@@ -212,6 +214,7 @@ impl DomainFilter {
     /// * `DomainMatch::Exact` - Domain exactly matches an entry
     /// * `DomainMatch::Wildcard` - Domain matches a wildcard pattern
     /// * `DomainMatch::Blocked` - Domain is not allowed
+    #[must_use]
     pub fn matches(&self, domain: &str) -> DomainMatch {
         let normalized = normalize_domain(domain);
         if normalized.is_empty() {
@@ -239,24 +242,28 @@ impl DomainFilter {
     /// Returns `true` if the domain is allowed.
     ///
     /// Convenience method equivalent to `filter.matches(domain).is_allowed()`.
+    #[must_use]
     pub fn is_allowed(&self, domain: &str) -> bool {
         self.matches(domain).is_allowed()
     }
 
     /// Get the number of patterns in the filter.
-    pub fn pattern_count(&self) -> usize {
+    #[must_use]
+    pub const fn pattern_count(&self) -> usize {
         self.patterns.len()
     }
 
     /// Get all patterns as strings.
+    #[must_use]
     pub fn patterns(&self) -> Vec<&str> {
-        self.patterns.iter().map(|p| p.pattern()).collect()
+        self.patterns.iter().map(DomainPattern::pattern).collect()
     }
 
     /// Create a new filter with an additional domain.
     ///
-    /// Returns a new DomainFilter with the domain added to the allowlist.
+    /// Returns a new `DomainFilter` with the domain added to the allowlist.
     /// The original filter is unchanged.
+    #[must_use]
     pub fn with_domain(&self, domain: String) -> Self {
         let mut domains: Vec<String> = self
             .patterns
@@ -264,13 +271,13 @@ impl DomainFilter {
             .map(|p| p.pattern().to_string())
             .collect();
         domains.push(domain);
-        Self::new(domains)
+        Self::new(&domains)
     }
 
     /// Add a domain pattern to this filter in-place.
     ///
     /// More efficient than [`with_domain`](Self::with_domain) for runtime additions
-    /// because it avoids cloning all existing patterns. The HashSet and Vec are
+    /// because it avoids cloning all existing patterns. The `HashSet` and `Vec` are
     /// updated directly in O(1) amortized time.
     pub fn push(&mut self, domain: String) {
         let pattern = DomainPattern::parse(&domain);
@@ -338,26 +345,26 @@ mod tests {
 
     #[test]
     fn test_exact_match_same() {
-        let filter = DomainFilter::new(vec!["example.com".to_string()]);
+        let filter = DomainFilter::new(&["example.com".to_string()]);
         assert!(filter.is_allowed("example.com"));
     }
 
     #[test]
     fn test_exact_match_no_subdomain() {
-        let filter = DomainFilter::new(vec!["example.com".to_string()]);
+        let filter = DomainFilter::new(&["example.com".to_string()]);
         assert!(!filter.is_allowed("sub.example.com"));
         assert!(!filter.is_allowed("www.example.com"));
     }
 
     #[test]
     fn test_exact_match_no_parent() {
-        let filter = DomainFilter::new(vec!["sub.example.com".to_string()]);
+        let filter = DomainFilter::new(&["sub.example.com".to_string()]);
         assert!(!filter.is_allowed("example.com"));
     }
 
     #[test]
     fn test_exact_match_different_tld() {
-        let filter = DomainFilter::new(vec!["example.com".to_string()]);
+        let filter = DomainFilter::new(&["example.com".to_string()]);
         assert!(!filter.is_allowed("example.org"));
         assert!(!filter.is_allowed("example.net"));
     }
@@ -368,7 +375,7 @@ mod tests {
 
     #[test]
     fn test_single_wildcard_one_level() {
-        let filter = DomainFilter::new(vec!["*.example.com".to_string()]);
+        let filter = DomainFilter::new(&["*.example.com".to_string()]);
         assert!(filter.is_allowed("sub.example.com"));
         assert!(filter.is_allowed("www.example.com"));
         assert!(filter.is_allowed("api.example.com"));
@@ -377,21 +384,21 @@ mod tests {
     #[test]
     fn test_single_wildcard_not_base() {
         // *.example.com should NOT match example.com
-        let filter = DomainFilter::new(vec!["*.example.com".to_string()]);
+        let filter = DomainFilter::new(&["*.example.com".to_string()]);
         assert!(!filter.is_allowed("example.com"));
     }
 
     #[test]
     fn test_single_wildcard_not_multi_level() {
         // *.example.com should NOT match a.b.example.com
-        let filter = DomainFilter::new(vec!["*.example.com".to_string()]);
+        let filter = DomainFilter::new(&["*.example.com".to_string()]);
         assert!(!filter.is_allowed("a.b.example.com"));
         assert!(!filter.is_allowed("x.y.z.example.com"));
     }
 
     #[test]
     fn test_single_wildcard_different_suffix() {
-        let filter = DomainFilter::new(vec!["*.example.com".to_string()]);
+        let filter = DomainFilter::new(&["*.example.com".to_string()]);
         assert!(!filter.is_allowed("sub.example.org"));
         assert!(!filter.is_allowed("sub.notexample.com"));
     }
@@ -402,27 +409,27 @@ mod tests {
 
     #[test]
     fn test_multi_wildcard_two_levels() {
-        let filter = DomainFilter::new(vec!["**.example.com".to_string()]);
+        let filter = DomainFilter::new(&["**.example.com".to_string()]);
         assert!(filter.is_allowed("a.b.example.com"));
     }
 
     #[test]
     fn test_multi_wildcard_many_levels() {
-        let filter = DomainFilter::new(vec!["**.example.com".to_string()]);
+        let filter = DomainFilter::new(&["**.example.com".to_string()]);
         assert!(filter.is_allowed("a.b.c.d.e.example.com"));
     }
 
     #[test]
     fn test_multi_wildcard_one_level() {
         // ** should also match single level subdomain
-        let filter = DomainFilter::new(vec!["**.example.com".to_string()]);
+        let filter = DomainFilter::new(&["**.example.com".to_string()]);
         assert!(filter.is_allowed("sub.example.com"));
     }
 
     #[test]
     fn test_multi_wildcard_not_base() {
         // **.example.com should NOT match example.com
-        let filter = DomainFilter::new(vec!["**.example.com".to_string()]);
+        let filter = DomainFilter::new(&["**.example.com".to_string()]);
         assert!(!filter.is_allowed("example.com"));
     }
 
@@ -432,7 +439,7 @@ mod tests {
 
     #[test]
     fn test_case_insensitive_exact() {
-        let filter = DomainFilter::new(vec!["Example.COM".to_string()]);
+        let filter = DomainFilter::new(&["Example.COM".to_string()]);
         assert!(filter.is_allowed("example.com"));
         assert!(filter.is_allowed("EXAMPLE.COM"));
         assert!(filter.is_allowed("ExAmPlE.cOm"));
@@ -440,7 +447,7 @@ mod tests {
 
     #[test]
     fn test_case_insensitive_wildcard() {
-        let filter = DomainFilter::new(vec!["*.GitHub.COM".to_string()]);
+        let filter = DomainFilter::new(&["*.GitHub.COM".to_string()]);
         assert!(filter.is_allowed("api.github.com"));
         assert!(filter.is_allowed("API.GITHUB.COM"));
     }
@@ -452,19 +459,19 @@ mod tests {
     #[test]
     fn test_trailing_dot_ignored() {
         // DNS names can have trailing dot (FQDN)
-        let filter = DomainFilter::new(vec!["example.com".to_string()]);
+        let filter = DomainFilter::new(&["example.com".to_string()]);
         assert!(filter.is_allowed("example.com."));
     }
 
     #[test]
     fn test_whitespace_trimmed() {
-        let filter = DomainFilter::new(vec!["  example.com  ".to_string()]);
+        let filter = DomainFilter::new(&["  example.com  ".to_string()]);
         assert!(filter.is_allowed("example.com"));
     }
 
     #[test]
     fn test_empty_domain_not_allowed() {
-        let filter = DomainFilter::new(vec!["example.com".to_string()]);
+        let filter = DomainFilter::new(&["example.com".to_string()]);
         assert!(!filter.is_allowed(""));
     }
 
@@ -474,7 +481,7 @@ mod tests {
 
     #[test]
     fn test_domain_match_exact_type() {
-        let filter = DomainFilter::new(vec!["exact.com".to_string()]);
+        let filter = DomainFilter::new(&["exact.com".to_string()]);
         let result = filter.matches("exact.com");
         assert!(matches!(result, DomainMatch::Exact(_)));
         assert_eq!(result.domain(), Some("exact.com"));
@@ -482,7 +489,7 @@ mod tests {
 
     #[test]
     fn test_domain_match_wildcard_type() {
-        let filter = DomainFilter::new(vec!["*.wild.com".to_string()]);
+        let filter = DomainFilter::new(&["*.wild.com".to_string()]);
         let result = filter.matches("sub.wild.com");
         assert!(matches!(result, DomainMatch::Wildcard { .. }));
         assert_eq!(result.domain(), Some("sub.wild.com"));
@@ -490,7 +497,7 @@ mod tests {
 
     #[test]
     fn test_domain_match_blocked_type() {
-        let filter = DomainFilter::new(vec!["allowed.com".to_string()]);
+        let filter = DomainFilter::new(&["allowed.com".to_string()]);
         let result = filter.matches("blocked.com");
         assert!(matches!(result, DomainMatch::Blocked));
         assert_eq!(result.domain(), None);
@@ -503,7 +510,7 @@ mod tests {
 
     #[test]
     fn test_multiple_exact_patterns() {
-        let filter = DomainFilter::new(vec![
+        let filter = DomainFilter::new(&[
             "a.com".to_string(),
             "b.com".to_string(),
             "c.com".to_string(),
@@ -516,7 +523,7 @@ mod tests {
 
     #[test]
     fn test_mixed_patterns() {
-        let filter = DomainFilter::new(vec![
+        let filter = DomainFilter::new(&[
             "exact.com".to_string(),
             "*.single.com".to_string(),
             "**.multi.com".to_string(),
@@ -530,7 +537,7 @@ mod tests {
     #[test]
     fn test_overlapping_patterns() {
         // Both exact and wildcard match - exact should take precedence
-        let filter = DomainFilter::new(vec![
+        let filter = DomainFilter::new(&[
             "api.github.com".to_string(),
             "*.github.com".to_string(),
         ]);
@@ -545,7 +552,7 @@ mod tests {
 
     #[test]
     fn test_empty_allowlist() {
-        let filter = DomainFilter::new(vec![]);
+        let filter = DomainFilter::new(&[]);
         assert!(!filter.is_allowed("any.com"));
         assert_eq!(filter.pattern_count(), 0);
     }
@@ -553,7 +560,7 @@ mod tests {
     #[test]
     fn test_single_label_domain() {
         // "localhost" is a valid domain
-        let filter = DomainFilter::new(vec!["localhost".to_string()]);
+        let filter = DomainFilter::new(&["localhost".to_string()]);
         assert!(filter.is_allowed("localhost"));
     }
 
@@ -561,28 +568,28 @@ mod tests {
     fn test_very_long_domain() {
         // Max label is 63 chars, max domain is 253 chars
         let long_label = "a".repeat(63);
-        let domain = format!("{}.example.com", long_label);
-        let filter = DomainFilter::new(vec!["*.example.com".to_string()]);
+        let domain = format!("{long_label}.example.com");
+        let filter = DomainFilter::new(&["*.example.com".to_string()]);
         assert!(filter.is_allowed(&domain));
     }
 
     #[test]
     fn test_numeric_subdomain() {
-        let filter = DomainFilter::new(vec!["*.example.com".to_string()]);
+        let filter = DomainFilter::new(&["*.example.com".to_string()]);
         assert!(filter.is_allowed("123.example.com"));
         assert!(filter.is_allowed("192-168-1-1.example.com"));
     }
 
     #[test]
     fn test_hyphen_in_domain() {
-        let filter = DomainFilter::new(vec!["my-domain.example.com".to_string()]);
+        let filter = DomainFilter::new(&["my-domain.example.com".to_string()]);
         assert!(filter.is_allowed("my-domain.example.com"));
     }
 
     #[test]
     fn test_punycode_domain() {
         // Internationalized domains use punycode (xn--...)
-        let filter = DomainFilter::new(vec!["*.example.com".to_string()]);
+        let filter = DomainFilter::new(&["*.example.com".to_string()]);
         assert!(filter.is_allowed("xn--nxasmq5b.example.com"));
     }
 
@@ -592,7 +599,7 @@ mod tests {
 
     #[test]
     fn test_github_patterns() {
-        let filter = DomainFilter::new(vec![
+        let filter = DomainFilter::new(&[
             "github.com".to_string(),
             "*.github.com".to_string(),
             "*.githubusercontent.com".to_string(),
@@ -605,7 +612,7 @@ mod tests {
 
     #[test]
     fn test_api_patterns() {
-        let filter = DomainFilter::new(vec![
+        let filter = DomainFilter::new(&[
             "api.anthropic.com".to_string(),
             "api.openai.com".to_string(),
         ]);

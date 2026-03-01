@@ -1,3 +1,4 @@
+#![allow(unreachable_pub)]
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -23,13 +24,14 @@ fn resolve_config_path(global: bool, cwd: &Path) -> Result<PathBuf, CliError> {
     }
 }
 
-pub async fn config(args: crate::cli::ConfigArgs, cwd: PathBuf) -> Result<(), CliError> {
+#[allow(clippy::needless_pass_by_value)] // PathBuf taken for ergonomics
+pub fn config(args: crate::cli::ConfigArgs, cwd: PathBuf) -> Result<(), CliError> {
     match args.subcommand {
         ConfigSubcommand::Init { global } => init(global, &cwd),
         ConfigSubcommand::Show { format } => show(format, &cwd),
         ConfigSubcommand::Edit { global } => edit(global, &cwd),
-        ConfigSubcommand::Add { profiles, global } => add_profile(global, profiles, &cwd),
-        ConfigSubcommand::Remove { profiles, global } => rm_profile(global, profiles, &cwd),
+        ConfigSubcommand::Add { profiles, global } => add_profile(global, &profiles, &cwd),
+        ConfigSubcommand::Remove { profiles, global } => rm_profile(global, &profiles, &cwd),
     }
 }
 
@@ -81,7 +83,7 @@ fn edit(global: bool, cwd: &Path) -> Result<(), CliError> {
     Ok(())
 }
 
-fn add_profile(global: bool, profiles: Vec<String>, cwd: &Path) -> Result<(), CliError> {
+fn add_profile(global: bool, profiles: &[String], cwd: &Path) -> Result<(), CliError> {
     let parsed: Vec<Profile> = profiles
         .iter()
         .map(|s| Profile::from_str(s).map_err(CliError::Other))
@@ -106,7 +108,7 @@ fn add_profile(global: bool, profiles: Vec<String>, cwd: &Path) -> Result<(), Cl
     Ok(())
 }
 
-fn rm_profile(global: bool, profiles: Vec<String>, cwd: &Path) -> Result<(), CliError> {
+fn rm_profile(global: bool, profiles: &[String], cwd: &Path) -> Result<(), CliError> {
     let parsed: Vec<Profile> = profiles
         .iter()
         .map(|s| Profile::from_str(s).map_err(CliError::Other))

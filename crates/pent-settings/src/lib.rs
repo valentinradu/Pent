@@ -51,7 +51,7 @@ pub enum SettingsError {
 pub enum NetworkMode {
     /// Unrestricted network access.
     Unrestricted,
-    /// Only loopback (127.0.0.1 / ::1) is reachable.
+    /// Only loopback (127.0.0.1 / `::1`) is reachable.
     LocalhostOnly,
     /// Route all traffic through a local proxy at the given address.
     ///
@@ -98,7 +98,7 @@ pub struct SandboxPaths {
 impl SandboxPaths {
     /// Merge `other` paths on top of `self`, deduplicating all four lists.
     #[must_use]
-    pub fn merge(mut self, other: SandboxPaths) -> SandboxPaths {
+    pub fn merge(mut self, other: Self) -> Self {
         self.traversal.extend(other.traversal);
         dedup_preserve_order(&mut self.traversal);
         self.read.extend(other.read);
@@ -124,10 +124,9 @@ impl SandboxPaths {
         for entry in &self.read_write {
             if entry.ends_with('*') {
                 return Err(format!(
-                    "read_write path {:?} uses a glob ('*') which is not supported \
+                    "read_write path {entry:?} uses a glob ('*') which is not supported \
                      on Linux (overlayfs requires exact paths); \
-                     remove the trailing '*' or use the exact filename",
-                    entry
+                     remove the trailing '*' or use the exact filename"
                 ));
             }
         }
@@ -143,29 +142,21 @@ impl SandboxPaths {
     /// with `*`; the `*` is stripped from the returned `PathBuf` and callers
     /// should treat the path as a prefix (matching the path and everything
     /// under / starting with it).
+    #[must_use]
     pub fn expand_paths(&self) -> ExpandedPathLists {
         let home = dirs::home_dir();
         let expand = |s: &str| -> ExpandedPath {
-            let (s, is_glob) = if let Some(stripped) = s.strip_suffix('*') {
-                (stripped, true)
-            } else {
-                (s, false)
-            };
-            let path = if let Some(rest) = s.strip_prefix("~/") {
-                if let Some(ref h) = home {
-                    h.join(rest)
-                } else {
-                    PathBuf::from(s)
-                }
-            } else if s == "~" {
-                if let Some(ref h) = home {
-                    h.clone()
-                } else {
-                    PathBuf::from(s)
-                }
-            } else {
-                PathBuf::from(s)
-            };
+            let (s, is_glob) = s.strip_suffix('*').map_or((s, false), |stripped| (stripped, true));
+            let path = s.strip_prefix("~/").map_or_else(
+                || {
+                    if s == "~" {
+                        home.as_ref().map_or_else(|| PathBuf::from(s), Clone::clone)
+                    } else {
+                        PathBuf::from(s)
+                    }
+                },
+                |rest| home.as_ref().map_or_else(|| PathBuf::from(s), |h| h.join(rest)),
+            );
             (path, is_glob)
         };
         let to_paths = |v: &Vec<String>| v.iter().map(|s| expand(s)).collect::<Vec<_>>();
@@ -291,7 +282,7 @@ impl PentConfig {
     /// - List fields (`domain_allowlist`, `paths.*`, `mounts`): extended with
     ///   `other`'s values so both global and project entries contribute.
     #[must_use]
-    pub fn merge(mut self, other: PentConfig) -> PentConfig {
+    pub fn merge(mut self, other: Self) -> Self {
         // sandbox scalars: project wins if set
         if other.sandbox.network.is_some() {
             self.sandbox.network = other.sandbox.network;

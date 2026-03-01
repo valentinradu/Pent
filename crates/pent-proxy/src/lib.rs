@@ -91,11 +91,11 @@ pub enum TraceEvent {
 // pattern so it isn't repeated at every lock site.
 
 fn read_lock<T>(lock: &std::sync::RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
-    lock.read().unwrap_or_else(|e| e.into_inner())
+    lock.read().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn write_lock<T>(lock: &std::sync::RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
-    lock.write().unwrap_or_else(|e| e.into_inner())
+    lock.write().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Errors that can occur in proxy operations.
@@ -172,11 +172,13 @@ pub struct ResolutionCache {
 
 impl ResolutionCache {
     /// Create a new empty cache with the default capacity limit.
+    #[must_use]
     pub fn new() -> Self {
         Self::new_with_max(DEFAULT_MAX_CACHE_ENTRIES)
     }
 
     /// Create a new empty cache with a custom capacity limit.
+    #[must_use]
     pub fn new_with_max(max_entries: usize) -> Self {
         Self {
             entries: std::sync::RwLock::new(std::collections::HashMap::new()),
@@ -191,6 +193,7 @@ impl ResolutionCache {
     ///
     /// # Arguments
     /// * `resolved` - The resolved address to cache
+    #[allow(clippy::needless_pass_by_value)] // owned for ergonomics at call sites
     pub fn insert(&self, resolved: ResolvedAddress) {
         let mut entries = write_lock(&self.entries);
         let now = std::time::Instant::now();
@@ -255,7 +258,7 @@ impl Default for ResolutionCache {
 /// Shared state between DNS server and TCP proxy.
 ///
 /// Contains the domain filter and resolution cache.
-/// The filter is wrapped in RwLock to support runtime domain additions.
+/// The filter is wrapped in `RwLock` to support runtime domain additions.
 pub struct SharedState {
     /// Domain filter for allowlist matching (wrapped for mutation).
     filter: std::sync::RwLock<DomainFilter>,
@@ -279,17 +282,20 @@ impl SharedState {
     ///
     /// # Arguments
     /// * `allowlist` - List of allowed domains (supports wildcards like `*.github.com`)
+    #[must_use]
     pub fn new(allowlist: Vec<String>) -> Self {
         Self::with_violation_tx(allowlist, None)
     }
 
     /// Create new shared state, optionally wiring up a violation channel.
+    #[must_use]
+    #[allow(clippy::needless_pass_by_value)] // Vec<String> owned for ergonomics
     pub fn with_violation_tx(
         allowlist: Vec<String>,
         violation_tx: Option<tokio::sync::mpsc::UnboundedSender<TraceEvent>>,
     ) -> Self {
         Self {
-            filter: std::sync::RwLock::new(DomainFilter::new(allowlist)),
+            filter: std::sync::RwLock::new(DomainFilter::new(&allowlist)),
             cache: ResolutionCache::new(),
             violation_tx,
             connections_accepted: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -344,7 +350,7 @@ impl SharedState {
         read_lock(&self.filter)
             .patterns()
             .iter()
-            .map(|s| s.to_string())
+            .map(std::string::ToString::to_string)
             .collect()
     }
 }
@@ -456,9 +462,9 @@ mod tests {
         for i in 0..10 {
             let cache = Arc::clone(&cache);
             handles.push(thread::spawn(move || {
-                let ip: std::net::IpAddr = format!("1.2.3.{}", i).parse().unwrap();
+                let ip: std::net::IpAddr = format!("1.2.3.{i}").parse().unwrap();
                 let resolved = ResolvedAddress {
-                    domain: format!("domain{}.com", i),
+                    domain: format!("domain{i}.com"),
                     addresses: vec![ip],
                     expires_at: std::time::Instant::now() + std::time::Duration::from_secs(300),
                 };
@@ -557,7 +563,7 @@ mod tests {
     // RwLock Poisoning Consistency Tests
     // ========================================================================
 
-    /// This test verifies that SharedState handles RwLock poisoning consistently.
+    /// This test verifies that `SharedState` handles `RwLock` poisoning consistently.
     /// Both `cache` and `filter` now use `unwrap_or_else(|e| e.into_inner())` to
     /// recover from poisoned locks, so operations continue to work even after
     /// a thread panics while holding a lock.
@@ -604,8 +610,8 @@ mod tests {
         let cache = ResolutionCache::new_with_max(2);
 
         let make_resolved = |suffix: u8, secs: u64| ResolvedAddress {
-            domain: format!("d{}.com", suffix),
-            addresses: vec![format!("1.2.3.{}", suffix).parse().unwrap()],
+            domain: format!("d{suffix}.com"),
+            addresses: vec![format!("1.2.3.{suffix}").parse().unwrap()],
             expires_at: std::time::Instant::now() + std::time::Duration::from_secs(secs),
         };
 

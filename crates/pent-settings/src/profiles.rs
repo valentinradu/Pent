@@ -51,7 +51,7 @@ const PROFILES: &[(Profile, &str)] = &[
 
 impl Profile {
     /// Returns an iterator over every defined profile variant.
-    pub fn all() -> impl Iterator<Item = Profile> {
+    pub fn all() -> impl Iterator<Item = Self> {
         PROFILES.iter().map(|(p, _)| *p)
     }
 }
@@ -83,6 +83,7 @@ impl FromStr for Profile {
 }
 
 /// Returns the direct dependencies of a profile.
+#[must_use]
 pub fn profile_requires(p: Profile) -> &'static [Profile] {
     static NODE_DEP: [Profile; 1] = [Profile::Node];
     static SSH_DEP: [Profile; 1] = [Profile::Ssh];
@@ -102,6 +103,7 @@ pub fn profile_requires(p: Profile) -> &'static [Profile] {
 }
 
 /// Returns the full transitive dependency closure, deduplicated, deps-first.
+#[must_use]
 pub fn profile_deps_transitive(profiles: &[Profile]) -> Vec<Profile> {
     let mut result = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -127,6 +129,7 @@ fn expand_deps(
     }
 }
 
+#[allow(clippy::too_many_lines)] // data table, not logic
 /// Returns the `PentConfig` fragment for a single profile (platform-aware).
 fn profile_config(p: Profile) -> PentConfig {
     let macos = std::env::consts::OS == "macos";
@@ -538,6 +541,7 @@ fn profile_config(p: Profile) -> PentConfig {
 }
 
 /// Merges the config fragments for all given profiles into a single `PentConfig`.
+#[must_use]
 pub fn build_profiles_config(profiles: &[Profile]) -> PentConfig {
     profiles
         .iter()
@@ -549,6 +553,7 @@ pub fn build_profiles_config(profiles: &[Profile]) -> PentConfig {
 /// For profiles with domains: active when ≥1 domain is in `domain_allowlist`.
 /// For path-only profiles (node, git, keychain): active when ≥1 path from the
 /// profile's fragment is present in the config's path lists.
+#[must_use]
 pub fn is_profile_likely_active(config: &PentConfig, p: Profile) -> bool {
     let fragment = profile_config(p);
 

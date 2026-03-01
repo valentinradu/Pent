@@ -9,6 +9,7 @@ use std::path::PathBuf;
 /// Provides sensible baseline access (system binaries, libraries, temp dirs)
 /// that most processes need. Lives here rather than in `pent-settings` because
 /// the content is platform-specific knowledge, not config-format knowledge.
+#[must_use]
 pub fn system_default_paths() -> SandboxPaths {
     SandboxPaths {
         traversal: vec!["/".to_string()],
@@ -49,7 +50,7 @@ pub struct SandboxConfig {
     /// Workspace directory — always granted read-write access.
     pub workspace: PathBuf,
 
-    /// Sandbox filesystem paths (traversal, read, execute, read_write).
+    /// Sandbox filesystem paths (traversal, read, execute, `read_write`).
     /// Applied by both the macOS SBPL profile generator and Linux Landlock ruleset.
     pub paths: SandboxPaths,
 
@@ -82,6 +83,7 @@ impl SandboxConfig {
     /// * `workspace` - Workspace directory (read-write)
     /// * `paths` - Sandbox filesystem paths (macOS SBPL)
     /// * `cwd` - Working directory
+    #[must_use]
     pub fn new(workspace: PathBuf, paths: SandboxPaths, cwd: PathBuf) -> Self {
         Self {
             data_dir: workspace.clone(),
@@ -96,31 +98,36 @@ impl SandboxConfig {
     }
 
     /// Set the environment variables.
+    #[must_use]
     pub fn with_env(mut self, env: HashMap<String, String>) -> Self {
         self.env = env;
         self
     }
 
     /// Set the network mode.
-    pub fn with_network(mut self, network: NetworkMode) -> Self {
+    #[must_use]
+    pub const fn with_network(mut self, network: NetworkMode) -> Self {
         self.network = network;
         self
     }
 
     /// Set the application data directory (used by Linux Landlock).
+    #[must_use]
     pub fn with_data_dir(mut self, data_dir: PathBuf) -> Self {
         self.data_dir = data_dir;
         self
     }
 
     /// Add an additional mount point (used by Linux Landlock).
+    #[must_use]
     pub fn with_mount(mut self, mount: Mount) -> Self {
         self.mounts.push(mount);
         self
     }
 
     /// Disable filesystem enforcement (no Landlock, no overlayfs).
-    pub fn with_no_enforcement(mut self) -> Self {
+    #[must_use]
+    pub const fn with_no_enforcement(mut self) -> Self {
         self.no_enforcement = true;
         self
     }
@@ -130,6 +137,7 @@ impl SandboxConfig {
     ///
     /// This is the canonical way to construct a `SandboxConfig` from loaded
     /// config files; it avoids the manual path-extension boilerplate in callers.
+    #[must_use]
     pub fn from_sandbox_settings(
         settings: SandboxSettings,
         workspace: PathBuf,
