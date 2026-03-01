@@ -520,10 +520,6 @@ fn profile_config(p: Profile) -> PentConfig {
             },
             sandbox: SandboxSettings {
                 paths: SandboxPaths {
-                    // Execute access to npm global install directory so Node can
-                    // resolve modules from ~/.npm-global/lib/node_modules/ and
-                    // run the binary at ~/.npm-global/bin/gemini.
-                    execute: vec!["~/.npm-global".to_string()],
                     read_write: if macos {
                         vec![
                             "~/Library/Application Support/gemini-cli".to_string(),

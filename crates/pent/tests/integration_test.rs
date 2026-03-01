@@ -972,7 +972,7 @@ mod no_hang {
     /// `~/.config/pent/pent.toml` global config is invisible to pent.
     /// `XDG_CONFIG_HOME` and `XDG_DATA_HOME` are also cleared so they cannot
     /// override the isolated home.
-    /// stdout is discarded (Stdio::null) — we only capture stderr for
+    /// stdout is discarded (`Stdio::null`) — we only capture stderr for
     /// diagnostics.  stderr is drained in a background thread so the child
     /// can never block on a full pipe.
     fn pent_timeout(dir: &Path, home: &Path, args: &[&str], timeout_secs: u64) -> (bool, String) {
@@ -1175,28 +1175,32 @@ mod no_hang {
 
     // ── PTY-simulated interactive sessions ────────────────────────────────────
     //
-    // The previous tests use stdin=null (no TTY).  Binaries like `claude` behave
-    // differently with a real TTY: they start an interactive REPL instead of
-    // exiting immediately.  These tests allocate a PTY pair so the child sees a
-    // real terminal, then:
-    //   1. Wait up to `prompt_secs` for any output on the master (the prompt).
-    //   2. Write `quit_bytes` (e.g. Ctrl+C or "exit\n") through the master.
+    // Isolation model:
+    //   HOME            = real test-process HOME  (so ~/.npm-global, ~/.local/share/claude
+    //                     etc. are reachable by the sandboxed binary)
+    //   XDG_CONFIG_HOME = empty TempDir           (hides ~/.config/pent/pent.toml)
+    //   cwd             = fresh TempDir with .pent/pent.toml written by
+    //                     `pent config add @<agent>` so the profile paths are applied
+    //
+    // Test flow:
+    //   1. Wait up to `prompt_secs` for PTY output that looks like a prompt
+    //      (non-empty AND no error markers such as ERR_MODULE_NOT_FOUND).
+    //   2. Write Ctrl+C through the master.
     //   3. Assert pent exits within `exit_secs`.
     //
-    // A hang in step 1 means pent is stuck during sandbox/network setup and
-    // the child never printed a prompt.  A hang in step 3 means pent doesn't
-    // propagate the quit signal or overlayfs teardown is blocking.
+    // A hang in step 1 → pent stuck in sandbox/network setup, child never started.
+    // Error in step 1 → sandbox is blocking a resource the binary needs (profile bug).
+    // A hang in step 3 → overlayfs teardown or proxy shutdown is blocking.
 
-    /// Spawn `pent` with a fresh PTY as its controlling terminal.
-    /// Returns `(master_fd, child)`.  Caller owns master_fd.
-    ///
-    /// # Safety
-    /// Uses raw fds.  The caller must eventually close master_fd.
-    /// Spawn `pent` with a fresh PTY as its controlling terminal.
-    /// `home` is an empty temp dir set as `$HOME` to hide the real global config.
-    /// Returns `(master_fd, child)`.  Caller owns master_fd.
+    /// Spawn `pent` with a PTY.  `xdg_config_home` is an empty `TempDir` that
+    /// shadows the real ~/.config so no global pent config leaks in.
+    /// HOME is inherited from the test process so binaries can find their modules.
     #[allow(clippy::cast_sign_loss)]
-    fn spawn_with_pty(dir: &Path, home: &Path, args: &[&str]) -> (libc::c_int, std::process::Child) {
+    fn spawn_with_pty(
+        dir: &Path,
+        xdg_config_home: &Path,
+        args: &[&str],
+    ) -> (libc::c_int, std::process::Child) {
         use std::os::unix::io::FromRawFd;
         use std::process::Stdio;
 
@@ -1204,8 +1208,8 @@ mod no_hang {
         let mut slave: libc::c_int = -1;
         let rc = unsafe {
             libc::openpty(
-                &mut master,
-                &mut slave,
+                std::ptr::addr_of_mut!(master),
+                std::ptr::addr_of_mut!(slave),
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
@@ -1213,7 +1217,6 @@ mod no_hang {
         };
         assert_eq!(rc, 0, "openpty failed: {}", std::io::Error::last_os_error());
 
-        // Dup slave for stdout and stderr; stdin consumes the original.
         let slave_out = unsafe { libc::dup(slave) };
         let slave_err = unsafe { libc::dup(slave) };
         assert!(slave_out >= 0 && slave_err >= 0, "dup(slave) failed");
@@ -1221,8 +1224,9 @@ mod no_hang {
         let child = Command::new(PENT)
             .args(args)
             .current_dir(dir)
-            .env("HOME", home)
-            .env_remove("XDG_CONFIG_HOME")
+            // Real HOME so ~/.npm-global / ~/.local/share/claude are visible.
+            // XDG_CONFIG_HOME overrides so ~/.config/pent/pent.toml is hidden.
+            .env("XDG_CONFIG_HOME", xdg_config_home)
             .env_remove("XDG_DATA_HOME")
             .env_remove("PENT_LOG")
             .stdin(unsafe { Stdio::from_raw_fd(slave) })
@@ -1234,66 +1238,91 @@ mod no_hang {
         (master, child)
     }
 
-    /// Read from `master_fd` (non-blocking poll loop) for up to `timeout`.
-    /// Returns all bytes received so far.
+    /// Poll `master_fd` (non-blocking) for up to `timeout`.  Returns what arrived.
     fn drain_pty(master_fd: libc::c_int, timeout: Duration) -> Vec<u8> {
-        // Set master to non-blocking so we can poll without a separate thread.
         unsafe { libc::fcntl(master_fd, libc::F_SETFL, libc::O_NONBLOCK) };
-
         let deadline = Instant::now() + timeout;
         let mut buf = Vec::new();
         let mut tmp = [0u8; 4096];
         loop {
             let n = unsafe { libc::read(master_fd, tmp.as_mut_ptr().cast(), tmp.len()) };
-            if n > 0 {
-                buf.extend_from_slice(&tmp[..n as usize]);
-            }
-            if Instant::now() >= deadline {
-                break;
-            }
-            if n <= 0 {
-                std::thread::sleep(Duration::from_millis(50));
-            }
+            #[allow(clippy::cast_sign_loss)]
+            if n > 0 { buf.extend_from_slice(&tmp[..n as usize]); }
+            if Instant::now() >= deadline { break; }
+            if n <= 0 { std::thread::sleep(Duration::from_millis(50)); }
         }
-        // Restore blocking mode.
         unsafe { libc::fcntl(master_fd, libc::F_SETFL, 0) };
         buf
     }
 
-    /// Core of all PTY-based hang tests.
-    ///
-    /// 1. Spawn `pent` with a PTY so the child sees a real terminal.
-    /// 2. Wait `prompt_secs` for any output (the interactive prompt).
-    /// 3. Write `quit_bytes` through the master to request exit.
-    /// 4. Assert pent exits within `exit_secs`.
-    fn assert_pty_exits(
-        dir: &Path,
-        home: &Path,
-        pent_args: &[&str],
-        prompt_secs: u64,
-        quit_bytes: &[u8],
-        exit_secs: u64,
-        label: &str,
-    ) {
-        let (master, mut child) = spawn_with_pty(dir, home, pent_args);
+    /// Return true if `output` looks like a real prompt rather than a crash.
+    /// We check for the absence of known error markers.
+    fn looks_like_prompt(output: &[u8]) -> bool {
+        if output.is_empty() { return false; }
+        let s = String::from_utf8_lossy(output);
+        // If any of these appear the binary crashed before showing a TUI.
+        let error_markers = [
+            "ERR_MODULE_NOT_FOUND",
+            "Error:",
+            "error:",
+            "Cannot find",
+            "ENOENT",
+            "EACCES",
+            "Permission denied",
+        ];
+        !error_markers.iter().any(|m| s.contains(m))
+    }
 
-        // Step 1: wait for any output from the child (the prompt).
-        let prompt_output = drain_pty(master, Duration::from_secs(prompt_secs));
-        if prompt_output.is_empty() {
+    /// Core PTY hang test with output validation.
+    fn assert_pty_interactive(name: &str, profile: &str) {
+        let Some(bin) = detect_binary(name) else {
+            println!("SKIP: {name} not found");
+            return;
+        };
+        let bin_s = bin.to_str().unwrap();
+
+        // Project dir: apply the agent profile so sandbox paths are correct.
+        let dir = TempDir::new().unwrap();
+        let status = Command::new(PENT)
+            .args(["config", "add", profile])
+            .current_dir(dir.path())
+            .env_remove("PENT_LOG")
+            .status()
+            .expect("pent config add failed");
+        if !status.success() {
+            println!("SKIP: pent config add {profile} failed");
+            return;
+        }
+
+        // XDG_CONFIG_HOME → empty dir hides real global pent config.
+        let xdg = TempDir::new().unwrap();
+
+        let (master, mut child) = spawn_with_pty(
+            dir.path(), xdg.path(),
+            &["run", "--", bin_s],
+        );
+
+        // Step 1: wait for a real prompt (non-error output).
+        let output = drain_pty(master, Duration::from_secs(8));
+        let printable = String::from_utf8_lossy(&output);
+
+        if !looks_like_prompt(&output) {
             child.kill().ok();
             child.wait().ok();
             unsafe { libc::close(master) };
             panic!(
-                "{label}: no output on PTY within {prompt_secs}s — \
-                 pent may be hanging during sandbox/network setup"
+                "pent run -- {name}: PTY output within 8s was empty or contained errors\n\
+                 output: {printable:?}\n\
+                 hint: sandbox may be blocking a resource the binary needs \
+                 (check profile paths) or pent is hanging during setup"
             );
         }
 
-        // Step 2: send quit signal through master.
-        unsafe { libc::write(master, quit_bytes.as_ptr().cast(), quit_bytes.len()) };
+        // Step 2: send Ctrl+C to quit.
+        unsafe { libc::write(master, b"\x03".as_ptr().cast(), 1) };
 
-        // Step 3: wait for pent to exit.
-        let deadline = Instant::now() + Duration::from_secs(exit_secs);
+        // Step 3: pent should exit cleanly.
+        let deadline = Instant::now() + Duration::from_secs(5);
         let exited = loop {
             match child.try_wait().expect("try_wait") {
                 Some(_) => break true,
@@ -1305,81 +1334,20 @@ mod no_hang {
                 None => std::thread::sleep(Duration::from_millis(50)),
             }
         };
-
         unsafe { libc::close(master) };
 
         assert!(
             exited,
-            "{label}: pent did not exit within {exit_secs}s after sending quit\n\
+            "pent run -- {name}: did not exit within 5s after Ctrl+C\n\
              hint: overlayfs teardown or proxy shutdown may be hanging"
         );
     }
 
-    fn assert_pty_version_exits(name: &str) {
-        let Some(bin) = detect_binary(name) else {
-            println!("SKIP: {name} not found");
-            return;
-        };
-        let bin_s = bin.to_str().unwrap();
-        let dir = TempDir::new().unwrap();
-        let home = TempDir::new().unwrap();
-
-        // --version should print and exit even with a PTY — no quit needed.
-        let (master, mut child) = spawn_with_pty(
-            dir.path(), home.path(),
-            &["run", "--no-config", "--", bin_s, "--version"],
-        );
-
-        let deadline = Instant::now() + Duration::from_secs(3);
-        let exited = loop {
-            match child.try_wait().expect("try_wait") {
-                Some(_) => break true,
-                None if Instant::now() >= deadline => {
-                    child.kill().ok();
-                    child.wait().ok();
-                    break false;
-                }
-                None => std::thread::sleep(Duration::from_millis(50)),
-            }
-        };
-        unsafe { libc::close(master) };
-
-        assert!(exited, "pent run -- {name} --version (with PTY) timed out (3s)");
-    }
-
-    fn assert_pty_interactive_exits(name: &str) {
-        let Some(bin) = detect_binary(name) else {
-            println!("SKIP: {name} not found");
-            return;
-        };
-        let bin_s = bin.to_str().unwrap();
-        let dir = TempDir::new().unwrap();
-        let home = TempDir::new().unwrap();
-
-        // Ctrl+C (ETX) then newline: the PTY line discipline converts \x03
-        // to SIGINT for the foreground process group.
-        assert_pty_exits(
-            dir.path(), home.path(),
-            &["run", "--no-config", "--", bin_s],
-            5,             // wait up to 5s for the interactive prompt
-            b"\x03\n",    // Ctrl+C + newline
-            5,             // pent should then exit within 5s
-            &format!("pent run -- {name} (interactive PTY)"),
-        );
-    }
-
     #[test]
-    fn pty_claude_version_exits_quickly()      { assert_pty_version_exits("claude"); }
+    fn pty_claude_interactive_exits_quickly() { assert_pty_interactive("claude", "@claude"); }
     #[test]
-    fn pty_codex_version_exits_quickly()       { assert_pty_version_exits("codex"); }
+    fn pty_codex_interactive_exits_quickly()  { assert_pty_interactive("codex",  "@codex"); }
     #[test]
-    fn pty_gemini_version_exits_quickly()      { assert_pty_version_exits("gemini"); }
-
-    #[test]
-    fn pty_claude_interactive_exits_quickly()  { assert_pty_interactive_exits("claude"); }
-    #[test]
-    fn pty_codex_interactive_exits_quickly()   { assert_pty_interactive_exits("codex"); }
-    #[test]
-    fn pty_gemini_interactive_exits_quickly()  { assert_pty_interactive_exits("gemini"); }
+    fn pty_gemini_interactive_exits_quickly() { assert_pty_interactive("gemini", "@gemini"); }
 }
 

@@ -723,7 +723,21 @@ pub fn spawn_with_landlock(
             if let Some(parent) = real.parent() {
                 let parent_buf = parent.to_path_buf();
                 if !path_dirs.contains(&parent_buf) {
-                    path_dirs.push(parent_buf);
+                    path_dirs.push(parent_buf.clone());
+                }
+                // If the binary lives in a directory named "bin" (e.g.
+                // ~/.npm-global/bin/gemini, ~/.nvm/.../bin/node), also grant
+                // access to the package root one level up.  Node.js, Python,
+                // and similar runtimes import module files from sibling dirs
+                // (e.g. ~/.npm-global/lib/node_modules/) that would otherwise
+                // be invisible to Landlock.
+                if parent_buf.file_name().is_some_and(|n| n == "bin") {
+                    if let Some(pkg_root) = parent_buf.parent() {
+                        let pkg_root_buf = pkg_root.to_path_buf();
+                        if !path_dirs.contains(&pkg_root_buf) {
+                            path_dirs.push(pkg_root_buf);
+                        }
+                    }
                 }
             }
         }
