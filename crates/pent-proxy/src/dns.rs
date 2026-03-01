@@ -59,8 +59,11 @@ pub struct DnsServerConfig {
 
 impl Default for DnsServerConfig {
     fn default() -> Self {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        const LOCALHOST_ANY: SocketAddr =
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
         Self {
-            bind_addr: "127.0.0.1:0".parse().expect("hardcoded loopback address"),
+            bind_addr: LOCALHOST_ANY,
             upstream: None, // Use system resolvers
             ttl: std::time::Duration::from_secs(300),
             resolve_timeout: std::time::Duration::from_secs(5),
@@ -73,9 +76,6 @@ impl DnsServerConfig {
     ///
     /// Reads `/etc/resolv.conf` on Linux/macOS if no explicit upstream is set.
     /// Falls back to well-known public DNS if system config is unavailable.
-    ///
-    /// # Panics
-    /// Never panics in practice; the hardcoded fallback addresses are valid.
     #[must_use]
     pub fn get_upstream(&self) -> Vec<SocketAddr> {
         if let Some(ref upstream) = self.upstream {
@@ -85,12 +85,12 @@ impl DnsServerConfig {
         // Try to read system DNS configuration
         Self::read_system_resolvers().unwrap_or_else(|| {
             // Fallback to well-known public DNS
-            vec![
-                "1.1.1.1:53"
-                    .parse()
-                    .expect("hardcoded Cloudflare DNS address"),
-                "8.8.8.8:53".parse().expect("hardcoded Google DNS address"),
-            ]
+            use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+            const CLOUDFLARE: SocketAddr =
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53);
+            const GOOGLE: SocketAddr =
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53);
+            vec![CLOUDFLARE, GOOGLE]
         })
     }
 
@@ -698,6 +698,7 @@ impl DnsServer {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // test infrastructure: parse on known-good literals
 mod tests {
     use super::*;
 

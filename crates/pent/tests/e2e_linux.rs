@@ -21,6 +21,8 @@ mod linux {
     use std::sync::{Mutex, OnceLock};
     use tempfile::TempDir;
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
     const PENT_BIN: &str = env!("CARGO_BIN_EXE_pent");
 
     // ── root check ───────────────────────────────────────────────────────────
@@ -48,6 +50,7 @@ mod linux {
     struct RoutingGuard(Vec<u32>);
 
     impl RoutingGuard {
+        #[allow(clippy::expect_used)] // infrastructure: ip rule show must succeed for routing tests
         fn install() -> Self {
             let out = Command::new("ip")
                 .args(["rule", "show"])
@@ -163,6 +166,7 @@ mod linux {
     ///
     /// On Linux `dirs::config_dir()` = `~/.config`, so the config lands at
     /// `$HOME/.config/pent/pent.toml`.
+    #[allow(clippy::unwrap_used, clippy::panic)] // infrastructure helper: TempDir/spawn failures are test setup failures
     fn agent_config(agent: &str, configs_root: &Path) -> PathBuf {
         let home = configs_root.join(format!("{agent}_home"));
         fs::create_dir_all(&home).unwrap();
@@ -179,6 +183,7 @@ mod linux {
 
     // ── run_halt helper ──────────────────────────────────────────────────────
 
+    #[allow(clippy::panic)] // infrastructure helper: spawn failure is a hard test setup error
     fn run_halt(config: &Path, extra: &[&str], cmd: &[&str]) -> (ExitStatus, String) {
         let out = Command::new(PENT_BIN)
             .arg("run")
@@ -198,17 +203,17 @@ mod linux {
 
     // ── filesystem tests ─────────────────────────────────────────────────────
 
-    fn test_filesystem(agent: &str) {
+    fn test_filesystem(agent: &str) -> TestResult {
         if !landlock_available() {
             println!("\nSKIP {agent}: sandbox not enforcing");
-            return;
+            return Ok(());
         }
 
-        let configs = TempDir::new().unwrap();
-        let ws = TempDir::new().unwrap();
+        let configs = TempDir::new()?;
+        let ws = TempDir::new()?;
         let config = agent_config(agent, configs.path());
         let sentinel = ws.path().join(format!("sentinel-{agent}.txt"));
-        let sentinel_s = sentinel.to_str().unwrap();
+        let sentinel_s = sentinel.to_str().ok_or("sentinel path is not valid UTF-8")?;
 
         // 1. Workspace write must succeed.
         let (status, stderr) = run_halt(
@@ -246,30 +251,32 @@ mod linux {
             "{agent}: write to /etc was NOT blocked by sandbox"
         );
         let _ = fs::remove_file(&blocked);
+
+        Ok(())
     }
 
     #[test]
-    fn filesystem_claude() { test_filesystem("claude"); }
+    fn filesystem_claude() -> TestResult { test_filesystem("claude") }
     #[test]
-    fn filesystem_codex()  { test_filesystem("codex"); }
+    fn filesystem_codex() -> TestResult  { test_filesystem("codex") }
     #[test]
-    fn filesystem_gemini() { test_filesystem("gemini"); }
+    fn filesystem_gemini() -> TestResult { test_filesystem("gemini") }
 
     // ── network tests ────────────────────────────────────────────────────────
 
     // Serialize network tests so RoutingGuard add/del doesn't race across threads.
     static NETWORK_MUTEX: Mutex<()> = Mutex::new(());
 
-    fn test_network(agent: &str, allowed_domain: &str) {
+    fn test_network(agent: &str, allowed_domain: &str) -> TestResult {
         if !is_root() {
             println!("\nSKIP {agent} network: requires root (`sudo -E cargo test --test e2e_linux`)");
-            return;
+            return Ok(());
         }
 
         let _lock = NETWORK_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let _routing = RoutingGuard::install();
 
-        let configs = TempDir::new().unwrap();
+        let configs = TempDir::new()?;
         let config = agent_config(agent, configs.path());
 
         // 4. Allowed domain reachable through proxy.
@@ -304,12 +311,14 @@ mod linux {
             "{agent}: blocked domain NOT denied \
              (curl exit {code}, expected 6 or 56)\nstderr: {stderr}"
         );
+
+        Ok(())
     }
 
     #[test]
-    fn network_claude()  { test_network("claude",  "api.anthropic.com"); }
+    fn network_claude() -> TestResult  { test_network("claude",  "api.anthropic.com") }
     #[test]
-    fn network_codex()   { test_network("codex",   "api.openai.com"); }
+    fn network_codex() -> TestResult   { test_network("codex",   "api.openai.com") }
     #[test]
-    fn network_gemini()  { test_network("gemini",  "generativelanguage.googleapis.com"); }
+    fn network_gemini() -> TestResult  { test_network("gemini",  "generativelanguage.googleapis.com") }
 }

@@ -45,3 +45,6 @@ priority = "optional"
 assets = [
     ["target/release/pent", "usr/bin/", "755"],
 ]
+
+[lints]
+workspace = true

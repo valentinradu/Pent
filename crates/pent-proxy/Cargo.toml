@@ -11,3 +11,6 @@ pent-settings = { path = "../pent-settings" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+
+[lints]
+workspace = true

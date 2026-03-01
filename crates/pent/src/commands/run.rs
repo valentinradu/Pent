@@ -289,7 +289,9 @@ async fn wait_child_with_events(
         let (done_tx, mut done_rx) = tokio::sync::oneshot::channel::<std::process::ExitStatus>();
         std::thread::spawn(move || {
             let status = child.wait().unwrap_or_else(|_| {
-                std::process::Command::new("true").status().unwrap()
+                // wait() can only fail if the child was already waited on.
+                // Synthesize exit-code-1 without spawning a subprocess.
+                std::os::unix::process::ExitStatusExt::from_raw(1 << 8)
             });
             let _ = done_tx.send(status);
         });
@@ -315,7 +317,8 @@ async fn wait_child_with_events(
         }
     } else {
         child.wait().unwrap_or_else(|_| {
-            std::process::Command::new("true").status().unwrap()
+            // wait() can only fail if the child was already waited on.
+            std::os::unix::process::ExitStatusExt::from_raw(1 << 8)
         })
     }
 }
@@ -380,7 +383,8 @@ async fn macos_trace_wait(
     let (done_tx, mut done_rx) = tokio::sync::oneshot::channel::<std::process::ExitStatus>();
     std::thread::spawn(move || {
         let status = child.wait().unwrap_or_else(|_| {
-            std::process::Command::new("true").status().unwrap()
+            // wait() can only fail if the child was already waited on.
+            std::os::unix::process::ExitStatusExt::from_raw(1 << 8)
         });
         let _ = done_tx.send(status);
     });
@@ -577,8 +581,12 @@ async fn setup_proxy(
             // Both the TCP proxy and DNS server must listen on all interfaces
             // (0.0.0.0) so they are reachable from the veth outer IP (10.200.x.1).
             // The child's loopback is isolated; only the veth reaches the host.
-            proxy_config.proxy_bind_addr = "0.0.0.0:0".parse().expect("hardcoded addr");
-            proxy_config.dns_bind_addr = "0.0.0.0:0".parse().expect("hardcoded addr");
+            const BIND_ALL_ANY: std::net::SocketAddr = std::net::SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                0,
+            );
+            proxy_config.proxy_bind_addr = BIND_ALL_ANY;
+            proxy_config.dns_bind_addr = BIND_ALL_ANY;
         }
         let handle = ProxyServer::new(proxy_config)?.start().await?;
         let proxy_addr = handle.proxy_addr();

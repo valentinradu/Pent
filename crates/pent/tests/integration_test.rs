@@ -13,12 +13,12 @@
 //! only on macOS where `sandbox-exec` is available. They are skipped at
 //! runtime on other platforms or when `sandbox-exec` is absent.
 
-#![allow(clippy::unwrap_used)]
-
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
 use tempfile::TempDir;
+
+type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 // ============================================================================
 // Infrastructure
@@ -28,6 +28,7 @@ use tempfile::TempDir;
 const PENT: &str = env!("CARGO_BIN_EXE_pent");
 
 /// Invoke `pent` with the given arguments in `cwd` and return the full Output.
+#[allow(clippy::panic)] // infrastructure helper: spawn failure is a hard test setup error
 fn run_halt(cwd: &Path, args: &[&str]) -> Output {
     Command::new(PENT)
         .args(args)
@@ -96,6 +97,7 @@ fn sys_exec_args() -> Vec<String> {
 }
 
 /// Invoke `pent run --no-config [extra_args] -- [cmd_args]` in `workspace`.
+#[allow(clippy::panic)] // infrastructure helper: spawn failure is a hard test setup error
 fn sandboxed_run(workspace: &Path, extra_args: &[String], cmd_args: &[&str]) -> Output {
     let mut args: Vec<String> = vec!["run".into(), "--no-config".into()];
     args.extend_from_slice(extra_args);
@@ -127,23 +129,24 @@ fn home_path(name: &str) -> Option<std::path::PathBuf> {
 // ============================================================================
 
 #[test]
-fn test_config_init_creates_project_config() {
-    let dir = TempDir::new().unwrap();
+fn test_config_init_creates_project_config() -> TestResult {
+    let dir = TempDir::new()?;
     let out = run_halt(dir.path(), &["config", "init"]);
     expect_success(&out);
 
     let config_path = dir.path().join(".pent").join("pent.toml");
     assert!(config_path.exists(), ".pent/pent.toml was not created");
-    let contents = fs::read_to_string(&config_path).unwrap();
+    let contents = fs::read_to_string(&config_path)?;
     assert!(
         toml::from_str::<toml::Value>(&contents).is_ok(),
         "Generated config is not valid TOML:\n{contents}"
     );
+    Ok(())
 }
 
 #[test]
-fn test_config_init_fails_if_already_exists() {
-    let dir = TempDir::new().unwrap();
+fn test_config_init_fails_if_already_exists() -> TestResult {
+    let dir = TempDir::new()?;
     // First init should succeed
     expect_success(&run_halt(dir.path(), &["config", "init"]));
     // Second init should fail with a clear error
@@ -154,11 +157,12 @@ fn test_config_init_fails_if_already_exists() {
         stderr.contains("already exists") || stderr.contains("Config file"),
         "Expected 'already exists' in stderr, got: {stderr}"
     );
+    Ok(())
 }
 
 #[test]
-fn test_config_show_toml_is_valid() {
-    let dir = TempDir::new().unwrap();
+fn test_config_show_toml_is_valid() -> TestResult {
+    let dir = TempDir::new()?;
     expect_success(&run_halt(dir.path(), &["config", "init"]));
 
     let out = run_halt(dir.path(), &["config", "show", "--format", "toml"]);
@@ -167,11 +171,12 @@ fn test_config_show_toml_is_valid() {
         toml::from_str::<toml::Value>(&stdout).is_ok(),
         "config show --format toml is not valid TOML:\n{stdout}"
     );
+    Ok(())
 }
 
 #[test]
-fn test_config_show_json_is_valid() {
-    let dir = TempDir::new().unwrap();
+fn test_config_show_json_is_valid() -> TestResult {
+    let dir = TempDir::new()?;
     expect_success(&run_halt(dir.path(), &["config", "init"]));
 
     let out = run_halt(dir.path(), &["config", "show", "--format", "json"]);
@@ -180,58 +185,61 @@ fn test_config_show_json_is_valid() {
         serde_json::from_str::<serde_json::Value>(&stdout).is_ok(),
         "config show --format json is not valid JSON:\n{stdout}"
     );
+    Ok(())
 }
 
 #[test]
-fn test_config_show_json_has_sandbox_and_proxy_keys() {
-    let dir = TempDir::new().unwrap();
+fn test_config_show_json_has_sandbox_and_proxy_keys() -> TestResult {
+    let dir = TempDir::new()?;
     expect_success(&run_halt(dir.path(), &["config", "init"]));
 
     let out = run_halt(dir.path(), &["config", "show", "--format", "json"]);
     let stdout = expect_success(&out);
-    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout)?;
 
     assert!(json.get("sandbox").is_some(), "Missing 'sandbox' key");
     assert!(json.get("proxy").is_some(), "Missing 'proxy' key");
+    Ok(())
 }
 
 #[test]
-fn test_config_show_without_config_file_uses_defaults() {
+fn test_config_show_without_config_file_uses_defaults() -> TestResult {
     // No config init — should still produce valid output using defaults
-    let dir = TempDir::new().unwrap();
+    let dir = TempDir::new()?;
     let out = run_halt(dir.path(), &["config", "show", "--format", "json"]);
     let stdout = expect_success(&out);
-    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout)?;
     assert!(json.get("sandbox").is_some());
     assert!(json.get("proxy").is_some());
+    Ok(())
 }
 
 #[test]
-fn test_config_project_overrides_domain_allowlist() {
-    let dir = TempDir::new().unwrap();
+fn test_config_project_overrides_domain_allowlist() -> TestResult {
+    let dir = TempDir::new()?;
 
     // Write a project config with a specific domain
     let dot_halt = dir.path().join(".pent");
-    fs::create_dir_all(&dot_halt).unwrap();
+    fs::create_dir_all(&dot_halt)?;
     fs::write(
         dot_halt.join("pent.toml"),
         "[proxy]\ndomain_allowlist = [\"project-domain.example\"]\n",
-    )
-    .unwrap();
+    )?;
 
     let out = run_halt(dir.path(), &["config", "show", "--format", "json"]);
     let stdout = expect_success(&out);
-    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout)?;
 
     let allowlist = json["proxy"]["domain_allowlist"]
         .as_array()
-        .expect("domain_allowlist should be an array");
+        .ok_or("domain_allowlist should be an array")?;
     assert!(
         allowlist
             .iter()
             .any(|v| v.as_str() == Some("project-domain.example")),
         "Expected project-domain.example in allowlist, got: {allowlist:?}"
     );
+    Ok(())
 }
 
 // ============================================================================
@@ -239,16 +247,17 @@ fn test_config_project_overrides_domain_allowlist() {
 // ============================================================================
 
 #[test]
-fn test_check_reports_platform() {
+fn test_check_reports_platform() -> TestResult {
     // `pent check` should always print platform info even when sandboxing
     // is unavailable. The exit status may be non-zero in restricted envs.
-    let dir = TempDir::new().unwrap();
+    let dir = TempDir::new()?;
     let out = run_halt(dir.path(), &["check"]);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("platform"),
         "Expected 'platform' in check stderr, got: {stderr}"
     );
+    Ok(())
 }
 
 // ============================================================================
@@ -256,13 +265,13 @@ fn test_check_reports_platform() {
 // ============================================================================
 
 #[test]
-fn test_run_reads_file_in_workspace() {
+fn test_run_reads_file_in_workspace() -> TestResult {
     if !sandbox_available() {
-        return;
+        return Ok(());
     }
 
-    let dir = TempDir::new().unwrap();
-    fs::write(dir.path().join("hello.txt"), "hello-workspace\n").unwrap();
+    let dir = TempDir::new()?;
+    fs::write(dir.path().join("hello.txt"), "hello-workspace\n")?;
 
     let out = sandboxed_run(dir.path(), &sys_exec_args(), &["/bin/cat", "hello.txt"]);
     let stdout = expect_success(&out);
@@ -270,15 +279,16 @@ fn test_run_reads_file_in_workspace() {
         stdout.contains("hello-workspace"),
         "Expected file content, got: {stdout}"
     );
+    Ok(())
 }
 
 #[test]
-fn test_run_writes_file_in_workspace() {
+fn test_run_writes_file_in_workspace() -> TestResult {
     if !sandbox_available() {
-        return;
+        return Ok(());
     }
 
-    let dir = TempDir::new().unwrap();
+    let dir = TempDir::new()?;
     let target = dir.path().join("created.txt");
 
     let out = sandboxed_run(
@@ -289,71 +299,73 @@ fn test_run_writes_file_in_workspace() {
     expect_success(&out);
     assert!(target.exists(), "created.txt was not created in workspace");
     assert!(
-        fs::read_to_string(&target).unwrap().contains("wrote"),
+        fs::read_to_string(&target)?.contains("wrote"),
         "Unexpected content in created.txt"
     );
+    Ok(())
 }
 
 #[test]
-fn test_run_cannot_read_file_in_home_dir() {
+fn test_run_cannot_read_file_in_home_dir() -> TestResult {
     // $HOME (/Users/<user>) is NOT in sandbox defaults, so the sandboxed
     // process should not be able to read files placed there.
     if !sandbox_available() {
-        return;
+        return Ok(());
     }
 
     let Some(secret_path) = home_path("secret.txt") else {
-        return; // no HOME env var, skip
+        return Ok(()); // no HOME env var, skip
     };
 
-    fs::write(&secret_path, "should-not-be-readable\n").unwrap();
+    fs::write(&secret_path, "should-not-be-readable\n")?;
 
-    let dir = TempDir::new().unwrap();
+    let dir = TempDir::new()?;
     let out = sandboxed_run(
         dir.path(),
         &sys_exec_args(),
-        &["/bin/cat", secret_path.to_str().unwrap()],
+        &["/bin/cat", secret_path.to_str().ok_or("secret path is not valid UTF-8")?],
     );
     // Sandbox blocks the read → non-zero exit
     expect_failure(&out);
 
     let _ = fs::remove_file(&secret_path); // cleanup
+    Ok(())
 }
 
 #[test]
-fn test_run_extra_read_gives_access_to_home_dir_file() {
+fn test_run_extra_read_gives_access_to_home_dir_file() -> TestResult {
     // Verify that --read <dir> grants read access to that directory from
     // inside the sandbox, even if it would otherwise be inaccessible.
     if !sandbox_available() {
-        return;
+        return Ok(());
     }
 
     let Some(secret_dir) = home_path("extra-read-dir") else {
-        return;
+        return Ok(());
     };
-    fs::create_dir_all(&secret_dir).unwrap();
+    fs::create_dir_all(&secret_dir)?;
     let secret_file = secret_dir.join("data.txt");
-    fs::write(&secret_file, "accessible-via-flag\n").unwrap();
+    fs::write(&secret_file, "accessible-via-flag\n")?;
 
-    let dir = TempDir::new().unwrap();
+    let dir = TempDir::new()?;
 
     // Without --read: access should fail
     let out_blocked = sandboxed_run(
         dir.path(),
         &sys_exec_args(),
-        &["/bin/cat", secret_file.to_str().unwrap()],
+        &["/bin/cat", secret_file.to_str().ok_or("secret_file path is not valid UTF-8")?],
     );
     expect_failure(&out_blocked);
 
     // With --read <secret_dir>: access should succeed
     let mut extra = sys_exec_args();
     extra.push("--read".into());
-    extra.push(secret_dir.to_str().unwrap().to_string());
+    extra.push(secret_dir.to_str().ok_or("secret_dir path is not valid UTF-8")?.to_string());
 
     let out_allowed = sandboxed_run(
         dir.path(),
         &extra,
-        &["/bin/cat", secret_file.to_str().unwrap()],
+        &["/bin/cat", secret_file.to_str().ok_or("secret_file path is not valid UTF-8")?],
     );
     let stdout = expect_success(&out_allowed);
     assert!(
@@ -364,27 +376,28 @@ fn test_run_extra_read_gives_access_to_home_dir_file() {
     // cleanup
     let _ = fs::remove_file(&secret_file);
     let _ = fs::remove_dir(&secret_dir);
+    Ok(())
 }
 
 #[test]
-fn test_run_extra_write_gives_write_access() {
+fn test_run_extra_write_gives_write_access() -> TestResult {
     // --write <dir> should grant write access to a directory that is
     // otherwise inaccessible.
     if !sandbox_available() {
-        return;
+        return Ok(());
     }
 
     let Some(write_dir) = home_path("extra-write-dir") else {
-        return;
+        return Ok(());
     };
-    fs::create_dir_all(&write_dir).unwrap();
+    fs::create_dir_all(&write_dir)?;
     let target = write_dir.join("out.txt");
-    let target_str = target.to_str().unwrap().to_string();
+    let target_str = target.to_str().ok_or("target path is not valid UTF-8")?.to_string();
 
-    let dir = TempDir::new().unwrap();
+    let dir = TempDir::new()?;
     let mut extra = sys_exec_args();
     extra.push("--write".into());
-    extra.push(write_dir.to_str().unwrap().to_string());
+    extra.push(write_dir.to_str().ok_or("write_dir path is not valid UTF-8")?.to_string());
 
     let out = sandboxed_run(
         dir.path(),
@@ -397,6 +410,7 @@ fn test_run_extra_write_gives_write_access() {
     // cleanup
     let _ = fs::remove_file(&target);
     let _ = fs::remove_dir(&write_dir);
+    Ok(())
 }
 
 // ============================================================================
@@ -416,38 +430,40 @@ fn nc_test(workspace: &Path, net_args: &[&str]) -> Output {
 }
 
 #[test]
-fn test_run_blocked_network_prevents_tcp_connect() {
+fn test_run_blocked_network_prevents_tcp_connect() -> TestResult {
     if !sandbox_available() {
-        return;
+        return Ok(());
     }
 
-    let dir = TempDir::new().unwrap();
+    let dir = TempDir::new()?;
     // --network blocked: SBPL generates (deny network*) → connect() returns EPERM
     let out = nc_test(dir.path(), &["--network", "blocked"]);
     expect_failure(&out);
+    Ok(())
 }
 
 #[test]
-fn test_run_localhost_network_blocks_external_connect() {
+fn test_run_localhost_network_blocks_external_connect() -> TestResult {
     if !sandbox_available() {
-        return;
+        return Ok(());
     }
 
-    let dir = TempDir::new().unwrap();
+    let dir = TempDir::new()?;
     // --network localhost: only loopback allowed; 1.1.1.1 is not localhost
     let out = nc_test(dir.path(), &["--network", "localhost"]);
     expect_failure(&out);
+    Ok(())
 }
 
 #[test]
-fn test_run_blocked_network_by_direct_ip() {
+fn test_run_blocked_network_by_direct_ip() -> TestResult {
     if !sandbox_available() {
-        return;
+        return Ok(());
     }
 
     // Direct IP (bypasses DNS) under blocked mode. The sandbox network* deny
     // covers connect() regardless of how the destination was obtained.
-    let dir = TempDir::new().unwrap();
+    let dir = TempDir::new()?;
     let mut extra = sys_exec_args();
     extra.extend_from_slice(&["--network".into(), "blocked".into()]);
     // Use 8.8.8.8:53 (Google DNS) — different IP to avoid any local-network edge cases
@@ -457,15 +473,16 @@ fn test_run_blocked_network_by_direct_ip() {
         &["/usr/bin/nc", "-zw2", "8.8.8.8", "53"],
     );
     expect_failure(&out);
+    Ok(())
 }
 
 #[test]
-fn test_run_localhost_network_allows_loopback() {
+fn test_run_localhost_network_allows_loopback() -> TestResult {
     if !sandbox_available() {
-        return;
+        return Ok(());
     }
 
-    let dir = TempDir::new().unwrap();
+    let dir = TempDir::new()?;
     let mut extra = sys_exec_args();
     extra.extend_from_slice(&["--network".into(), "localhost".into()]);
     // nc -zw2 127.0.0.1 <any> will return "connection refused" (ECONNREFUSED,
@@ -486,6 +503,7 @@ fn test_run_localhost_network_allows_loopback() {
         stdout.contains("NC_DONE"),
         "Shell did not complete: {stdout}"
     );
+    Ok(())
 }
 
 // ============================================================================
@@ -493,19 +511,20 @@ fn test_run_localhost_network_allows_loopback() {
 // ============================================================================
 
 #[test]
-fn test_run_allow_flag_starts_proxy_without_crash() {
+fn test_run_allow_flag_starts_proxy_without_crash() -> TestResult {
     if !sandbox_available() {
-        return;
+        return Ok(());
     }
 
     // Passing --allow starts the proxy server. We run a neutral command
     // (echo) to verify the proxy starts and shuts down cleanly.
-    let dir = TempDir::new().unwrap();
+    let dir = TempDir::new()?;
     let mut extra = sys_exec_args();
     extra.extend_from_slice(&["--allow".into(), "example.com".into()]);
     let out = sandboxed_run(dir.path(), &extra, &["/bin/echo", "proxy-ok"]);
     let stdout = expect_success(&out);
     assert!(stdout.contains("proxy-ok"));
+    Ok(())
 }
 
 // ============================================================================
@@ -513,12 +532,12 @@ fn test_run_allow_flag_starts_proxy_without_crash() {
 // ============================================================================
 
 #[test]
-fn test_run_env_flag_passes_named_variable() {
+fn test_run_env_flag_passes_named_variable() -> TestResult {
     if !sandbox_available() {
-        return;
+        return Ok(());
     }
 
-    let dir = TempDir::new().unwrap();
+    let dir = TempDir::new()?;
     let mut extra = sys_exec_args();
     extra.extend_from_slice(&["--env".into(), "HOME".into()]);
     let out = sandboxed_run(dir.path(), &extra, &["/bin/sh", "-c", "echo HOME=$HOME"]);
@@ -527,15 +546,16 @@ fn test_run_env_flag_passes_named_variable() {
         stdout.contains("HOME=/"),
         "Expected HOME to be set, got: {stdout}"
     );
+    Ok(())
 }
 
 #[test]
-fn test_run_env_explicit_kv_sets_variable() {
+fn test_run_env_explicit_kv_sets_variable() -> TestResult {
     if !sandbox_available() {
-        return;
+        return Ok(());
     }
 
-    let dir = TempDir::new().unwrap();
+    let dir = TempDir::new()?;
     let mut extra = sys_exec_args();
     extra.extend_from_slice(&["--env".into(), "HALT_TEST=injected".into()]);
     let out = sandboxed_run(
@@ -548,6 +568,7 @@ fn test_run_env_explicit_kv_sets_variable() {
         stdout.contains("RESULT=injected"),
         "Expected injected value, got: {stdout}"
     );
+    Ok(())
 }
 
 // ============================================================================
@@ -555,28 +576,28 @@ fn test_run_env_explicit_kv_sets_variable() {
 // ============================================================================
 
 #[test]
-fn test_run_no_config_ignores_project_config() {
+fn test_run_no_config_ignores_project_config() -> TestResult {
     if !sandbox_available() {
-        return;
+        return Ok(());
     }
 
-    let dir = TempDir::new().unwrap();
+    let dir = TempDir::new()?;
 
     // Create a project config that requests blocked networking.
     // With --no-config this should be ignored and defaults apply.
     let dot_halt = dir.path().join(".pent");
-    fs::create_dir_all(&dot_halt).unwrap();
+    fs::create_dir_all(&dot_halt)?;
     fs::write(
         dot_halt.join("pent.toml"),
         "[sandbox.network]\nmode = \"blocked\"\n",
-    )
-    .unwrap();
+    )?;
 
     // sandboxed_run already passes --no-config; echo should succeed even
     // though the project config requests blocked networking.
     let out = sandboxed_run(dir.path(), &sys_exec_args(), &["/bin/echo", "no-config"]);
     let stdout = expect_success(&out);
     assert!(stdout.contains("no-config"));
+    Ok(())
 }
 
 // ============================================================================
@@ -588,8 +609,8 @@ fn test_run_no_config_ignores_project_config() {
 // ============================================================================
 
 #[test]
-fn test_config_add_creates_config_if_missing() {
-    let dir = TempDir::new().unwrap();
+fn test_config_add_creates_config_if_missing() -> TestResult {
+    let dir = TempDir::new()?;
     let config_path = dir.path().join(".pent").join("pent.toml");
     assert!(!config_path.exists());
 
@@ -597,31 +618,33 @@ fn test_config_add_creates_config_if_missing() {
     expect_success(&out);
 
     assert!(config_path.exists(), "config should be created by add");
+    Ok(())
 }
 
 #[test]
-fn test_config_add_writes_domains() {
-    let dir = TempDir::new().unwrap();
+fn test_config_add_writes_domains() -> TestResult {
+    let dir = TempDir::new()?;
     let out = run_halt(dir.path(), &["config", "add", "@npm"]);
     expect_success(&out);
 
     let config_path = dir.path().join(".pent").join("pent.toml");
-    let contents = fs::read_to_string(&config_path).unwrap();
+    let contents = fs::read_to_string(&config_path)?;
     assert!(
         contents.contains("registry.npmjs.org"),
         "Expected registry.npmjs.org in config after adding @npm: {contents}"
     );
+    Ok(())
 }
 
 #[test]
-fn test_config_add_npm_also_adds_node() {
-    let dir = TempDir::new().unwrap();
+fn test_config_add_npm_also_adds_node() -> TestResult {
+    let dir = TempDir::new()?;
     let out = run_halt(dir.path(), &["config", "add", "@npm"]);
     expect_success(&out);
 
     // @npm depends on @node; @node adds traversal: ~ on all platforms
     let config_path = dir.path().join(".pent").join("pent.toml");
-    let contents = fs::read_to_string(&config_path).unwrap();
+    let contents = fs::read_to_string(&config_path)?;
     assert!(
         contents.contains("\"~\""),
         "Expected traversal '~' from @node profile after adding @npm: {contents}"
@@ -632,40 +655,43 @@ fn test_config_add_npm_also_adds_node() {
         stderr.contains("@node"),
         "Expected '@node' in add stderr: {stderr}"
     );
+    Ok(())
 }
 
 #[test]
-fn test_config_add_deduplicates() {
-    let dir = TempDir::new().unwrap();
+fn test_config_add_deduplicates() -> TestResult {
+    let dir = TempDir::new()?;
     expect_success(&run_halt(dir.path(), &["config", "add", "@npm"]));
     expect_success(&run_halt(dir.path(), &["config", "add", "@npm"]));
 
     let config_path = dir.path().join(".pent").join("pent.toml");
-    let contents = fs::read_to_string(&config_path).unwrap();
+    let contents = fs::read_to_string(&config_path)?;
     let count = contents.matches("registry.npmjs.org").count();
     assert_eq!(
         count, 1,
         "registry.npmjs.org should appear exactly once: {contents}"
     );
+    Ok(())
 }
 
 #[test]
-fn test_config_rm_removes_domains() {
-    let dir = TempDir::new().unwrap();
+fn test_config_rm_removes_domains() -> TestResult {
+    let dir = TempDir::new()?;
     expect_success(&run_halt(dir.path(), &["config", "add", "@npm"]));
     expect_success(&run_halt(dir.path(), &["config", "rm", "@npm"]));
 
     let config_path = dir.path().join(".pent").join("pent.toml");
-    let contents = fs::read_to_string(&config_path).unwrap();
+    let contents = fs::read_to_string(&config_path)?;
     assert!(
         !contents.contains("registry.npmjs.org"),
         "registry.npmjs.org should be removed after rm @npm: {contents}"
     );
+    Ok(())
 }
 
 #[test]
-fn test_config_rm_node_blocked_by_gemini() {
-    let dir = TempDir::new().unwrap();
+fn test_config_rm_node_blocked_by_gemini() -> TestResult {
+    let dir = TempDir::new()?;
     expect_success(&run_halt(dir.path(), &["config", "add", "@gemini"]));
 
     let out = run_halt(dir.path(), &["config", "rm", "@node"]);
@@ -676,40 +702,43 @@ fn test_config_rm_node_blocked_by_gemini() {
         stderr.contains("@gemini") || stderr.contains("depends"),
         "Expected error mentioning @gemini dependency: {stderr}"
     );
+    Ok(())
 }
 
 #[test]
-fn test_config_rm_gemini_node_together_succeeds() {
-    let dir = TempDir::new().unwrap();
+fn test_config_rm_gemini_node_together_succeeds() -> TestResult {
+    let dir = TempDir::new()?;
     expect_success(&run_halt(dir.path(), &["config", "add", "@gemini"]));
 
     let out = run_halt(dir.path(), &["config", "rm", "@gemini", "@node"]);
     expect_success(&out);
 
     let config_path = dir.path().join(".pent").join("pent.toml");
-    let contents = fs::read_to_string(&config_path).unwrap();
+    let contents = fs::read_to_string(&config_path)?;
     assert!(
         !contents.contains("generativelanguage.googleapis.com"),
         "gemini domains should be removed: {contents}"
     );
+    Ok(())
 }
 
 #[test]
-fn test_config_add_multiple_profiles() {
-    let dir = TempDir::new().unwrap();
+fn test_config_add_multiple_profiles() -> TestResult {
+    let dir = TempDir::new()?;
     let out = run_halt(dir.path(), &["config", "add", "@npm", "@cargo", "@gh"]);
     expect_success(&out);
 
     let config_path = dir.path().join(".pent").join("pent.toml");
-    let contents = fs::read_to_string(&config_path).unwrap();
+    let contents = fs::read_to_string(&config_path)?;
     assert!(contents.contains("registry.npmjs.org"), "npm domain missing");
     assert!(contents.contains("crates.io"), "cargo domain missing");
     assert!(contents.contains("github.com"), "gh domain missing");
+    Ok(())
 }
 
 #[test]
-fn test_config_add_unknown_profile_fails() {
-    let dir = TempDir::new().unwrap();
+fn test_config_add_unknown_profile_fails() -> TestResult {
+    let dir = TempDir::new()?;
     let out = run_halt(dir.path(), &["config", "add", "@not-a-real-profile"]);
     expect_failure(&out);
 
@@ -718,6 +747,7 @@ fn test_config_add_unknown_profile_fails() {
         stderr.contains("unknown") || stderr.contains("@not-a-real-profile"),
         "Expected error about unknown profile: {stderr}"
     );
+    Ok(())
 }
 
 // ============================================================================
@@ -725,18 +755,18 @@ fn test_config_add_unknown_profile_fails() {
 // ============================================================================
 
 #[test]
-fn test_proxy_mode_allows_localhost_mcp_connection() {
+fn test_proxy_mode_allows_localhost_mcp_connection() -> TestResult {
     // MCP servers typically run on localhost (stdio or SSE). Verify that a
     // sandboxed process in proxy_only mode can reach a TCP server on 127.0.0.1.
     if !sandbox_available() {
-        return;
+        return Ok(());
     }
 
     // Bind an ephemeral TCP port so there is something to connect to.
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
 
-    let dir = TempDir::new().unwrap();
+    let dir = TempDir::new()?;
     let mut extra = sys_exec_args();
     // --allow triggers proxy_only mode, same as the example configs use.
     extra.extend_from_slice(&["--allow".into(), "example.com".into()]);
@@ -764,28 +794,27 @@ fn test_proxy_mode_allows_localhost_mcp_connection() {
     );
 
     drop(listener);
+    Ok(())
 }
 
 #[test]
-fn test_run_extra_config_merges_domain_allowlist() {
+fn test_run_extra_config_merges_domain_allowlist() -> TestResult {
     // Verify that an additional config file passed via --config is merged into
     // the effective configuration. We test this at the `config show` level.
-    let dir = TempDir::new().unwrap();
+    let dir = TempDir::new()?;
     let extra_cfg = dir.path().join("extra.toml");
     fs::write(
         &extra_cfg,
         "[proxy]\ndomain_allowlist = [\"extra-domain.example\"]\n",
-    )
-    .unwrap();
+    )?;
 
     // Write a project config with a base domain
     let dot_halt = dir.path().join(".pent");
-    fs::create_dir_all(&dot_halt).unwrap();
+    fs::create_dir_all(&dot_halt)?;
     fs::write(
         dot_halt.join("pent.toml"),
         "[proxy]\ndomain_allowlist = [\"base-domain.example\"]\n",
-    )
-    .unwrap();
+    )?;
 
     // `pent run --config extra.toml --no-config echo` would skip project config
     // but load the extra one. Instead we test via a `run` that exits immediately.
@@ -795,16 +824,17 @@ fn test_run_extra_config_merges_domain_allowlist() {
     // For now, just verify the project config is reflected in config show.
     let out = run_halt(dir.path(), &["config", "show", "--format", "json"]);
     let stdout = expect_success(&out);
-    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout)?;
     let allowlist = json["proxy"]["domain_allowlist"]
         .as_array()
-        .expect("domain_allowlist should be an array");
+        .ok_or("domain_allowlist should be an array")?;
     assert!(
         allowlist
             .iter()
             .any(|v| v.as_str() == Some("base-domain.example")),
         "Expected base-domain.example in allowlist, got: {allowlist:?}"
     );
+    Ok(())
 }
 
 
@@ -814,7 +844,7 @@ fn test_run_extra_config_merges_domain_allowlist() {
 
 #[test]
 #[cfg(target_os = "linux")]
-fn test_execute_flag_allows_binary() {
+fn test_execute_flag_allows_binary() -> TestResult {
     // Only runs when Landlock is enforcing; otherwise meaningless.
     // We skip silently if unavailable.
     let out = run_halt(
@@ -836,6 +866,7 @@ fn test_execute_flag_allows_binary() {
         "pent --execute /usr/bin -- /usr/bin/true should succeed\nstderr: {}",
         String::from_utf8_lossy(&out.stderr),
     );
+    Ok(())
 }
 
 // ============================================================================
@@ -843,12 +874,12 @@ fn test_execute_flag_allows_binary() {
 // ============================================================================
 
 #[test]
-fn test_config_add_claude_has_correct_domains_and_paths() {
-    let dir = TempDir::new().unwrap();
+fn test_config_add_claude_has_correct_domains_and_paths() -> TestResult {
+    let dir = TempDir::new()?;
     expect_success(&run_halt(dir.path(), &["config", "add", "@claude"]));
 
     let contents =
-        fs::read_to_string(dir.path().join(".pent").join("pent.toml")).unwrap();
+        fs::read_to_string(dir.path().join(".pent").join("pent.toml"))?;
     assert!(
         contents.contains("api.anthropic.com"),
         "@claude missing api.anthropic.com: {contents}"
@@ -873,29 +904,31 @@ fn test_config_add_claude_has_correct_domains_and_paths() {
         contents.contains("raw.githubusercontent.com"),
         "@claude missing raw.githubusercontent.com (marketplace): {contents}"
     );
+    Ok(())
 }
 
 #[test]
 #[cfg(target_os = "macos")]
-fn test_config_add_claude_has_macos_app_support_path() {
-    let dir = TempDir::new().unwrap();
+fn test_config_add_claude_has_macos_app_support_path() -> TestResult {
+    let dir = TempDir::new()?;
     expect_success(&run_halt(dir.path(), &["config", "add", "@claude"]));
 
     let contents =
-        fs::read_to_string(dir.path().join(".pent").join("pent.toml")).unwrap();
+        fs::read_to_string(dir.path().join(".pent").join("pent.toml"))?;
     assert!(
         contents.contains("Application Support/claude"),
         "@claude missing ~/Library/Application Support/claude on macOS: {contents}"
     );
+    Ok(())
 }
 
 #[test]
-fn test_config_add_codex_has_correct_domains_and_paths() {
-    let dir = TempDir::new().unwrap();
+fn test_config_add_codex_has_correct_domains_and_paths() -> TestResult {
+    let dir = TempDir::new()?;
     expect_success(&run_halt(dir.path(), &["config", "add", "@codex"]));
 
     let contents =
-        fs::read_to_string(dir.path().join(".pent").join("pent.toml")).unwrap();
+        fs::read_to_string(dir.path().join(".pent").join("pent.toml"))?;
     assert!(
         contents.contains("api.openai.com"),
         "@codex missing api.openai.com: {contents}"
@@ -904,15 +937,16 @@ fn test_config_add_codex_has_correct_domains_and_paths() {
         contents.contains("~/.codex"),
         "@codex missing ~/.codex path: {contents}"
     );
+    Ok(())
 }
 
 #[test]
-fn test_config_add_gemini_has_correct_domains_and_paths() {
-    let dir = TempDir::new().unwrap();
+fn test_config_add_gemini_has_correct_domains_and_paths() -> TestResult {
+    let dir = TempDir::new()?;
     expect_success(&run_halt(dir.path(), &["config", "add", "@gemini"]));
 
     let contents =
-        fs::read_to_string(dir.path().join(".pent").join("pent.toml")).unwrap();
+        fs::read_to_string(dir.path().join(".pent").join("pent.toml"))?;
     assert!(
         contents.contains("generativelanguage.googleapis.com"),
         "@gemini missing generativelanguage.googleapis.com: {contents}"
@@ -921,11 +955,12 @@ fn test_config_add_gemini_has_correct_domains_and_paths() {
         contents.contains("~/.gemini") || contents.contains("gemini-cli"),
         "@gemini missing data path (~/.gemini or gemini-cli): {contents}"
     );
+    Ok(())
 }
 
 #[test]
-fn test_config_add_output_shows_file_path() {
-    let dir = TempDir::new().unwrap();
+fn test_config_add_output_shows_file_path() -> TestResult {
+    let dir = TempDir::new()?;
     let out = run_halt(dir.path(), &["config", "add", "@cargo"]);
     expect_success(&out);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -933,11 +968,12 @@ fn test_config_add_output_shows_file_path() {
         stderr.contains("pent.toml"),
         "Expected pent.toml path in add stderr: {stderr}"
     );
+    Ok(())
 }
 
 #[test]
-fn test_config_rm_output_shows_file_path() {
-    let dir = TempDir::new().unwrap();
+fn test_config_rm_output_shows_file_path() -> TestResult {
+    let dir = TempDir::new()?;
     expect_success(&run_halt(dir.path(), &["config", "add", "@cargo"]));
     let out = run_halt(dir.path(), &["config", "rm", "@cargo"]);
     expect_success(&out);
@@ -946,6 +982,7 @@ fn test_config_rm_output_shows_file_path() {
         stderr.contains("pent.toml"),
         "Expected pent.toml path in rm stderr: {stderr}"
     );
+    Ok(())
 }
 
 // ============================================================================
@@ -976,6 +1013,7 @@ mod no_hang {
     /// stdout is discarded (`Stdio::null`) — we only capture stderr for
     /// diagnostics.  stderr is drained in a background thread so the child
     /// can never block on a full pipe.
+    #[allow(clippy::panic, clippy::unwrap_used, clippy::expect_used)] // infrastructure helper: spawn/pipe failures are hard test setup errors
     fn pent_timeout(dir: &Path, home: &Path, args: &[&str], timeout_secs: u64) -> (bool, String) {
         let mut child = Command::new(PENT)
             .args(args)
@@ -1033,45 +1071,48 @@ mod no_hang {
 
     /// /usr/bin/true: the simplest possible exit.  Should always finish in <2s.
     #[test]
-    fn system_true_exits_quickly() {
-        let dir = TempDir::new().unwrap();
-        let home = TempDir::new().unwrap();
+    fn system_true_exits_quickly() -> TestResult {
+        let dir = TempDir::new()?;
+        let home = TempDir::new()?;
         let (ok, stderr) = pent_timeout(
             dir.path(), home.path(),
             &["run", "--no-config", "--", "/usr/bin/true"],
             2,
         );
         assert!(ok, "pent run -- /usr/bin/true timed out (2s)\nstderr:\n{stderr}");
+        Ok(())
     }
 
     /// Same as above but with explicit --network blocked (the default).
     #[test]
-    fn system_true_blocked_network_exits_quickly() {
-        let dir = TempDir::new().unwrap();
-        let home = TempDir::new().unwrap();
+    fn system_true_blocked_network_exits_quickly() -> TestResult {
+        let dir = TempDir::new()?;
+        let home = TempDir::new()?;
         let (ok, stderr) = pent_timeout(
             dir.path(), home.path(),
             &["run", "--no-config", "--network", "blocked", "--", "/usr/bin/true"],
             2,
         );
         assert!(ok, "pent run --network blocked -- /usr/bin/true timed out (2s)\nstderr:\n{stderr}");
+        Ok(())
     }
 
     /// /usr/bin/curl --version: a real binary that reads shared libs from /usr/lib.
     #[test]
-    fn system_curl_version_exits_quickly() {
+    fn system_curl_version_exits_quickly() -> TestResult {
         if !std::path::Path::new("/usr/bin/curl").exists() {
             println!("SKIP: /usr/bin/curl not found");
-            return;
+            return Ok(());
         }
-        let dir = TempDir::new().unwrap();
-        let home = TempDir::new().unwrap();
+        let dir = TempDir::new()?;
+        let home = TempDir::new()?;
         let (ok, stderr) = pent_timeout(
             dir.path(), home.path(),
             &["run", "--no-config", "--", "/usr/bin/curl", "--version"],
             2,
         );
         assert!(ok, "pent run -- curl --version timed out (2s)\nstderr:\n{stderr}");
+        Ok(())
     }
 
     // ── local binaries: --version flag ────────────────────────────────────────
@@ -1079,6 +1120,7 @@ mod no_hang {
     // detect_binary uses the REAL $HOME (the test process's env) to locate the
     // binary.  pent itself gets a fresh empty home so it finds no global config.
 
+    #[allow(clippy::unwrap_used)] // infrastructure helper: to_str() only fails on non-UTF-8 paths
     fn assert_version_exits_quickly(name: &str) {
         let Some(bin) = detect_binary(name) else {
             println!("SKIP: {name} not found in PATH or ~/.local/bin");
@@ -1107,6 +1149,7 @@ mod no_hang {
     // The project config lives only in the temp `dir` (.pent/pent.toml).
     // The isolated `home` ensures no global config is loaded on top of it.
 
+    #[allow(clippy::unwrap_used)] // infrastructure helper: to_str()/TempDir failures are hard errors
     fn assert_proxy_mode_exits_quickly(name: &str) {
         let Some(bin) = detect_binary(name) else {
             println!("SKIP: {name} not found in PATH or ~/.local/bin");
@@ -1168,6 +1211,7 @@ mod no_hang {
     /// Spawn `pent` with a PTY.  `agent_home` is the temp HOME that contains the
     /// agent's config (written by `setup_agent_config`).  The real HOME is still
     /// inherited so binaries can find their modules (e.g. ~/.npm-global, ~/.local).
+    #[allow(clippy::expect_used)] // infrastructure helper: PTY/dup failures are hard test setup errors
     fn spawn_with_pty(
         dir: &Path,
         agent_home: &Path,
@@ -1212,6 +1256,7 @@ mod no_hang {
 
     /// Install the `@{agent}` global profile into a fresh temp HOME.
     /// Returns the TempDir (keep alive) — its path is used as HOME.
+    #[allow(clippy::unwrap_used, clippy::panic)] // infrastructure helper: config setup failures are hard test setup errors
     fn setup_agent_config(agent: &str) -> TempDir {
         let home = TempDir::new().unwrap();
         let status = Command::new(PENT)
@@ -1308,6 +1353,7 @@ mod no_hang {
     /// confirm the TUI renders (≥ 2 non-empty lines after ANSI strip, no crash
     /// markers).  Then kill pent.  This test is purely about sandbox access —
     /// teardown is covered by the _version_exits_quickly tests.
+    #[allow(clippy::panic, clippy::unwrap_used)] // infrastructure helper: PTY test failure should panic with a clear message
     fn assert_pty_interactive(agent: &str) {
         let Some(bin) = detect_binary(agent) else {
             println!("SKIP: {agent} not found");
@@ -1352,4 +1398,3 @@ mod no_hang {
     #[test] #[serial(pty)]
     fn pty_gemini_interactive_exits_quickly() { assert_pty_interactive("gemini"); }
 }
-

@@ -576,9 +576,20 @@ pub fn run_ip_local(args: &[&str]) -> Result<(), SandboxError> {
                 unsafe { libc::_exit(4) };
             }
 
-            let ip_cstr = CString::new("ip").unwrap();
+            // SAFETY: "ip" contains no null bytes; _exit is async-signal-safe.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            let ip_cstr = match CString::new("ip") {
+                Ok(s) => s,
+                Err(_) => unsafe { libc::_exit(127) },
+            };
             let mut c_args: Vec<CString> = vec![ip_cstr.clone()];
-            c_args.extend(args.iter().map(|a| CString::new(*a).unwrap()));
+            for a in args {
+                let cs = match CString::new(*a) {
+                    Ok(s) => s,
+                    Err(_) => unsafe { libc::_exit(127) },
+                };
+                c_args.push(cs);
+            }
             let mut ptrs: Vec<*const libc::c_char> =
                 c_args.iter().map(|a| a.as_ptr()).collect();
             ptrs.push(std::ptr::null());
@@ -801,6 +812,8 @@ mod tests {
     use super::*;
     use serial_test::serial;
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
     // ========================================================================
     // NetnsConfig::new tests
     // ========================================================================
@@ -838,14 +851,15 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_check_netns_privileges_returns_result() {
+    fn test_check_netns_privileges_returns_result() -> TestResult {
         // This will likely fail unless running as root
         let result = check_netns_privileges();
         // Just verify it returns something sensible
         match result {
             Ok(()) | Err(SandboxError::PrivilegeRequired(_)) => {}
-            Err(e) => panic!("Unexpected error: {e:?}"),
+            Err(e) => return Err(format!("Unexpected error: {e:?}").into()),
         }
+        Ok(())
     }
 
     // ========================================================================
@@ -886,12 +900,12 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_create_netns_returns_valid_handle() {
+    fn test_create_netns_returns_valid_handle() -> TestResult {
         if check_netns_privileges().is_err() {
-            return; // skip — requires CAP_NET_ADMIN
+            return Ok(()); // skip — requires CAP_NET_ADMIN
         }
         let config = NetnsConfig::from_pid();
-        let handle = create_netns(&config, 0).expect("create_netns failed");
+        let handle = create_netns(&config, 0).map_err(|e| format!("create_netns failed: {e:?}"))?;
 
         // outer_ip must match config
         assert_eq!(handle.outer_ip, config.outer_ip);
@@ -913,11 +927,12 @@ mod tests {
         let output = std::process::Command::new("ip")
             .args(["link", "show", &veth_outer])
             .output()
-            .unwrap();
+            .map_err(|e| format!("ip link show failed: {e}"))?;
         assert!(
             !output.status.success(),
             "veth-out should be deleted after NetnsHandle drop"
         );
+        Ok(())
     }
 
 }

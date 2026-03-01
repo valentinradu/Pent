@@ -266,11 +266,12 @@ pub fn check_availability() -> Result<(), SandboxError> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use serial_test::serial;
     use tempfile::TempDir;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     #[test]
     fn test_sandbox_error_display() {
@@ -314,6 +315,7 @@ mod tests {
     }
 
     fn make_test_config() -> TestDirs {
+        #[allow(clippy::unwrap_used)] // infra-only helper, no meaningful error recovery
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("workspace");
         std::fs::create_dir_all(&workspace).ok();
@@ -330,47 +332,49 @@ mod tests {
     #[test]
     #[serial]
     #[cfg(target_os = "macos")]
-    fn test_spawn_sandboxed_native_macos() {
+    fn test_spawn_sandboxed_native_macos() -> TestResult {
         if check_availability().is_err() {
-            return;
+            return Ok(());
         }
         let dirs = make_test_config();
         let result = spawn_sandboxed(&dirs.config, "/usr/bin/true", &[]);
 
         match result {
             Ok(mut sc) => {
-                let status = sc.child.wait().expect("Failed to wait");
+                let status = sc.child.wait().map_err(|e| format!("Failed to wait: {e}"))?;
                 if !status.success() {
                     if status.code() == Some(71) {
-                        return;
+                        return Ok(());
                     }
-                    panic!("Exit status: {:?}", status);
+                    return Err(format!("Exit status: {:?}", status).into());
                 }
             }
             Err(SandboxError::SpawnFailed(err))
                 if err.kind() == std::io::ErrorKind::PermissionDenied => {}
-            Err(e) => panic!("spawn_sandboxed failed: {e:?}"),
+            Err(e) => return Err(format!("spawn_sandboxed failed: {e:?}").into()),
         }
+        Ok(())
     }
 
     #[test]
     #[serial]
     #[cfg(target_os = "linux")]
-    fn test_spawn_sandboxed_native_linux() {
+    fn test_spawn_sandboxed_native_linux() -> TestResult {
         let dirs = make_test_config();
         let result = spawn_sandboxed(&dirs.config, "/bin/true", &[]);
 
         if check_availability().is_ok() {
             match result {
                 Ok(mut sc) => {
-                    let status = sc.child.wait().expect("Failed to wait");
+                    let status = sc.child.wait().map_err(|e| format!("Failed to wait: {e}"))?;
                     assert!(status.success());
                 }
                 Err(SandboxError::SpawnFailed(err))
                     if err.kind() == std::io::ErrorKind::PermissionDenied => {}
-                Err(e) => panic!("spawn_sandboxed failed: {e:?}"),
+                Err(e) => return Err(format!("spawn_sandboxed failed: {e:?}").into()),
             }
         }
+        Ok(())
     }
 
     // =========================================================================
@@ -412,49 +416,50 @@ mod tests {
     #[test]
     #[serial]
     #[cfg(target_os = "linux")]
-    fn test_linux_landlock_workspace_file_readable() {
+    fn test_linux_landlock_workspace_file_readable() -> TestResult {
         // Verifies that spawn_with_landlock grants rw access to the workspace:
         // a file written before spawning must be readable by the child process.
         if check_availability().is_err() {
-            return;
+            return Ok(());
         }
-        let temp = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
         let workspace = temp.path().to_path_buf();
         let test_file = workspace.join("hello.txt");
-        std::fs::write(&test_file, "hello landlock").unwrap();
+        std::fs::write(&test_file, "hello landlock").map_err(|e| format!("write: {e}"))?;
 
         let config = linux_test_config(workspace, NetworkMode::LocalhostOnly);
-        let code = match sandboxed_exit(&config, "/bin/cat", &[test_file.to_str().unwrap()]) {
+        let code = match sandboxed_exit(&config, "/bin/cat", &[test_file.to_str().unwrap_or("")]) {
             Ok(code) => code,
             Err(SandboxError::SpawnFailed(err))
                 if err.kind() == std::io::ErrorKind::PermissionDenied =>
             {
-                return;
+                return Ok(());
             }
-            Err(e) => panic!("spawn_sandboxed failed: {e:?}"),
+            Err(e) => return Err(format!("spawn_sandboxed failed: {e:?}").into()),
         };
         assert_eq!(
             code,
             Some(0),
             "cat should succeed for a file inside the workspace"
         );
+        Ok(())
     }
 
     #[test]
     #[serial]
     #[cfg(target_os = "linux")]
-    fn test_linux_landlock_sysfs_blocked() {
+    fn test_linux_landlock_sysfs_blocked() -> TestResult {
         // /sys is not in the allowed read set, so access must fail.
         // /sys/kernel/version is present on every Linux kernel and readable
         // without root — it's a reliable blocked-path canary.
         if check_availability().is_err() {
-            return;
+            return Ok(());
         }
         // Skip if /sys/kernel/version doesn't exist on this kernel build.
         if !std::path::Path::new("/sys/kernel/version").exists() {
-            return;
+            return Ok(());
         }
-        let temp = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
         let workspace = temp.path().to_path_buf();
 
         let config = linux_test_config(workspace, NetworkMode::LocalhostOnly);
@@ -463,31 +468,32 @@ mod tests {
             Err(SandboxError::SpawnFailed(err))
                 if err.kind() == std::io::ErrorKind::PermissionDenied =>
             {
-                return;
+                return Ok(());
             }
-            Err(e) => panic!("spawn_sandboxed failed: {e:?}"),
+            Err(e) => return Err(format!("spawn_sandboxed failed: {e:?}").into()),
         };
         assert!(
             code != Some(0),
             "cat /sys/kernel/version should fail because /sys is not in the Landlock allow set"
         );
+        Ok(())
     }
 
     #[test]
     #[serial]
     #[cfg(target_os = "linux")]
-    fn test_linux_landlock_network_blocked() {
+    fn test_linux_landlock_network_blocked() -> TestResult {
         // In Blocked mode, spawn_with_landlock calls unshare(CLONE_NEWNET) in
         // pre_exec, leaving the child in an empty network namespace with no
         // external connectivity.
         if check_availability().is_err() {
-            return;
+            return Ok(());
         }
         // Skip if bash is not available (needed for /dev/tcp redirection).
         if !std::path::Path::new("/bin/bash").exists() {
-            return;
+            return Ok(());
         }
-        let temp = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
         let workspace = temp.path().to_path_buf();
 
         let config = linux_test_config(workspace, NetworkMode::Blocked);
@@ -503,31 +509,32 @@ mod tests {
             Err(SandboxError::SpawnFailed(err))
                 if err.kind() == std::io::ErrorKind::PermissionDenied =>
             {
-                return;
+                return Ok(());
             }
-            Err(e) => panic!("spawn_sandboxed failed: {e:?}"),
+            Err(e) => return Err(format!("spawn_sandboxed failed: {e:?}").into()),
         };
         assert!(
             code != Some(0),
             "TCP connection to external IP should fail in Blocked network mode"
         );
+        Ok(())
     }
 
     #[test]
     #[serial]
     #[cfg(target_os = "linux")]
-    fn test_linux_landlock_network_localhost_allows_loopback() {
+    fn test_linux_landlock_network_localhost_allows_loopback() -> TestResult {
         // In LocalhostOnly mode, loopback is brought up inside the new network
         // namespace, so the child must be able to connect to 127.0.0.1.
         // We check ECONNREFUSED (port not listening), which proves the loopback
         // interface is up — contrast with ENETUNREACH in the blocked test.
         if check_availability().is_err() {
-            return;
+            return Ok(());
         }
         if !std::path::Path::new("/bin/bash").exists() {
-            return;
+            return Ok(());
         }
-        let temp = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
         let workspace = temp.path().to_path_buf();
 
         let config = linux_test_config(workspace, NetworkMode::LocalhostOnly);
@@ -543,9 +550,9 @@ mod tests {
             Err(SandboxError::SpawnFailed(err))
                 if err.kind() == std::io::ErrorKind::PermissionDenied =>
             {
-                return;
+                return Ok(());
             }
-            Err(e) => panic!("spawn_sandboxed failed: {e:?}"),
+            Err(e) => return Err(format!("spawn_sandboxed failed: {e:?}").into()),
         };
         // The child exits non-zero (ECONNREFUSED), but it must exit — not hang.
         // A hang or ENETUNREACH exit would indicate the loopback interface is down.
@@ -553,5 +560,6 @@ mod tests {
             code.is_some(),
             "Child should exit (even with an error) when loopback is available"
         );
+        Ok(())
     }
 }

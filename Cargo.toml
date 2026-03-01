@@ -8,6 +8,11 @@ edition = "2021"
 authors = ["Valentin Radu"]
 license = "MIT"
 
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic       = "deny"
+
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"

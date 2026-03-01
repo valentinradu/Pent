@@ -356,6 +356,7 @@ impl SharedState {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // test infrastructure: parse on known-good literals
 mod tests {
     use super::*;
 

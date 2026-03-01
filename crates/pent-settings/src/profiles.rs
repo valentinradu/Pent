@@ -62,7 +62,7 @@ impl fmt::Display for Profile {
             .iter()
             .find(|(p, _)| p == self)
             .map(|(_, s)| *s)
-            .expect("all Profile variants are in PROFILES");
+            .unwrap_or("unknown");
         write!(f, "{name}")
     }
 }

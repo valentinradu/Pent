@@ -20,3 +20,6 @@ landlock = "0.4"
 [dev-dependencies]
 serial_test = "3"
 tempfile = { workspace = true }
+
+[lints]
+workspace = true

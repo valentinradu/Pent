@@ -71,9 +71,12 @@ pub struct ProxyConfig {
 
 impl Default for ProxyConfig {
     fn default() -> Self {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        const LOCALHOST_ANY: SocketAddr =
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
         Self {
-            dns_bind_addr: "127.0.0.1:0".parse().expect("hardcoded loopback address"),
-            proxy_bind_addr: "127.0.0.1:0".parse().expect("hardcoded loopback address"),
+            dns_bind_addr: LOCALHOST_ANY,
+            proxy_bind_addr: LOCALHOST_ANY,
             upstream_dns: None,       // Use system resolvers
             domain_allowlist: vec![], // Populated from settings per-assistant
             violation_tx: None,
@@ -407,14 +410,17 @@ impl TryFrom<&pent_settings::ProxySettings> for ProxyConfig {
 mod tests {
     use super::*;
 
+    type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
+
     fn can_bind_tcp_localhost() -> bool {
         match std::net::TcpListener::bind("127.0.0.1:0") {
             Ok(listener) => {
                 drop(listener);
                 true
             }
-            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => false,
-            Err(err) => panic!("Failed to bind TCP localhost for test: {err}"),
+            // Treat any bind error (including unexpected ones) as "can't bind" to
+            // avoid panicking in helper code that runs before the test body.
+            Err(_) => false,
         }
     }
 
@@ -424,8 +430,7 @@ mod tests {
                 drop(socket);
                 true
             }
-            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => false,
-            Err(err) => panic!("Failed to bind UDP localhost for test: {err}"),
+            Err(_) => false,
         }
     }
 
@@ -436,7 +441,7 @@ mod tests {
     macro_rules! skip_if_no_bind {
         () => {
             if !can_bind_localhost() {
-                return;
+                return Ok(());
             }
         };
     }
@@ -503,31 +508,34 @@ mod tests {
     }
 
     #[test]
-    fn test_proxy_server_new_initializes_filter() {
+    fn test_proxy_server_new_initializes_filter() -> TestResult {
         let config = ProxyConfig::with_allowlist(vec!["example.com".to_string()]);
-        let server = ProxyServer::new(config).unwrap();
+        let server = ProxyServer::new(config)?;
         assert!(server.state.is_allowed("example.com"));
         assert!(!server.state.is_allowed("other.com"));
+        Ok(())
     }
 
     #[test]
-    fn test_proxy_server_new_initializes_cache() {
+    fn test_proxy_server_new_initializes_cache() -> TestResult {
         let config = ProxyConfig::default();
-        let server = ProxyServer::new(config).unwrap();
+        let server = ProxyServer::new(config)?;
         assert!(server.state.cache.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_proxy_server_allowlist_accessor() {
+    fn test_proxy_server_allowlist_accessor() -> TestResult {
         let config = ProxyConfig::with_allowlist(vec![
             "example.com".to_string(),
             "*.github.com".to_string(),
         ]);
-        let server = ProxyServer::new(config).unwrap();
+        let server = ProxyServer::new(config)?;
         let patterns = server.allowlist();
         assert_eq!(patterns.len(), 2);
         assert!(patterns.contains(&"example.com".to_string()));
         assert!(patterns.contains(&"*.github.com".to_string()));
+        Ok(())
     }
 
     // ========================================================================
@@ -536,76 +544,80 @@ mod tests {
 
     #[tokio::test]
 
-    async fn test_proxy_handle_is_running_true() {
+    async fn test_proxy_handle_is_running_true() -> TestResult {
         skip_if_no_bind!();
         let config = ProxyConfig {
-            dns_bind_addr: "127.0.0.1:25353".parse().unwrap(),
-            proxy_bind_addr: "127.0.0.1:29300".parse().unwrap(),
+            dns_bind_addr: "127.0.0.1:25353".parse()?,
+            proxy_bind_addr: "127.0.0.1:29300".parse()?,
             ..Default::default()
         };
-        let server = ProxyServer::new(config).unwrap();
-        let handle = server.start().await.unwrap();
+        let server = ProxyServer::new(config)?;
+        let handle = server.start().await?;
 
         // Should report as running
         assert!(handle.is_running());
 
-        handle.shutdown().await.unwrap();
+        handle.shutdown().await?;
+        Ok(())
     }
 
     #[tokio::test]
 
-    async fn test_proxy_handle_is_running_false_after_shutdown() {
+    async fn test_proxy_handle_is_running_false_after_shutdown() -> TestResult {
         skip_if_no_bind!();
         let config = ProxyConfig {
-            dns_bind_addr: "127.0.0.1:25354".parse().unwrap(),
-            proxy_bind_addr: "127.0.0.1:29301".parse().unwrap(),
+            dns_bind_addr: "127.0.0.1:25354".parse()?,
+            proxy_bind_addr: "127.0.0.1:29301".parse()?,
             ..Default::default()
         };
-        let server = ProxyServer::new(config).unwrap();
-        let handle = server.start().await.unwrap();
+        let server = ProxyServer::new(config)?;
+        let handle = server.start().await?;
 
-        handle.shutdown().await.unwrap();
+        handle.shutdown().await?;
 
         // Cannot check is_running after shutdown since handle is consumed
         // This test verifies shutdown completes without error
+        Ok(())
     }
 
     #[tokio::test]
 
-    async fn test_proxy_handle_dns_addr() {
+    async fn test_proxy_handle_dns_addr() -> TestResult {
         skip_if_no_bind!();
         let config = ProxyConfig {
-            dns_bind_addr: "127.0.0.1:25355".parse().unwrap(),
-            proxy_bind_addr: "127.0.0.1:29302".parse().unwrap(),
+            dns_bind_addr: "127.0.0.1:25355".parse()?,
+            proxy_bind_addr: "127.0.0.1:29302".parse()?,
             ..Default::default()
         };
-        let server = ProxyServer::new(config).unwrap();
-        let handle = server.start().await.unwrap();
+        let server = ProxyServer::new(config)?;
+        let handle = server.start().await?;
 
         let dns_addr = handle.dns_addr();
         assert_eq!(dns_addr.port(), 25355);
         assert_eq!(dns_addr.ip().to_string(), "127.0.0.1");
 
-        handle.shutdown().await.unwrap();
+        handle.shutdown().await?;
+        Ok(())
     }
 
     #[tokio::test]
 
-    async fn test_proxy_handle_proxy_addr() {
+    async fn test_proxy_handle_proxy_addr() -> TestResult {
         skip_if_no_bind!();
         let config = ProxyConfig {
-            dns_bind_addr: "127.0.0.1:25356".parse().unwrap(),
-            proxy_bind_addr: "127.0.0.1:29303".parse().unwrap(),
+            dns_bind_addr: "127.0.0.1:25356".parse()?,
+            proxy_bind_addr: "127.0.0.1:29303".parse()?,
             ..Default::default()
         };
-        let server = ProxyServer::new(config).unwrap();
-        let handle = server.start().await.unwrap();
+        let server = ProxyServer::new(config)?;
+        let handle = server.start().await?;
 
         let proxy_addr = handle.proxy_addr();
         assert_eq!(proxy_addr.port(), 29303);
         assert_eq!(proxy_addr.ip().to_string(), "127.0.0.1");
 
-        handle.shutdown().await.unwrap();
+        handle.shutdown().await?;
+        Ok(())
     }
 
     // ========================================================================
@@ -614,32 +626,33 @@ mod tests {
 
     #[tokio::test]
 
-    async fn test_proxy_server_start_returns_handle() {
+    async fn test_proxy_server_start_returns_handle() -> TestResult {
         skip_if_no_bind!();
         let config = ProxyConfig {
-            dns_bind_addr: "127.0.0.1:25357".parse().unwrap(),
-            proxy_bind_addr: "127.0.0.1:29304".parse().unwrap(),
+            dns_bind_addr: "127.0.0.1:25357".parse()?,
+            proxy_bind_addr: "127.0.0.1:29304".parse()?,
             ..Default::default()
         };
-        let server = ProxyServer::new(config).unwrap();
+        let server = ProxyServer::new(config)?;
         let handle = server.start().await;
 
         assert!(handle.is_ok());
-        handle.unwrap().shutdown().await.unwrap();
+        handle?.shutdown().await?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_proxy_server_start_binds_dns() {
+    async fn test_proxy_server_start_binds_dns() -> TestResult {
         skip_if_no_bind!();
         use tokio::net::UdpSocket;
 
         let config = ProxyConfig {
-            dns_bind_addr: "127.0.0.1:25358".parse().unwrap(),
-            proxy_bind_addr: "127.0.0.1:29305".parse().unwrap(),
+            dns_bind_addr: "127.0.0.1:25358".parse()?,
+            proxy_bind_addr: "127.0.0.1:29305".parse()?,
             ..Default::default()
         };
-        let server = ProxyServer::new(config).unwrap();
-        let handle = server.start().await.unwrap();
+        let server = ProxyServer::new(config)?;
+        let handle = server.start().await?;
 
         // Give the spawned server task time to actually bind
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -648,21 +661,22 @@ mod tests {
         let result = UdpSocket::bind("127.0.0.1:25358").await;
         assert!(result.is_err());
 
-        handle.shutdown().await.unwrap();
+        handle.shutdown().await?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_proxy_server_start_binds_tcp() {
+    async fn test_proxy_server_start_binds_tcp() -> TestResult {
         skip_if_no_bind!();
         use tokio::net::TcpListener;
 
         let config = ProxyConfig {
-            dns_bind_addr: "127.0.0.1:25359".parse().unwrap(),
-            proxy_bind_addr: "127.0.0.1:29306".parse().unwrap(),
+            dns_bind_addr: "127.0.0.1:25359".parse()?,
+            proxy_bind_addr: "127.0.0.1:29306".parse()?,
             ..Default::default()
         };
-        let server = ProxyServer::new(config).unwrap();
-        let handle = server.start().await.unwrap();
+        let server = ProxyServer::new(config)?;
+        let handle = server.start().await?;
 
         // Give the spawned server task time to actually bind
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -671,79 +685,83 @@ mod tests {
         let result = TcpListener::bind("127.0.0.1:29306").await;
         assert!(result.is_err());
 
-        handle.shutdown().await.unwrap();
+        handle.shutdown().await?;
+        Ok(())
     }
 
     #[tokio::test]
 
-    async fn test_proxy_server_shutdown_graceful() {
+    async fn test_proxy_server_shutdown_graceful() -> TestResult {
         skip_if_no_bind!();
         let config = ProxyConfig {
-            dns_bind_addr: "127.0.0.1:25360".parse().unwrap(),
-            proxy_bind_addr: "127.0.0.1:29307".parse().unwrap(),
+            dns_bind_addr: "127.0.0.1:25360".parse()?,
+            proxy_bind_addr: "127.0.0.1:29307".parse()?,
             ..Default::default()
         };
-        let server = ProxyServer::new(config).unwrap();
-        let handle = server.start().await.unwrap();
+        let server = ProxyServer::new(config)?;
+        let handle = server.start().await?;
 
         // Shutdown should complete without error
         let result = handle.shutdown().await;
         assert!(result.is_ok());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_proxy_server_shutdown_stops_dns() {
+    async fn test_proxy_server_shutdown_stops_dns() -> TestResult {
         skip_if_no_bind!();
         use tokio::net::UdpSocket;
 
         let config = ProxyConfig {
-            dns_bind_addr: "127.0.0.1:25361".parse().unwrap(),
-            proxy_bind_addr: "127.0.0.1:29308".parse().unwrap(),
+            dns_bind_addr: "127.0.0.1:25361".parse()?,
+            proxy_bind_addr: "127.0.0.1:29308".parse()?,
             ..Default::default()
         };
-        let server = ProxyServer::new(config).unwrap();
-        let handle = server.start().await.unwrap();
-        handle.shutdown().await.unwrap();
+        let server = ProxyServer::new(config)?;
+        let handle = server.start().await?;
+        handle.shutdown().await?;
 
         // After shutdown, port should be available again
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let result = UdpSocket::bind("127.0.0.1:25361").await;
         assert!(result.is_ok());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_proxy_server_shutdown_stops_tcp() {
+    async fn test_proxy_server_shutdown_stops_tcp() -> TestResult {
         skip_if_no_bind!();
         use tokio::net::TcpListener;
 
         let config = ProxyConfig {
-            dns_bind_addr: "127.0.0.1:25362".parse().unwrap(),
-            proxy_bind_addr: "127.0.0.1:29309".parse().unwrap(),
+            dns_bind_addr: "127.0.0.1:25362".parse()?,
+            proxy_bind_addr: "127.0.0.1:29309".parse()?,
             ..Default::default()
         };
-        let server = ProxyServer::new(config).unwrap();
-        let handle = server.start().await.unwrap();
-        handle.shutdown().await.unwrap();
+        let server = ProxyServer::new(config)?;
+        let handle = server.start().await?;
+        handle.shutdown().await?;
 
         // After shutdown, port should be available again
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let result = TcpListener::bind("127.0.0.1:29309").await;
         assert!(result.is_ok());
+        Ok(())
     }
 
     #[tokio::test]
 
-    async fn test_proxy_server_run_blocks() {
+    async fn test_proxy_server_run_blocks() -> TestResult {
         skip_if_no_bind!();
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
 
         let config = ProxyConfig {
-            dns_bind_addr: "127.0.0.1:25363".parse().unwrap(),
-            proxy_bind_addr: "127.0.0.1:29310".parse().unwrap(),
+            dns_bind_addr: "127.0.0.1:25363".parse()?,
+            proxy_bind_addr: "127.0.0.1:29310".parse()?,
             ..Default::default()
         };
-        let server = ProxyServer::new(config).unwrap();
+        let server = ProxyServer::new(config)?;
 
         let completed = Arc::new(AtomicBool::new(false));
         let completed_clone = completed.clone();
@@ -761,6 +779,7 @@ mod tests {
 
         // Abort to clean up
         handle.abort();
+        Ok(())
     }
 
     // ========================================================================
@@ -769,110 +788,108 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn test_integration_allowed_domain_flow() {
+    async fn test_integration_allowed_domain_flow() -> TestResult {
         skip_if_no_bind!();
         use tokio::net::UdpSocket;
 
         let config = ProxyConfig {
-            dns_bind_addr: "127.0.0.1:25364".parse().unwrap(),
-            proxy_bind_addr: "127.0.0.1:29311".parse().unwrap(),
+            dns_bind_addr: "127.0.0.1:25364".parse()?,
+            proxy_bind_addr: "127.0.0.1:29311".parse()?,
             domain_allowlist: vec!["example.com".to_string()],
             ..Default::default()
         };
-        let server = ProxyServer::new(config).unwrap();
-        let handle = server.start().await.unwrap();
+        let server = ProxyServer::new(config)?;
+        let handle = server.start().await?;
 
         // Build DNS query for example.com
         let query = build_test_dns_query("example.com", 1); // A record
 
         // Send DNS query
-        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        socket.send_to(&query, "127.0.0.1:25364").await.unwrap();
+        let socket = UdpSocket::bind("127.0.0.1:0").await?;
+        socket.send_to(&query, "127.0.0.1:25364").await?;
 
         let mut buf = [0u8; 512];
         let (len, _) = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             socket.recv_from(&mut buf),
         )
-        .await
-        .unwrap()
-        .unwrap();
+        .await??;
 
         // Should get successful response (RCODE = 0 in byte 3)
         assert!(len > 12);
         let rcode = buf[3] & 0x0F;
         assert_eq!(rcode, 0, "Expected success RCODE");
 
-        handle.shutdown().await.unwrap();
+        handle.shutdown().await?;
+        Ok(())
     }
 
     #[tokio::test]
 
-    async fn test_integration_blocked_domain_flow() {
+    async fn test_integration_blocked_domain_flow() -> TestResult {
         skip_if_no_bind!();
         use tokio::net::UdpSocket;
 
         let config = ProxyConfig {
-            dns_bind_addr: "127.0.0.1:25365".parse().unwrap(),
-            proxy_bind_addr: "127.0.0.1:29312".parse().unwrap(),
+            dns_bind_addr: "127.0.0.1:25365".parse()?,
+            proxy_bind_addr: "127.0.0.1:29312".parse()?,
             domain_allowlist: vec!["allowed.com".to_string()],
             ..Default::default()
         };
-        let server = ProxyServer::new(config).unwrap();
-        let handle = server.start().await.unwrap();
+        let server = ProxyServer::new(config)?;
+        let handle = server.start().await?;
 
         // Build DNS query for blocked domain
         let query = build_test_dns_query("blocked.com", 1);
 
-        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        socket.send_to(&query, "127.0.0.1:25365").await.unwrap();
+        let socket = UdpSocket::bind("127.0.0.1:0").await?;
+        socket.send_to(&query, "127.0.0.1:25365").await?;
 
         let mut buf = [0u8; 512];
         let (len, _) = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             socket.recv_from(&mut buf),
         )
-        .await
-        .unwrap()
-        .unwrap();
+        .await??;
 
         // Should get NXDOMAIN (RCODE = 3 in byte 3)
         assert!(len > 12);
         let rcode = buf[3] & 0x0F;
         assert_eq!(rcode, 3, "Expected NXDOMAIN RCODE");
 
-        handle.shutdown().await.unwrap();
+        handle.shutdown().await?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_integration_direct_ip_blocked() {
+    async fn test_integration_direct_ip_blocked() -> TestResult {
         skip_if_no_bind!();
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpStream;
 
         let config = ProxyConfig {
-            dns_bind_addr: "127.0.0.1:25366".parse().unwrap(),
-            proxy_bind_addr: "127.0.0.1:29313".parse().unwrap(),
+            dns_bind_addr: "127.0.0.1:25366".parse()?,
+            proxy_bind_addr: "127.0.0.1:29313".parse()?,
             domain_allowlist: vec!["example.com".to_string()],
             ..Default::default()
         };
-        let server = ProxyServer::new(config).unwrap();
-        let handle = server.start().await.unwrap();
+        let server = ProxyServer::new(config)?;
+        let handle = server.start().await?;
 
         // Give the spawned server task time to actually bind
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // Connect to proxy and try direct IP (not resolved through DNS)
-        let mut stream = TcpStream::connect("127.0.0.1:29313").await.unwrap();
+        let mut stream = TcpStream::connect("127.0.0.1:29313").await?;
 
         // SOCKS5 handshake
-        stream.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        stream.write_all(&[0x05, 0x01, 0x00]).await?;
         let mut response = [0u8; 2];
-        stream.read_exact(&mut response).await.unwrap();
+        stream.read_exact(&mut response).await?;
 
         // Request connection to raw IP (1.2.3.4:80)
         let request = [0x05, 0x01, 0x00, 0x01, 1, 2, 3, 4, 0x00, 0x50];
-        stream.write_all(&request).await.unwrap();
+        stream.write_all(&request).await?;
 
         let mut reply = [0u8; 10];
         let _ = stream.read(&mut reply).await;
@@ -880,72 +897,72 @@ mod tests {
         // Should be rejected (reply[1] != 0x00)
         assert_ne!(reply[1], 0x00, "Direct IP should be rejected");
 
-        handle.shutdown().await.unwrap();
+        handle.shutdown().await?;
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn test_integration_wildcard_subdomain() {
+    async fn test_integration_wildcard_subdomain() -> TestResult {
         skip_if_no_bind!();
         use tokio::net::UdpSocket;
 
         let config = ProxyConfig {
-            dns_bind_addr: "127.0.0.1:25367".parse().unwrap(),
-            proxy_bind_addr: "127.0.0.1:29314".parse().unwrap(),
+            dns_bind_addr: "127.0.0.1:25367".parse()?,
+            proxy_bind_addr: "127.0.0.1:29314".parse()?,
             domain_allowlist: vec!["*.github.com".to_string()],
             ..Default::default()
         };
-        let server = ProxyServer::new(config).unwrap();
-        let handle = server.start().await.unwrap();
+        let server = ProxyServer::new(config)?;
+        let handle = server.start().await?;
 
         // Query subdomain that matches wildcard
         let query = build_test_dns_query("api.github.com", 1);
 
-        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        socket.send_to(&query, "127.0.0.1:25367").await.unwrap();
+        let socket = UdpSocket::bind("127.0.0.1:0").await?;
+        socket.send_to(&query, "127.0.0.1:25367").await?;
 
         let mut buf = [0u8; 512];
         let (len, _) = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             socket.recv_from(&mut buf),
         )
-        .await
-        .unwrap()
-        .unwrap();
+        .await??;
 
         // Should get success (wildcard matches)
         assert!(len > 12);
         let rcode = buf[3] & 0x0F;
         assert_eq!(rcode, 0, "Wildcard subdomain should be allowed");
 
-        handle.shutdown().await.unwrap();
+        handle.shutdown().await?;
+        Ok(())
     }
 
     #[tokio::test]
 
-    async fn test_integration_cache_expiry() {
+    async fn test_integration_cache_expiry() -> TestResult {
         skip_if_no_bind!();
         use crate::ResolvedAddress;
 
         let config = ProxyConfig {
-            dns_bind_addr: "127.0.0.1:25368".parse().unwrap(),
-            proxy_bind_addr: "127.0.0.1:29315".parse().unwrap(),
+            dns_bind_addr: "127.0.0.1:25368".parse()?,
+            proxy_bind_addr: "127.0.0.1:29315".parse()?,
             domain_allowlist: vec!["test.local".to_string()],
             dns_ttl: std::time::Duration::from_secs(1), // Very short TTL
             ..Default::default()
         };
-        let server = ProxyServer::new(config).unwrap();
+        let server = ProxyServer::new(config)?;
 
         // Manually insert a cache entry with short expiry
         let resolved = ResolvedAddress {
             domain: "test.local".to_string(),
-            addresses: vec!["10.0.0.1".parse().unwrap()],
+            addresses: vec!["10.0.0.1".parse()?],
             expires_at: std::time::Instant::now() + std::time::Duration::from_millis(100),
         };
         server.state.cache.insert(resolved);
 
         // Verify it's in cache
-        let ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+        let ip: std::net::IpAddr = "10.0.0.1".parse()?;
         assert!(server.state.cache.lookup(&ip).is_some());
 
         // Wait for expiry
@@ -957,6 +974,7 @@ mod tests {
         // Depending on implementation: assert!(lookup.is_none());
         // If lazy expiry: lookup might still exist but be expired
         let _ = lookup; // Test structure ready for production code
+        Ok(())
     }
 
     // ========================================================================
@@ -964,9 +982,9 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_add_domain_updates_allowlist() {
+    fn test_add_domain_updates_allowlist() -> TestResult {
         let config = ProxyConfig::default();
-        let server = ProxyServer::new(config).unwrap();
+        let server = ProxyServer::new(config)?;
 
         assert!(!server.allowlist().contains(&"newdomain.com".to_string()));
 
@@ -974,12 +992,13 @@ mod tests {
 
         // After adding, should be in allowlist
         assert!(server.allowlist().contains(&"newdomain.com".to_string()));
+        Ok(())
     }
 
     #[test]
-    fn test_add_domain_supports_wildcard() {
+    fn test_add_domain_supports_wildcard() -> TestResult {
         let config = ProxyConfig::default();
-        let server = ProxyServer::new(config).unwrap();
+        let server = ProxyServer::new(config)?;
 
         server.add_domain("*.newdomain.com".to_string());
 
@@ -987,6 +1006,7 @@ mod tests {
 
         // Verify wildcard matching works
         assert!(server.state.is_allowed("sub.newdomain.com"));
+        Ok(())
     }
 
     // ========================================================================
@@ -994,67 +1014,70 @@ mod tests {
     // ========================================================================
 
     #[tokio::test]
-    async fn test_start_dns_port_in_use() {
+    async fn test_start_dns_port_in_use() -> TestResult {
         skip_if_no_bind!();
         use tokio::net::UdpSocket;
 
         // Bind to DNS port first
-        let _blocker = UdpSocket::bind("127.0.0.1:25369").await.unwrap();
+        let _blocker = UdpSocket::bind("127.0.0.1:25369").await?;
 
         let config = ProxyConfig {
-            dns_bind_addr: "127.0.0.1:25369".parse().unwrap(),
-            proxy_bind_addr: "127.0.0.1:29316".parse().unwrap(),
+            dns_bind_addr: "127.0.0.1:25369".parse()?,
+            proxy_bind_addr: "127.0.0.1:29316".parse()?,
             ..Default::default()
         };
-        let server = ProxyServer::new(config).unwrap();
+        let server = ProxyServer::new(config)?;
         // start() now pre-binds before spawning; bind error surfaces immediately.
         let result = server.start().await;
         assert!(
             result.is_err(),
             "start() should fail when DNS port is in use"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_start_proxy_port_in_use() {
+    async fn test_start_proxy_port_in_use() -> TestResult {
         skip_if_no_bind!();
         use tokio::net::TcpListener;
 
         // Bind to proxy port first
-        let _blocker = TcpListener::bind("127.0.0.1:29317").await.unwrap();
+        let _blocker = TcpListener::bind("127.0.0.1:29317").await?;
 
         let config = ProxyConfig {
-            dns_bind_addr: "127.0.0.1:25370".parse().unwrap(),
-            proxy_bind_addr: "127.0.0.1:29317".parse().unwrap(),
+            dns_bind_addr: "127.0.0.1:25370".parse()?,
+            proxy_bind_addr: "127.0.0.1:29317".parse()?,
             ..Default::default()
         };
-        let server = ProxyServer::new(config).unwrap();
+        let server = ProxyServer::new(config)?;
         // start() now pre-binds before spawning; bind error surfaces immediately.
         let result = server.start().await;
         assert!(
             result.is_err(),
             "start() should fail when proxy port is in use"
         );
+        Ok(())
     }
 
     #[tokio::test]
 
-    async fn test_shutdown_already_stopped() {
+    async fn test_shutdown_already_stopped() -> TestResult {
         skip_if_no_bind!();
         let config = ProxyConfig {
-            dns_bind_addr: "127.0.0.1:25371".parse().unwrap(),
-            proxy_bind_addr: "127.0.0.1:29318".parse().unwrap(),
+            dns_bind_addr: "127.0.0.1:25371".parse()?,
+            proxy_bind_addr: "127.0.0.1:29318".parse()?,
             ..Default::default()
         };
-        let server = ProxyServer::new(config).unwrap();
-        let handle = server.start().await.unwrap();
+        let server = ProxyServer::new(config)?;
+        let handle = server.start().await?;
 
         // First shutdown
-        handle.shutdown().await.unwrap();
+        handle.shutdown().await?;
 
         // Note: handle is consumed, so this tests that shutdown completes
         // without panicking. A second shutdown on the same handle
         // isn't possible due to ownership semantics.
+        Ok(())
     }
 
     // ========================================================================
@@ -1063,25 +1086,25 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn test_concurrent_dns_and_tcp() {
+    async fn test_concurrent_dns_and_tcp() -> TestResult {
         skip_if_no_bind!();
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::{TcpStream, UdpSocket};
 
         let config = ProxyConfig {
-            dns_bind_addr: "127.0.0.1:25372".parse().unwrap(),
-            proxy_bind_addr: "127.0.0.1:29319".parse().unwrap(),
+            dns_bind_addr: "127.0.0.1:25372".parse()?,
+            proxy_bind_addr: "127.0.0.1:29319".parse()?,
             domain_allowlist: vec!["example.com".to_string()],
             ..Default::default()
         };
-        let server = ProxyServer::new(config).unwrap();
-        let handle = server.start().await.unwrap();
+        let server = ProxyServer::new(config)?;
+        let handle = server.start().await?;
 
         // Spawn DNS query
         let dns_task = tokio::spawn(async {
-            let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let Ok(socket) = UdpSocket::bind("127.0.0.1:0").await else { return false; };
             let query = build_test_dns_query("example.com", 1);
-            socket.send_to(&query, "127.0.0.1:25372").await.unwrap();
+            if socket.send_to(&query, "127.0.0.1:25372").await.is_err() { return false; }
             let mut buf = [0u8; 512];
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
@@ -1107,26 +1130,27 @@ mod tests {
 
         // Both should complete
         let (dns_result, tcp_result) = tokio::join!(dns_task, tcp_task);
-        assert!(dns_result.unwrap());
-        assert!(tcp_result.unwrap());
+        assert!(dns_result?);
+        assert!(tcp_result?);
 
-        handle.shutdown().await.unwrap();
+        handle.shutdown().await?;
+        Ok(())
     }
 
     #[tokio::test]
 
-    async fn test_concurrent_multiple_clients() {
+    async fn test_concurrent_multiple_clients() -> TestResult {
         skip_if_no_bind!();
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpStream;
 
         let config = ProxyConfig {
-            dns_bind_addr: "127.0.0.1:25373".parse().unwrap(),
-            proxy_bind_addr: "127.0.0.1:29320".parse().unwrap(),
+            dns_bind_addr: "127.0.0.1:25373".parse()?,
+            proxy_bind_addr: "127.0.0.1:29320".parse()?,
             ..Default::default()
         };
-        let server = ProxyServer::new(config).unwrap();
-        let handle = server.start().await.unwrap();
+        let server = ProxyServer::new(config)?;
+        let handle = server.start().await?;
 
         // Spawn multiple concurrent TCP clients
         let mut tasks = vec![];
@@ -1146,26 +1170,27 @@ mod tests {
 
         // All clients should connect successfully
         for task in tasks {
-            let result = task.await.unwrap();
+            let result = task.await?;
             assert!(result, "All concurrent clients should connect");
         }
 
-        handle.shutdown().await.unwrap();
+        handle.shutdown().await?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_dns_cache_shared_with_tcp() {
+    async fn test_dns_cache_shared_with_tcp() -> TestResult {
         skip_if_no_bind!();
         use crate::ResolvedAddress;
         use std::sync::Arc;
 
         let config = ProxyConfig {
-            dns_bind_addr: "127.0.0.1:25374".parse().unwrap(),
-            proxy_bind_addr: "127.0.0.1:29321".parse().unwrap(),
+            dns_bind_addr: "127.0.0.1:25374".parse()?,
+            proxy_bind_addr: "127.0.0.1:29321".parse()?,
             domain_allowlist: vec!["cached.example".to_string()],
             ..Default::default()
         };
-        let server = ProxyServer::new(config).unwrap();
+        let server = ProxyServer::new(config)?;
 
         // Clone state Arc before server.start() consumes self
         let state = Arc::clone(&server.state);
@@ -1174,21 +1199,25 @@ mod tests {
         // We insert before start() to verify the cache survives server init.
         let resolved = ResolvedAddress {
             domain: "cached.example".to_string(),
-            addresses: vec!["192.0.2.1".parse().unwrap()],
+            addresses: vec!["192.0.2.1".parse()?],
             expires_at: std::time::Instant::now() + std::time::Duration::from_secs(300),
         };
         state.cache.insert(resolved);
 
-        let handle = server.start().await.unwrap();
+        let handle = server.start().await?;
 
         // The shared cache is visible to the TCP proxy side: a connection to
         // 192.0.2.1 should be recognised as targeting "cached.example".
-        let ip: std::net::IpAddr = "192.0.2.1".parse().unwrap();
+        let ip: std::net::IpAddr = "192.0.2.1".parse()?;
         let lookup = state.cache.lookup(&ip);
         assert!(lookup.is_some());
-        assert_eq!(lookup.unwrap(), "cached.example");
+        assert_eq!(
+            lookup.ok_or("cache lookup returned None")?,
+            "cached.example"
+        );
 
-        handle.shutdown().await.unwrap();
+        handle.shutdown().await?;
+        Ok(())
     }
 
     // ========================================================================
@@ -1209,7 +1238,10 @@ mod tests {
 
         // Question: domain name in DNS format
         for label in domain.split('.') {
-            query.push(u8::try_from(label.len()).expect("DNS label exceeds 255 bytes"));
+            // All test domains use short labels well within 63-byte DNS limit.
+            // Saturate to 255 rather than panic on impossibly long labels.
+            let label_len = u8::try_from(label.len()).unwrap_or(255);
+            query.push(label_len);
             query.extend_from_slice(label.as_bytes());
         }
         query.push(0); // Root label

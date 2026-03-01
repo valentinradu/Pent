@@ -91,49 +91,41 @@ impl ConfigLoader {
     }
 }
 
-#[cfg(test)]
-impl ConfigLoader {
-    /// Load only the project-level config, skipping the global file.
-    ///
-    /// Used in unit tests to avoid pollution from the developer's real global
-    /// pent.toml (`~/Library/Application Support/pent/pent.toml`).
-    fn load_project_only(workspace: &Path) -> Result<PentConfig, SettingsError> {
-        Ok(Self::load_file(&Self::project_config_path(workspace))?.unwrap_or_default())
-    }
-}
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use std::fs;
 
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
     #[test]
-    fn test_load_no_project_config_returns_default() {
-        let dir = tempfile::tempdir().unwrap();
+    fn test_load_no_project_config_returns_default() -> TestResult {
+        let dir = tempfile::tempdir()?;
         // No .pent/pent.toml → load() must return defaults regardless of any
         // global config the developer may have installed on this machine.
-        let config = ConfigLoader::load(dir.path()).unwrap();
+        let config = ConfigLoader::load(dir.path())?;
         assert!(config.sandbox.network.is_none());
         assert!(config.proxy.domain_allowlist.is_empty());
+        Ok(())
     }
 
     #[test]
-    fn test_load_project_config_only() {
-        let dir = tempfile::tempdir().unwrap();
+    fn test_load_project_config_only() -> TestResult {
+        let dir = tempfile::tempdir()?;
         let pent_dir = dir.path().join(".pent");
-        fs::create_dir_all(&pent_dir).unwrap();
+        fs::create_dir_all(&pent_dir)?;
         fs::write(
             pent_dir.join("pent.toml"),
             "[proxy]\ndomain_allowlist = [\"example.com\"]\n",
-        )
-        .unwrap();
+        )?;
 
-        let config = ConfigLoader::load(dir.path()).unwrap();
+        let config = ConfigLoader::load(dir.path())?;
         assert!(
             config.proxy.domain_allowlist.contains(&"example.com".to_string()),
             "project domain_allowlist should be present"
         );
+        Ok(())
     }
 
     #[test]
@@ -152,38 +144,37 @@ mod tests {
     }
 
     #[test]
-    fn test_load_malformed_config_returns_error() {
-        let dir = tempfile::tempdir().unwrap();
+    fn test_load_malformed_config_returns_error() -> TestResult {
+        let dir = tempfile::tempdir()?;
         let pent_dir = dir.path().join(".pent");
-        fs::create_dir_all(&pent_dir).unwrap();
-        fs::write(pent_dir.join("pent.toml"), "not valid toml :::").unwrap();
+        fs::create_dir_all(&pent_dir)?;
+        fs::write(pent_dir.join("pent.toml"), "not valid toml :::")?;
 
         let result = ConfigLoader::load(dir.path());
         assert!(result.is_err(), "malformed config should return an error");
+        Ok(())
     }
 
     #[test]
-    fn test_load_merges_global_and_project() {
-        let global_dir = tempfile::tempdir().unwrap();
+    fn test_load_merges_global_and_project() -> TestResult {
+        let global_dir = tempfile::tempdir()?;
         let global_config_path = global_dir.path().join("pent.toml");
         std::fs::write(
             &global_config_path,
             "[proxy]\ndomain_allowlist = [\"global.com\"]\n",
-        )
-        .unwrap();
+        )?;
 
-        let project_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir()?;
         let pent_dir = project_dir.path().join(".pent");
-        fs::create_dir_all(&pent_dir).unwrap();
+        fs::create_dir_all(&pent_dir)?;
         fs::write(
             pent_dir.join("pent.toml"),
             "[proxy]\ndomain_allowlist = [\"project.com\"]\n",
-        )
-        .unwrap();
+        )?;
 
         // Load global manually then merge with project to test merge logic
-        let global = PentConfig::load(&global_config_path).unwrap();
-        let project = PentConfig::load(&pent_dir.join("pent.toml")).unwrap();
+        let global = PentConfig::load(&global_config_path)?;
+        let project = PentConfig::load(&pent_dir.join("pent.toml"))?;
         let merged = global.merge(project);
 
         assert!(merged
@@ -194,5 +185,6 @@ mod tests {
             .proxy
             .domain_allowlist
             .contains(&"project.com".to_string()));
+        Ok(())
     }
 }

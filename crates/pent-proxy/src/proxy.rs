@@ -52,10 +52,11 @@ pub struct TcpProxyConfig {
 
 impl Default for TcpProxyConfig {
     fn default() -> Self {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        const DEFAULT_BIND: SocketAddr =
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9300);
         Self {
-            bind_addr: "127.0.0.1:9300"
-                .parse()
-                .expect("hardcoded loopback address"),
+            bind_addr: DEFAULT_BIND,
             connect_timeout: std::time::Duration::from_secs(30),
             idle_timeout: std::time::Duration::from_secs(300),
             max_connections: 1000,
@@ -293,9 +294,8 @@ impl TcpProxy {
         };
 
         let local_addr = destination.local_addr().unwrap_or_else(|_| {
-            "0.0.0.0:0"
-                .parse()
-                .expect("hardcoded zero-address fallback")
+            use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
         });
 
         client
@@ -711,6 +711,7 @@ mod socks5 {
 
 #[cfg(test)]
 #[allow(clippy::items_after_statements)] // use statements in test fns after let bindings
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // test infrastructure: parse on known-good literals
 mod tests {
     use super::*;
 
