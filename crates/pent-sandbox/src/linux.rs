@@ -315,10 +315,15 @@ unsafe fn bring_up_loopback() {
 
 /// Set up UID/GID mappings for a newly created user namespace.
 ///
-/// Maps the caller's real UID/GID to 0 (root) inside the user namespace.
-/// This grants `CAP_NET_ADMIN` within the namespace — required to bring up
-/// the loopback interface via ioctl — while leaving host filesystem permission
-/// checks unchanged (the kernel uses the real/host UID for those).
+/// Uses an identity mapping: the caller's real UID/GID maps to itself inside
+/// the user namespace. The sandboxed process therefore appears as the real user
+/// (not root) after execve, which is the correct principle-of-least-privilege
+/// behaviour.
+///
+/// All privileged pre-exec operations (veth config, overlayfs mount, etc.)
+/// run after `unshare(CLONE_NEWUSER)` grants a full capability set in the new
+/// namespace and before execve — so they are unaffected by this mapping.
+/// After execve the sandboxed binary has no capabilities, which is intentional.
 ///
 /// Must be called after `unshare(CLONE_NEWUSER | CLONE_NEWNET)`, in a
 /// post-fork, single-threaded child before exec.
@@ -339,8 +344,8 @@ unsafe fn setup_userns_mappings(uid: u32, gid: u32) {
         libc::close(fd);
     }
 
-    // Map host GID → 0 inside namespace.
-    let gid_map = format!("0 {gid} 1\n");
+    // Identity mapping: host GID → same GID inside namespace.
+    let gid_map = format!("{gid} {gid} 1\n");
     let fd = libc::open(
         c"/proc/self/gid_map".as_ptr(),
         libc::O_WRONLY | libc::O_CLOEXEC,
@@ -351,8 +356,8 @@ unsafe fn setup_userns_mappings(uid: u32, gid: u32) {
         libc::close(fd);
     }
 
-    // Map host UID → 0 inside namespace.
-    let uid_map = format!("0 {uid} 1\n");
+    // Identity mapping: host UID → same UID inside namespace.
+    let uid_map = format!("{uid} {uid} 1\n");
     let fd = libc::open(
         c"/proc/self/uid_map".as_ptr(),
         libc::O_WRONLY | libc::O_CLOEXEC,
