@@ -25,6 +25,10 @@ serde_json    = "1"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[build-dependencies]
+clap_mangen = "0.2"
+clap        = { workspace = true, features = ["string"] }
+
 [dev-dependencies]
 tempfile    = { workspace = true }
 toml        = "0.8"
@@ -44,6 +48,15 @@ section = "utils"
 priority = "optional"
 assets = [
     ["target/release/pent", "usr/bin/", "755"],
+    ["../../man/pent.1",            "usr/share/man/man1/", "644"],
+    ["../../man/pent-run.1",        "usr/share/man/man1/", "644"],
+    ["../../man/pent-check.1",      "usr/share/man/man1/", "644"],
+    ["../../man/pent-config.1",     "usr/share/man/man1/", "644"],
+    ["../../man/pent-config-add.1", "usr/share/man/man1/", "644"],
+    ["../../man/pent-config-edit.1","usr/share/man/man1/", "644"],
+    ["../../man/pent-config-init.1","usr/share/man/man1/", "644"],
+    ["../../man/pent-config-rm.1",  "usr/share/man/man1/", "644"],
+    ["../../man/pent-config-show.1","usr/share/man/man1/", "644"],
 ]
 
 [lints]

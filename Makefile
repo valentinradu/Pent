@@ -45,6 +45,22 @@ build-release:
 
 install:
 	cargo install --path crates/pent --force
+	@# Install man pages (generated into man/ by build.rs during cargo build).
+	@if [ -d man ]; then \
+		if [ "$$(uname)" = "Darwin" ]; then \
+			MAN_DIR="$$(brew --prefix 2>/dev/null)/share/man/man1"; \
+			MAN_DIR=$${MAN_DIR:-/usr/local/share/man/man1}; \
+		else \
+			MAN_DIR="/usr/local/share/man/man1"; \
+		fi; \
+		mkdir -p "$$MAN_DIR"; \
+		for page in man/*.1; do \
+			gzip -c "$$page" > "$$page.gz"; \
+			cp "$$page.gz" "$$MAN_DIR/$$(basename $$page.gz)"; \
+			rm "$$page.gz"; \
+		done; \
+		echo "Man pages installed to $$MAN_DIR"; \
+	fi
 	@PENT_BIN=$$(which pent); \
 	echo ""; \
 	echo "pent uses veth pairs for network proxying, which requires CAP_NET_ADMIN."; \
