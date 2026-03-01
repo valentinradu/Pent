@@ -22,6 +22,7 @@ use crate::cli::RunArgs;
 use crate::error::CliError;
 use crate::ui;
 
+#[allow(clippy::too_many_lines)]
 pub async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
     #[cfg(target_os = "macos")]
     if args.no_sandbox {
@@ -75,28 +76,52 @@ pub async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
 
     let mut sandbox_child = spawn_sandboxed(&sandbox_cfg, cmd, &cmd_args)?;
     let child = sandbox_child.child;
+    let child_pid = child.id();
     #[cfg(target_os = "linux")]
     let overlay_handle = sandbox_child.overlay;
 
-    // When running with a proxy, spawn a background task that warns if the
-    // sandboxed process hasn't made any proxy connections after 8 seconds.
-    // This catches the common case where the process doesn't honour HTTP_PROXY
-    // / ALL_PROXY and its direct network connections are silently blocked by
-    // the sandbox, causing it to hang.
+    // Print a one-line network mode hint so the user always knows what's active.
     #[cfg(not(target_os = "macos"))]
-    if let Some(ref handle) = proxy_handle {
-        let handle_ref = handle.connections_accepted_ref();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(8)).await;
-            if handle_ref.load(std::sync::atomic::Ordering::Relaxed) == 0 {
-                ui::warn(
-                    "8s elapsed with no proxy connections; \
-                     process may not honor HTTP_PROXY / ALL_PROXY — \
-                     direct network connections are blocked",
-                );
-            }
-        });
+    match &sandbox_cfg.network {
+        NetworkMode::ProxyOnly { .. } => {}  // proxy status shown by setup_proxy
+        NetworkMode::Blocked => ui::status(
+            "network",
+            "blocked — add domains to [proxy] domain_allowlist in pent.toml to enable",
+        ),
+        NetworkMode::LocalhostOnly => ui::status("network", "localhost only"),
+        NetworkMode::Unrestricted => ui::status("network", "unrestricted"),
     }
+
+    // When running with a proxy, kill the process after 5 seconds if it has
+    // made no proxy connections.  This catches the common case where the
+    // process does not honour HTTP_PROXY / ALL_PROXY and its direct network
+    // connections are silently blocked by the sandbox, causing it to hang.
+    #[cfg(not(target_os = "macos"))]
+    let proxy_timeout_fired = {
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        if let Some(ref handle) = proxy_handle {
+            let handle_ref = handle.connections_accepted_ref();
+            let fired2 = std::sync::Arc::clone(&fired);
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                if handle_ref.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                    fired2.store(true, std::sync::atomic::Ordering::Relaxed);
+                    ui::error(
+                        "5s elapsed with no proxy connections — \
+                         the process does not honour HTTP_PROXY / ALL_PROXY\n  \
+                         hint: verify [proxy] domain_allowlist in pent.toml, \
+                         or check that the command supports HTTP proxies",
+                    );
+                    // SIGKILL the child so child.wait() unblocks and the
+                    // normal cleanup path (overlay flush, netns teardown) runs.
+                    // SAFETY: child_pid is a valid child PID we just spawned.
+                    #[allow(clippy::cast_possible_wrap)]
+                    unsafe { libc::kill(child_pid as libc::pid_t, libc::SIGKILL) };
+                }
+            });
+        }
+        fired
+    };
 
     // macOS: in trace mode, stream sandboxd denials live so the user can see
     // every blocked path in one run. Without --trace just wait for the child.
@@ -129,6 +154,12 @@ pub async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
     #[cfg(not(target_os = "macos"))]
     if let Some(handle) = proxy_handle {
         handle.shutdown().await?;
+    }
+
+    // If the proxy timeout fired, exit with code 1 regardless of child status.
+    #[cfg(not(target_os = "macos"))]
+    if proxy_timeout_fired.load(std::sync::atomic::Ordering::Relaxed) {
+        std::process::exit(1);
     }
 
     // On Unix, if the sandboxed process was killed by a signal, re-raise that
