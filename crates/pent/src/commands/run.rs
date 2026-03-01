@@ -87,89 +87,11 @@ pub async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
         NetworkMode::Unrestricted => ui::status("network", "unrestricted"),
     }
 
-    // On Linux, spawn_sandboxed is synchronous and may block for several
-    // seconds (ProxyOnly background thread waits for veth handshake, overlayfs
-    // mount, nft setup).  Wrap in spawn_blocking with a 15-second timeout so a
-    // stalled namespace setup never hangs silently.
-    #[cfg(target_os = "linux")]
-    let mut sandbox_child = {
-        let cfg = sandbox_cfg.clone();
-        let c = cmd.clone();
-        let a = cmd_args.clone();
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(15),
-            tokio::task::spawn_blocking(move || spawn_sandboxed(&cfg, &c, &a)),
-        )
-        .await
-        {
-            Ok(Ok(result)) => result?,
-            Ok(Err(e)) => return Err(CliError::Other(format!("sandbox setup panicked: {e}"))),
-            Err(_) => {
-                ui::error(
-                    "sandbox setup timed out after 15s\n  \
-                     hint: network namespace setup may have stalled — \
-                     try --network unrestricted to rule out an nft/veth issue",
-                );
-                std::process::exit(1);
-            }
-        }
-    };
-    #[cfg(not(target_os = "linux"))]
     let mut sandbox_child = spawn_sandboxed(&sandbox_cfg, cmd, &cmd_args)?;
 
     let child = sandbox_child.child;
-    let child_pid = child.id();
     #[cfg(target_os = "linux")]
     let overlay_handle = sandbox_child.overlay;
-
-    // Watchdog timers: kill the child if it appears stuck due to sandbox config.
-    //
-    // ProxyOnly — kill after 5s with no proxy connections:  catches processes
-    //   that don't honour HTTP_PROXY / ALL_PROXY and hang waiting for direct
-    //   network access that the sandbox denies.
-    //
-    // Blocked — kill after 30s still running:  in blocked-network mode the
-    //   child cannot make any outbound connections.  If it is still alive after
-    //   30s it is almost certainly stuck in a connection retry loop.
-    #[cfg(not(target_os = "macos"))]
-    let watchdog_fired = {
-        let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let fired2 = std::sync::Arc::clone(&fired);
-        let is_blocked = sandbox_cfg.network == NetworkMode::Blocked;
-
-        if let Some(ref handle) = proxy_handle {
-            // ProxyOnly watchdog.
-            let handle_ref = handle.connections_accepted_ref();
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                if handle_ref.load(std::sync::atomic::Ordering::Relaxed) == 0 {
-                    fired2.store(true, std::sync::atomic::Ordering::Relaxed);
-                    ui::error(
-                        "5s elapsed with no proxy connections — \
-                         the process does not honour HTTP_PROXY / ALL_PROXY\n  \
-                         hint: verify [proxy] domain_allowlist in pent.toml, \
-                         or check that the command supports HTTP proxies",
-                    );
-                    #[allow(clippy::cast_possible_wrap)]
-                    unsafe { libc::kill(child_pid as libc::pid_t, libc::SIGKILL) };
-                }
-            });
-        } else if is_blocked {
-            // Blocked-network watchdog.
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                fired2.store(true, std::sync::atomic::Ordering::Relaxed);
-                ui::error(
-                    "process still running after 30s with network blocked\n  \
-                     hint: add domains to [proxy] domain_allowlist in pent.toml, \
-                     or run with --network unrestricted",
-                );
-                #[allow(clippy::cast_possible_wrap)]
-                unsafe { libc::kill(child_pid as libc::pid_t, libc::SIGKILL) };
-            });
-        }
-        fired
-    };
 
     // macOS: in trace mode, stream sandboxd denials live so the user can see
     // every blocked path in one run. Without --trace just wait for the child.
@@ -202,12 +124,6 @@ pub async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
     #[cfg(not(target_os = "macos"))]
     if let Some(handle) = proxy_handle {
         handle.shutdown().await?;
-    }
-
-    // If a watchdog fired, exit with code 1 regardless of child status.
-    #[cfg(not(target_os = "macos"))]
-    if watchdog_fired.load(std::sync::atomic::Ordering::Relaxed) {
-        std::process::exit(1);
     }
 
     // On Unix, if the sandboxed process was killed by a signal, re-raise that
