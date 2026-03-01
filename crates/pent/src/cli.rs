@@ -74,6 +74,13 @@ pub struct RunArgs {
     #[arg(long)]
     pub trace: bool,
 
+    /// Disable filesystem sandbox (no Landlock, no overlayfs). Linux only.
+    /// Network isolation is preserved unless --network unrestricted is also set.
+    /// When combined with --trace, logs every file open that would have been
+    /// denied, so you can discover which paths to add to your config.
+    #[arg(long, hide = cfg!(target_os = "macos"))]
+    pub no_sandbox: bool,
+
     /// Command and arguments to run inside the sandbox
     #[arg(trailing_var_arg = true, required = true, value_name = "COMMAND")]
     pub command: Vec<String>,

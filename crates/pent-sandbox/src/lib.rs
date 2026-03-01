@@ -43,6 +43,8 @@ pub use config::{system_default_paths, SandboxConfig};
 pub use env::{build_env, resolve_path_dirs_from, resolve_path_directories};
 pub use pent_settings::{Mount, NetworkMode, SandboxPaths, SandboxSettings};
 #[cfg(target_os = "linux")]
+pub use linux::compute_accessible_set;
+#[cfg(target_os = "linux")]
 pub use linux_overlayfs::OverlayHandle;
 
 use std::process::Child;

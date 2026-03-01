@@ -22,6 +22,7 @@ read = [
     "~/.gitconfig_local",
     "~/.config/gh",
     "~/.agents/skills",
+    "~/.cargo/env",
 ]
 execute = [
     "~/.local/bin",
@@ -38,6 +39,8 @@ read_write = [
     "~/.cache/claude",
     "~/.codex",
     "~/.gemini",
+    "~/.cargo",
+    "~/.rustup",
 ]
 
 [proxy]
@@ -59,4 +62,10 @@ domain_allowlist = [
     "cloudresourcemanager.googleapis.com",
     "oauth2.googleapis.com",
     "accounts.google.com",
+    "cloudcode-pa.googleapis.com",
+    "play.googleapis.com",
+    "www.googleapis.com",
+    "crates.io",
+    "static.crates.io",
+    "index.crates.io",
 ]

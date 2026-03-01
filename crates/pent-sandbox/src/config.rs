@@ -70,6 +70,9 @@ pub struct SandboxConfig {
     /// Working directory for the process.
     pub cwd: PathBuf,
 
+    /// When true, skip filesystem enforcement (no Landlock, no overlayfs).
+    /// Network isolation is unaffected.  Used by `--no-sandbox`.
+    pub no_enforcement: bool,
 }
 
 impl SandboxConfig {
@@ -88,6 +91,7 @@ impl SandboxConfig {
             env: HashMap::new(),
             network: NetworkMode::default(),
             cwd,
+            no_enforcement: false,
         }
     }
 
@@ -112,6 +116,12 @@ impl SandboxConfig {
     /// Add an additional mount point (used by Linux Landlock).
     pub fn with_mount(mut self, mount: Mount) -> Self {
         self.mounts.push(mount);
+        self
+    }
+
+    /// Disable filesystem enforcement (no Landlock, no overlayfs).
+    pub fn with_no_enforcement(mut self) -> Self {
+        self.no_enforcement = true;
         self
     }
 

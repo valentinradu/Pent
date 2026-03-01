@@ -58,6 +58,42 @@ const TEMP_PATHS: &[&str] = &["/tmp", "/var/tmp"];
 /// Device and proc paths to allow read access.
 const DEVICE_PATHS: &[&str] = &["/dev", "/proc"];
 
+/// Compute the set of paths the sandboxed process is allowed to read/execute.
+///
+/// This mirrors the accessible set built inside `spawn_with_landlock` and is used
+/// by the filesystem trace watcher (`--no-sandbox --trace`) to determine which
+/// file opens would have been denied by the sandbox policy.
+#[cfg(target_os = "linux")]
+pub fn compute_accessible_set(
+    config: &SandboxConfig,
+    path_dirs: &[PathBuf],
+) -> std::collections::HashSet<PathBuf> {
+    use std::collections::HashSet;
+    let (_, read_expanded, execute_expanded, rw_expanded) = config.paths.expand_paths();
+    let mut accessible: HashSet<PathBuf> = HashSet::new();
+    for (p, _) in read_expanded.iter().chain(&execute_expanded).chain(&rw_expanded) {
+        accessible.insert(p.clone());
+    }
+    accessible.insert(config.workspace.clone());
+    accessible.insert(config.data_dir.clone());
+    for mount in &config.mounts {
+        accessible.insert(mount.path.clone());
+    }
+    for sys_path in SYSTEM_PATHS {
+        accessible.insert(PathBuf::from(sys_path));
+    }
+    for tmp_path in TEMP_PATHS {
+        accessible.insert(PathBuf::from(tmp_path));
+    }
+    for dev_path in DEVICE_PATHS {
+        accessible.insert(PathBuf::from(dev_path));
+    }
+    for path_dir in path_dirs {
+        accessible.insert(path_dir.clone());
+    }
+    accessible
+}
+
 /// Check if Landlock ABI v4 is available.
 ///
 /// # Errors
@@ -453,6 +489,7 @@ pub fn spawn_with_landlock(
     let paths = config.paths.clone();
     let mut path_dirs = path_dirs.to_vec();
     let network = config.network.clone();
+    let no_enforcement = config.no_enforcement;
 
     // Identify write-listed file paths (as opposed to directories) and prepare
     // overlayfs staging directories for them. Directories use regular Landlock
@@ -534,10 +571,14 @@ pub fn spawn_with_landlock(
         accessible.insert(path_dir.clone());
     }
 
+    // In no_enforcement mode, skip overlayfs entirely.
     let pid = std::process::id();
-    let overlay_mounts =
+    let overlay_mounts = if no_enforcement {
+        Vec::new()
+    } else {
         super::linux_overlayfs::prepare_overlay_dirs(&overlay_file_paths, pid)
-            .map_err(SandboxError::SpawnFailed)?;
+            .map_err(SandboxError::SpawnFailed)?
+    };
 
     // Compute the set of parent directories covered by overlayfs (for Landlock rules).
     let overlay_dirs: HashSet<PathBuf> =
@@ -736,7 +777,8 @@ pub fn spawn_with_landlock(
             // When overlayfs is in use we need CLONE_NEWUSER + CLONE_NEWNS (and
             // CLONE_NEWNET for network-isolating modes) in a single unshare call.
             // ProxyOnly now creates its own user+net namespace here too.
-            let has_overlays = !overlay_mounts_pre.is_empty();
+            // In no_enforcement mode, skip overlay entirely.
+            let has_overlays = !no_enforcement && !overlay_mounts_pre.is_empty();
 
             if has_overlays {
                 // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
@@ -865,6 +907,8 @@ pub fn spawn_with_landlock(
             }
 
             // ── Phase 2: Landlock ─────────────────────────────────────────────
+            // Skip entire Landlock setup when no_enforcement is active.
+            if !no_enforcement {
             let all_access = AccessFs::from_all(ABI::V4);
             let read_access = AccessFs::ReadFile | AccessFs::ReadDir;
             let execute_access = AccessFs::ReadFile | AccessFs::ReadDir | AccessFs::Execute;
@@ -956,10 +1000,11 @@ pub fn spawn_with_landlock(
                 add_path(&mut ruleset, Path::new(dev_path), read_access)?;
             }
 
-            // Apply the ruleset
+            // Apply the ruleset.
             ruleset
                 .restrict_self()
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
+            } // end if !no_enforcement (Phase 2)
 
             // ── Phase 3: Network isolation ────────────────────────────────────
             if has_overlays || proxy_ready_w >= 0 {

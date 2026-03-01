@@ -22,6 +22,13 @@ use crate::error::CliError;
 use crate::ui;
 
 pub async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
+    #[cfg(target_os = "macos")]
+    if args.no_sandbox {
+        return Err(CliError::Other(
+            "--no-sandbox is not supported on macOS".to_string(),
+        ));
+    }
+
     let mut config = load_config(&args, &cwd)?;
     apply_cli_overrides(&mut config, &args)?;
     let env_map = build_run_env(&args.env);
@@ -50,8 +57,14 @@ pub async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
         sandbox_cfg = sandbox_cfg.with_data_dir(data_dir);
     }
 
-    // Validate sandbox availability before spawning
-    check_availability()?;
+    if args.no_sandbox {
+        sandbox_cfg = sandbox_cfg.with_no_enforcement();
+    }
+
+    // Validate sandbox availability before spawning (skipped in --no-sandbox mode).
+    if !args.no_sandbox {
+        check_availability()?;
+    }
 
     let cmd_parts = &args.command;
     let cmd = cmd_parts

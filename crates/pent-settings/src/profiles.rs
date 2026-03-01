@@ -509,6 +509,9 @@ fn profile_config(p: Profile) -> PentConfig {
                     "accounts.google.com".to_string(),
                     "cloudcode-pa.googleapis.com".to_string(),
                     "play.googleapis.com".to_string(),
+                    // Required for OAuth user-info endpoint (fetchAndCacheUserInfo)
+                    // and for certificate validation used by google-auth-library.
+                    "www.googleapis.com".to_string(),
                 ],
                 ..Default::default()
             },
