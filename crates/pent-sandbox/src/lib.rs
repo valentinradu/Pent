@@ -105,6 +105,63 @@ pub fn spawn_sandboxed(
     cmd: &str,
     args: &[String],
 ) -> Result<SandboxChild, SandboxError> {
+    // ── Auto-grant access to the binary's location ───────────────────────────
+    // Rule: the binary's resolved directory (and the package root when it lives
+    // in a `bin/` subdirectory) is always readable and executable.  This lets
+    // runtimes like Node.js find sibling dirs (lib/node_modules/, etc.).
+    //
+    // Two-step resolution:
+    // 1. Locate the binary in PATH without canonicalising — the symlink path
+    //    preserves the `bin/` structure we need for the package-root heuristic.
+    //    (e.g. ~/.npm-global/bin/gemini → ../lib/…/index.js: the symlink parent
+    //    IS `bin/`, but the canonicalized parent is `dist/`.)
+    // 2. Canonicalize separately and add the real parent as well, so the
+    //    Landlock execute rule covers the actual inode the kernel will check.
+    //
+    // Must happen before any platform-specific call:
+    // - Linux: overlayfs accessible set is built from config at mount time.
+    // - macOS: SBPL profile is generated from config before spawn.
+    let mut effective_config = config.clone();
+    {
+        let path_env = config.env.get("PATH").map_or("", String::as_str);
+
+        // Step 1: find the binary as it appears in PATH (symlink not resolved).
+        let found: Option<std::path::PathBuf> = if std::path::Path::new(cmd).is_absolute() {
+            Some(std::path::PathBuf::from(cmd))
+        } else {
+            path_env
+                .split(':')
+                .map(|dir| std::path::Path::new(dir).join(cmd))
+                .find(|p| p.is_file())
+        };
+
+        let mut add = |s: String| {
+            if !effective_config.paths.execute.contains(&s) {
+                effective_config.paths.execute.push(s);
+            }
+        };
+
+        if let Some(ref fp) = found {
+            if let Some(parent) = fp.parent() {
+                // Symlink-path parent → always add (covers bin/ dirs).
+                add(parent.to_string_lossy().into_owned());
+                // Package-root heuristic: `bin/` sibling dirs (lib/, etc.).
+                if parent.file_name().is_some_and(|n| n == "bin") {
+                    if let Some(pkg_root) = parent.parent() {
+                        add(pkg_root.to_string_lossy().into_owned());
+                    }
+                }
+            }
+            // Step 2: canonical parent for Landlock execute on the real inode.
+            if let Ok(real) = std::fs::canonicalize(fp) {
+                if let Some(real_parent) = real.parent() {
+                    add(real_parent.to_string_lossy().into_owned());
+                }
+            }
+        }
+    }
+    let config = &effective_config;
+
     #[cfg(target_os = "macos")]
     {
         let profile = macos::generate_sbpl_profile(config)?;

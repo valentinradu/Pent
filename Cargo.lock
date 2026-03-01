@@ -476,6 +476,7 @@ dependencies = [
  "pent-sandbox",
  "pent-settings",
  "serde_json",
+ "serial_test",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

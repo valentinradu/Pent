@@ -495,7 +495,7 @@ pub fn spawn_with_landlock(
     let data_dir = config.data_dir.clone();
     let mounts = config.mounts.clone();
     let paths = config.paths.clone();
-    let mut path_dirs = path_dirs.to_vec();
+    let path_dirs = path_dirs.to_vec();
     let network = config.network.clone();
     let no_enforcement = config.no_enforcement;
 
@@ -697,51 +697,6 @@ pub fn spawn_with_landlock(
     command.stdin(Stdio::inherit());
     command.stdout(Stdio::inherit());
     command.stderr(Stdio::inherit());
-
-    // pre_exec runs in child after fork, before exec.
-    // SAFETY: Although we use heap allocations and file I/O here (which are not
-    // strictly async-signal-safe), this is safe in practice because:
-    // 1. We're in a single-threaded child process after fork
-    // 2. No locks are held from the parent that could deadlock
-    // 3. Modern Linux handles this correctly before exec
-    // Resolve the real path of cmd (following symlinks) and ensure its parent
-    // directory is in the Landlock execute rules.  Without this, a command that
-    // is a symlink (e.g. ~/.local/bin/claude -> ~/.local/share/claude/versions/X)
-    // would fail with EACCES because Landlock checks execute access on the
-    // *resolved* inode, not the symlink itself.
-    {
-        let cmd_path = if cmd.contains('/') {
-            PathBuf::from(cmd)
-        } else {
-            path_dirs
-                .iter()
-                .map(|d| d.join(cmd))
-                .find(|p| p.exists())
-                .unwrap_or_else(|| PathBuf::from(cmd))
-        };
-        if let Ok(real) = std::fs::canonicalize(&cmd_path) {
-            if let Some(parent) = real.parent() {
-                let parent_buf = parent.to_path_buf();
-                if !path_dirs.contains(&parent_buf) {
-                    path_dirs.push(parent_buf.clone());
-                }
-                // If the binary lives in a directory named "bin" (e.g.
-                // ~/.npm-global/bin/gemini, ~/.nvm/.../bin/node), also grant
-                // access to the package root one level up.  Node.js, Python,
-                // and similar runtimes import module files from sibling dirs
-                // (e.g. ~/.npm-global/lib/node_modules/) that would otherwise
-                // be invisible to Landlock.
-                if parent_buf.file_name().is_some_and(|n| n == "bin") {
-                    if let Some(pkg_root) = parent_buf.parent() {
-                        let pkg_root_buf = pkg_root.to_path_buf();
-                        if !path_dirs.contains(&pkg_root_buf) {
-                            path_dirs.push(pkg_root_buf);
-                        }
-                    }
-                }
-            }
-        }
-    }
 
     // Clone strings that are used in BOTH the pre_exec closure and the
     // background thread (the closure moves them; the thread needs its own copy).
