@@ -74,16 +74,11 @@ pub async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
         .ok_or_else(|| CliError::Other("command list is empty".to_string()))?;
     let cmd_args: Vec<String> = cmd_parts[1..].to_vec();
 
-    let mut sandbox_child = spawn_sandboxed(&sandbox_cfg, cmd, &cmd_args)?;
-    let child = sandbox_child.child;
-    let child_pid = child.id();
-    #[cfg(target_os = "linux")]
-    let overlay_handle = sandbox_child.overlay;
-
-    // Print a one-line network mode hint so the user always knows what's active.
+    // Print network mode hint BEFORE spawn so the user sees it even if spawn
+    // takes time (ProxyOnly veth setup) or stalls during namespace init.
     #[cfg(not(target_os = "macos"))]
     match &sandbox_cfg.network {
-        NetworkMode::ProxyOnly { .. } => {}  // proxy status shown by setup_proxy
+        NetworkMode::ProxyOnly { .. } => {}  // proxy message already shown by setup_proxy
         NetworkMode::Blocked => ui::status(
             "network",
             "blocked — add domains to [proxy] domain_allowlist in pent.toml to enable",
@@ -92,16 +87,59 @@ pub async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
         NetworkMode::Unrestricted => ui::status("network", "unrestricted"),
     }
 
-    // When running with a proxy, kill the process after 5 seconds if it has
-    // made no proxy connections.  This catches the common case where the
-    // process does not honour HTTP_PROXY / ALL_PROXY and its direct network
-    // connections are silently blocked by the sandbox, causing it to hang.
+    // On Linux, spawn_sandboxed is synchronous and may block for several
+    // seconds (ProxyOnly background thread waits for veth handshake, overlayfs
+    // mount, nft setup).  Wrap in spawn_blocking with a 15-second timeout so a
+    // stalled namespace setup never hangs silently.
+    #[cfg(target_os = "linux")]
+    let mut sandbox_child = {
+        let cfg = sandbox_cfg.clone();
+        let c = cmd.clone();
+        let a = cmd_args.clone();
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            tokio::task::spawn_blocking(move || spawn_sandboxed(&cfg, &c, &a)),
+        )
+        .await
+        {
+            Ok(Ok(result)) => result?,
+            Ok(Err(e)) => return Err(CliError::Other(format!("sandbox setup panicked: {e}"))),
+            Err(_) => {
+                ui::error(
+                    "sandbox setup timed out after 15s\n  \
+                     hint: network namespace setup may have stalled — \
+                     try --network unrestricted to rule out an nft/veth issue",
+                );
+                std::process::exit(1);
+            }
+        }
+    };
+    #[cfg(not(target_os = "linux"))]
+    let mut sandbox_child = spawn_sandboxed(&sandbox_cfg, cmd, &cmd_args)?;
+
+    let child = sandbox_child.child;
+    let child_pid = child.id();
+    #[cfg(target_os = "linux")]
+    let overlay_handle = sandbox_child.overlay;
+
+    // Watchdog timers: kill the child if it appears stuck due to sandbox config.
+    //
+    // ProxyOnly — kill after 5s with no proxy connections:  catches processes
+    //   that don't honour HTTP_PROXY / ALL_PROXY and hang waiting for direct
+    //   network access that the sandbox denies.
+    //
+    // Blocked — kill after 30s still running:  in blocked-network mode the
+    //   child cannot make any outbound connections.  If it is still alive after
+    //   30s it is almost certainly stuck in a connection retry loop.
     #[cfg(not(target_os = "macos"))]
-    let proxy_timeout_fired = {
+    let watchdog_fired = {
         let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fired2 = std::sync::Arc::clone(&fired);
+        let is_blocked = sandbox_cfg.network == NetworkMode::Blocked;
+
         if let Some(ref handle) = proxy_handle {
+            // ProxyOnly watchdog.
             let handle_ref = handle.connections_accepted_ref();
-            let fired2 = std::sync::Arc::clone(&fired);
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 if handle_ref.load(std::sync::atomic::Ordering::Relaxed) == 0 {
@@ -112,12 +150,22 @@ pub async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
                          hint: verify [proxy] domain_allowlist in pent.toml, \
                          or check that the command supports HTTP proxies",
                     );
-                    // SIGKILL the child so child.wait() unblocks and the
-                    // normal cleanup path (overlay flush, netns teardown) runs.
-                    // SAFETY: child_pid is a valid child PID we just spawned.
                     #[allow(clippy::cast_possible_wrap)]
                     unsafe { libc::kill(child_pid as libc::pid_t, libc::SIGKILL) };
                 }
+            });
+        } else if is_blocked {
+            // Blocked-network watchdog.
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                fired2.store(true, std::sync::atomic::Ordering::Relaxed);
+                ui::error(
+                    "process still running after 30s with network blocked\n  \
+                     hint: add domains to [proxy] domain_allowlist in pent.toml, \
+                     or run with --network unrestricted",
+                );
+                #[allow(clippy::cast_possible_wrap)]
+                unsafe { libc::kill(child_pid as libc::pid_t, libc::SIGKILL) };
             });
         }
         fired
@@ -156,9 +204,9 @@ pub async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
         handle.shutdown().await?;
     }
 
-    // If the proxy timeout fired, exit with code 1 regardless of child status.
+    // If a watchdog fired, exit with code 1 regardless of child status.
     #[cfg(not(target_os = "macos"))]
-    if proxy_timeout_fired.load(std::sync::atomic::Ordering::Relaxed) {
+    if watchdog_fired.load(std::sync::atomic::Ordering::Relaxed) {
         std::process::exit(1);
     }
 
