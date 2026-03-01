@@ -968,13 +968,20 @@ mod no_hang {
     /// Spawn `pent` with `args` in `dir`; kill it if it has not exited after
     /// `timeout_secs`.  Returns `(finished_before_deadline, stderr_text)`.
     ///
+    /// `home` must be an empty temp dir — it is set as `$HOME` so the real
+    /// `~/.config/pent/pent.toml` global config is invisible to pent.
+    /// `XDG_CONFIG_HOME` and `XDG_DATA_HOME` are also cleared so they cannot
+    /// override the isolated home.
     /// stdout is discarded (Stdio::null) — we only capture stderr for
     /// diagnostics.  stderr is drained in a background thread so the child
     /// can never block on a full pipe.
-    fn pent_timeout(dir: &Path, args: &[&str], timeout_secs: u64) -> (bool, String) {
+    fn pent_timeout(dir: &Path, home: &Path, args: &[&str], timeout_secs: u64) -> (bool, String) {
         let mut child = Command::new(PENT)
             .args(args)
             .current_dir(dir)
+            .env("HOME", home)
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("XDG_DATA_HOME")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -1027,8 +1034,9 @@ mod no_hang {
     #[test]
     fn system_true_exits_quickly() {
         let dir = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
         let (ok, stderr) = pent_timeout(
-            dir.path(),
+            dir.path(), home.path(),
             &["run", "--no-config", "--", "/usr/bin/true"],
             2,
         );
@@ -1039,8 +1047,9 @@ mod no_hang {
     #[test]
     fn system_true_blocked_network_exits_quickly() {
         let dir = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
         let (ok, stderr) = pent_timeout(
-            dir.path(),
+            dir.path(), home.path(),
             &["run", "--no-config", "--network", "blocked", "--", "/usr/bin/true"],
             2,
         );
@@ -1055,8 +1064,9 @@ mod no_hang {
             return;
         }
         let dir = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
         let (ok, stderr) = pent_timeout(
-            dir.path(),
+            dir.path(), home.path(),
             &["run", "--no-config", "--", "/usr/bin/curl", "--version"],
             2,
         );
@@ -1065,9 +1075,8 @@ mod no_hang {
 
     // ── local binaries: --version flag ────────────────────────────────────────
     //
-    // A binary that honours --version prints a short string and exits 0.
-    // With --no-config the sandbox uses default paths only; the binary's parent
-    // dir is automatically added to the execute set by pent (EACCES fix).
+    // detect_binary uses the REAL $HOME (the test process's env) to locate the
+    // binary.  pent itself gets a fresh empty home so it finds no global config.
 
     fn assert_version_exits_quickly(name: &str) {
         let Some(bin) = detect_binary(name) else {
@@ -1076,8 +1085,9 @@ mod no_hang {
         };
         let bin_s = bin.to_str().unwrap();
         let dir = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
         let (ok, stderr) = pent_timeout(
-            dir.path(),
+            dir.path(), home.path(),
             &["run", "--no-config", "--", bin_s, "--version"],
             2,
         );
@@ -1092,11 +1102,6 @@ mod no_hang {
     fn gemini_version_exits_quickly() { assert_version_exits_quickly("gemini"); }
 
     // ── local binaries: no args, no TTY ──────────────────────────────────────
-    //
-    // When stdin is not a terminal most interactive CLIs print something like
-    // "not a terminal" and exit within milliseconds.  A hang here means the
-    // binary (or a library it calls) is blocking on something the sandbox
-    // denies rather than failing fast.
 
     fn assert_no_tty_exits_quickly(name: &str) {
         let Some(bin) = detect_binary(name) else {
@@ -1105,16 +1110,17 @@ mod no_hang {
         };
         let bin_s = bin.to_str().unwrap();
         let dir = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
         let (ok, stderr) = pent_timeout(
-            dir.path(),
+            dir.path(), home.path(),
             &["run", "--no-config", "--", bin_s],
             2,
         );
         assert!(
             ok,
             "pent run -- {name} (no args, stdin=null) timed out (2s)\n\
-             hint: the binary did not detect 'not a tty' and exit — \
-             it may be blocking on a sandboxed resource\nstderr:\n{stderr}",
+             hint: binary did not detect 'not a tty' — \
+             may be blocking on a sandboxed resource\nstderr:\n{stderr}",
         );
     }
 
@@ -1127,10 +1133,8 @@ mod no_hang {
 
     // ── with-config: project pent.toml sets domain_allowlist → ProxyOnly ─────
     //
-    // When a domain_allowlist is present pent starts a proxy and creates a veth
-    // pair.  Verify that even in proxy mode a fast-exiting binary terminates
-    // promptly.  This is the scenario that previously caused hangs when pent was
-    // run from a directory that loaded a config with an allowlist.
+    // The project config lives only in the temp `dir` (.pent/pent.toml).
+    // The isolated `home` ensures no global config is loaded on top of it.
 
     fn assert_proxy_mode_exits_quickly(name: &str) {
         let Some(bin) = detect_binary(name) else {
@@ -1139,8 +1143,8 @@ mod no_hang {
         };
         let bin_s = bin.to_str().unwrap();
 
-        // Create a project dir with a pent.toml that has a domain_allowlist.
         let dir = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
         let dot_pent = dir.path().join(".pent");
         fs::create_dir_all(&dot_pent).unwrap();
         fs::write(
@@ -1150,7 +1154,7 @@ mod no_hang {
         .unwrap();
 
         let (ok, stderr) = pent_timeout(
-            dir.path(),
+            dir.path(), home.path(),
             &["run", "--", bin_s, "--version"],
             5,  // proxy + veth setup may take ~1s; allow 5s total
         );
@@ -1188,8 +1192,11 @@ mod no_hang {
     ///
     /// # Safety
     /// Uses raw fds.  The caller must eventually close master_fd.
+    /// Spawn `pent` with a fresh PTY as its controlling terminal.
+    /// `home` is an empty temp dir set as `$HOME` to hide the real global config.
+    /// Returns `(master_fd, child)`.  Caller owns master_fd.
     #[allow(clippy::cast_sign_loss)]
-    fn spawn_with_pty(dir: &Path, args: &[&str]) -> (libc::c_int, std::process::Child) {
+    fn spawn_with_pty(dir: &Path, home: &Path, args: &[&str]) -> (libc::c_int, std::process::Child) {
         use std::os::unix::io::FromRawFd;
         use std::process::Stdio;
 
@@ -1214,6 +1221,9 @@ mod no_hang {
         let child = Command::new(PENT)
             .args(args)
             .current_dir(dir)
+            .env("HOME", home)
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("XDG_DATA_HOME")
             .env_remove("PENT_LOG")
             .stdin(unsafe { Stdio::from_raw_fd(slave) })
             .stdout(unsafe { Stdio::from_raw_fd(slave_out) })
@@ -1258,13 +1268,14 @@ mod no_hang {
     /// 4. Assert pent exits within `exit_secs`.
     fn assert_pty_exits(
         dir: &Path,
+        home: &Path,
         pent_args: &[&str],
         prompt_secs: u64,
         quit_bytes: &[u8],
         exit_secs: u64,
         label: &str,
     ) {
-        let (master, mut child) = spawn_with_pty(dir, pent_args);
+        let (master, mut child) = spawn_with_pty(dir, home, pent_args);
 
         // Step 1: wait for any output from the child (the prompt).
         let prompt_output = drain_pty(master, Duration::from_secs(prompt_secs));
@@ -1311,10 +1322,11 @@ mod no_hang {
         };
         let bin_s = bin.to_str().unwrap();
         let dir = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
 
         // --version should print and exit even with a PTY — no quit needed.
         let (master, mut child) = spawn_with_pty(
-            dir.path(),
+            dir.path(), home.path(),
             &["run", "--no-config", "--", bin_s, "--version"],
         );
 
@@ -1342,11 +1354,12 @@ mod no_hang {
         };
         let bin_s = bin.to_str().unwrap();
         let dir = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
 
         // Ctrl+C (ETX) then newline: the PTY line discipline converts \x03
         // to SIGINT for the foreground process group.
         assert_pty_exits(
-            dir.path(),
+            dir.path(), home.path(),
             &["run", "--no-config", "--", bin_s],
             5,             // wait up to 5s for the interactive prompt
             b"\x03\n",    // Ctrl+C + newline
