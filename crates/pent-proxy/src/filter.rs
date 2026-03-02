@@ -537,10 +537,7 @@ mod tests {
     #[test]
     fn test_overlapping_patterns() {
         // Both exact and wildcard match - exact should take precedence
-        let filter = DomainFilter::new(&[
-            "api.github.com".to_string(),
-            "*.github.com".to_string(),
-        ]);
+        let filter = DomainFilter::new(&["api.github.com".to_string(), "*.github.com".to_string()]);
         let result = filter.matches("api.github.com");
         // Should prefer exact match
         assert!(matches!(result, DomainMatch::Exact(_)));

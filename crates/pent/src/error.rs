@@ -1,4 +1,3 @@
-
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum CliError {
     #[error("{0}")]

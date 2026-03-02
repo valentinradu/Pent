@@ -24,10 +24,7 @@ read = [
     "~/.agents/skills",
     "~/.cargo/env",
 ]
-execute = [
-    "~/.local/bin",
-    "~/.npm-global",
-]
+execute = ["~/.local/bin"]
 read_write = [
     "~/.npm",
     "~/.local/share/keyrings",

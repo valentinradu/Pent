@@ -77,7 +77,11 @@ impl FromStr for Profile {
             .map(|(p, _)| *p)
             .ok_or_else(|| {
                 let valid: Vec<&str> = PROFILES.iter().map(|(_, n)| *n).collect();
-                format!("unknown profile '{}'; valid profiles: {}", s, valid.join(" "))
+                format!(
+                    "unknown profile '{}'; valid profiles: {}",
+                    s,
+                    valid.join(" ")
+                )
             })
     }
 }
@@ -184,10 +188,7 @@ fn profile_config(p: Profile) -> PentConfig {
         // ── @npm ──────────────────────────────────────────────────────────────
         Profile::Npm => PentConfig {
             proxy: ProxySettings {
-                domain_allowlist: vec![
-                    "registry.npmjs.org".to_string(),
-                    "*.npmjs.org".to_string(),
-                ],
+                domain_allowlist: vec!["registry.npmjs.org".to_string(), "*.npmjs.org".to_string()],
                 ..Default::default()
             },
             sandbox: SandboxSettings {
@@ -248,10 +249,7 @@ fn profile_config(p: Profile) -> PentConfig {
                         ]
                     },
                     // pip config files (index URL, trusted hosts, etc.)
-                    read: vec![
-                        "~/.pip".to_string(),
-                        "~/.config/pip".to_string(),
-                    ],
+                    read: vec!["~/.pip".to_string(), "~/.config/pip".to_string()],
                     ..Default::default()
                 },
                 ..Default::default()
@@ -261,10 +259,7 @@ fn profile_config(p: Profile) -> PentConfig {
         // ── @gem ──────────────────────────────────────────────────────────────
         Profile::Gem => PentConfig {
             proxy: ProxySettings {
-                domain_allowlist: vec![
-                    "rubygems.org".to_string(),
-                    "*.rubygems.org".to_string(),
-                ],
+                domain_allowlist: vec!["rubygems.org".to_string(), "*.rubygems.org".to_string()],
                 ..Default::default()
             },
             sandbox: SandboxSettings {
@@ -483,10 +478,7 @@ fn profile_config(p: Profile) -> PentConfig {
 
         Profile::Codex => PentConfig {
             proxy: ProxySettings {
-                domain_allowlist: vec![
-                    "api.openai.com".to_string(),
-                    "*.openai.com".to_string(),
-                ],
+                domain_allowlist: vec!["api.openai.com".to_string(), "*.openai.com".to_string()],
                 ..Default::default()
             },
             sandbox: SandboxSettings {
@@ -539,9 +531,9 @@ fn profile_config(p: Profile) -> PentConfig {
 /// Merges the config fragments for all given profiles into a single `PentConfig`.
 #[must_use]
 pub fn build_profiles_config(profiles: &[Profile]) -> PentConfig {
-    profiles
-        .iter()
-        .fold(PentConfig::default(), |acc, &p| acc.merge(profile_config(p)))
+    profiles.iter().fold(PentConfig::default(), |acc, &p| {
+        acc.merge(profile_config(p))
+    })
 }
 
 /// Returns `true` if a profile appears to be active in the given config.

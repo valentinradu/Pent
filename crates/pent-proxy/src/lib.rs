@@ -91,11 +91,13 @@ pub enum TraceEvent {
 // pattern so it isn't repeated at every lock site.
 
 fn read_lock<T>(lock: &std::sync::RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
-    lock.read().unwrap_or_else(std::sync::PoisonError::into_inner)
+    lock.read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn write_lock<T>(lock: &std::sync::RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
-    lock.write().unwrap_or_else(std::sync::PoisonError::into_inner)
+    lock.write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Errors that can occur in proxy operations.

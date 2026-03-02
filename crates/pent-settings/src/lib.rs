@@ -76,7 +76,12 @@ fn default_proxy_addr() -> std::net::SocketAddr {
 }
 
 type ExpandedPath = (PathBuf, bool);
-type ExpandedPathLists = (Vec<ExpandedPath>, Vec<ExpandedPath>, Vec<ExpandedPath>, Vec<ExpandedPath>);
+type ExpandedPathLists = (
+    Vec<ExpandedPath>,
+    Vec<ExpandedPath>,
+    Vec<ExpandedPath>,
+    Vec<ExpandedPath>,
+);
 
 /// Filesystem paths made available to the sandboxed process.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -146,7 +151,9 @@ impl SandboxPaths {
     pub fn expand_paths(&self) -> ExpandedPathLists {
         let home = dirs::home_dir();
         let expand = |s: &str| -> ExpandedPath {
-            let (s, is_glob) = s.strip_suffix('*').map_or((s, false), |stripped| (stripped, true));
+            let (s, is_glob) = s
+                .strip_suffix('*')
+                .map_or((s, false), |stripped| (stripped, true));
             let path = s.strip_prefix("~/").map_or_else(
                 || {
                     if s == "~" {
@@ -155,7 +162,10 @@ impl SandboxPaths {
                         PathBuf::from(s)
                     }
                 },
-                |rest| home.as_ref().map_or_else(|| PathBuf::from(s), |h| h.join(rest)),
+                |rest| {
+                    home.as_ref()
+                        .map_or_else(|| PathBuf::from(s), |h| h.join(rest))
+                },
             );
             (path, is_glob)
         };
@@ -167,7 +177,6 @@ impl SandboxPaths {
             to_paths(&self.read_write),
         )
     }
-
 }
 
 /// An additional mount point exposed inside the sandbox.

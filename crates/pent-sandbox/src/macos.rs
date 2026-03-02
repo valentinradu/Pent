@@ -117,7 +117,11 @@ pub fn generate_sbpl_profile(config: &SandboxConfig) -> Result<String, SandboxEr
     let mut parent = config.workspace.parent();
     while let Some(p) = parent {
         let canonical = canonicalize_for_sbpl(p);
-        write!(profile, "(allow file-read-data (literal \"{canonical}\"))\n").unwrap();
+        write!(
+            profile,
+            "(allow file-read-data (literal \"{canonical}\"))\n"
+        )
+        .unwrap();
         parent = p.parent();
     }
 
@@ -148,9 +152,17 @@ pub fn generate_sbpl_profile(config: &SandboxConfig) -> Result<String, SandboxEr
             let canonical = canonicalize_for_sbpl(path);
             let original = escape_sbpl_path(path);
             let modifier = if path.is_file() { "literal" } else { "subpath" };
-            write!(profile, "(allow process-exec ({modifier} \"{canonical}\"))\n").unwrap();
+            write!(
+                profile,
+                "(allow process-exec ({modifier} \"{canonical}\"))\n"
+            )
+            .unwrap();
             if original != canonical {
-                write!(profile, "(allow process-exec ({modifier} \"{original}\"))\n").unwrap();
+                write!(
+                    profile,
+                    "(allow process-exec ({modifier} \"{original}\"))\n"
+                )
+                .unwrap();
             }
         }
     }
@@ -449,7 +461,10 @@ mod tests {
     #[test]
     fn test_network_rules_proxy_only() {
         let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-        let rules = generate_network_rules(&NetworkMode::ProxyOnly { proxy_addr: addr });
+        let rules = generate_network_rules(&NetworkMode::ProxyOnly {
+            proxy_addr: addr,
+            dns_port: 0,
+        });
         // On macOS, ProxyOnly produces no Seatbelt network rules — enforcement is
         // impossible without per-process network namespaces (Linux-only).
         assert!(

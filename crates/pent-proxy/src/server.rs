@@ -72,8 +72,7 @@ pub struct ProxyConfig {
 impl Default for ProxyConfig {
     fn default() -> Self {
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-        const LOCALHOST_ANY: SocketAddr =
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        const LOCALHOST_ANY: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
         Self {
             dns_bind_addr: LOCALHOST_ANY,
             proxy_bind_addr: LOCALHOST_ANY,
@@ -134,9 +133,7 @@ impl ProxyHandle {
     /// Check if the server is still running.
     #[must_use]
     pub fn is_running(&self) -> bool {
-        self.join_handle
-            .as_ref()
-            .is_some_and(|h| !h.is_finished())
+        self.join_handle.as_ref().is_some_and(|h| !h.is_finished())
     }
 
     /// Shut down the proxy server gracefully.
@@ -150,7 +147,10 @@ impl ProxyHandle {
     /// within 2 seconds it is left to finish on its own (not aborted).
     pub async fn shutdown(mut self) -> Result<()> {
         // Send shutdown signal - this triggers the tokio::select! in the server task
-        let signal_sent = self.shutdown_tx.take().is_some_and(|tx| tx.send(()).is_ok());
+        let signal_sent = self
+            .shutdown_tx
+            .take()
+            .is_some_and(|tx| tx.send(()).is_ok());
 
         // Wait for server task to complete
         if let Some(handle) = self.join_handle.take() {
@@ -1102,9 +1102,13 @@ mod tests {
 
         // Spawn DNS query
         let dns_task = tokio::spawn(async {
-            let Ok(socket) = UdpSocket::bind("127.0.0.1:0").await else { return false; };
+            let Ok(socket) = UdpSocket::bind("127.0.0.1:0").await else {
+                return false;
+            };
             let query = build_test_dns_query("example.com", 1);
-            if socket.send_to(&query, "127.0.0.1:25372").await.is_err() { return false; }
+            if socket.send_to(&query, "127.0.0.1:25372").await.is_err() {
+                return false;
+            }
             let mut buf = [0u8; 512];
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(2),

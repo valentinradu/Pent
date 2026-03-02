@@ -60,8 +60,7 @@ pub struct DnsServerConfig {
 impl Default for DnsServerConfig {
     fn default() -> Self {
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-        const LOCALHOST_ANY: SocketAddr =
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        const LOCALHOST_ANY: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
         Self {
             bind_addr: LOCALHOST_ANY,
             upstream: None, // Use system resolvers
@@ -88,8 +87,7 @@ impl DnsServerConfig {
             use std::net::{IpAddr, Ipv4Addr, SocketAddr};
             const CLOUDFLARE: SocketAddr =
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53);
-            const GOOGLE: SocketAddr =
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53);
+            const GOOGLE: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53);
             vec![CLOUDFLARE, GOOGLE]
         })
     }
@@ -403,7 +401,9 @@ impl DnsServer {
             let query = Self::build_dns_query(domain, record_type);
 
             for upstream in &upstreams {
-                let Ok(socket) = UdpSocket::bind("0.0.0.0:0").await else { continue };
+                let Ok(socket) = UdpSocket::bind("0.0.0.0:0").await else {
+                    continue;
+                };
 
                 if socket.connect(upstream).await.is_err() {
                     continue;
@@ -415,8 +415,7 @@ impl DnsServer {
 
                 let mut buf = [0u8; 512];
                 let result =
-                    tokio::time::timeout(self.config.resolve_timeout, socket.recv(&mut buf))
-                        .await;
+                    tokio::time::timeout(self.config.resolve_timeout, socket.recv(&mut buf)).await;
 
                 if let Ok(Ok(len)) = result {
                     if let Some(addresses) = Self::parse_dns_response(&buf[..len]) {
@@ -1041,7 +1040,10 @@ mod tests {
         let query = build_test_dns_query("example.com", 1);
         server.handle_query(&query).await.unwrap();
         // The server resolved the domain and populated the cache.
-        assert!(!state.cache.is_empty(), "cache should be populated after resolution");
+        assert!(
+            !state.cache.is_empty(),
+            "cache should be populated after resolution"
+        );
         // TTL-based expiry semantics (lookup returns None after expiry) are
         // covered by test_resolution_cache_lookup_expired in lib.rs.
     }

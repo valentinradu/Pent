@@ -95,18 +95,17 @@ impl Drop for NetnsHandle {
     fn drop(&mut self) {
         use std::process::Command;
 
-        let log_cleanup = |label: &str, result: std::io::Result<std::process::Output>| {
-            match result {
-                Ok(out) if !out.status.success() => {
-                    tracing::debug!(
-                        cmd = label,
-                        stderr = %String::from_utf8_lossy(&out.stderr).trim(),
-                        "cleanup command failed (may be expected if resource already removed)"
-                    );
-                }
-                Err(e) => tracing::warn!(cmd = label, err = %e, "failed to run cleanup command"),
-                _ => {}
+        let log_cleanup = |label: &str, result: std::io::Result<std::process::Output>| match result
+        {
+            Ok(out) if !out.status.success() => {
+                tracing::debug!(
+                    cmd = label,
+                    stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+                    "cleanup command failed (may be expected if resource already removed)"
+                );
             }
+            Err(e) => tracing::warn!(cmd = label, err = %e, "failed to run cleanup command"),
+            _ => {}
         };
 
         // Delete the outer veth. If the child's namespace is already gone the
@@ -121,14 +120,30 @@ impl Drop for NetnsHandle {
 
         if let Some(h) = nft_find_iface_rule_handle("input", "iifname", &self.veth_outer) {
             let mut cmd = Command::new("nft");
-            cmd.args(["delete", "rule", "inet", "filter", "input", "handle", &h.to_string()]);
+            cmd.args([
+                "delete",
+                "rule",
+                "inet",
+                "filter",
+                "input",
+                "handle",
+                &h.to_string(),
+            ]);
             // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe { cmd.pre_exec(raise_net_admin_ambient) };
             log_cleanup("nft delete rule input", cmd.output());
         }
         if let Some(h) = nft_find_iface_rule_handle("output", "oifname", &self.veth_outer) {
             let mut cmd = Command::new("nft");
-            cmd.args(["delete", "rule", "inet", "filter", "output", "handle", &h.to_string()]);
+            cmd.args([
+                "delete",
+                "rule",
+                "inet",
+                "filter",
+                "output",
+                "handle",
+                &h.to_string(),
+            ]);
             // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe { cmd.pre_exec(raise_net_admin_ambient) };
             log_cleanup("nft delete rule output", cmd.output());
@@ -147,7 +162,16 @@ impl Drop for NetnsHandle {
         // the veth subnet.
         {
             let mut cmd = Command::new("ip");
-            cmd.args(["rule", "del", "to", &self.outer_cidr, "table", "main", "priority", "100"]);
+            cmd.args([
+                "rule",
+                "del",
+                "to",
+                &self.outer_cidr,
+                "table",
+                "main",
+                "priority",
+                "100",
+            ]);
             // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe { cmd.pre_exec(raise_net_admin_ambient) };
             log_cleanup("ip rule del", cmd.output());
@@ -208,14 +232,25 @@ pub fn raise_net_admin_ambient() -> std::io::Result<()> {
     // this runs in a single-threaded fork child before exec.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
-        let mut hdr = CapHeader { version: LINUX_CAPABILITY_VERSION_3, pid: 0 };
-        let mut data = [CapData { effective: 0, permitted: 0, inheritable: 0 }; 2];
+        let mut hdr = CapHeader {
+            version: LINUX_CAPABILITY_VERSION_3,
+            pid: 0,
+        };
+        let mut data = [CapData {
+            effective: 0,
+            permitted: 0,
+            inheritable: 0,
+        }; 2];
 
         if libc::syscall(libc::SYS_capget, &raw mut hdr, data.as_mut_ptr()) != 0 {
             let errno = std::io::Error::last_os_error();
             // Write to stderr since logging from pre_exec doesn't work
             let msg = format!("capget failed: {errno}\n");
-            libc::write(libc::STDERR_FILENO, msg.as_ptr().cast::<libc::c_void>(), msg.len());
+            libc::write(
+                libc::STDERR_FILENO,
+                msg.as_ptr().cast::<libc::c_void>(),
+                msg.len(),
+            );
             return Err(errno);
         }
 
@@ -227,7 +262,11 @@ pub fn raise_net_admin_ambient() -> std::io::Result<()> {
             let msg = format!(
                 "CAP_NET_ADMIN not in effective set (effective=0x{effective:x}, permitted=0x{permitted:x})\n"
             );
-            libc::write(libc::STDERR_FILENO, msg.as_ptr().cast::<libc::c_void>(), msg.len());
+            libc::write(
+                libc::STDERR_FILENO,
+                msg.as_ptr().cast::<libc::c_void>(),
+                msg.len(),
+            );
         }
 
         // Add CAP_NET_ADMIN to the inheritable set — required before raising as ambient.
@@ -238,15 +277,30 @@ pub fn raise_net_admin_ambient() -> std::io::Result<()> {
         if libc::syscall(libc::SYS_capset, &raw mut hdr, data.as_ptr()) != 0 {
             let errno = std::io::Error::last_os_error();
             let msg = format!("capset failed: {errno}\n");
-            libc::write(libc::STDERR_FILENO, msg.as_ptr().cast::<libc::c_void>(), msg.len());
+            libc::write(
+                libc::STDERR_FILENO,
+                msg.as_ptr().cast::<libc::c_void>(),
+                msg.len(),
+            );
             return Err(errno);
         }
 
         // Raise CAP_NET_ADMIN as ambient so the exec'd binary inherits it.
-        if libc::prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, libc::c_ulong::from(CAP_NET_ADMIN), 0, 0) != 0 {
+        if libc::prctl(
+            PR_CAP_AMBIENT,
+            PR_CAP_AMBIENT_RAISE,
+            libc::c_ulong::from(CAP_NET_ADMIN),
+            0,
+            0,
+        ) != 0
+        {
             let errno = std::io::Error::last_os_error();
             let msg = format!("prctl(CAP_AMBIENT_RAISE) failed: {errno}\n");
-            libc::write(libc::STDERR_FILENO, msg.as_ptr().cast::<libc::c_void>(), msg.len());
+            libc::write(
+                libc::STDERR_FILENO,
+                msg.as_ptr().cast::<libc::c_void>(),
+                msg.len(),
+            );
             return Err(errno);
         }
     }
@@ -290,7 +344,8 @@ pub fn check_netns_privileges() -> Result<(), SandboxError> {
         "ProxyOnly mode on Linux requires CAP_NET_ADMIN to create the veth pair \
          between the sandbox and the proxy. \
          Run: sudo setcap cap_net_admin=eip $(which pent)\n\
-         Or use --network localhost/blocked which do not require elevated privileges.".to_string()
+         Or use --network localhost/blocked which do not require elevated privileges."
+            .to_string(),
     ))
 }
 
@@ -333,9 +388,9 @@ pub fn create_netns(config: &NetnsConfig, dns_port: u16) -> Result<NetnsHandle, 
         // raise_net_admin_ambient uses only async-signal-safe syscalls.
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { cmd.pre_exec(raise_net_admin_ambient) };
-        let output = cmd.output().map_err(|e| {
-            SandboxError::NetworkSetupFailed(format!("failed to run ip: {e}"))
-        })?;
+        let output = cmd
+            .output()
+            .map_err(|e| SandboxError::NetworkSetupFailed(format!("failed to run ip: {e}")))?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(SandboxError::NetworkSetupFailed(format!(
@@ -354,9 +409,9 @@ pub fn create_netns(config: &NetnsConfig, dns_port: u16) -> Result<NetnsHandle, 
         // raise_net_admin_ambient uses only async-signal-safe syscalls.
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { cmd.pre_exec(raise_net_admin_ambient) };
-        let output = cmd.output().map_err(|e| {
-            SandboxError::NetworkSetupFailed(format!("failed to run nft: {e}"))
-        })?;
+        let output = cmd
+            .output()
+            .map_err(|e| SandboxError::NetworkSetupFailed(format!("failed to run nft: {e}")))?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(SandboxError::NetworkSetupFailed(format!(
@@ -370,7 +425,16 @@ pub fn create_netns(config: &NetnsConfig, dns_port: u16) -> Result<NetnsHandle, 
 
     // Create veth pair. Both ends start in the host namespace; the background
     // thread moves veth_inner to the child after it unshares.
-    run_ip(&["link", "add", &veth_inner, "type", "veth", "peer", "name", &veth_outer])?;
+    run_ip(&[
+        "link",
+        "add",
+        &veth_inner,
+        "type",
+        "veth",
+        "peer",
+        "name",
+        &veth_outer,
+    ])?;
 
     // Configure outer veth; on error clean up the pair.
     if let Err(e) = (|| -> Result<(), SandboxError> {
@@ -388,7 +452,16 @@ pub fn create_netns(config: &NetnsConfig, dns_port: u16) -> Result<NetnsHandle, 
     // interface, causing the proxy ↔ child TCP connections to fail.
     {
         let mut cmd = Command::new("ip");
-        cmd.args(["rule", "add", "to", &outer_cidr, "table", "main", "priority", "100"]);
+        cmd.args([
+            "rule",
+            "add",
+            "to",
+            &outer_cidr,
+            "table",
+            "main",
+            "priority",
+            "100",
+        ]);
         // SAFETY: raise_net_admin_ambient uses only async-signal-safe syscalls.
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { cmd.pre_exec(raise_net_admin_ambient) };
@@ -410,8 +483,14 @@ pub fn create_netns(config: &NetnsConfig, dns_port: u16) -> Result<NetnsHandle, 
     // NOTE: All firewall commands need CAP_NET_ADMIN; we raise it as ambient.
     {
         let mut cmd = Command::new("nft");
-        cmd.args(["insert", "rule", "inet", "filter", "input",
-            &format!("iifname \"{veth_outer}\" accept")]);
+        cmd.args([
+            "insert",
+            "rule",
+            "inet",
+            "filter",
+            "input",
+            &format!("iifname \"{veth_outer}\" accept"),
+        ]);
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { cmd.pre_exec(raise_net_admin_ambient) };
         match cmd.output() {
@@ -425,8 +504,14 @@ pub fn create_netns(config: &NetnsConfig, dns_port: u16) -> Result<NetnsHandle, 
     }
     {
         let mut cmd = Command::new("nft");
-        cmd.args(["insert", "rule", "inet", "filter", "output",
-            &format!("oifname \"{veth_outer}\" accept")]);
+        cmd.args([
+            "insert",
+            "rule",
+            "inet",
+            "filter",
+            "output",
+            &format!("oifname \"{veth_outer}\" accept"),
+        ]);
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { cmd.pre_exec(raise_net_admin_ambient) };
         match cmd.output() {
@@ -471,7 +556,11 @@ pub fn create_netns(config: &NetnsConfig, dns_port: u16) -> Result<NetnsHandle, 
         let result = (|| -> Result<(), SandboxError> {
             run_nft(&["add", "table", "ip", &table])?;
             run_nft(&[
-                "add", "chain", "ip", &table, "prerouting",
+                "add",
+                "chain",
+                "ip",
+                &table,
+                "prerouting",
                 "{ type nat hook prerouting priority -100 ; }",
             ])?;
             for proto in &["udp", "tcp"] {
@@ -590,8 +679,7 @@ pub fn run_ip_local(args: &[&str]) -> Result<(), SandboxError> {
                 };
                 c_args.push(cs);
             }
-            let mut ptrs: Vec<*const libc::c_char> =
-                c_args.iter().map(|a| a.as_ptr()).collect();
+            let mut ptrs: Vec<*const libc::c_char> = c_args.iter().map(|a| a.as_ptr()).collect();
             ptrs.push(std::ptr::null());
 
             // SAFETY: execvp with valid null-terminated argv array.
@@ -627,7 +715,6 @@ pub fn run_ip_local(args: &[&str]) -> Result<(), SandboxError> {
         }
     }
 }
-
 
 /// Set up resolv.conf inside the child's own network namespace.
 ///
@@ -780,10 +867,7 @@ fn setup_child_resolv_conf(content: &str) {
 ///
 /// # Errors
 /// Returns `NetworkSetupFailed` if the `ip link set netns` call fails.
-pub fn move_inner_veth_to_pid(
-    inner_veth: &str,
-    pid: libc::pid_t,
-) -> Result<(), SandboxError> {
+pub fn move_inner_veth_to_pid(inner_veth: &str, pid: libc::pid_t) -> Result<(), SandboxError> {
     use std::process::Command;
 
     let pid_str = pid.to_string();
@@ -792,9 +876,9 @@ pub fn move_inner_veth_to_pid(
     // SAFETY: pre_exec runs in a single-threaded fork child before exec.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe { cmd.pre_exec(raise_net_admin_ambient) };
-    let output = cmd.output().map_err(|e| {
-        SandboxError::NetworkSetupFailed(format!("failed to run ip: {e}"))
-    })?;
+    let output = cmd
+        .output()
+        .map_err(|e| SandboxError::NetworkSetupFailed(format!("failed to run ip: {e}")))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(SandboxError::NetworkSetupFailed(format!(
@@ -934,5 +1018,4 @@ mod tests {
         );
         Ok(())
     }
-
 }

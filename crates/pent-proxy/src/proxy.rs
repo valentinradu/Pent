@@ -53,8 +53,7 @@ pub struct TcpProxyConfig {
 impl Default for TcpProxyConfig {
     fn default() -> Self {
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-        const DEFAULT_BIND: SocketAddr =
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9300);
+        const DEFAULT_BIND: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9300);
         Self {
             bind_addr: DEFAULT_BIND,
             connect_timeout: std::time::Duration::from_secs(30),
@@ -354,9 +353,8 @@ impl TcpProxy {
                 domain: domain_lower,
             });
         }
-        self.state.report_access(format!(
-            "network: connection to \"{domain_lower}\" allowed"
-        ));
+        self.state
+            .report_access(format!("network: connection to \"{domain_lower}\" allowed"));
 
         // Resolve the host.
         let addr_str = format!("{host}:{port}");
@@ -446,9 +444,8 @@ impl TcpProxy {
                 domain: domain_lower,
             });
         }
-        self.state.report_access(format!(
-            "network: connection to \"{domain_lower}\" allowed"
-        ));
+        self.state
+            .report_access(format!("network: connection to \"{domain_lower}\" allowed"));
 
         // Resolve via system resolver (domain is allowed).
         let addr_str = format!("{domain}:{port}");

@@ -79,10 +79,14 @@ impl ConfigLoader {
     fn load_file(path: &Path) -> Result<Option<PentConfig>, SettingsError> {
         match std::fs::read_to_string(path) {
             Ok(contents) => PentConfig::parse(&contents).map(Some),
-            Err(e) if matches!(
-                e.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
-            ) => Ok(None),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                Ok(None)
+            }
             // EPERM (raw os error 1) is not always mapped to PermissionDenied by
             // std on macOS; handle it explicitly so sandboxed environments work.
             Err(ref e) if e.raw_os_error() == Some(1) => Ok(None),
@@ -90,7 +94,6 @@ impl ConfigLoader {
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -122,7 +125,10 @@ mod tests {
 
         let config = ConfigLoader::load(dir.path())?;
         assert!(
-            config.proxy.domain_allowlist.contains(&"example.com".to_string()),
+            config
+                .proxy
+                .domain_allowlist
+                .contains(&"example.com".to_string()),
             "project domain_allowlist should be present"
         );
         Ok(())

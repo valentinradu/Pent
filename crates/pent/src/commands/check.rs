@@ -1,4 +1,3 @@
-
 use std::path::PathBuf;
 
 use pent_proxy::{ProxyConfig, ProxyServer};
@@ -58,7 +57,11 @@ pub(crate) async fn check(cwd: PathBuf) -> Result<(), CliError> {
     } else {
         ui::status("global", "n/a (home directory not available)");
     }
-    let found = if project_path.exists() { "found" } else { "not found" };
+    let found = if project_path.exists() {
+        "found"
+    } else {
+        "not found"
+    };
     ui::status("project", format!("{} ({})", project_path.display(), found));
 
     match ConfigLoader::load(&cwd) {

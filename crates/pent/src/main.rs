@@ -24,7 +24,6 @@ async fn main() {
     }
 }
 
-
 async fn dispatch(cli: Cli) -> Result<(), CliError> {
     let cwd = std::env::current_dir()?;
     match cli.command {
@@ -37,7 +36,11 @@ async fn dispatch(cli: Cli) -> Result<(), CliError> {
 fn setup_tracing(verbose: u8, run_mode: bool) {
     // In run mode the sandboxed process owns the terminal; suppress pent's own
     // log output unless the user explicitly requested verbosity or PENT_LOG.
-    let default_level = if run_mode && verbose == 0 { "warn" } else { "info" };
+    let default_level = if run_mode && verbose == 0 {
+        "warn"
+    } else {
+        "info"
+    };
     let level = match verbose {
         0 => default_level,
         1 => "debug",

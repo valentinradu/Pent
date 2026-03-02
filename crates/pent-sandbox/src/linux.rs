@@ -77,7 +77,11 @@ pub fn compute_accessible_set(
     use std::collections::HashSet;
     let (_, read_expanded, execute_expanded, rw_expanded) = config.paths.expand_paths();
     let mut accessible: HashSet<PathBuf> = HashSet::new();
-    for (p, _) in read_expanded.iter().chain(&execute_expanded).chain(&rw_expanded) {
+    for (p, _) in read_expanded
+        .iter()
+        .chain(&execute_expanded)
+        .chain(&rw_expanded)
+    {
         accessible.insert(p.clone());
     }
     accessible.insert(config.workspace.clone());
@@ -194,7 +198,10 @@ pub fn build_landlock_ruleset(
             ruleset
                 .add_rule(PathBeneath::new(fd, access))
                 .map_err(|e| {
-                    SandboxError::InvalidConfig(format!("Failed to add rule for {}: {e}", path.display()))
+                    SandboxError::InvalidConfig(format!(
+                        "Failed to add rule for {}: {e}",
+                        path.display()
+                    ))
                 })?;
             Ok(())
         };
@@ -407,8 +414,7 @@ fn apply_network_isolation(network: &NetworkMode) -> std::io::Result<()> {
             // CLONE_NEWUSER | CLONE_NEWNET: create both namespaces atomically.
             // Does not require root when unprivileged user namespaces are enabled.
             // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-            let ret =
-                unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) };
+            let ret = unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) };
             if ret != 0 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -426,8 +432,7 @@ fn apply_network_isolation(network: &NetworkMode) -> std::io::Result<()> {
             // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             let gid = unsafe { libc::getgid() };
             // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-            let ret =
-                unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) };
+            let ret = unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) };
             if ret != 0 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -472,7 +477,14 @@ pub fn spawn_with_landlock(
     args: &[String],
     env: &std::collections::HashMap<String, String>,
     path_dirs: &[PathBuf],
-) -> Result<(std::process::Child, Option<super::linux_overlayfs::OverlayHandle>, Option<super::linux_netns::NetnsHandle>), SandboxError> {
+) -> Result<
+    (
+        std::process::Child,
+        Option<super::linux_overlayfs::OverlayHandle>,
+        Option<super::linux_netns::NetnsHandle>,
+    ),
+    SandboxError,
+> {
     use landlock::{
         Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr, ABI,
     };
@@ -499,8 +511,7 @@ pub fn spawn_with_landlock(
             // Include paths that are files, or don't exist yet but whose parent
             // directory exists (will be created as a file on first write).
             if path.is_file()
-                || (!path.exists()
-                    && path.parent().is_some_and(std::path::Path::is_dir))
+                || (!path.exists() && path.parent().is_some_and(std::path::Path::is_dir))
             {
                 Some(path.clone())
             } else {
@@ -547,7 +558,11 @@ pub fn spawn_with_landlock(
     // Build the set of paths the sandboxed process is allowed to read.
     // Traversal-only paths are intentionally excluded (ReadDir but not ReadFile).
     let mut accessible: HashSet<PathBuf> = HashSet::new();
-    for (p, _) in read_expanded.iter().chain(&execute_expanded).chain(&rw_expanded) {
+    for (p, _) in read_expanded
+        .iter()
+        .chain(&execute_expanded)
+        .chain(&rw_expanded)
+    {
         accessible.insert(p.clone());
     }
     accessible.extend(write_set.iter().cloned());
@@ -606,10 +621,12 @@ pub fn spawn_with_landlock(
 
     // Proxy data for the pre_exec closure and background thread.
     let is_proxy = proxy_netns.is_some();
-    let proxy_inner_veth: String =
-        proxy_netns.as_ref().map_or(String::new(), |h| h.inner_veth.clone());
-    let proxy_inner_cidr: String =
-        proxy_netns.as_ref().map_or(String::new(), |h| h.inner_cidr.clone());
+    let proxy_inner_veth: String = proxy_netns
+        .as_ref()
+        .map_or(String::new(), |h| h.inner_veth.clone());
+    let proxy_inner_cidr: String = proxy_netns
+        .as_ref()
+        .map_or(String::new(), |h| h.inner_cidr.clone());
     let proxy_gateway: String = proxy_netns
         .as_ref()
         .map_or(String::new(), |h| h.outer_ip.to_string());
@@ -730,13 +747,27 @@ pub fn spawn_with_landlock(
             }
             {
                 #[repr(C)]
-                struct CapHeader { version: u32, pid: i32 }
+                struct CapHeader {
+                    version: u32,
+                    pid: i32,
+                }
                 #[repr(C)]
                 #[derive(Copy, Clone)]
-                struct CapData { effective: u32, permitted: u32, inheritable: u32 }
+                struct CapData {
+                    effective: u32,
+                    permitted: u32,
+                    inheritable: u32,
+                }
                 const CAP_V3: u32 = 0x2008_0522;
-                let mut hdr = CapHeader { version: CAP_V3, pid: 0 };
-                let mut data = [CapData { effective: 0, permitted: 0, inheritable: 0 }; 2];
+                let mut hdr = CapHeader {
+                    version: CAP_V3,
+                    pid: 0,
+                };
+                let mut data = [CapData {
+                    effective: 0,
+                    permitted: 0,
+                    inheritable: 0,
+                }; 2];
                 // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                 libc::syscall(libc::SYS_capget, &raw mut hdr, data.as_mut_ptr());
                 data[0].inheritable = 0;
@@ -782,10 +813,7 @@ pub fn spawn_with_landlock(
                 // the same security context as the overlay mount.  Doing this
                 // in the parent process (before fork) causes EACCES on the
                 // overlay mount on kernel 6.18 with btrfs lower.
-                super::linux_overlayfs::setup_overlay_dirs(
-                    &overlay_mounts_pre,
-                    &accessible_pre,
-                )?;
+                super::linux_overlayfs::setup_overlay_dirs(&overlay_mounts_pre, &accessible_pre)?;
 
                 // Mount overlayfs inside the new mount namespace.
                 // SAFETY: we are in a single-threaded post-fork child that has
@@ -810,9 +838,8 @@ pub fn spawn_with_landlock(
                 // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                 let gid = libc::getgid();
                 // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-                let ret = libc::unshare(
-                    libc::CLONE_NEWUSER | libc::CLONE_NEWNET | libc::CLONE_NEWNS,
-                );
+                let ret =
+                    libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET | libc::CLONE_NEWNS);
                 if ret != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
@@ -853,17 +880,23 @@ pub fn spawn_with_landlock(
                 // Configure the inner veth inside our new network namespace.
                 // ip is still accessible here — Landlock hasn't been applied yet.
                 super::linux_netns::run_ip_local(&[
-                    "addr", "add", &proxy_inner_cidr, "dev", &proxy_inner_veth,
+                    "addr",
+                    "add",
+                    &proxy_inner_cidr,
+                    "dev",
+                    &proxy_inner_veth,
                 ])
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
-                super::linux_netns::run_ip_local(&[
-                    "link", "set", &proxy_inner_veth, "up",
-                ])
-                .map_err(|e| std::io::Error::other(e.to_string()))?;
+                super::linux_netns::run_ip_local(&["link", "set", &proxy_inner_veth, "up"])
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
                 super::linux_netns::run_ip_local(&["link", "set", "lo", "up"])
                     .map_err(|e| std::io::Error::other(e.to_string()))?;
                 super::linux_netns::run_ip_local(&[
-                    "route", "add", "default", "via", &proxy_gateway,
+                    "route",
+                    "add",
+                    "default",
+                    "via",
+                    &proxy_gateway,
                 ])
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
 
@@ -882,111 +915,111 @@ pub fn spawn_with_landlock(
             // ── Phase 2: Landlock ─────────────────────────────────────────────
             // Skip entire Landlock setup when no_enforcement is active.
             if !no_enforcement {
-            let all_access = AccessFs::from_all(ABI::V4);
-            let read_access = AccessFs::ReadFile | AccessFs::ReadDir;
-            // Execute: runnable but not readable (binary directories, installed tools).
-            // ReadFile is intentionally omitted — execute paths should not be readable
-            // by the sandboxed process; Landlock enforces this at the syscall level.
-            let execute_access = AccessFs::ReadDir | AccessFs::Execute;
-            // System library paths need ReadFile in addition to Execute so that the
-            // dynamic linker can open() shared libraries. This is separate from
-            // execute_access (user-configured execute paths) which is intentionally
-            // execute-only without ReadFile.
-            let syslib_access = AccessFs::ReadFile | AccessFs::ReadDir | AccessFs::Execute;
-            let write_access = all_access;
+                let all_access = AccessFs::from_all(ABI::V4);
+                let read_access = AccessFs::ReadFile | AccessFs::ReadDir;
+                // Execute: runnable but not readable (binary directories, installed tools).
+                // ReadFile is intentionally omitted — execute paths should not be readable
+                // by the sandboxed process; Landlock enforces this at the syscall level.
+                let execute_access = AccessFs::ReadDir | AccessFs::Execute;
+                // System library paths need ReadFile in addition to Execute so that the
+                // dynamic linker can open() shared libraries. This is separate from
+                // execute_access (user-configured execute paths) which is intentionally
+                // execute-only without ReadFile.
+                let syslib_access = AccessFs::ReadFile | AccessFs::ReadDir | AccessFs::Execute;
+                let write_access = all_access;
 
-            let mut ruleset = Ruleset::default()
-                .handle_access(all_access)
-                .map_err(|e| std::io::Error::other(e.to_string()))?
-                .create()
-                .map_err(|e| std::io::Error::other(e.to_string()))?;
-
-            // Helper: pass ruleset by &mut so it isn't moved into the closure.
-            let add_path = |ruleset: &mut landlock::RulesetCreated,
-                            path: &Path,
-                            access|
-             -> std::io::Result<()> {
-                if !path.exists() {
-                    return Ok(());
-                }
-                let fd = PathFd::new(path).map_err(|e| std::io::Error::other(e.to_string()))?;
-                ruleset
-                    .add_rule(PathBeneath::new(fd, access))
+                let mut ruleset = Ruleset::default()
+                    .handle_access(all_access)
+                    .map_err(|e| std::io::Error::other(e.to_string()))?
+                    .create()
                     .map_err(|e| std::io::Error::other(e.to_string()))?;
-                Ok(())
-            };
 
-            // Add workspace and data_dir
-            add_path(&mut ruleset, &workspace, write_access)?;
-            add_path(&mut ruleset, &data_dir, write_access)?;
+                // Helper: pass ruleset by &mut so it isn't moved into the closure.
+                let add_path = |ruleset: &mut landlock::RulesetCreated,
+                                path: &Path,
+                                access|
+                 -> std::io::Result<()> {
+                    if !path.exists() {
+                        return Ok(());
+                    }
+                    let fd = PathFd::new(path).map_err(|e| std::io::Error::other(e.to_string()))?;
+                    ruleset
+                        .add_rule(PathBeneath::new(fd, access))
+                        .map_err(|e| std::io::Error::other(e.to_string()))?;
+                    Ok(())
+                };
 
-            // Add mounts
-            for mount in &mounts {
-                if mount.readonly {
-                    add_path(&mut ruleset, &mount.path, read_access)?;
-                } else {
-                    add_path(&mut ruleset, &mount.path, write_access)?;
+                // Add workspace and data_dir
+                add_path(&mut ruleset, &workspace, write_access)?;
+                add_path(&mut ruleset, &data_dir, write_access)?;
+
+                // Add mounts
+                for mount in &mounts {
+                    if mount.readonly {
+                        add_path(&mut ruleset, &mount.path, read_access)?;
+                    } else {
+                        add_path(&mut ruleset, &mount.path, write_access)?;
+                    }
                 }
-            }
 
-            // Add configured SandboxPaths (from profiles and TOML config).
-            let traversal_access = AccessFs::ReadDir;
-            let (traversal_paths, read_paths, execute_paths, rw_paths) = paths.expand_paths();
-            for (path, _) in &traversal_paths {
-                add_path(&mut ruleset, path, traversal_access.into())?;
-            }
-            for (path, _) in &read_paths {
-                add_path(&mut ruleset, path, read_access)?;
-            }
-            for (path, _) in &execute_paths {
-                add_path(&mut ruleset, path, execute_access)?;
-            }
-            // For rw_paths:
-            // - Paths covered by overlayfs (files in write_set_pre): skip; access
-            //   is granted at the parent directory level via the overlay_dirs rule.
-            // - Paths not covered (directories, non-overlay files): add directly.
-            for (path, _) in &rw_paths {
-                if write_set_pre.contains(path) {
-                    continue; // covered by overlay parent-dir rule below
+                // Add configured SandboxPaths (from profiles and TOML config).
+                let traversal_access = AccessFs::ReadDir;
+                let (traversal_paths, read_paths, execute_paths, rw_paths) = paths.expand_paths();
+                for (path, _) in &traversal_paths {
+                    add_path(&mut ruleset, path, traversal_access.into())?;
                 }
-                add_path(&mut ruleset, path, write_access)?;
-            }
-            // Overlay parent directories — grant full write access so the child
-            // can read/write through the overlayfs mount point. Inside the
-            // namespace, writes go to upper (tmpfs); the real filesystem only
-            // sees changes when the parent's watcher flushes write_set files.
-            // The overlay's opaque/whiteout stubs protect non-manifest content;
-            // if the mount failed, pre_exec already returned an error above.
-            for dir in &overlay_dirs_pre {
-                add_path(&mut ruleset, dir, write_access)?;
-            }
+                for (path, _) in &read_paths {
+                    add_path(&mut ruleset, path, read_access)?;
+                }
+                for (path, _) in &execute_paths {
+                    add_path(&mut ruleset, path, execute_access)?;
+                }
+                // For rw_paths:
+                // - Paths covered by overlayfs (files in write_set_pre): skip; access
+                //   is granted at the parent directory level via the overlay_dirs rule.
+                // - Paths not covered (directories, non-overlay files): add directly.
+                for (path, _) in &rw_paths {
+                    if write_set_pre.contains(path) {
+                        continue; // covered by overlay parent-dir rule below
+                    }
+                    add_path(&mut ruleset, path, write_access)?;
+                }
+                // Overlay parent directories — grant full write access so the child
+                // can read/write through the overlayfs mount point. Inside the
+                // namespace, writes go to upper (tmpfs); the real filesystem only
+                // sees changes when the parent's watcher flushes write_set files.
+                // The overlay's opaque/whiteout stubs protect non-manifest content;
+                // if the mount failed, pre_exec already returned an error above.
+                for dir in &overlay_dirs_pre {
+                    add_path(&mut ruleset, dir, write_access)?;
+                }
 
-            // Add PATH directories (binary dirs — need ReadFile for the dynamic
-            // linker to load shared libraries when executing binaries in $PATH)
-            for path_dir in &path_dirs {
-                add_path(&mut ruleset, path_dir, syslib_access)?;
-            }
+                // Add PATH directories (binary dirs — need ReadFile for the dynamic
+                // linker to load shared libraries when executing binaries in $PATH)
+                for path_dir in &path_dirs {
+                    add_path(&mut ruleset, path_dir, syslib_access)?;
+                }
 
-            // Add system paths (dynamic linker in /usr/lib, /lib64 needs ReadFile
-            // to open() shared libraries; use syslib_access not execute_access)
-            for sys_path in SYSTEM_PATHS {
-                add_path(&mut ruleset, Path::new(sys_path), syslib_access)?;
-            }
+                // Add system paths (dynamic linker in /usr/lib, /lib64 needs ReadFile
+                // to open() shared libraries; use syslib_access not execute_access)
+                for sys_path in SYSTEM_PATHS {
+                    add_path(&mut ruleset, Path::new(sys_path), syslib_access)?;
+                }
 
-            // Add temp paths
-            for tmp_path in TEMP_PATHS {
-                add_path(&mut ruleset, Path::new(tmp_path), write_access)?;
-            }
+                // Add temp paths
+                for tmp_path in TEMP_PATHS {
+                    add_path(&mut ruleset, Path::new(tmp_path), write_access)?;
+                }
 
-            // Add device and proc paths
-            for dev_path in DEVICE_PATHS {
-                add_path(&mut ruleset, Path::new(dev_path), read_access)?;
-            }
+                // Add device and proc paths
+                for dev_path in DEVICE_PATHS {
+                    add_path(&mut ruleset, Path::new(dev_path), read_access)?;
+                }
 
-            // Apply the ruleset.
-            ruleset
-                .restrict_self()
-                .map_err(|e| std::io::Error::other(e.to_string()))?;
+                // Apply the ruleset.
+                ruleset
+                    .restrict_self()
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
             } // end if !no_enforcement (Phase 2)
 
             // ── Phase 3: Network isolation ────────────────────────────────────
@@ -1083,7 +1116,11 @@ pub fn spawn_with_landlock(
     let overlay_handle = if overlay_mounts.is_empty() {
         None
     } else {
-        Some(super::linux_overlayfs::spawn_watcher(overlay_mounts, write_set, rw_dirs))
+        Some(super::linux_overlayfs::spawn_watcher(
+            overlay_mounts,
+            write_set,
+            rw_dirs,
+        ))
     };
 
     Ok((child, overlay_handle, proxy_netns))
@@ -1103,8 +1140,8 @@ pub fn spawn_with_landlock(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serial_test::serial;
     use crate::SandboxPaths;
+    use serial_test::serial;
     use tempfile::TempDir;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -1285,7 +1322,9 @@ mod tests {
         if check_available().is_ok() {
             match result {
                 Ok((mut child, _overlay, _netns)) => {
-                    let status = child.wait().map_err(|e| format!("Failed to wait on child: {e}"))?;
+                    let status = child
+                        .wait()
+                        .map_err(|e| format!("Failed to wait on child: {e}"))?;
                     assert!(status.success(), "true command should succeed");
                 }
                 Err(SandboxError::SpawnFailed(err))
@@ -1327,7 +1366,9 @@ mod tests {
         if check_available().is_ok() {
             match result {
                 Ok((mut child, _overlay, _netns)) => {
-                    let status = child.wait().map_err(|e| format!("Failed to wait on child: {e}"))?;
+                    let status = child
+                        .wait()
+                        .map_err(|e| format!("Failed to wait on child: {e}"))?;
                     assert!(status.success());
                 }
                 Err(SandboxError::SpawnFailed(err))
@@ -1415,7 +1456,9 @@ mod tests {
             flag_b = flag_b.display(),
         );
 
-        let Some((mut child, overlay_handle)) = spawn_rw(temp.path(), &[rw_dir.to_str().unwrap_or("")], &cmd) else {
+        let Some((mut child, overlay_handle)) =
+            spawn_rw(temp.path(), &[rw_dir.to_str().unwrap_or("")], &cmd)
+        else {
             return Ok(()); // overlayfs unavailable
         };
         let Some(handle) = overlay_handle else {
@@ -1426,7 +1469,10 @@ mod tests {
         // Wait for the sandbox to write phase_a (flag_a appears).
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !flag_a.exists() {
-            assert!(std::time::Instant::now() < deadline, "timed out waiting for flag_a");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for flag_a"
+            );
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
 
@@ -1447,7 +1493,10 @@ mod tests {
         // Wait for phase_b.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !flag_b.exists() {
-            assert!(std::time::Instant::now() < deadline, "timed out waiting for flag_b");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for flag_b"
+            );
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
@@ -1497,7 +1546,10 @@ mod tests {
         workspace: &std::path::Path,
         rw_paths: &[&str],
         cmd: &str,
-    ) -> Option<(std::process::Child, Option<crate::linux_overlayfs::OverlayHandle>)> {
+    ) -> Option<(
+        std::process::Child,
+        Option<crate::linux_overlayfs::OverlayHandle>,
+    )> {
         use std::collections::HashMap;
 
         if check_available().is_err() {
@@ -1514,7 +1566,9 @@ mod tests {
         let sentinel = workspace.join(".pent_sentinel");
         std::fs::write(&sentinel, "sentinel").ok();
         #[allow(clippy::unwrap_used)] // path always valid UTF-8 in tests
-        paths.read_write.push(sentinel.to_str().unwrap().to_string());
+        paths
+            .read_write
+            .push(sentinel.to_str().unwrap().to_string());
 
         let config = SandboxConfig::new(workspace.to_path_buf(), paths, workspace.to_path_buf())
             .with_data_dir(workspace.to_path_buf())
@@ -1522,9 +1576,19 @@ mod tests {
 
         let path_dirs = vec![PathBuf::from("/bin"), PathBuf::from("/usr/bin")];
 
-        match spawn_with_landlock(&config, "/bin/sh", &["-c".to_string(), cmd.to_string()], &HashMap::new(), &path_dirs) {
+        match spawn_with_landlock(
+            &config,
+            "/bin/sh",
+            &["-c".to_string(), cmd.to_string()],
+            &HashMap::new(),
+            &path_dirs,
+        ) {
             Ok((child, handle, _netns)) => Some((child, handle)),
-            Err(SandboxError::SpawnFailed(e)) if e.kind() == std::io::ErrorKind::PermissionDenied => None,
+            Err(SandboxError::SpawnFailed(e))
+                if e.kind() == std::io::ErrorKind::PermissionDenied =>
+            {
+                None
+            }
             #[allow(clippy::panic)] // unexpected spawn error — fail loudly in test helper
             Err(e) => panic!("spawn_with_landlock failed: {e:?}"),
         }
@@ -1583,7 +1647,9 @@ mod tests {
         std::fs::write(&dot_file, "{}").map_err(|e| format!("write dot_file: {e}"))?;
 
         let mut paths = SandboxPaths::default();
-        paths.read_write.push(dot_file.to_str().unwrap_or("").to_string());
+        paths
+            .read_write
+            .push(dot_file.to_str().unwrap_or("").to_string());
         // workspace is intentionally NOT in read_write — it's the workspace arg.
 
         let config = SandboxConfig::new(workspace.clone(), paths, workspace.clone())
@@ -1591,15 +1657,26 @@ mod tests {
             .with_env(HashMap::new());
 
         let path_dirs = vec![PathBuf::from("/bin"), PathBuf::from("/usr/bin")];
-        let cmd = format!("printf 'fn main() {{ println!(\"hi\"); }}' > '{}'", target.display());
+        let cmd = format!(
+            "printf 'fn main() {{ println!(\"hi\"); }}' > '{}'",
+            target.display()
+        );
 
         let result = spawn_with_landlock(
-            &config, "/bin/sh", &["-c".to_string(), cmd], &HashMap::new(), &path_dirs,
+            &config,
+            "/bin/sh",
+            &["-c".to_string(), cmd],
+            &HashMap::new(),
+            &path_dirs,
         );
 
         let (mut child, overlay_handle, _netns) = match result {
             Ok(r) => r,
-            Err(SandboxError::SpawnFailed(e)) if e.kind() == std::io::ErrorKind::PermissionDenied => return Ok(()),
+            Err(SandboxError::SpawnFailed(e))
+                if e.kind() == std::io::ErrorKind::PermissionDenied =>
+            {
+                return Ok(())
+            }
             Err(e) => return Err(format!("spawn_with_landlock failed: {e:?}").into()),
         };
 
@@ -1636,10 +1713,15 @@ mod tests {
             &[target.to_str().unwrap_or("")],
             &format!("printf '{{\"v\":2}}' > '{}'", target.display()),
         );
-        if !active { return Ok(()); }
+        if !active {
+            return Ok(());
+        }
 
         let content = std::fs::read_to_string(&target).map_err(|e| format!("read: {e}"))?;
-        assert_eq!(content, r#"{"v":2}"#, "direct file-level write_set entry must be flushed");
+        assert_eq!(
+            content, r#"{"v":2}"#,
+            "direct file-level write_set entry must be flushed"
+        );
         Ok(())
     }
 
@@ -1657,10 +1739,12 @@ mod tests {
 
         let active = run_sandboxed_rw(
             temp.path(),
-            &[dir.to_str().unwrap_or("")],   // directory, not file
+            &[dir.to_str().unwrap_or("")], // directory, not file
             &format!("printf '{{\"v\":2}}' > '{}'", target.display()),
         );
-        if !active { return Ok(()); }
+        if !active {
+            return Ok(());
+        }
 
         let content = std::fs::read_to_string(&target).map_err(|e| format!("read: {e}"))?;
         assert_eq!(content, r#"{"v":2}"#, "file inside rw_dir must be flushed");
@@ -1682,13 +1766,24 @@ mod tests {
 
         let cmd = format!(
             "printf 'new-a' > '{}' && printf 'new-b' > '{}'",
-            a.display(), b.display()
+            a.display(),
+            b.display()
         );
         let active = run_sandboxed_rw(temp.path(), &[dir.to_str().unwrap_or("")], &cmd);
-        if !active { return Ok(()); }
+        if !active {
+            return Ok(());
+        }
 
-        assert_eq!(std::fs::read_to_string(&a).map_err(|e| format!("read a: {e}"))?, "new-a", "a.txt must be flushed");
-        assert_eq!(std::fs::read_to_string(&b).map_err(|e| format!("read b: {e}"))?, "new-b", "b.txt must be flushed");
+        assert_eq!(
+            std::fs::read_to_string(&a).map_err(|e| format!("read a: {e}"))?,
+            "new-a",
+            "a.txt must be flushed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&b).map_err(|e| format!("read b: {e}"))?,
+            "new-b",
+            "b.txt must be flushed"
+        );
         Ok(())
     }
 
@@ -1708,10 +1803,18 @@ mod tests {
             &[dir.to_str().unwrap_or("")],
             &format!("printf 'hello' > '{}'", target.display()),
         );
-        if !active { return Ok(()); }
+        if !active {
+            return Ok(());
+        }
 
-        assert!(target.exists(), "newly created file must exist on real FS after teardown");
-        assert_eq!(std::fs::read_to_string(&target).map_err(|e| format!("read: {e}"))?, "hello");
+        assert!(
+            target.exists(),
+            "newly created file must exist on real FS after teardown"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).map_err(|e| format!("read: {e}"))?,
+            "hello"
+        );
         Ok(())
     }
 
@@ -1734,11 +1837,15 @@ mod tests {
             &[rw_dir.to_str().unwrap_or("")],
             &format!("printf '{{\"v\":2}}' > '{}'", target.display()),
         );
-        if !active { return Ok(()); }
+        if !active {
+            return Ok(());
+        }
 
         let content = std::fs::read_to_string(&target).map_err(|e| format!("read: {e}"))?;
-        assert_eq!(content, r#"{"v":2}"#,
-            "deeply nested existing file must be flushed to real FS");
+        assert_eq!(
+            content, r#"{"v":2}"#,
+            "deeply nested existing file must be flushed to real FS"
+        );
         Ok(())
     }
 
@@ -1757,14 +1864,26 @@ mod tests {
 
         let cmd = format!(
             "mkdir -p '{}' && printf '{{\"ok\":true}}' > '{}'",
-            subdir.display(), target.display()
+            subdir.display(),
+            target.display()
         );
         let active = run_sandboxed_rw(temp.path(), &[rw_dir.to_str().unwrap_or("")], &cmd);
-        if !active { return Ok(()); }
+        if !active {
+            return Ok(());
+        }
 
-        assert!(subdir.exists(), "new subdirectory must exist on real FS after teardown");
-        assert!(target.exists(), "file in new subdir must be flushed to real FS");
-        assert_eq!(std::fs::read_to_string(&target).map_err(|e| format!("read: {e}"))?, r#"{"ok":true}"#);
+        assert!(
+            subdir.exists(),
+            "new subdirectory must exist on real FS after teardown"
+        );
+        assert!(
+            target.exists(),
+            "file in new subdir must be flushed to real FS"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).map_err(|e| format!("read: {e}"))?,
+            r#"{"ok":true}"#
+        );
         Ok(())
     }
 
@@ -1782,13 +1901,20 @@ mod tests {
 
         let cmd = format!(
             "printf 'version = 2' > '{}' && mv '{}' '{}'",
-            tmp.display(), tmp.display(), target.display()
+            tmp.display(),
+            tmp.display(),
+            target.display()
         );
         let active = run_sandboxed_rw(temp.path(), &[dir.to_str().unwrap_or("")], &cmd);
-        if !active { return Ok(()); }
+        if !active {
+            return Ok(());
+        }
 
-        assert_eq!(std::fs::read_to_string(&target).map_err(|e| format!("read: {e}"))?, "version = 2",
-            "atomic write (tmp→rename) in rw_dir must be flushed");
+        assert_eq!(
+            std::fs::read_to_string(&target).map_err(|e| format!("read: {e}"))?,
+            "version = 2",
+            "atomic write (tmp→rename) in rw_dir must be flushed"
+        );
         Ok(())
     }
 
@@ -1807,19 +1933,31 @@ mod tests {
 
         let cmd = format!(
             "printf 'new' > '{}' && printf 'fresh' > '{}'",
-            file_entry.display(), cache_file.display()
+            file_entry.display(),
+            cache_file.display()
         );
         let active = run_sandboxed_rw(
             temp.path(),
-            &[file_entry.to_str().unwrap_or(""), dir_entry.to_str().unwrap_or("")],
+            &[
+                file_entry.to_str().unwrap_or(""),
+                dir_entry.to_str().unwrap_or(""),
+            ],
             &cmd,
         );
-        if !active { return Ok(()); }
+        if !active {
+            return Ok(());
+        }
 
-        assert_eq!(std::fs::read_to_string(&file_entry).map_err(|e| format!("read file_entry: {e}"))?, "new",
-            "direct file entry must be flushed");
-        assert_eq!(std::fs::read_to_string(&cache_file).map_err(|e| format!("read cache_file: {e}"))?, "fresh",
-            "file inside directory entry must be flushed");
+        assert_eq!(
+            std::fs::read_to_string(&file_entry).map_err(|e| format!("read file_entry: {e}"))?,
+            "new",
+            "direct file entry must be flushed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&cache_file).map_err(|e| format!("read cache_file: {e}"))?,
+            "fresh",
+            "file inside directory entry must be flushed"
+        );
         Ok(())
     }
 
@@ -1839,10 +1977,15 @@ mod tests {
             &[dir.to_str().unwrap_or("")],
             &format!("printf 'line2\\n' >> '{}'", target.display()),
         );
-        if !active { return Ok(()); }
+        if !active {
+            return Ok(());
+        }
 
         let content = std::fs::read_to_string(&target).map_err(|e| format!("read: {e}"))?;
-        assert_eq!(content, "line1\nline2\n", "appended content must be flushed");
+        assert_eq!(
+            content, "line1\nline2\n",
+            "appended content must be flushed"
+        );
         Ok(())
     }
 
@@ -1860,14 +2003,26 @@ mod tests {
 
         let cmd = format!(
             "mkdir -p '{}' && printf '{{\"ok\":true}}' > '{}'",
-            rw_dir.display(), target.display()
+            rw_dir.display(),
+            target.display()
         );
         let active = run_sandboxed_rw(temp.path(), &[rw_dir.to_str().unwrap_or("")], &cmd);
-        if !active { return Ok(()); }
+        if !active {
+            return Ok(());
+        }
 
-        assert!(rw_dir.exists(), "directory created by sandbox must exist on real FS");
-        assert!(target.exists(), "file inside newly-created rw dir must be flushed");
-        assert_eq!(std::fs::read_to_string(&target).map_err(|e| format!("read: {e}"))?, r#"{"ok":true}"#);
+        assert!(
+            rw_dir.exists(),
+            "directory created by sandbox must exist on real FS"
+        );
+        assert!(
+            target.exists(),
+            "file inside newly-created rw dir must be flushed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).map_err(|e| format!("read: {e}"))?,
+            r#"{"ok":true}"#
+        );
         Ok(())
     }
 
@@ -1902,7 +2057,8 @@ mod tests {
         let ws_file = workspace.join("ok.txt");
         let sibling_file = sibling.join("secret.txt");
         std::fs::write(&ws_file, "original-ws").map_err(|e| format!("write ws_file: {e}"))?;
-        std::fs::write(&sibling_file, "original-sibling").map_err(|e| format!("write sibling_file: {e}"))?;
+        std::fs::write(&sibling_file, "original-sibling")
+            .map_err(|e| format!("write sibling_file: {e}"))?;
 
         // Sentinel in base/ triggers overlay on base/ (covering both workspace/
         // and sibling/).
@@ -1910,7 +2066,9 @@ mod tests {
         std::fs::write(&sentinel, "s").map_err(|e| format!("write sentinel: {e}"))?;
 
         let mut paths = SandboxPaths::default();
-        paths.read_write.push(sentinel.to_str().unwrap_or("").to_string());
+        paths
+            .read_write
+            .push(sentinel.to_str().unwrap_or("").to_string());
         // workspace is NOT in read_write but is the workspace arg — it gets
         // added to rw_dirs automatically and its files are flushed.
 
@@ -1923,15 +2081,24 @@ mod tests {
         // sibling (Landlock denies it — the write fails silently).
         let cmd = format!(
             "printf 'modified-ws' > '{}'; printf 'should-not-persist' > '{}' 2>/dev/null; true",
-            ws_file.display(), sibling_file.display()
+            ws_file.display(),
+            sibling_file.display()
         );
 
         let result = spawn_with_landlock(
-            &config, "/bin/sh", &["-c".to_string(), cmd], &HashMap::new(), &path_dirs,
+            &config,
+            "/bin/sh",
+            &["-c".to_string(), cmd],
+            &HashMap::new(),
+            &path_dirs,
         );
         let (mut child, overlay_handle, _netns) = match result {
             Ok(r) => r,
-            Err(SandboxError::SpawnFailed(e)) if e.kind() == std::io::ErrorKind::PermissionDenied => return Ok(()),
+            Err(SandboxError::SpawnFailed(e))
+                if e.kind() == std::io::ErrorKind::PermissionDenied =>
+            {
+                return Ok(())
+            }
             Err(e) => return Err(format!("spawn_with_landlock failed: {e:?}").into()),
         };
         let Some(handle) = overlay_handle else {
@@ -1942,10 +2109,17 @@ mod tests {
         assert!(status.success());
         crate::linux_overlayfs::teardown(handle);
 
-        assert_eq!(std::fs::read_to_string(&ws_file).map_err(|e| format!("read ws_file: {e}"))?, "modified-ws",
-            "workspace file must be flushed");
-        assert_eq!(std::fs::read_to_string(&sibling_file).map_err(|e| format!("read sibling_file: {e}"))?, "original-sibling",
-            "file outside workspace and rw_dirs must NOT be modified on real FS");
+        assert_eq!(
+            std::fs::read_to_string(&ws_file).map_err(|e| format!("read ws_file: {e}"))?,
+            "modified-ws",
+            "workspace file must be flushed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&sibling_file)
+                .map_err(|e| format!("read sibling_file: {e}"))?,
+            "original-sibling",
+            "file outside workspace and rw_dirs must NOT be modified on real FS"
+        );
         Ok(())
     }
 
@@ -1972,12 +2146,16 @@ mod tests {
         let temp = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
         let target = temp.path().join("target.json");
         std::fs::write(&target, r#"{"version":1}"#).map_err(|e| format!("write: {e}"))?;
-        let inode_before = std::fs::metadata(&target).map_err(|e| format!("metadata: {e}"))?.ino();
+        let inode_before = std::fs::metadata(&target)
+            .map_err(|e| format!("metadata: {e}"))?
+            .ino();
 
         // A SandboxConfig that lists target.json in read_write.
         let workspace = temp.path().to_path_buf();
         let mut paths = SandboxPaths::default();
-        paths.read_write.push(target.to_str().unwrap_or("").to_string());
+        paths
+            .read_write
+            .push(target.to_str().unwrap_or("").to_string());
 
         let config = SandboxConfig::new(workspace.clone(), paths, workspace)
             .with_data_dir(temp.path().to_path_buf())
@@ -1996,8 +2174,13 @@ mod tests {
             target.display(),
         );
 
-        let result =
-            spawn_with_landlock(&config, "/bin/sh", &["-c".to_string(), cmd], &HashMap::new(), &path_dirs);
+        let result = spawn_with_landlock(
+            &config,
+            "/bin/sh",
+            &["-c".to_string(), cmd],
+            &HashMap::new(),
+            &path_dirs,
+        );
 
         let (mut child, overlay_handle, _netns) = match result {
             Err(SandboxError::SpawnFailed(e))
@@ -2010,19 +2193,30 @@ mod tests {
             Ok(pair) => pair,
         };
 
-        let status = child.wait().map_err(|e| format!("Failed to wait on child: {e}"))?;
+        let status = child
+            .wait()
+            .map_err(|e| format!("Failed to wait on child: {e}"))?;
 
         if let Some(handle) = overlay_handle {
             // Flush upper-layer writes back to real inodes and clean up staging.
             crate::linux_overlayfs::teardown(handle);
 
-            assert!(status.success(), "atomic write shell command should succeed");
+            assert!(
+                status.success(),
+                "atomic write shell command should succeed"
+            );
 
             let content = std::fs::read_to_string(&target).unwrap_or_default();
             let inode_after = std::fs::metadata(&target).map(|m| m.ino()).unwrap_or(0);
 
-            assert_eq!(content, new_content, "overlayfs flush must write new content to real file");
-            assert_eq!(inode_before, inode_after, "real file inode must not change after overlayfs flush");
+            assert_eq!(
+                content, new_content,
+                "overlayfs flush must write new content to real file"
+            );
+            assert_eq!(
+                inode_before, inode_after,
+                "real file inode must not change after overlayfs flush"
+            );
         }
         // If overlay_handle is None, overlayfs is unavailable; skip assertions.
         Ok(())
@@ -2081,7 +2275,10 @@ mod tests {
         rw_files: &[&std::path::Path],
         rw_dirs: &[&std::path::Path],
         cmd: &str,
-    ) -> Option<(std::process::Child, Option<crate::linux_overlayfs::OverlayHandle>)> {
+    ) -> Option<(
+        std::process::Child,
+        Option<crate::linux_overlayfs::OverlayHandle>,
+    )> {
         use std::collections::HashMap;
 
         if check_available().is_err() {

@@ -1,4 +1,3 @@
-
 #[cfg(unix)]
 extern crate libc;
 
@@ -6,14 +5,12 @@ use std::collections::HashMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
+use pent_proxy::TraceEvent;
 #[cfg(not(target_os = "macos"))]
 use pent_proxy::{ProxyConfig, ProxyHandle, ProxyServer};
-use pent_proxy::TraceEvent;
-use pent_sandbox::{
-    build_env, check_availability, spawn_sandboxed, NetworkMode, SandboxConfig,
-};
 #[cfg(target_os = "linux")]
 use pent_sandbox::teardown_overlay;
+use pent_sandbox::{build_env, check_availability, spawn_sandboxed, NetworkMode, SandboxConfig};
 use pent_settings::{ConfigLoader, PentConfig};
 
 #[cfg(target_os = "macos")]
@@ -78,7 +75,7 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
     // takes time (ProxyOnly veth setup) or stalls during namespace init.
     #[cfg(not(target_os = "macos"))]
     match &sandbox_cfg.network {
-        NetworkMode::ProxyOnly { .. } => {}  // proxy message already shown by setup_proxy
+        NetworkMode::ProxyOnly { .. } => {} // proxy message already shown by setup_proxy
         NetworkMode::Blocked => ui::status(
             "network",
             "blocked — add domains to [proxy] domain_allowlist in pent.toml to enable",
@@ -173,11 +170,11 @@ fn apply_cli_overrides(config: &mut PentConfig, args: &RunArgs) -> Result<(), Cl
         .paths
         .read_write
         .extend(args.write.iter().map(|p| p.to_string_lossy().into_owned()));
-    config
-        .sandbox
-        .paths
-        .execute
-        .extend(args.execute.iter().map(|p| p.to_string_lossy().into_owned()));
+    config.sandbox.paths.execute.extend(
+        args.execute
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned()),
+    );
     config
         .proxy
         .domain_allowlist
@@ -186,7 +183,11 @@ fn apply_cli_overrides(config: &mut PentConfig, args: &RunArgs) -> Result<(), Cl
     // On Linux, read_write paths must be exact filenames — glob ('*') patterns
     // are not supported because overlayfs requires specific paths to mount over.
     #[cfg(target_os = "linux")]
-    config.sandbox.paths.validate_no_rw_globs().map_err(CliError::Other)?;
+    config
+        .sandbox
+        .paths
+        .validate_no_rw_globs()
+        .map_err(CliError::Other)?;
 
     Ok(())
 }
@@ -432,11 +433,13 @@ fn parse_sandboxd_line(log_line: &str) -> String {
     for (i, tok) in tokens.iter().enumerate() {
         if tok.starts_with("file-") || tok.starts_with("network-") {
             let path = tokens[i + 1..].join(" ");
-            let op = if tok.contains("write") { "write" } else { "read" };
+            let op = if tok.contains("write") {
+                "write"
+            } else {
+                "read"
+            };
             if !path.is_empty() {
-                return format!(
-                    "filesystem: \"process\" was denied \"{op}\" access to \"{path}\""
-                );
+                return format!("filesystem: \"process\" was denied \"{op}\" access to \"{path}\"");
             }
             return format!("filesystem: sandbox denied \"{tok}\"");
         }
@@ -451,9 +454,7 @@ fn violation_fix(violation: &str) -> String {
         if let Some(start) = violation.find('"') {
             if let Some(end) = violation[start + 1..].find('"') {
                 let domain = &violation[start + 1..start + 1 + end];
-                return format!(
-                    "add \"{domain}\" to [proxy.domain_allowlist] in your pent config"
-                );
+                return format!("add \"{domain}\" to [proxy.domain_allowlist] in your pent config");
             }
         }
         "add the domain to [proxy.domain_allowlist] in your pent config".to_string()
@@ -562,8 +563,7 @@ async fn setup_proxy(
     };
 
     if wants_proxy {
-        let mut proxy_config =
-            ProxyConfig::try_from(&config.proxy).map_err(CliError::Other)?;
+        let mut proxy_config = ProxyConfig::try_from(&config.proxy).map_err(CliError::Other)?;
         proxy_config.violation_tx = violation_tx;
         // On Linux, ProxyOnly routes child traffic from a separate network
         // namespace through a veth pair. Both the TCP proxy and DNS server must
@@ -581,10 +581,8 @@ async fn setup_proxy(
             // Both the TCP proxy and DNS server must listen on all interfaces
             // (0.0.0.0) so they are reachable from the veth outer IP (10.200.x.1).
             // The child's loopback is isolated; only the veth reaches the host.
-            const BIND_ALL_ANY: std::net::SocketAddr = std::net::SocketAddr::new(
-                std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-                0,
-            );
+            const BIND_ALL_ANY: std::net::SocketAddr =
+                std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
             proxy_config.proxy_bind_addr = BIND_ALL_ANY;
             proxy_config.dns_bind_addr = BIND_ALL_ANY;
         }
@@ -598,7 +596,10 @@ async fn setup_proxy(
             "proxy started (HTTP CONNECT + SOCKS5h on same port); DNS resolved server-side"
         );
         Ok(ProxySetup {
-            network: NetworkMode::ProxyOnly { proxy_addr, dns_port },
+            network: NetworkMode::ProxyOnly {
+                proxy_addr,
+                dns_port,
+            },
             handle: Some(handle),
             event_rx,
         })

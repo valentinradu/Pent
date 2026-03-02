@@ -40,12 +40,12 @@ mod linux_netns;
 mod linux_overlayfs;
 
 pub use config::{system_default_paths, SandboxConfig};
-pub use env::{build_env, resolve_path_dirs_from, resolve_path_directories};
-pub use pent_settings::{Mount, NetworkMode, SandboxPaths, SandboxSettings};
+pub use env::{build_env, resolve_path_directories, resolve_path_dirs_from};
 #[cfg(target_os = "linux")]
 pub use linux::compute_accessible_set;
 #[cfg(target_os = "linux")]
 pub use linux_overlayfs::OverlayHandle;
+pub use pent_settings::{Mount, NetworkMode, SandboxPaths, SandboxSettings};
 
 use std::process::Child;
 use thiserror::Error;
@@ -191,7 +191,7 @@ pub fn spawn_sandboxed(
     {
         let profile = macos::generate_sbpl_profile(config)?;
         let env_with_proxy;
-        let env = if let NetworkMode::ProxyOnly { proxy_addr } = &config.network {
+        let env = if let NetworkMode::ProxyOnly { proxy_addr, .. } = &config.network {
             let port = proxy_addr.port();
             let http_url = format!("http://127.0.0.1:{port}");
             let socks_url = format!("socks5h://127.0.0.1:{port}");
@@ -233,7 +233,11 @@ pub fn spawn_sandboxed(
         }
         let (child, overlay, netns) =
             linux::spawn_with_landlock(config, cmd, args, &config.env, &path_dirs)?;
-        Ok(SandboxChild { child, overlay, netns })
+        Ok(SandboxChild {
+            child,
+            overlay,
+            netns,
+        })
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
@@ -373,7 +377,10 @@ mod tests {
 
         match result {
             Ok(mut sc) => {
-                let status = sc.child.wait().map_err(|e| format!("Failed to wait: {e}"))?;
+                let status = sc
+                    .child
+                    .wait()
+                    .map_err(|e| format!("Failed to wait: {e}"))?;
                 if !status.success() {
                     if status.code() == Some(71) {
                         return Ok(());
@@ -398,7 +405,10 @@ mod tests {
         if check_availability().is_ok() {
             match result {
                 Ok(mut sc) => {
-                    let status = sc.child.wait().map_err(|e| format!("Failed to wait: {e}"))?;
+                    let status = sc
+                        .child
+                        .wait()
+                        .map_err(|e| format!("Failed to wait: {e}"))?;
                     assert!(status.success());
                 }
                 Err(SandboxError::SpawnFailed(err))
@@ -429,20 +439,19 @@ mod tests {
     ) -> Result<Option<i32>, SandboxError> {
         let args: Vec<String> = args.iter().map(std::string::ToString::to_string).collect();
         let mut sandbox_child = spawn_sandboxed(config, cmd, &args)?;
-        let status = sandbox_child.child.wait().map_err(SandboxError::SpawnFailed)?;
+        let status = sandbox_child
+            .child
+            .wait()
+            .map_err(SandboxError::SpawnFailed)?;
         Ok(status.code())
     }
 
     /// Build a test config with the given network mode and no extra paths.
     #[cfg(target_os = "linux")]
     fn linux_test_config(workspace: std::path::PathBuf, network: NetworkMode) -> SandboxConfig {
-        SandboxConfig::new(
-            workspace.clone(),
-            system_default_paths(),
-            workspace,
-        )
-        .with_network(network)
-        .with_env(build_env(&[]))
+        SandboxConfig::new(workspace.clone(), system_default_paths(), workspace)
+            .with_network(network)
+            .with_env(build_env(&[]))
     }
 
     #[test]

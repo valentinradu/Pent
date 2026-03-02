@@ -104,25 +104,21 @@ fn kernel_supports_xwhiteout() -> bool {
 /// which is never the intent — whiteouts are overlay-internal bookkeeping.
 fn is_overlay_whiteout(path: &Path) -> bool {
     use std::os::unix::ffi::OsStrExt;
-    let Ok(path_c) = CString::new(path.as_os_str().as_bytes()) else { return false };
-    let Ok(name_c) = CString::new("user.overlay.whiteout") else { return false };
-    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-    let ret = unsafe {
-        libc::getxattr(
-            path_c.as_ptr(),
-            name_c.as_ptr(),
-            std::ptr::null_mut(),
-            0,
-        )
+    let Ok(path_c) = CString::new(path.as_os_str().as_bytes()) else {
+        return false;
     };
+    let Ok(name_c) = CString::new("user.overlay.whiteout") else {
+        return false;
+    };
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let ret = unsafe { libc::getxattr(path_c.as_ptr(), name_c.as_ptr(), std::ptr::null_mut(), 0) };
     ret >= 0
 }
 
 /// Set an extended attribute on `path`.
 fn set_xattr(path: &Path, name: &str, value: &[u8]) -> std::io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
-    let path_c = CString::new(path.as_os_str().as_bytes())
-        .map_err(std::io::Error::other)?;
+    let path_c = CString::new(path.as_os_str().as_bytes()).map_err(std::io::Error::other)?;
     let name_c = CString::new(name).map_err(std::io::Error::other)?;
     let ptr = if value.is_empty() {
         std::ptr::null()
@@ -131,7 +127,11 @@ fn set_xattr(path: &Path, name: &str, value: &[u8]) -> std::io::Result<()> {
     };
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let ret = unsafe { libc::setxattr(path_c.as_ptr(), name_c.as_ptr(), ptr, value.len(), 0) };
-    if ret != 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) }
+    if ret != 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -184,7 +184,9 @@ fn populate_upper_stubs(
         return Ok(());
     }
 
-    let Ok(entries) = std::fs::read_dir(real_dir) else { return Ok(()) }; // unreadable dir — skip gracefully
+    let Ok(entries) = std::fs::read_dir(real_dir) else {
+        return Ok(());
+    }; // unreadable dir — skip gracefully
 
     let mut upper_has_xwhiteouts = false;
 
@@ -347,7 +349,12 @@ pub fn prepare_overlay_dirs(
         let base_dir = PathBuf::from(format!("/tmp/pent-ovl-{pid}-{idx}"));
         let upper_dir = base_dir.join("upper");
         let work_dir = base_dir.join("work");
-        mounts.push(OverlayMount { real_dir: root.clone(), upper_dir, work_dir, base_dir });
+        mounts.push(OverlayMount {
+            real_dir: root.clone(),
+            upper_dir,
+            work_dir,
+            base_dir,
+        });
     }
     mounts
 }
@@ -405,16 +412,26 @@ pub unsafe fn mount_overlays(overlays: &[OverlayMount]) -> std::io::Result<()> {
         if !overlay.real_dir.is_dir() {
             continue;
         }
-        let Some(real_str) = overlay.real_dir.to_str() else { continue };
-        let Some(upper_str) = overlay.upper_dir.to_str() else { continue };
-        let Some(work_str) = overlay.work_dir.to_str() else { continue };
+        let Some(real_str) = overlay.real_dir.to_str() else {
+            continue;
+        };
+        let Some(upper_str) = overlay.upper_dir.to_str() else {
+            continue;
+        };
+        let Some(work_str) = overlay.work_dir.to_str() else {
+            continue;
+        };
 
-        let Ok(target) = CString::new(real_str) else { continue };
+        let Ok(target) = CString::new(real_str) else {
+            continue;
+        };
         // userxattr: use user.overlay.* namespace for opaque/whiteout xattrs,
         // which works in unprivileged user namespaces.
         let options =
             format!("lowerdir={real_str},upperdir={upper_str},workdir={work_str},userxattr");
-        let Ok(options_c) = CString::new(options) else { continue };
+        let Ok(options_c) = CString::new(options) else {
+            continue;
+        };
 
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let ret = libc::mount(
@@ -495,9 +512,20 @@ pub fn spawn_watcher(
     let write_set_thread = write_set.clone();
     let rw_dirs_thread = rw_dirs.clone();
     let thread = std::thread::spawn(move || {
-        run_watcher(overlays_thread, write_set_thread, rw_dirs_thread, shutdown_rx);
+        run_watcher(
+            overlays_thread,
+            write_set_thread,
+            rw_dirs_thread,
+            shutdown_rx,
+        );
     });
-    OverlayHandle { shutdown_tx, thread: Some(thread), overlays, write_set, rw_dirs }
+    OverlayHandle {
+        shutdown_tx,
+        thread: Some(thread),
+        overlays,
+        write_set,
+        rw_dirs,
+    }
 }
 
 /// Add an inotify watch on `upper_dir` and recurse into all existing
@@ -512,7 +540,9 @@ fn add_inotify_watches(
     depth: u32,
 ) {
     use std::os::unix::ffi::OsStrExt;
-    let Ok(path_c) = CString::new(upper_dir.as_os_str().as_bytes()) else { return };
+    let Ok(path_c) = CString::new(upper_dir.as_os_str().as_bytes()) else {
+        return;
+    };
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let wd = unsafe {
         libc::inotify_add_watch(
@@ -529,7 +559,9 @@ fn add_inotify_watches(
         return;
     }
 
-    let Ok(entries) = std::fs::read_dir(upper_dir) else { return };
+    let Ok(entries) = std::fs::read_dir(upper_dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
             let name = entry.file_name();
@@ -552,8 +584,7 @@ fn run_watcher(
     shutdown_rx: std::sync::mpsc::Receiver<()>,
 ) {
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-    let inotify_fd =
-        unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
+    let inotify_fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
     if inotify_fd < 0 {
         // inotify unavailable; final flush on teardown is the fallback.
         return;
@@ -564,7 +595,13 @@ fn run_watcher(
     // when the sandbox creates new directories.
     let mut wd_map: HashMap<libc::c_int, (PathBuf, PathBuf)> = HashMap::new();
     for overlay in &overlays {
-        add_inotify_watches(inotify_fd, &overlay.upper_dir, &overlay.real_dir, &mut wd_map, 8);
+        add_inotify_watches(
+            inotify_fd,
+            &overlay.upper_dir,
+            &overlay.real_dir,
+            &mut wd_map,
+            8,
+        );
     }
 
     let event_hdr = std::mem::size_of::<libc::inotify_event>();
@@ -576,17 +613,26 @@ fn run_watcher(
             break;
         }
 
-        let mut pfd =
-            libc::pollfd { fd: inotify_fd, events: libc::POLLIN, revents: 0 };
+        let mut pfd = libc::pollfd {
+            fd: inotify_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-        let ret = unsafe { libc::poll(&raw mut pfd, 1, 50 /* ms */) };
+        let ret = unsafe {
+            libc::poll(&raw mut pfd, 1, 50 /* ms */)
+        };
         if ret <= 0 || (pfd.revents & libc::POLLIN) == 0 {
             continue;
         }
 
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let n = unsafe {
-            libc::read(inotify_fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len())
+            libc::read(
+                inotify_fd,
+                buf.as_mut_ptr().cast::<libc::c_void>(),
+                buf.len(),
+            )
         };
         if n <= 0 {
             continue;
@@ -599,17 +645,14 @@ fn run_watcher(
             // SAFETY: verified there are at least event_hdr bytes at offset.
             // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             #[allow(clippy::cast_ptr_alignment)] // inotify buffer is properly aligned
-            let event =
-                unsafe { &*(buf.as_ptr().add(offset).cast::<libc::inotify_event>()) };
+            let event = unsafe { &*(buf.as_ptr().add(offset).cast::<libc::inotify_event>()) };
             let name_len = event.len as usize;
             if offset + event_hdr + name_len > n {
                 break;
             }
 
-            let name_bytes =
-                &buf[offset + event_hdr..offset + event_hdr + name_len];
-            let name_end =
-                name_bytes.iter().position(|&b| b == 0).unwrap_or(name_len);
+            let name_bytes = &buf[offset + event_hdr..offset + event_hdr + name_len];
+            let name_end = name_bytes.iter().position(|&b| b == 0).unwrap_or(name_len);
             let filename = std::str::from_utf8(&name_bytes[..name_end]).unwrap_or("");
 
             if !filename.is_empty() {
@@ -621,7 +664,13 @@ fn run_watcher(
                         // The sandbox created or renamed a directory into place.
                         // Add a watch so we catch writes to files inside it.
                         if (event.mask & (libc::IN_CREATE | libc::IN_MOVED_TO)) != 0 {
-                            add_inotify_watches(inotify_fd, &upper_path, &real_path, &mut wd_map, 4);
+                            add_inotify_watches(
+                                inotify_fd,
+                                &upper_path,
+                                &real_path,
+                                &mut wd_map,
+                                4,
+                            );
                             // Flush any files already present in the new directory.
                             // This handles the race where IN_CLOSE_WRITE fires for a
                             // file written immediately after mkdir — before our watcher
@@ -682,7 +731,9 @@ fn flush_upper_recursive(
     write_set: &HashSet<PathBuf>,
     rw_dirs: &HashSet<PathBuf>,
 ) {
-    let Ok(entries) = std::fs::read_dir(upper_dir) else { return };
+    let Ok(entries) = std::fs::read_dir(upper_dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let upper_path = entry.path();
         let real_path = real_dir.join(entry.file_name());
@@ -691,9 +742,7 @@ fn flush_upper_recursive(
             // user.overlay.whiteout xattr that represent deletions inside the
             // sandbox.  Flushing them would truncate the real file to zero bytes.
             let under_rw = rw_dirs.iter().any(|d| real_path.starts_with(d));
-            if (write_set.contains(&real_path) || under_rw)
-                && !is_overlay_whiteout(&upper_path)
-            {
+            if (write_set.contains(&real_path) || under_rw) && !is_overlay_whiteout(&upper_path) {
                 // Ensure the parent directory exists on the real filesystem.
                 // The sandbox may have created new subdirectories under an rw_dir.
                 if let Some(parent) = real_path.parent() {
@@ -706,7 +755,9 @@ fn flush_upper_recursive(
         } else if upper_path.is_dir() {
             // If this directory is new (doesn't exist on the real FS) and is
             // inside an rw_dir, create it so files within can be flushed.
-            let under_rw = rw_dirs.iter().any(|d| real_path.starts_with(d) || *d == real_path);
+            let under_rw = rw_dirs
+                .iter()
+                .any(|d| real_path.starts_with(d) || *d == real_path);
             if under_rw && !real_path.exists() {
                 let _ = std::fs::create_dir_all(&real_path);
             }
@@ -722,7 +773,13 @@ fn flush_upper_recursive(
 /// exits; this function only handles staging directory cleanup and ensures any
 /// writes not caught by inotify are flushed to the real inodes.
 pub fn teardown(handle: OverlayHandle) {
-    let OverlayHandle { shutdown_tx, mut thread, overlays, write_set, rw_dirs } = handle;
+    let OverlayHandle {
+        shutdown_tx,
+        mut thread,
+        overlays,
+        write_set,
+        rw_dirs,
+    } = handle;
     let _ = shutdown_tx.send(());
     if let Some(t) = thread.take() {
         let _ = t.join();
@@ -826,7 +883,10 @@ mod tests {
             "/proc/self/status",
         ]);
         let roots = overlay_roots_for_accessible(&accessible, &home);
-        assert!(roots.is_empty(), "system / temp paths must not produce overlay roots");
+        assert!(
+            roots.is_empty(),
+            "system / temp paths must not produce overlay roots"
+        );
     }
 
     /// A file directly under home (e.g. `~/.bashrc`) produces `~` as the root.

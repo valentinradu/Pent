@@ -52,7 +52,8 @@ mod macos {
         let out = Command::new(PENT_BIN)
             .arg("run")
             .arg("--no-config")
-            .arg("--config").arg(config)
+            .arg("--config")
+            .arg(config)
             .arg("--")
             .args(cmd)
             .stdin(Stdio::null())
@@ -96,14 +97,20 @@ mod macos {
         //    so we target a path the SBPL sandbox does not allow.
         //    PID suffix mirrors bash's $$ to avoid collisions between parallel runs.
         let real_home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-        let blocked = PathBuf::from(&real_home)
-            .join(format!("pent-test-blocked-{agent}-{}.tmp", std::process::id()));
+        let blocked = PathBuf::from(&real_home).join(format!(
+            "pent-test-blocked-{agent}-{}.tmp",
+            std::process::id()
+        ));
         let blocked_s = blocked.to_str().unwrap();
         let _ = fs::remove_file(&blocked);
 
         let _ = run_halt(
             &config,
-            &["/bin/sh", "-c", &format!("echo x > '{blocked_s}' 2>/dev/null; exit 0")],
+            &[
+                "/bin/sh",
+                "-c",
+                &format!("echo x > '{blocked_s}' 2>/dev/null; exit 0"),
+            ],
         );
         assert!(
             !blocked.exists(),
@@ -113,9 +120,15 @@ mod macos {
     }
 
     #[test]
-    fn filesystem_claude() { test_filesystem("claude"); }
+    fn filesystem_claude() {
+        test_filesystem("claude");
+    }
     #[test]
-    fn filesystem_codex()  { test_filesystem("codex"); }
+    fn filesystem_codex() {
+        test_filesystem("codex");
+    }
     #[test]
-    fn filesystem_gemini() { test_filesystem("gemini"); }
+    fn filesystem_gemini() {
+        test_filesystem("gemini");
+    }
 }

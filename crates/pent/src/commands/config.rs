@@ -1,4 +1,3 @@
-
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -170,11 +169,7 @@ fn rm_profile(global: bool, profiles: &[String], cwd: &Path) -> Result<(), CliEr
         .paths
         .traversal
         .retain(|p| !rm_traversal.contains(p));
-    config
-        .sandbox
-        .paths
-        .read
-        .retain(|p| !rm_read.contains(p));
+    config.sandbox.paths.read.retain(|p| !rm_read.contains(p));
     config
         .sandbox
         .paths
@@ -189,6 +184,10 @@ fn rm_profile(global: bool, profiles: &[String], cwd: &Path) -> Result<(), CliEr
     config.save(&path)?;
 
     let names: Vec<String> = parsed.iter().map(ToString::to_string).collect();
-    ui::ok(format!("removed {} from {}", names.join(" "), path.display()));
+    ui::ok(format!(
+        "removed {} from {}",
+        names.join(" "),
+        path.display()
+    ));
     Ok(())
 }
