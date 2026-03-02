@@ -5,27 +5,6 @@
 
 Wrap any process in a lightweight containment layer that restricts filesystem and network access using native OS mechanisms — no containers, no VMs.
 
-```
-  $ pent run -- <any-command>
-
-       ┌─────────────────────────────────────────────┐
-       │  Filesystem sandbox                         │
-       │  (Landlock + OverlayFS on Linux,            │
-       │   Seatbelt on macOS)                        │
-       │                                             │
-       │  ┌───────────────────────────────────────┐  │
-       │  │  Network sandbox  (Linux only)        │  │
-       │  │                                       │  │
-       │  │      <any-command>                    │  │
-       │  │            │  DNS + TCP               │  │
-       │  │      ┌─────▼──────┐                   │  │
-       │  │      │   proxy    │  domain allowlist  │  │
-       │  │      └─────┬──────┘                   │  │
-       │  └────────────┼───────────────────────────┘  │
-       └───────────────┼─────────────────────────────┘
-                       ▼
-                   internet
-```
 
 ```bash
 # Setup — run once to write ~/.config/pent/pent.toml.
