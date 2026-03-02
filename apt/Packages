@@ -4,10 +4,10 @@ Architecture: amd64
 Maintainer: Valentin Radu
 Installed-Size: 4193
 Filename: ./pent_0.0.1_amd64.deb
-Size: 1270060
-MD5sum: 6a77baff862679b77a42360e071f8ed6
-SHA1: b568120e5215b38f8312f4050b1e2d94c4684a38
-SHA256: fc8d58d687ddc32928516c6a3efec7f0afe412d651e2c3fa40a52db5b650b419
+Size: 1269788
+MD5sum: eed47d6e6ceec937eb723ada93c03dc3
+SHA1: 765120ef5dc30b2424671342d59469c3f0d1bf1c
+SHA256: 8740b08122e4f318e196a3c421c3b36bb583940bb0bf82c3cd7d9d69369cb174
 Section: utils
 Priority: optional
 Description: Run processes under filesystem and network containment
@@ -21,10 +21,10 @@ Architecture: arm64
 Maintainer: Valentin Radu
 Installed-Size: 4158
 Filename: ./pent_0.0.1_arm64.deb
-Size: 1160692
-MD5sum: 9d0097bc7ef45a789e67777302c8a0ec
-SHA1: 0fc09cd6c5cba26429341aef72b742258ccb479d
-SHA256: f421b49536198db7947f55e8dfb7f789c0505ee0d2809d147189ea95e4a924b7
+Size: 1160128
+MD5sum: 86f50a658e70f509b84bf4b2fec73d3f
+SHA1: ce1d4e81f7dda7868c1e9a4af21b1b6e1bda31b6
+SHA256: 6329a2bb46ef0955169b5dc16f27cf989a5dfe9eb7e8b589d3b581e9a122748b
 Section: utils
 Priority: optional
 Description: Run processes under filesystem and network containment
