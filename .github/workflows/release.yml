@@ -170,43 +170,55 @@ jobs:
             -d "{\"event_type\":\"pent_release_published\",\"client_payload\":{\"tag\":\"${RELEASE_TAG}\"}}"
 
   # ── Verify release artifacts ──────────────────────────────────────────────
-  verify:
-    name: Verify ${{ matrix.name }}
+  verify-linux:
+    name: Verify linux via APT (${{ matrix.arch }})
+    needs: apt
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+
+    steps:
+      - name: Install pent from APT repo
+        run: |
+          curl -fsSL https://valentinradu.github.io/Pent/apt/KEY.gpg \
+            | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pent.gpg
+          echo "deb [arch=${{ matrix.arch }}] https://valentinradu.github.io/Pent/apt stable main" \
+            | sudo tee /etc/apt/sources.list.d/pent.list
+          sudo apt-get update
+          sudo apt-get install -y pent
+
+      - name: Verify
+        run: pent --version
+
+  verify-macos:
+    name: Verify macOS binary (${{ matrix.arch }})
     needs: release
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - name: linux x86_64 binary
-            runner: ubuntu-latest
-            asset: pent-x86_64-unknown-linux-musl.tar.gz
-            cmd: tar -xzf pent-x86_64-unknown-linux-musl.tar.gz && ./pent --version
-          - name: linux aarch64 binary
-            runner: ubuntu-24.04-arm
-            asset: pent-aarch64-unknown-linux-musl.tar.gz
-            cmd: tar -xzf pent-aarch64-unknown-linux-musl.tar.gz && ./pent --version
-          - name: linux amd64 deb
-            runner: ubuntu-latest
-            asset: pent_*_amd64.deb
-            cmd: sudo dpkg -i pent_*_amd64.deb && pent --version
-          - name: macos x86_64 binary
+          - arch: x86_64
             runner: macos-13
             asset: pent-x86_64-apple-darwin.tar.gz
-            cmd: tar -xzf pent-x86_64-apple-darwin.tar.gz && ./pent --version
-          - name: macos aarch64 binary
+          - arch: aarch64
             runner: macos-latest
             asset: pent-aarch64-apple-darwin.tar.gz
-            cmd: tar -xzf pent-aarch64-apple-darwin.tar.gz && ./pent --version
 
     steps:
       - name: Download artifact
-        run: gh release download ${{ github.ref_name }} -p '${{ matrix.asset }}'
+        run: gh release download ${{ github.ref_name }} -p '${{ matrix.asset }}' -R valentinradu/Pent
         env:
           GH_TOKEN: ${{ github.token }}
 
       - name: Verify
-        run: ${{ matrix.cmd }}
+        run: tar -xzf ${{ matrix.asset }} && ./pent --version
 
   # ── Publish AUR package ───────────────────────────────────────────────────
   aur:
