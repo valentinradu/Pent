@@ -6,12 +6,6 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
-    inputs:
-      run_linux_e2e:
-        description: "Run Linux Docker agent e2e job"
-        required: false
-        default: false
-        type: boolean
 
 env:
   CARGO_TERM_COLOR: always
@@ -89,7 +83,6 @@ jobs:
   test-linux-agents:
     name: Agent configs (Linux / Docker)
     runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_linux_e2e }}
     steps:
       - uses: actions/checkout@v4
 
