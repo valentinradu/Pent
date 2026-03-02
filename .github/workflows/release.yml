@@ -170,9 +170,32 @@ jobs:
             -d "{\"event_type\":\"pent_release_published\",\"client_payload\":{\"tag\":\"${RELEASE_TAG}\"}}"
 
   # ── Verify release artifacts ──────────────────────────────────────────────
+  wait-for-pages:
+    name: Wait for GitHub Pages deployment
+    needs: apt
+    runs-on: ubuntu-latest
+    permissions:
+      pages: read
+    steps:
+      - name: Poll Pages build until deployed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "Waiting for GitHub Pages to reflect the apt job's gh-pages push..."
+          for i in $(seq 1 20); do
+            status=$(gh api /repos/${{ github.repository }}/pages/builds/latest \
+              --jq '.status' 2>/dev/null || echo "unknown")
+            echo "Attempt $i: Pages build status = $status"
+            [ "$status" = "built" ] && exit 0
+            [ "$status" = "errored" ] && { echo "Pages build errored"; exit 1; }
+            sleep 15
+          done
+          echo "Timed out waiting for Pages deployment"
+          exit 1
+
   verify-linux:
     name: Verify linux via APT (${{ matrix.arch }})
-    needs: apt
+    needs: wait-for-pages
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -186,16 +209,8 @@ jobs:
     steps:
       - name: Install pent from APT repo
         run: |
-          # GitHub Pages can take a few minutes to reflect a gh-pages push.
-          # Retry fetching the key up to 10 times (5 min total) before failing.
-          for i in $(seq 1 10); do
-            curl -fsSL https://valentinradu.github.io/Pent/apt/KEY.gpg \
-              | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pent.gpg \
-              && break
-            echo "Attempt $i: GitHub Pages not ready yet, retrying in 30s..."
-            sudo rm -f /etc/apt/trusted.gpg.d/pent.gpg
-            sleep 30
-          done
+          curl -fsSL https://valentinradu.github.io/Pent/apt/KEY.gpg \
+            | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pent.gpg
           echo "deb [arch=${{ matrix.arch }}] https://valentinradu.github.io/Pent/apt stable main" \
             | sudo tee /etc/apt/sources.list.d/pent.list
           sudo apt-get update
