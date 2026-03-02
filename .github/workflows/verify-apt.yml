@@ -4,6 +4,7 @@ name: Verify APT
 # Runs immediately after the new content is live — no polling needed.
 on:
   page_build:
+  workflow_dispatch:
 
 jobs:
   verify-linux:
