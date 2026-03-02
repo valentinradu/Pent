@@ -249,7 +249,7 @@ impl DomainFilter {
 
     /// Get the number of patterns in the filter.
     #[must_use]
-    pub const fn pattern_count(&self) -> usize {
+    pub fn pattern_count(&self) -> usize {
         self.patterns.len()
     }
 
