@@ -188,7 +188,7 @@ jobs:
             echo "Attempt $i: Pages build status = $status"
             [ "$status" = "built" ] && exit 0
             [ "$status" = "errored" ] && { echo "Pages build errored"; exit 1; }
-            sleep 15
+            sleep 5
           done
           echo "Timed out waiting for Pages deployment"
           exit 1
