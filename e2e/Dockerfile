@@ -13,7 +13,7 @@
 # NET_ADMIN is required for pent's Linux network-namespace isolation
 # (ProxyOnly / LocalhostOnly modes call unshare(CLONE_NEWNET) + ip-link).
 
-FROM rust:1.85-slim-bookworm
+FROM rust:1.87-slim-bookworm
 
 # iproute2       — ip rule / ip netns / ip link commands used by pent
 # curl           — network tests (proxy-aware HTTP client)
