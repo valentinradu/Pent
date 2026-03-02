@@ -494,6 +494,7 @@ pub fn spawn_with_landlock(
 
     // Clone config data for use in pre_exec closure
     let workspace = config.workspace.clone();
+    let cwd_path = config.cwd.clone();
     let data_dir = config.data_dir.clone();
     let mounts = config.mounts.clone();
     let paths = config.paths.clone();
@@ -827,6 +828,24 @@ pub fn spawn_with_landlock(
                 // it is needed before mounting tmpfs on /run.
                 // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                 super::linux_overlayfs::mount_overlays(&overlay_mounts_pre)?;
+
+                // Re-chdir after overlay mount: Rust's Command::current_dir() calls
+                // chdir() BEFORE pre_exec hooks run, so the CWD dentry points to the
+                // lower-layer (real-fs) inode at the time the overlay is mounted.
+                // After mounting, Landlock rules are registered against the overlay's
+                // merged inodes.  Without this re-chdir, relative paths resolved via
+                // the stale CWD dentry reference lower-layer inodes not covered by any
+                // Landlock rule, causing EACCES on relative-path writes even when the
+                // same absolute path succeeds.
+                {
+                    use std::os::unix::ffi::OsStrExt;
+                    if let Ok(cwd_c) =
+                        std::ffi::CString::new(cwd_path.as_os_str().as_bytes())
+                    {
+                        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+                        libc::chdir(cwd_c.as_ptr());
+                    }
+                }
             } else if proxy_ready_w >= 0 {
                 // ProxyOnly without overlays: unshare user+net+mount namespace.
                 // CLONE_NEWNS is required so that:
