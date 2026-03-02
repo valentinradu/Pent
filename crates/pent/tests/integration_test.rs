@@ -29,7 +29,7 @@ const PENT: &str = env!("CARGO_BIN_EXE_pent");
 
 /// Invoke `pent` with the given arguments in `cwd` and return the full Output.
 #[allow(clippy::panic)] // infrastructure helper: spawn failure is a hard test setup error
-fn run_halt(cwd: &Path, args: &[&str]) -> Output {
+fn run_pent(cwd: &Path, args: &[&str]) -> Output {
     Command::new(PENT)
         .args(args)
         .current_dir(cwd)
@@ -131,7 +131,7 @@ fn home_path(name: &str) -> Option<std::path::PathBuf> {
 #[test]
 fn test_config_init_creates_project_config() -> TestResult {
     let dir = TempDir::new()?;
-    let out = run_halt(dir.path(), &["config", "init"]);
+    let out = run_pent(dir.path(), &["config", "init"]);
     expect_success(&out);
 
     let config_path = dir.path().join(".pent").join("pent.toml");
@@ -148,9 +148,9 @@ fn test_config_init_creates_project_config() -> TestResult {
 fn test_config_init_fails_if_already_exists() -> TestResult {
     let dir = TempDir::new()?;
     // First init should succeed
-    expect_success(&run_halt(dir.path(), &["config", "init"]));
+    expect_success(&run_pent(dir.path(), &["config", "init"]));
     // Second init should fail with a clear error
-    let out = run_halt(dir.path(), &["config", "init"]);
+    let out = run_pent(dir.path(), &["config", "init"]);
     expect_failure(&out);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -163,9 +163,9 @@ fn test_config_init_fails_if_already_exists() -> TestResult {
 #[test]
 fn test_config_show_toml_is_valid() -> TestResult {
     let dir = TempDir::new()?;
-    expect_success(&run_halt(dir.path(), &["config", "init"]));
+    expect_success(&run_pent(dir.path(), &["config", "init"]));
 
-    let out = run_halt(dir.path(), &["config", "show", "--format", "toml"]);
+    let out = run_pent(dir.path(), &["config", "show", "--format", "toml"]);
     let stdout = expect_success(&out);
     assert!(
         toml::from_str::<toml::Value>(&stdout).is_ok(),
@@ -177,9 +177,9 @@ fn test_config_show_toml_is_valid() -> TestResult {
 #[test]
 fn test_config_show_json_is_valid() -> TestResult {
     let dir = TempDir::new()?;
-    expect_success(&run_halt(dir.path(), &["config", "init"]));
+    expect_success(&run_pent(dir.path(), &["config", "init"]));
 
-    let out = run_halt(dir.path(), &["config", "show", "--format", "json"]);
+    let out = run_pent(dir.path(), &["config", "show", "--format", "json"]);
     let stdout = expect_success(&out);
     assert!(
         serde_json::from_str::<serde_json::Value>(&stdout).is_ok(),
@@ -191,9 +191,9 @@ fn test_config_show_json_is_valid() -> TestResult {
 #[test]
 fn test_config_show_json_has_sandbox_and_proxy_keys() -> TestResult {
     let dir = TempDir::new()?;
-    expect_success(&run_halt(dir.path(), &["config", "init"]));
+    expect_success(&run_pent(dir.path(), &["config", "init"]));
 
-    let out = run_halt(dir.path(), &["config", "show", "--format", "json"]);
+    let out = run_pent(dir.path(), &["config", "show", "--format", "json"]);
     let stdout = expect_success(&out);
     let json: serde_json::Value = serde_json::from_str(&stdout)?;
 
@@ -206,7 +206,7 @@ fn test_config_show_json_has_sandbox_and_proxy_keys() -> TestResult {
 fn test_config_show_without_config_file_uses_defaults() -> TestResult {
     // No config init — should still produce valid output using defaults
     let dir = TempDir::new()?;
-    let out = run_halt(dir.path(), &["config", "show", "--format", "json"]);
+    let out = run_pent(dir.path(), &["config", "show", "--format", "json"]);
     let stdout = expect_success(&out);
     let json: serde_json::Value = serde_json::from_str(&stdout)?;
     assert!(json.get("sandbox").is_some());
@@ -219,14 +219,14 @@ fn test_config_project_overrides_domain_allowlist() -> TestResult {
     let dir = TempDir::new()?;
 
     // Write a project config with a specific domain
-    let dot_halt = dir.path().join(".pent");
-    fs::create_dir_all(&dot_halt)?;
+    let dot_pent = dir.path().join(".pent");
+    fs::create_dir_all(&dot_pent)?;
     fs::write(
-        dot_halt.join("pent.toml"),
+        dot_pent.join("pent.toml"),
         "[proxy]\ndomain_allowlist = [\"project-domain.example\"]\n",
     )?;
 
-    let out = run_halt(dir.path(), &["config", "show", "--format", "json"]);
+    let out = run_pent(dir.path(), &["config", "show", "--format", "json"]);
     let stdout = expect_success(&out);
     let json: serde_json::Value = serde_json::from_str(&stdout)?;
 
@@ -251,7 +251,7 @@ fn test_check_reports_platform() -> TestResult {
     // `pent check` should always print platform info even when sandboxing
     // is unavailable. The exit status may be non-zero in restricted envs.
     let dir = TempDir::new()?;
-    let out = run_halt(dir.path(), &["check"]);
+    let out = run_pent(dir.path(), &["check"]);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("platform"),
@@ -585,11 +585,11 @@ fn test_run_env_explicit_kv_sets_variable() -> TestResult {
 
     let dir = TempDir::new()?;
     let mut extra = sys_exec_args();
-    extra.extend_from_slice(&["--env".into(), "HALT_TEST=injected".into()]);
+    extra.extend_from_slice(&["--env".into(), "PENT_TEST=injected".into()]);
     let out = sandboxed_run(
         dir.path(),
         &extra,
-        &["/bin/sh", "-c", "echo RESULT=$HALT_TEST"],
+        &["/bin/sh", "-c", "echo RESULT=$PENT_TEST"],
     );
     let stdout = expect_success(&out);
     assert!(
@@ -613,10 +613,10 @@ fn test_run_no_config_ignores_project_config() -> TestResult {
 
     // Create a project config that requests blocked networking.
     // With --no-config this should be ignored and defaults apply.
-    let dot_halt = dir.path().join(".pent");
-    fs::create_dir_all(&dot_halt)?;
+    let dot_pent = dir.path().join(".pent");
+    fs::create_dir_all(&dot_pent)?;
     fs::write(
-        dot_halt.join("pent.toml"),
+        dot_pent.join("pent.toml"),
         "[sandbox.network]\nmode = \"blocked\"\n",
     )?;
 
@@ -642,7 +642,7 @@ fn test_config_add_creates_config_if_missing() -> TestResult {
     let config_path = dir.path().join(".pent").join("pent.toml");
     assert!(!config_path.exists());
 
-    let out = run_halt(dir.path(), &["config", "add", "@cargo"]);
+    let out = run_pent(dir.path(), &["config", "add", "@cargo"]);
     expect_success(&out);
 
     assert!(config_path.exists(), "config should be created by add");
@@ -652,7 +652,7 @@ fn test_config_add_creates_config_if_missing() -> TestResult {
 #[test]
 fn test_config_add_writes_domains() -> TestResult {
     let dir = TempDir::new()?;
-    let out = run_halt(dir.path(), &["config", "add", "@npm"]);
+    let out = run_pent(dir.path(), &["config", "add", "@npm"]);
     expect_success(&out);
 
     let config_path = dir.path().join(".pent").join("pent.toml");
@@ -667,7 +667,7 @@ fn test_config_add_writes_domains() -> TestResult {
 #[test]
 fn test_config_add_npm_also_adds_node() -> TestResult {
     let dir = TempDir::new()?;
-    let out = run_halt(dir.path(), &["config", "add", "@npm"]);
+    let out = run_pent(dir.path(), &["config", "add", "@npm"]);
     expect_success(&out);
 
     // @npm depends on @node; @node adds traversal: ~ on all platforms
@@ -689,8 +689,8 @@ fn test_config_add_npm_also_adds_node() -> TestResult {
 #[test]
 fn test_config_add_deduplicates() -> TestResult {
     let dir = TempDir::new()?;
-    expect_success(&run_halt(dir.path(), &["config", "add", "@npm"]));
-    expect_success(&run_halt(dir.path(), &["config", "add", "@npm"]));
+    expect_success(&run_pent(dir.path(), &["config", "add", "@npm"]));
+    expect_success(&run_pent(dir.path(), &["config", "add", "@npm"]));
 
     let config_path = dir.path().join(".pent").join("pent.toml");
     let contents = fs::read_to_string(&config_path)?;
@@ -705,8 +705,8 @@ fn test_config_add_deduplicates() -> TestResult {
 #[test]
 fn test_config_rm_removes_domains() -> TestResult {
     let dir = TempDir::new()?;
-    expect_success(&run_halt(dir.path(), &["config", "add", "@npm"]));
-    expect_success(&run_halt(dir.path(), &["config", "rm", "@npm"]));
+    expect_success(&run_pent(dir.path(), &["config", "add", "@npm"]));
+    expect_success(&run_pent(dir.path(), &["config", "rm", "@npm"]));
 
     let config_path = dir.path().join(".pent").join("pent.toml");
     let contents = fs::read_to_string(&config_path)?;
@@ -720,9 +720,9 @@ fn test_config_rm_removes_domains() -> TestResult {
 #[test]
 fn test_config_rm_node_blocked_by_gemini() -> TestResult {
     let dir = TempDir::new()?;
-    expect_success(&run_halt(dir.path(), &["config", "add", "@gemini"]));
+    expect_success(&run_pent(dir.path(), &["config", "add", "@gemini"]));
 
-    let out = run_halt(dir.path(), &["config", "rm", "@node"]);
+    let out = run_pent(dir.path(), &["config", "rm", "@node"]);
     expect_failure(&out);
 
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -736,9 +736,9 @@ fn test_config_rm_node_blocked_by_gemini() -> TestResult {
 #[test]
 fn test_config_rm_gemini_node_together_succeeds() -> TestResult {
     let dir = TempDir::new()?;
-    expect_success(&run_halt(dir.path(), &["config", "add", "@gemini"]));
+    expect_success(&run_pent(dir.path(), &["config", "add", "@gemini"]));
 
-    let out = run_halt(dir.path(), &["config", "rm", "@gemini", "@node"]);
+    let out = run_pent(dir.path(), &["config", "rm", "@gemini", "@node"]);
     expect_success(&out);
 
     let config_path = dir.path().join(".pent").join("pent.toml");
@@ -753,7 +753,7 @@ fn test_config_rm_gemini_node_together_succeeds() -> TestResult {
 #[test]
 fn test_config_add_multiple_profiles() -> TestResult {
     let dir = TempDir::new()?;
-    let out = run_halt(dir.path(), &["config", "add", "@npm", "@cargo", "@gh"]);
+    let out = run_pent(dir.path(), &["config", "add", "@npm", "@cargo", "@gh"]);
     expect_success(&out);
 
     let config_path = dir.path().join(".pent").join("pent.toml");
@@ -770,7 +770,7 @@ fn test_config_add_multiple_profiles() -> TestResult {
 #[test]
 fn test_config_add_unknown_profile_fails() -> TestResult {
     let dir = TempDir::new()?;
-    let out = run_halt(dir.path(), &["config", "add", "@not-a-real-profile"]);
+    let out = run_pent(dir.path(), &["config", "add", "@not-a-real-profile"]);
     expect_failure(&out);
 
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -840,10 +840,10 @@ fn test_run_extra_config_merges_domain_allowlist() -> TestResult {
     )?;
 
     // Write a project config with a base domain
-    let dot_halt = dir.path().join(".pent");
-    fs::create_dir_all(&dot_halt)?;
+    let dot_pent = dir.path().join(".pent");
+    fs::create_dir_all(&dot_pent)?;
     fs::write(
-        dot_halt.join("pent.toml"),
+        dot_pent.join("pent.toml"),
         "[proxy]\ndomain_allowlist = [\"base-domain.example\"]\n",
     )?;
 
@@ -853,7 +853,7 @@ fn test_run_extra_config_merges_domain_allowlist() -> TestResult {
     // via the run command's config loading indirectly).
     //
     // For now, just verify the project config is reflected in config show.
-    let out = run_halt(dir.path(), &["config", "show", "--format", "json"]);
+    let out = run_pent(dir.path(), &["config", "show", "--format", "json"]);
     let stdout = expect_success(&out);
     let json: serde_json::Value = serde_json::from_str(&stdout)?;
     let allowlist = json["proxy"]["domain_allowlist"]
@@ -880,7 +880,7 @@ fn test_execute_flag_allows_binary() -> TestResult {
     //
     // execute_access is now ReadDir | Execute (no ReadFile), so the binary and
     // its shared libraries must also be listed under --read for execve to succeed.
-    let out = run_halt(
+    let out = run_pent(
         std::path::Path::new("/tmp"),
         &[
             "run",
@@ -927,7 +927,7 @@ fn test_execute_flag_allows_binary() -> TestResult {
 #[test]
 fn test_config_add_claude_has_correct_domains_and_paths() -> TestResult {
     let dir = TempDir::new()?;
-    expect_success(&run_halt(dir.path(), &["config", "add", "@claude"]));
+    expect_success(&run_pent(dir.path(), &["config", "add", "@claude"]));
 
     let contents = fs::read_to_string(dir.path().join(".pent").join("pent.toml"))?;
     assert!(
@@ -961,7 +961,7 @@ fn test_config_add_claude_has_correct_domains_and_paths() -> TestResult {
 #[cfg(target_os = "macos")]
 fn test_config_add_claude_has_macos_app_support_path() -> TestResult {
     let dir = TempDir::new()?;
-    expect_success(&run_halt(dir.path(), &["config", "add", "@claude"]));
+    expect_success(&run_pent(dir.path(), &["config", "add", "@claude"]));
 
     let contents = fs::read_to_string(dir.path().join(".pent").join("pent.toml"))?;
     assert!(
@@ -974,7 +974,7 @@ fn test_config_add_claude_has_macos_app_support_path() -> TestResult {
 #[test]
 fn test_config_add_codex_has_correct_domains_and_paths() -> TestResult {
     let dir = TempDir::new()?;
-    expect_success(&run_halt(dir.path(), &["config", "add", "@codex"]));
+    expect_success(&run_pent(dir.path(), &["config", "add", "@codex"]));
 
     let contents = fs::read_to_string(dir.path().join(".pent").join("pent.toml"))?;
     assert!(
@@ -991,7 +991,7 @@ fn test_config_add_codex_has_correct_domains_and_paths() -> TestResult {
 #[test]
 fn test_config_add_gemini_has_correct_domains_and_paths() -> TestResult {
     let dir = TempDir::new()?;
-    expect_success(&run_halt(dir.path(), &["config", "add", "@gemini"]));
+    expect_success(&run_pent(dir.path(), &["config", "add", "@gemini"]));
 
     let contents = fs::read_to_string(dir.path().join(".pent").join("pent.toml"))?;
     assert!(
@@ -1008,7 +1008,7 @@ fn test_config_add_gemini_has_correct_domains_and_paths() -> TestResult {
 #[test]
 fn test_config_add_output_shows_file_path() -> TestResult {
     let dir = TempDir::new()?;
-    let out = run_halt(dir.path(), &["config", "add", "@cargo"]);
+    let out = run_pent(dir.path(), &["config", "add", "@cargo"]);
     expect_success(&out);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -1021,8 +1021,8 @@ fn test_config_add_output_shows_file_path() -> TestResult {
 #[test]
 fn test_config_rm_output_shows_file_path() -> TestResult {
     let dir = TempDir::new()?;
-    expect_success(&run_halt(dir.path(), &["config", "add", "@cargo"]));
-    let out = run_halt(dir.path(), &["config", "rm", "@cargo"]);
+    expect_success(&run_pent(dir.path(), &["config", "add", "@cargo"]));
+    let out = run_pent(dir.path(), &["config", "rm", "@cargo"]);
     expect_success(&out);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(

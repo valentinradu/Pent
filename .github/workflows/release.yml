@@ -123,13 +123,13 @@ jobs:
             --deb-version "$VERSION" \
             --no-strip
           mv target/${{ matrix.target }}/debian/*.deb \
-             halt_${VERSION}_${{ matrix.arch }}.deb
+             pent_${VERSION}_${{ matrix.arch }}.deb
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: deb-${{ matrix.arch }}
-          path: halt_*_${{ matrix.arch }}.deb
+          path: pent_*_${{ matrix.arch }}.deb
 
   # ── Create GitHub release ─────────────────────────────────────────────────
   release:

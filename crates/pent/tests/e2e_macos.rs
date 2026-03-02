@@ -46,9 +46,9 @@ mod macos {
             .join("pent.toml")
     }
 
-    // ── run_halt helper ──────────────────────────────────────────────────────
+    // ── run_pent helper ──────────────────────────────────────────────────────
 
-    fn run_halt(config: &Path, cmd: &[&str]) -> (ExitStatus, String) {
+    fn run_pent(config: &Path, cmd: &[&str]) -> (ExitStatus, String) {
         let out = Command::new(PENT_BIN)
             .arg("run")
             .arg("--no-config")
@@ -75,7 +75,7 @@ mod macos {
         let sentinel_s = sentinel.to_str().unwrap();
 
         // 1. Workspace write must succeed.
-        let (status, stderr) = run_halt(
+        let (status, stderr) = run_pent(
             &config,
             &["/bin/sh", "-c", &format!("echo ok > '{sentinel_s}'")],
         );
@@ -86,7 +86,7 @@ mod macos {
         );
 
         // 2. Workspace read must succeed.
-        let (status, stderr) = run_halt(&config, &["/bin/cat", sentinel_s]);
+        let (status, stderr) = run_pent(&config, &["/bin/cat", sentinel_s]);
         assert!(
             status.success(),
             "{agent}: workspace read failed\nstderr: {stderr}"
@@ -104,7 +104,7 @@ mod macos {
         let blocked_s = blocked.to_str().unwrap();
         let _ = fs::remove_file(&blocked);
 
-        let _ = run_halt(
+        let _ = run_pent(
             &config,
             &[
                 "/bin/sh",

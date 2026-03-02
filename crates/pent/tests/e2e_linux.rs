@@ -192,10 +192,10 @@ mod linux {
         home.join(".config").join("pent").join("pent.toml")
     }
 
-    // ── run_halt helper ──────────────────────────────────────────────────────
+    // ── run_pent helper ──────────────────────────────────────────────────────
 
     #[allow(clippy::panic)] // infrastructure helper: spawn failure is a hard test setup error
-    fn run_halt(config: &Path, extra: &[&str], cmd: &[&str]) -> (ExitStatus, String) {
+    fn run_pent(config: &Path, extra: &[&str], cmd: &[&str]) -> (ExitStatus, String) {
         let out = Command::new(PENT_BIN)
             .arg("run")
             .arg("--no-config")
@@ -230,7 +230,7 @@ mod linux {
             .ok_or("sentinel path is not valid UTF-8")?;
 
         // 1. Workspace write must succeed.
-        let (status, stderr) = run_halt(
+        let (status, stderr) = run_pent(
             &config,
             &["--network", "unrestricted"],
             &["bash", "-c", &format!("echo ok > '{sentinel_s}'")],
@@ -242,7 +242,7 @@ mod linux {
         );
 
         // 2. Workspace read must succeed.
-        let (status, stderr) = run_halt(
+        let (status, stderr) = run_pent(
             &config,
             &["--network", "unrestricted"],
             &["bash", "-c", &format!("cat '{sentinel_s}'")],
@@ -255,7 +255,7 @@ mod linux {
         // 3. Write outside workspace must be blocked.
         let blocked = format!("/etc/pent-test-{agent}");
         let _ = fs::remove_file(&blocked);
-        let _ = run_halt(
+        let _ = run_pent(
             &config,
             &["--network", "unrestricted"],
             &[
@@ -310,9 +310,9 @@ mod linux {
         // 4. Allowed domain reachable through proxy.
         //    curl exit 0=success  7=connect refused (DNS worked)  22=HTTP error (tunnel worked)
         //    curl exit 6=DNS fail  28=timeout — both are failures
-        // stdout is already null via run_halt — no -o /dev/null needed (would
+        // stdout is already null via run_pent — no -o /dev/null needed (would
         // trigger curl exit 23 because the sandbox may block opening /dev/null for write).
-        let (status, stderr) = run_halt(
+        let (status, stderr) = run_pent(
             &config,
             &[],
             &[
@@ -332,7 +332,7 @@ mod linux {
 
         // 5. Blocked domain must be denied.
         //    curl exit 6=NXDOMAIN  56=proxy rejected CONNECT
-        let (status, stderr) = run_halt(
+        let (status, stderr) = run_pent(
             &config,
             &[],
             &[
