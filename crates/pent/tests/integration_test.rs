@@ -847,6 +847,9 @@ fn test_run_extra_config_merges_domain_allowlist() -> TestResult {
 fn test_execute_flag_allows_binary() -> TestResult {
     // Only runs when Landlock is enforcing; otherwise meaningless.
     // We skip silently if unavailable.
+    //
+    // execute_access is now ReadDir | Execute (no ReadFile), so the binary and
+    // its shared libraries must also be listed under --read for execve to succeed.
     let out = run_halt(
         std::path::Path::new("/tmp"),
         &[
@@ -856,6 +859,16 @@ fn test_execute_flag_allows_binary() -> TestResult {
             "unrestricted",
             "--execute",
             "/usr/bin",
+            "--read",
+            "/usr/bin",
+            "--read",
+            "/usr/lib",
+            "--read",
+            "/usr/lib64",
+            "--read",
+            "/lib",
+            "--read",
+            "/lib64",
             "--",
             "/usr/bin/true",
         ],
@@ -863,7 +876,7 @@ fn test_execute_flag_allows_binary() -> TestResult {
     // If Landlock is not available pent falls back gracefully; either way exit 0.
     assert!(
         out.status.success(),
-        "pent --execute /usr/bin -- /usr/bin/true should succeed\nstderr: {}",
+        "pent --execute /usr/bin --read /usr/bin -- /usr/bin/true should succeed\nstderr: {}",
         String::from_utf8_lossy(&out.stderr),
     );
     Ok(())

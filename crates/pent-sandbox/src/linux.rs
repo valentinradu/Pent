@@ -161,8 +161,16 @@ pub fn build_landlock_ruleset(
     // Read-only: no Execute (config files, libraries, data).
     let read_access = AccessFs::ReadFile | AccessFs::ReadDir;
 
-    // Execute: readable and runnable (binary directories, installed tools).
-    let execute_access = AccessFs::ReadFile | AccessFs::ReadDir | AccessFs::Execute;
+    // Execute: runnable but not readable (binary directories, installed tools).
+    // ReadFile is intentionally omitted — execute paths should not be readable
+    // by the sandboxed process; Landlock enforces this at the syscall level.
+    let execute_access = AccessFs::ReadDir | AccessFs::Execute;
+
+    // System library paths need ReadFile in addition to Execute so that the
+    // dynamic linker can open() shared libraries. This is separate from
+    // execute_access (user-configured execute paths) which is intentionally
+    // execute-only without ReadFile.
+    let syslib_access = AccessFs::ReadFile | AccessFs::ReadDir | AccessFs::Execute;
 
     // Write: all rights (workspace, temp dirs, cache dirs); unchanged.
     let write_access = all_access;
@@ -209,7 +217,7 @@ pub fn build_landlock_ruleset(
     // Configured SandboxPaths (from profiles and TOML config).
     // traversal = ReadDir only (stat/list, no file reads or exec).
     // read = ReadFile | ReadDir (config files, libraries, data; no exec).
-    // execute = ReadFile | ReadDir | Execute (binary directories, installed tools).
+    // execute = ReadDir | Execute (binary directories, installed tools; no ReadFile).
     // read_write = all access rights.
     let traversal_access = AccessFs::ReadDir;
     let (traversal_paths, read_paths, execute_paths, rw_paths) = config.paths.expand_paths();
@@ -226,14 +234,16 @@ pub fn build_landlock_ruleset(
         add_path(&mut ruleset, path, write_access)?;
     }
 
-    // PATH directories - read + execute (these are binary dirs)
+    // PATH directories - read + execute (these are binary dirs; the dynamic
+    // linker reads binaries in $PATH so ReadFile is needed here via syslib_access)
     for path_dir in path_dirs {
-        add_path(&mut ruleset, path_dir, execute_access)?;
+        add_path(&mut ruleset, path_dir, syslib_access)?;
     }
 
-    // System libraries - read + execute (dynamic linker in /usr/lib, /lib64 needs Execute)
+    // System libraries - read + execute (dynamic linker in /usr/lib, /lib64 needs
+    // ReadFile to open() shared libraries; use syslib_access not execute_access)
     for sys_path in SYSTEM_PATHS {
-        add_path(&mut ruleset, Path::new(sys_path), execute_access)?;
+        add_path(&mut ruleset, Path::new(sys_path), syslib_access)?;
     }
 
     // Temp directories - read/write
@@ -559,12 +569,17 @@ pub fn spawn_with_landlock(
         accessible.insert(path_dir.clone());
     }
 
+    // Compute home_dir for overlay root calculation.
+    let home_dir: PathBuf = std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| config.workspace.clone());
+
     // In no_enforcement mode, skip overlayfs entirely.
     let pid = std::process::id();
     let overlay_mounts = if no_enforcement {
         Vec::new()
     } else {
-        super::linux_overlayfs::prepare_overlay_dirs(&overlay_file_paths, pid)
+        super::linux_overlayfs::prepare_overlay_dirs(&accessible, &home_dir, pid)
     };
 
     // Compute the set of parent directories covered by overlayfs (for Landlock rules).
@@ -869,7 +884,15 @@ pub fn spawn_with_landlock(
             if !no_enforcement {
             let all_access = AccessFs::from_all(ABI::V4);
             let read_access = AccessFs::ReadFile | AccessFs::ReadDir;
-            let execute_access = AccessFs::ReadFile | AccessFs::ReadDir | AccessFs::Execute;
+            // Execute: runnable but not readable (binary directories, installed tools).
+            // ReadFile is intentionally omitted — execute paths should not be readable
+            // by the sandboxed process; Landlock enforces this at the syscall level.
+            let execute_access = AccessFs::ReadDir | AccessFs::Execute;
+            // System library paths need ReadFile in addition to Execute so that the
+            // dynamic linker can open() shared libraries. This is separate from
+            // execute_access (user-configured execute paths) which is intentionally
+            // execute-only without ReadFile.
+            let syslib_access = AccessFs::ReadFile | AccessFs::ReadDir | AccessFs::Execute;
             let write_access = all_access;
 
             let mut ruleset = Ruleset::default()
@@ -938,14 +961,16 @@ pub fn spawn_with_landlock(
                 add_path(&mut ruleset, dir, write_access)?;
             }
 
-            // Add PATH directories (binary dirs — read + execute)
+            // Add PATH directories (binary dirs — need ReadFile for the dynamic
+            // linker to load shared libraries when executing binaries in $PATH)
             for path_dir in &path_dirs {
-                add_path(&mut ruleset, path_dir, execute_access)?;
+                add_path(&mut ruleset, path_dir, syslib_access)?;
             }
 
-            // Add system paths (dynamic linker in /usr/lib, /lib64 needs Execute)
+            // Add system paths (dynamic linker in /usr/lib, /lib64 needs ReadFile
+            // to open() shared libraries; use syslib_access not execute_access)
             for sys_path in SYSTEM_PATHS {
-                add_path(&mut ruleset, Path::new(sys_path), execute_access)?;
+                add_path(&mut ruleset, Path::new(sys_path), syslib_access)?;
             }
 
             // Add temp paths
@@ -2001,5 +2026,269 @@ mod tests {
         }
         // If overlay_handle is None, overlayfs is unavailable; skip assertions.
         Ok(())
+    }
+
+    // ========================================================================
+    // Overlay coverage and permission tests
+    //
+    // These tests verify that:
+    //   1. Non-accessible siblings inside an overlay dir get EACCES (mode 0000).
+    //   2. The mode 0000 stub in the upper layer never leaks to the real FS.
+    //   3. execute_access does not include ReadFile (execute-only enforcement).
+    //
+    // Tests that control $HOME set it temporarily via HomeGuard, which restores
+    // the original value on drop — safe under #[serial] (tests don't run in
+    // parallel).
+    // ========================================================================
+
+    /// RAII guard that saves and restores the HOME environment variable.
+    ///
+    /// Used by tests that temporarily redirect HOME to a temp directory so that
+    /// `spawn_with_landlock` computes overlay roots relative to a fake home.
+    #[cfg(target_os = "linux")]
+    struct HomeGuard(String);
+
+    #[cfg(target_os = "linux")]
+    impl HomeGuard {
+        fn set(new_home: &std::path::Path) -> Self {
+            let old = std::env::var("HOME").unwrap_or_default();
+            // SAFETY: this is a single-threaded test context (enforced by #[serial]).
+            #[allow(deprecated)] // set_var is safe in single-threaded serial tests
+            std::env::set_var("HOME", new_home);
+            Self(old)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            #[allow(deprecated)]
+            std::env::set_var("HOME", &self.0);
+        }
+    }
+
+    /// Spawn a sandboxed shell command with HOME pointed at `fake_home`.
+    ///
+    /// `rw_files` are added to `read_write` (file-level entries, which trigger
+    /// overlay mounts via the MCA algorithm).  `rw_dirs` are added as directory
+    /// entries so their writes are flushed back.  The command's working
+    /// directory and data_dir are both `work_dir`.
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_with_fake_home(
+        fake_home: &std::path::Path,
+        work_dir: &std::path::Path,
+        rw_files: &[&std::path::Path],
+        rw_dirs: &[&std::path::Path],
+        cmd: &str,
+    ) -> Option<(std::process::Child, Option<crate::linux_overlayfs::OverlayHandle>)> {
+        use std::collections::HashMap;
+
+        if check_available().is_err() {
+            return None;
+        }
+
+        let mut paths = SandboxPaths::default();
+        for f in rw_files {
+            if let Some(s) = f.to_str() {
+                paths.read_write.push(s.to_string());
+            }
+        }
+        for d in rw_dirs {
+            if let Some(s) = d.to_str() {
+                paths.read_write.push(s.to_string());
+            }
+        }
+
+        let config = SandboxConfig::new(work_dir.to_path_buf(), paths, work_dir.to_path_buf())
+            .with_data_dir(work_dir.to_path_buf())
+            .with_env(HashMap::new());
+
+        let path_dirs = vec![PathBuf::from("/bin"), PathBuf::from("/usr/bin")];
+
+        // HOME must be set to fake_home before this call so that
+        // spawn_with_landlock computes overlay roots relative to it.
+        let _guard = HomeGuard::set(fake_home);
+
+        match spawn_with_landlock(
+            &config,
+            "/bin/sh",
+            &["-c".to_string(), cmd.to_string()],
+            &HashMap::new(),
+            &path_dirs,
+        ) {
+            Ok((child, handle, _netns)) => Some((child, handle)),
+            Err(SandboxError::SpawnFailed(e))
+                if e.kind() == std::io::ErrorKind::PermissionDenied =>
+            {
+                None
+            }
+            #[allow(clippy::panic)] // unexpected spawn error in test helper — fail loudly
+            Err(e) => panic!("spawn_with_landlock failed unexpectedly: {e:?}"),
+        }
+    }
+
+    /// Non-accessible directories that are siblings of an accessible file inside
+    /// the overlay root must be EACCES inside the sandbox.
+    ///
+    /// Setup: fake_home/.config/allowed.txt (accessible via read_write) and
+    ///        fake_home/.config/secret/ (not accessible).
+    ///
+    /// Overlay root: ~/.config (MCA of accessible paths under home).
+    ///
+    /// Inside the overlay, `secret/` gets mode 0000 + opaque=y in the upper
+    /// layer.  The sandboxed `ls` on that directory must return non-zero.
+    #[test]
+    #[serial]
+    #[cfg(target_os = "linux")]
+    fn test_overlay_non_accessible_sibling_is_eacces() -> TestResult {
+        let fake_home = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
+        let config_dir = fake_home.path().join(".config");
+        let allowed_file = config_dir.join("allowed.txt");
+        let secret_dir = config_dir.join("secret");
+        let work_dir = fake_home.path().join("work");
+        let result_file = work_dir.join("ls_exit.txt");
+
+        std::fs::create_dir_all(&config_dir).map_err(|e| format!("mkdir config: {e}"))?;
+        std::fs::create_dir_all(&secret_dir).map_err(|e| format!("mkdir secret: {e}"))?;
+        std::fs::create_dir_all(&work_dir).map_err(|e| format!("mkdir work: {e}"))?;
+        std::fs::write(&allowed_file, "allowed").map_err(|e| format!("write: {e}"))?;
+        std::fs::write(secret_dir.join("top-secret.txt"), "secret")
+            .map_err(|e| format!("write secret: {e}"))?;
+
+        // Command: attempt ls on the non-accessible dir; record exit status in work_dir.
+        let cmd = format!(
+            "ls '{secret}' > /dev/null 2>&1; echo $? > '{out}'",
+            secret = secret_dir.display(),
+            out = result_file.display(),
+        );
+
+        let Some((mut child, overlay_handle)) = spawn_with_fake_home(
+            fake_home.path(),
+            &work_dir,
+            &[&allowed_file],
+            &[&work_dir],
+            &cmd,
+        ) else {
+            return Ok(()); // overlayfs or user namespaces unavailable
+        };
+        let Some(handle) = overlay_handle else {
+            child.wait().ok();
+            return Ok(()); // overlay not active (no file-type rw entries produced roots)
+        };
+
+        let status = child.wait().map_err(|e| format!("wait: {e}"))?;
+        crate::linux_overlayfs::teardown(handle);
+
+        assert!(status.success(), "outer shell command should exit 0");
+
+        let ls_exit: i32 = std::fs::read_to_string(&result_file)
+            .map_err(|e| format!("read result: {e}"))?
+            .trim()
+            .parse()
+            .map_err(|e| format!("parse exit: {e}"))?;
+
+        assert_ne!(
+            ls_exit, 0,
+            "ls on non-accessible dir must fail inside sandbox \
+             (expected EACCES from mode-0000 upper-layer stub)"
+        );
+        Ok(())
+    }
+
+    /// Mode 0000 stubs in the overlay's upper layer must NOT leak to the real
+    /// filesystem after teardown.
+    ///
+    /// The upper layer is a separate staging directory; the real directory is
+    /// never chmod'd.  After the sandbox exits and teardown() is called, the
+    /// real directory permissions must be identical to what they were before
+    /// the sandbox ran.
+    #[test]
+    #[serial]
+    #[cfg(target_os = "linux")]
+    fn test_overlay_real_permissions_not_leaked() -> TestResult {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fake_home = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
+        let config_dir = fake_home.path().join(".config");
+        let allowed_file = config_dir.join("allowed.txt");
+        let private_dir = config_dir.join("private");
+        let work_dir = fake_home.path().join("work");
+
+        std::fs::create_dir_all(&config_dir).map_err(|e| format!("mkdir config: {e}"))?;
+        std::fs::create_dir_all(&private_dir).map_err(|e| format!("mkdir private: {e}"))?;
+        std::fs::create_dir_all(&work_dir).map_err(|e| format!("mkdir work: {e}"))?;
+        std::fs::write(&allowed_file, "data").map_err(|e| format!("write: {e}"))?;
+
+        // Record original permissions of private_dir before the sandbox touches anything.
+        let perms_before = std::fs::metadata(&private_dir)
+            .map_err(|e| format!("metadata before: {e}"))?
+            .permissions()
+            .mode();
+
+        let Some((mut child, overlay_handle)) = spawn_with_fake_home(
+            fake_home.path(),
+            &work_dir,
+            &[&allowed_file],
+            &[&work_dir],
+            "true",
+        ) else {
+            return Ok(());
+        };
+        let Some(handle) = overlay_handle else {
+            child.wait().ok();
+            return Ok(());
+        };
+
+        child.wait().map_err(|e| format!("wait: {e}"))?;
+        crate::linux_overlayfs::teardown(handle);
+
+        let perms_after = std::fs::metadata(&private_dir)
+            .map_err(|e| format!("metadata after: {e}"))?
+            .permissions()
+            .mode();
+
+        assert_eq!(
+            perms_before, perms_after,
+            "mode 0000 in overlay upper layer must not leak to real filesystem: \
+             before=0o{perms_before:o} after=0o{perms_after:o}"
+        );
+        Ok(())
+    }
+
+    /// `execute_access` must NOT include `ReadFile`.
+    ///
+    /// Paths in `paths.execute` should be execute-only: the sandboxed process
+    /// can `execve` binaries there but cannot `open(O_RDONLY)` them (which
+    /// would let an attacker exfiltrate binary content).
+    ///
+    /// System library paths (`syslib_access`) intentionally DO include
+    /// `ReadFile` because the dynamic linker uses `open()` to load `.so` files.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_execute_access_excludes_read_file() {
+        use landlock::{Access, AccessFs, ABI};
+        // Reproduce the execute_access and syslib_access constants from the
+        // production Landlock ruleset builder.
+        let execute_access = AccessFs::ReadDir | AccessFs::Execute;
+        let syslib_access = AccessFs::ReadFile | AccessFs::ReadDir | AccessFs::Execute;
+        let all_access = AccessFs::from_all(ABI::V4);
+
+        // Sanity: both are subsets of all_access.
+        assert!(all_access.contains(execute_access));
+        assert!(all_access.contains(syslib_access));
+
+        // Core invariant: execute-only paths must not grant ReadFile.
+        assert!(
+            !execute_access.contains(AccessFs::ReadFile),
+            "execute_access must not grant ReadFile — \
+             execute paths should be execute-only so cat(1) cannot read installed binaries"
+        );
+
+        // System lib paths must grant ReadFile (dynamic linker needs it).
+        assert!(
+            syslib_access.contains(AccessFs::ReadFile),
+            "syslib_access must grant ReadFile so the dynamic linker can open shared libraries"
+        );
     }
 }

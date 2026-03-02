@@ -122,6 +122,13 @@ pub fn spawn_sandboxed(
     // - Linux: overlayfs accessible set is built from config at mount time.
     // - macOS: SBPL profile is generated from config before spawn.
     let mut effective_config = config.clone();
+    // Canonical binary parent directories that need ReadFile for execve to work.
+    // These are collected separately from execute_paths so they can receive
+    // syslib_access (ReadFile | ReadDir | Execute) rather than execute_access
+    // (ReadDir | Execute only). On Linux, the kernel requires ReadFile on the
+    // binary's directory for execve to succeed under Landlock, even though
+    // Execute alone should theoretically be sufficient.
+    let mut binary_real_parents: Vec<std::path::PathBuf> = Vec::new();
     {
         let path_env = config.env.get("PATH").map_or("", String::as_str);
 
@@ -145,16 +152,34 @@ pub fn spawn_sandboxed(
             if let Some(parent) = fp.parent() {
                 // Symlink-path parent → always add (covers bin/ dirs).
                 add(parent.to_string_lossy().into_owned());
+                // The symlink parent also needs syslib_access so that any
+                // binaries symlinked from it can be read and executed.
+                binary_real_parents.push(parent.to_path_buf());
                 // Package-root heuristic: `bin/` sibling dirs (lib/, etc.).
+                // The package root receives syslib_access so that Node.js
+                // runtimes can read .js files and spawn nested binaries from
+                // anywhere in the package tree.
+                // Only apply for user-space package roots (e.g. ~/.npm-global),
+                // NOT for system directories like / (pkg_root of /bin/true is /).
+                // Adding / to accessible/path_dirs would make every path appear
+                // to be "in an accessible subtree", breaking overlay stub logic.
                 if parent.file_name().is_some_and(|n| n == "bin") {
                     if let Some(pkg_root) = parent.parent() {
-                        add(pkg_root.to_string_lossy().into_owned());
+                        // Skip filesystem root and other degenerate cases.
+                        if pkg_root.parent().is_some() {
+                            add(pkg_root.to_string_lossy().into_owned());
+                            binary_real_parents.push(pkg_root.to_path_buf());
+                        }
                     }
                 }
             }
             // Step 2: canonical parent for Landlock execute on the real inode.
+            // Added to binary_real_parents so it receives syslib_access (with
+            // ReadFile) — required for execve to succeed under Landlock on Linux.
             if let Ok(real) = std::fs::canonicalize(fp) {
                 if let Some(real_parent) = real.parent() {
+                    binary_real_parents.push(real_parent.to_path_buf());
+                    // Also add as execute path for the accessible set computation.
                     add(real_parent.to_string_lossy().into_owned());
                 }
             }
@@ -198,7 +223,14 @@ pub fn spawn_sandboxed(
     #[cfg(target_os = "linux")]
     {
         let child_path = config.env.get("PATH").map_or("", |s| s.as_str());
-        let path_dirs = resolve_path_dirs_from(child_path);
+        let mut path_dirs = resolve_path_dirs_from(child_path);
+        // Add canonical binary parent dirs to path_dirs so they receive
+        // syslib_access (ReadFile | ReadDir | Execute) — execve requires ReadFile.
+        for p in binary_real_parents {
+            if p.is_dir() && !path_dirs.contains(&p) {
+                path_dirs.push(p);
+            }
+        }
         let (child, overlay, netns) =
             linux::spawn_with_landlock(config, cmd, args, &config.env, &path_dirs)?;
         Ok(SandboxChild { child, overlay, netns })

@@ -233,9 +233,16 @@ fn populate_upper_stubs(
                     depth_limit - 1,
                 )?;
             } else {
-                // No accessible descendants: make the directory opaque.
-                // The merged view shows an empty directory; contents return ENOENT.
+                // No accessible descendants: make the directory opaque so lower
+                // contents don't bleed through, AND set mode 0000 so even the
+                // directory itself returns EACCES on traversal or listing.
+                // opaque=y hides lower content at the overlayfs level.
+                // mode 0000 adds VFS-level enforcement (EACCES on readdir/chdir).
                 let _ = set_xattr(&upper_path, "user.overlay.opaque", b"y");
+                let _ = std::fs::set_permissions(
+                    &upper_path,
+                    <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o000),
+                );
             }
         } else if ft.is_file() {
             // Is this file accessible (explicitly listed or within an accessible subtree)?
@@ -272,84 +279,76 @@ fn populate_upper_stubs(
 // Public API
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Create staging directories for each unique parent directory of write-listed files.
+/// Compute the minimal set of overlay mount roots from the accessible path set.
 ///
-/// Call this from the **parent** process before `Command::spawn()`. The staging
-/// directories are created on the host filesystem so they are visible to both
-/// the parent (for inotify watching and final flush) and the child (as the
-/// overlayfs upper and work directories inside its mount namespace).
+/// For each accessible path that lives under `home_dir`, takes its immediate
+/// parent directory.  Then applies a domination filter: if directory A is an
+/// ancestor of directory B, B is already covered by A's overlay and is dropped.
+/// The result is the most-specific set of directories that collectively cover
+/// all home-directory-scoped accessible paths.
 ///
-/// Only parent directories that currently exist on disk get an overlay entry;
-/// non-existent parents are skipped.
+/// System paths (outside `home_dir`) are excluded — they are handled by
+/// Landlock alone and never need overlay stubs.
+fn overlay_roots_for_accessible(
+    accessible: &std::collections::HashSet<std::path::PathBuf>,
+    home_dir: &std::path::Path,
+) -> Vec<std::path::PathBuf> {
+    use std::collections::BTreeSet;
+
+    // Collect unique parent dirs of accessible paths under home_dir.
+    let mut parent_set: BTreeSet<std::path::PathBuf> = BTreeSet::new();
+    for path in accessible {
+        if !path.starts_with(home_dir) {
+            continue; // system / temp / device paths — no overlay needed
+        }
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() && parent.starts_with(home_dir) {
+                parent_set.insert(parent.to_path_buf());
+            }
+        }
+    }
+
+    // Sort shortest-first so we process the most general (shallowest) dirs first.
+    let mut sorted: Vec<std::path::PathBuf> = parent_set.into_iter().collect();
+    sorted.sort_by_key(|p| p.as_os_str().len());
+
+    // Keep only non-dominated entries: if an ancestor is already a root,
+    // the descendant is covered by that ancestor's overlay.
+    let mut roots: Vec<std::path::PathBuf> = Vec::new();
+    for dir in sorted {
+        if !roots.iter().any(|root| dir.starts_with(root)) {
+            roots.push(dir);
+        }
+    }
+    roots
+}
+
+/// Compute overlay mount plans for all accessible paths under the user's home directory.
 ///
-/// `accessible` is the set of paths (files and directories) that the sandboxed
-/// process is allowed to read — built from the `read`, `execute`, and `read_write`
-/// manifest expansions plus `workspace`, `data_dir`, configured mounts, and
-/// system paths.  Any file or directory in `real_dir` that is **not** covered by
-/// `accessible` will be stubbed out in `upper/` to prevent reads.
+/// Uses the minimal common-ancestor algorithm: for each accessible path under
+/// `home_dir`, takes its parent directory, then removes dominated entries so
+/// that the resulting set is the most specific coverage possible.  This ensures
+/// that non-accessible siblings within covered directories are hidden by the
+/// overlay's stub mechanism, without blanketing the entire home directory.
 ///
-/// # Errors
-///
-/// Returns an error if a staging directory cannot be created.
-/// Compute overlay mount plans for write-listed files.
-///
-/// Only determines which directories need overlays and what paths to use.
-/// Upper/work directory creation and stub population are deferred to
-/// [`setup_overlay_dirs`], which runs inside the child's user namespace
-/// after `unshare(CLONE_NEWUSER | CLONE_NEWNS)` — matching the execution
-/// context that the kernel expects for user-namespace overlay mounts.
+/// Write-set files are already part of `accessible` (they are in `read_write`),
+/// so write-isolation for those files is preserved automatically.
 pub fn prepare_overlay_dirs(
-    write_files: &[PathBuf],
+    accessible: &std::collections::HashSet<PathBuf>,
+    home_dir: &Path,
     pid: u32,
 ) -> Vec<OverlayMount> {
-    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let roots = overlay_roots_for_accessible(accessible, home_dir);
     let mut mounts = Vec::new();
-    let mut idx = 0usize;
-
-    // First pass: collect unique parent directories.
-    let mut parents: Vec<PathBuf> = Vec::new();
-    for file_path in write_files {
-        let parent = match file_path.parent() {
-            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-            _ => continue,
-        };
-        if !parent.is_dir() {
+    for (idx, root) in roots.iter().enumerate() {
+        if !root.is_dir() {
             continue;
         }
-        if !seen.insert(parent.clone()) {
-            continue;
-        }
-        parents.push(parent);
-    }
-
-    // Sort shortest-first so ancestor directories come before descendants.
-    parents.sort_by_key(|p| p.as_os_str().len());
-
-    // Second pass: skip directories already covered by an ancestor overlay.
-    // After mounting overlayfs on `~`, paths like `~/.local/share` resolve
-    // through that overlay.  Trying to mount a second overlayfs on a path
-    // inside an existing overlay fails with EACCES in user namespaces.
-    // The ancestor's populate_upper_stubs already handles visibility of
-    // files under the nested directory via the accessible set.
-    let mut overlay_roots: Vec<PathBuf> = Vec::new();
-    for parent in &parents {
-        let dominated = overlay_roots.iter().any(|root| parent.starts_with(root));
-        if dominated {
-            continue; // covered by an ancestor overlay
-        }
-        overlay_roots.push(parent.clone());
-    }
-
-    for parent in &overlay_roots {
         let base_dir = PathBuf::from(format!("/tmp/pent-ovl-{pid}-{idx}"));
         let upper_dir = base_dir.join("upper");
         let work_dir = base_dir.join("work");
-        // Directories are NOT created here; setup_overlay_dirs does that
-        // inside the child's user namespace after unshare.
-        mounts.push(OverlayMount { real_dir: parent.clone(), upper_dir, work_dir, base_dir });
-        idx += 1;
+        mounts.push(OverlayMount { real_dir: root.clone(), upper_dir, work_dir, base_dir });
     }
-
     mounts
 }
 
@@ -737,5 +736,136 @@ pub fn teardown(handle: OverlayHandle) {
     // they existed only inside the child's mount namespace.
     for overlay in &overlays {
         let _ = std::fs::remove_dir_all(&overlay.base_dir);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::overlay_roots_for_accessible;
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+
+    fn p(s: &str) -> PathBuf {
+        PathBuf::from(s)
+    }
+
+    fn set(paths: &[&str]) -> HashSet<PathBuf> {
+        paths.iter().map(|s| p(s)).collect()
+    }
+
+    /// Two files under the same subdirectory collapse to one overlay root —
+    /// the minimal common ancestor — not to the home directory itself.
+    ///
+    /// This is the canonical case: `~/.config/claude.json` and
+    /// `~/.config/gemini.toml` must produce a single root `~/.config`,
+    /// NOT `~`.  Mounting `~` as an overlay would hide every other home-dir
+    /// file, breaking any other tool that reads from home.
+    #[test]
+    fn two_files_same_subdir_gives_one_root() {
+        let home = p("/home/user");
+        let accessible = set(&[
+            "/home/user/.config/claude.json",
+            "/home/user/.config/gemini.toml",
+        ]);
+        let roots = overlay_roots_for_accessible(&accessible, &home);
+        assert_eq!(
+            roots,
+            vec![p("/home/user/.config")],
+            "expected ~/.config as root, not ~ — MCA must not go all the way up to home"
+        );
+    }
+
+    /// Files in disjoint subdirectories produce two independent overlay roots,
+    /// one per subtree.  There is no blanket home-dir overlay.
+    #[test]
+    fn files_in_different_subdirs_give_separate_roots() {
+        let home = p("/home/user");
+        let accessible = set(&[
+            "/home/user/.config/claude.json",
+            "/home/user/.ssh/known_hosts",
+        ]);
+        let mut roots = overlay_roots_for_accessible(&accessible, &home);
+        roots.sort();
+        let mut expected = vec![p("/home/user/.config"), p("/home/user/.ssh")];
+        expected.sort();
+        assert_eq!(roots, expected);
+    }
+
+    /// A shallower ancestor dominates a deeper one: if both `~/.config` and
+    /// `~/.config/tool/` appear as parents, only `~/.config` is kept.
+    #[test]
+    fn ancestor_dominates_deeper_descendant() {
+        let home = p("/home/user");
+        let accessible = set(&[
+            "/home/user/.config/claude.json",
+            "/home/user/.config/tool/settings.toml",
+        ]);
+        let roots = overlay_roots_for_accessible(&accessible, &home);
+        // Both parents (~/.config and ~/.config/tool) are candidates, but
+        // ~/.config/tool is dominated by ~/.config.
+        assert_eq!(
+            roots,
+            vec![p("/home/user/.config")],
+            "~/.config/tool should be dominated by ~/.config"
+        );
+    }
+
+    /// Paths that live outside `home_dir` (system and temp paths) are excluded
+    /// from overlay root computation — only the Landlock layer covers them.
+    #[test]
+    fn system_paths_outside_home_are_excluded() {
+        let home = p("/home/user");
+        let accessible = set(&[
+            "/usr/lib/libfoo.so",
+            "/tmp/scratch.txt",
+            "/etc/hosts",
+            "/proc/self/status",
+        ]);
+        let roots = overlay_roots_for_accessible(&accessible, &home);
+        assert!(roots.is_empty(), "system / temp paths must not produce overlay roots");
+    }
+
+    /// A file directly under home (e.g. `~/.bashrc`) produces `~` as the root.
+    #[test]
+    fn file_directly_under_home_gives_home_root() {
+        let home = p("/home/user");
+        let accessible = set(&["/home/user/.bashrc"]);
+        let roots = overlay_roots_for_accessible(&accessible, &home);
+        assert_eq!(roots, vec![p("/home/user")]);
+    }
+
+    /// A mix of home and system paths — only the home paths contribute roots;
+    /// system paths are silently ignored.
+    #[test]
+    fn mix_home_and_system_gives_only_home_roots() {
+        let home = p("/home/user");
+        let accessible = set(&[
+            "/usr/bin/bash",
+            "/home/user/.config/tool.cfg",
+            "/tmp/work.txt",
+        ]);
+        let roots = overlay_roots_for_accessible(&accessible, &home);
+        assert_eq!(roots, vec![p("/home/user/.config")]);
+    }
+
+    /// Three files under two distinct home subdirectories produce exactly two
+    /// roots, with no spurious intermediate or parent entries.
+    #[test]
+    fn three_files_two_subdirs_gives_two_roots() {
+        let home = p("/home/user");
+        let accessible = set(&[
+            "/home/user/.config/claude.json",
+            "/home/user/.config/gemini.toml",
+            "/home/user/.local/share/app/data.db",
+        ]);
+        let mut roots = overlay_roots_for_accessible(&accessible, &home);
+        roots.sort();
+        let mut expected = vec![p("/home/user/.config"), p("/home/user/.local/share/app")];
+        expected.sort();
+        assert_eq!(roots, expected);
     }
 }
