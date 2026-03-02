@@ -426,9 +426,13 @@ pub unsafe fn mount_overlays(overlays: &[OverlayMount]) -> std::io::Result<()> {
             continue;
         };
         // userxattr: use user.overlay.* namespace for opaque/whiteout xattrs,
-        // which works in unprivileged user namespaces.
-        let options =
-            format!("lowerdir={real_str},upperdir={upper_str},workdir={work_str},userxattr");
+        //   which works in unprivileged user namespaces.
+        // index=off: disable the index directory feature, which is required to
+        //   allow overlay-on-overlay (e.g. when pent runs inside a Docker
+        //   container whose root filesystem is already overlayfs/overlay2).
+        let options = format!(
+            "lowerdir={real_str},upperdir={upper_str},workdir={work_str},userxattr,index=off"
+        );
         let Ok(options_c) = CString::new(options) else {
             continue;
         };

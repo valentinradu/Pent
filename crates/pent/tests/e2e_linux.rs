@@ -177,8 +177,9 @@ mod linux {
     ///
     /// On Linux `dirs::config_dir()` = `~/.config`, so the config lands at
     /// `$HOME/.config/pent/pent.toml`.
+    /// Returns `(home_dir, config_path)`.
     #[allow(clippy::unwrap_used, clippy::panic)] // infrastructure helper: TempDir/spawn failures are test setup failures
-    fn agent_config(agent: &str, configs_root: &Path) -> PathBuf {
+    fn agent_config(agent: &str, configs_root: &Path) -> (PathBuf, PathBuf) {
         let home = configs_root.join(format!("{agent}_home"));
         fs::create_dir_all(&home).unwrap();
         let status = Command::new(PENT_BIN)
@@ -189,14 +190,16 @@ mod linux {
             .status()
             .unwrap_or_else(|e| panic!("pent config add @{agent}: {e}"));
         assert!(status.success(), "pent config add --global @{agent} failed");
-        home.join(".config").join("pent").join("pent.toml")
+        let config = home.join(".config").join("pent").join("pent.toml");
+        (home, config)
     }
 
     // ── run_pent helper ──────────────────────────────────────────────────────
 
     #[allow(clippy::panic)] // infrastructure helper: spawn failure is a hard test setup error
-    fn run_pent(config: &Path, extra: &[&str], cmd: &[&str]) -> (ExitStatus, String) {
+    fn run_pent(home: &Path, config: &Path, extra: &[&str], cmd: &[&str]) -> (ExitStatus, String) {
         let out = Command::new(PENT_BIN)
+            .env("HOME", home)
             .arg("run")
             .arg("--no-config")
             .arg("--config")
@@ -223,7 +226,7 @@ mod linux {
 
         let configs = TempDir::new()?;
         let ws = TempDir::new()?;
-        let config = agent_config(agent, configs.path());
+        let (home, config) = agent_config(agent, configs.path());
         let sentinel = ws.path().join(format!("sentinel-{agent}.txt"));
         let sentinel_s = sentinel
             .to_str()
@@ -231,6 +234,7 @@ mod linux {
 
         // 1. Workspace write must succeed.
         let (status, stderr) = run_pent(
+            &home,
             &config,
             &["--network", "unrestricted"],
             &["bash", "-c", &format!("echo ok > '{sentinel_s}'")],
@@ -243,6 +247,7 @@ mod linux {
 
         // 2. Workspace read must succeed.
         let (status, stderr) = run_pent(
+            &home,
             &config,
             &["--network", "unrestricted"],
             &["bash", "-c", &format!("cat '{sentinel_s}'")],
@@ -256,6 +261,7 @@ mod linux {
         let blocked = format!("/etc/pent-test-{agent}");
         let _ = fs::remove_file(&blocked);
         let _ = run_pent(
+            &home,
             &config,
             &["--network", "unrestricted"],
             &[
@@ -305,7 +311,7 @@ mod linux {
         let _routing = RoutingGuard::install();
 
         let configs = TempDir::new()?;
-        let config = agent_config(agent, configs.path());
+        let (home, config) = agent_config(agent, configs.path());
 
         // 4. Allowed domain reachable through proxy.
         //    curl exit 0=success  7=connect refused (DNS worked)  22=HTTP error (tunnel worked)
@@ -313,6 +319,7 @@ mod linux {
         // stdout is already null via run_pent — no -o /dev/null needed (would
         // trigger curl exit 23 because the sandbox may block opening /dev/null for write).
         let (status, stderr) = run_pent(
+            &home,
             &config,
             &[],
             &[
@@ -333,6 +340,7 @@ mod linux {
         // 5. Blocked domain must be denied.
         //    curl exit 6=NXDOMAIN  56=proxy rejected CONNECT
         let (status, stderr) = run_pent(
+            &home,
             &config,
             &[],
             &[
