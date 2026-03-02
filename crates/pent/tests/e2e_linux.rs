@@ -62,7 +62,8 @@ mod linux {
             let mut seen = std::collections::HashSet::new();
             for line in stdout.lines() {
                 // Lines look like: "5270:\tfrom all lookup 52"
-                if let Some(t_str) = line.split_whitespace()
+                if let Some(t_str) = line
+                    .split_whitespace()
                     .skip_while(|&w| w != "lookup")
                     .nth(1)
                 {
@@ -71,9 +72,14 @@ mod linux {
                         if table < 253 && seen.insert(table) {
                             let ok = Command::new("ip")
                                 .args([
-                                    "rule", "add", "from", "all",
-                                    "lookup", &table.to_string(),
-                                    "priority", "9990",
+                                    "rule",
+                                    "add",
+                                    "from",
+                                    "all",
+                                    "lookup",
+                                    &table.to_string(),
+                                    "priority",
+                                    "9990",
                                 ])
                                 .stderr(Stdio::null())
                                 .status()
@@ -95,9 +101,14 @@ mod linux {
             for &table in &self.0 {
                 let _ = Command::new("ip")
                     .args([
-                        "rule", "del", "from", "all",
-                        "lookup", &table.to_string(),
-                        "priority", "9990",
+                        "rule",
+                        "del",
+                        "from",
+                        "all",
+                        "lookup",
+                        &table.to_string(),
+                        "priority",
+                        "9990",
                     ])
                     .stderr(Stdio::null())
                     .status();
@@ -188,7 +199,8 @@ mod linux {
         let out = Command::new(PENT_BIN)
             .arg("run")
             .arg("--no-config")
-            .arg("--config").arg(config)
+            .arg("--config")
+            .arg(config)
             .args(extra)
             .arg("--")
             .args(cmd)
@@ -213,7 +225,9 @@ mod linux {
         let ws = TempDir::new()?;
         let config = agent_config(agent, configs.path());
         let sentinel = ws.path().join(format!("sentinel-{agent}.txt"));
-        let sentinel_s = sentinel.to_str().ok_or("sentinel path is not valid UTF-8")?;
+        let sentinel_s = sentinel
+            .to_str()
+            .ok_or("sentinel path is not valid UTF-8")?;
 
         // 1. Workspace write must succeed.
         let (status, stderr) = run_halt(
@@ -244,7 +258,11 @@ mod linux {
         let _ = run_halt(
             &config,
             &["--network", "unrestricted"],
-            &["bash", "-c", &format!("echo x > '{blocked}' 2>/dev/null; exit 0")],
+            &[
+                "bash",
+                "-c",
+                &format!("echo x > '{blocked}' 2>/dev/null; exit 0"),
+            ],
         );
         assert!(
             !Path::new(&blocked).exists(),
@@ -256,11 +274,17 @@ mod linux {
     }
 
     #[test]
-    fn filesystem_claude() -> TestResult { test_filesystem("claude") }
+    fn filesystem_claude() -> TestResult {
+        test_filesystem("claude")
+    }
     #[test]
-    fn filesystem_codex() -> TestResult  { test_filesystem("codex") }
+    fn filesystem_codex() -> TestResult {
+        test_filesystem("codex")
+    }
     #[test]
-    fn filesystem_gemini() -> TestResult { test_filesystem("gemini") }
+    fn filesystem_gemini() -> TestResult {
+        test_filesystem("gemini")
+    }
 
     // ── network tests ────────────────────────────────────────────────────────
 
@@ -269,11 +293,15 @@ mod linux {
 
     fn test_network(agent: &str, allowed_domain: &str) -> TestResult {
         if !is_root() {
-            println!("\nSKIP {agent} network: requires root (`sudo -E cargo test --test e2e_linux`)");
+            println!(
+                "\nSKIP {agent} network: requires root (`sudo -E cargo test --test e2e_linux`)"
+            );
             return Ok(());
         }
 
-        let _lock = NETWORK_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _lock = NETWORK_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _routing = RoutingGuard::install();
 
         let configs = TempDir::new()?;
@@ -287,8 +315,13 @@ mod linux {
         let (status, stderr) = run_halt(
             &config,
             &[],
-            &["curl", "-sS", "--max-time", "15",
-              &format!("https://{allowed_domain}")],
+            &[
+                "curl",
+                "-sS",
+                "--max-time",
+                "15",
+                &format!("https://{allowed_domain}"),
+            ],
         );
         let code = status.code().unwrap_or(-1);
         assert!(
@@ -302,8 +335,13 @@ mod linux {
         let (status, stderr) = run_halt(
             &config,
             &[],
-            &["curl", "-sS", "--max-time", "5",
-              "https://blocked-domain.invalid"],
+            &[
+                "curl",
+                "-sS",
+                "--max-time",
+                "5",
+                "https://blocked-domain.invalid",
+            ],
         );
         let code = status.code().unwrap_or(-1);
         assert!(
@@ -316,9 +354,15 @@ mod linux {
     }
 
     #[test]
-    fn network_claude() -> TestResult  { test_network("claude",  "api.anthropic.com") }
+    fn network_claude() -> TestResult {
+        test_network("claude", "api.anthropic.com")
+    }
     #[test]
-    fn network_codex() -> TestResult   { test_network("codex",   "api.openai.com") }
+    fn network_codex() -> TestResult {
+        test_network("codex", "api.openai.com")
+    }
     #[test]
-    fn network_gemini() -> TestResult  { test_network("gemini",  "generativelanguage.googleapis.com") }
+    fn network_gemini() -> TestResult {
+        test_network("gemini", "generativelanguage.googleapis.com")
+    }
 }

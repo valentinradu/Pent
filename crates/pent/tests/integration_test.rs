@@ -323,7 +323,12 @@ fn test_run_cannot_read_file_in_home_dir() -> TestResult {
     let out = sandboxed_run(
         dir.path(),
         &sys_exec_args(),
-        &["/bin/cat", secret_path.to_str().ok_or("secret path is not valid UTF-8")?],
+        &[
+            "/bin/cat",
+            secret_path
+                .to_str()
+                .ok_or("secret path is not valid UTF-8")?,
+        ],
     );
     // Sandbox blocks the read → non-zero exit
     expect_failure(&out);
@@ -353,19 +358,34 @@ fn test_run_extra_read_gives_access_to_home_dir_file() -> TestResult {
     let out_blocked = sandboxed_run(
         dir.path(),
         &sys_exec_args(),
-        &["/bin/cat", secret_file.to_str().ok_or("secret_file path is not valid UTF-8")?],
+        &[
+            "/bin/cat",
+            secret_file
+                .to_str()
+                .ok_or("secret_file path is not valid UTF-8")?,
+        ],
     );
     expect_failure(&out_blocked);
 
     // With --read <secret_dir>: access should succeed
     let mut extra = sys_exec_args();
     extra.push("--read".into());
-    extra.push(secret_dir.to_str().ok_or("secret_dir path is not valid UTF-8")?.to_string());
+    extra.push(
+        secret_dir
+            .to_str()
+            .ok_or("secret_dir path is not valid UTF-8")?
+            .to_string(),
+    );
 
     let out_allowed = sandboxed_run(
         dir.path(),
         &extra,
-        &["/bin/cat", secret_file.to_str().ok_or("secret_file path is not valid UTF-8")?],
+        &[
+            "/bin/cat",
+            secret_file
+                .to_str()
+                .ok_or("secret_file path is not valid UTF-8")?,
+        ],
     );
     let stdout = expect_success(&out_allowed);
     assert!(
@@ -392,12 +412,20 @@ fn test_run_extra_write_gives_write_access() -> TestResult {
     };
     fs::create_dir_all(&write_dir)?;
     let target = write_dir.join("out.txt");
-    let target_str = target.to_str().ok_or("target path is not valid UTF-8")?.to_string();
+    let target_str = target
+        .to_str()
+        .ok_or("target path is not valid UTF-8")?
+        .to_string();
 
     let dir = TempDir::new()?;
     let mut extra = sys_exec_args();
     extra.push("--write".into());
-    extra.push(write_dir.to_str().ok_or("write_dir path is not valid UTF-8")?.to_string());
+    extra.push(
+        write_dir
+            .to_str()
+            .ok_or("write_dir path is not valid UTF-8")?
+            .to_string(),
+    );
 
     let out = sandboxed_run(
         dir.path(),
@@ -730,7 +758,10 @@ fn test_config_add_multiple_profiles() -> TestResult {
 
     let config_path = dir.path().join(".pent").join("pent.toml");
     let contents = fs::read_to_string(&config_path)?;
-    assert!(contents.contains("registry.npmjs.org"), "npm domain missing");
+    assert!(
+        contents.contains("registry.npmjs.org"),
+        "npm domain missing"
+    );
     assert!(contents.contains("crates.io"), "cargo domain missing");
     assert!(contents.contains("github.com"), "gh domain missing");
     Ok(())
@@ -837,7 +868,6 @@ fn test_run_extra_config_merges_domain_allowlist() -> TestResult {
     Ok(())
 }
 
-
 // ============================================================================
 // K. Run — --execute flag
 // ============================================================================
@@ -891,8 +921,7 @@ fn test_config_add_claude_has_correct_domains_and_paths() -> TestResult {
     let dir = TempDir::new()?;
     expect_success(&run_halt(dir.path(), &["config", "add", "@claude"]));
 
-    let contents =
-        fs::read_to_string(dir.path().join(".pent").join("pent.toml"))?;
+    let contents = fs::read_to_string(dir.path().join(".pent").join("pent.toml"))?;
     assert!(
         contents.contains("api.anthropic.com"),
         "@claude missing api.anthropic.com: {contents}"
@@ -926,8 +955,7 @@ fn test_config_add_claude_has_macos_app_support_path() -> TestResult {
     let dir = TempDir::new()?;
     expect_success(&run_halt(dir.path(), &["config", "add", "@claude"]));
 
-    let contents =
-        fs::read_to_string(dir.path().join(".pent").join("pent.toml"))?;
+    let contents = fs::read_to_string(dir.path().join(".pent").join("pent.toml"))?;
     assert!(
         contents.contains("Application Support/claude"),
         "@claude missing ~/Library/Application Support/claude on macOS: {contents}"
@@ -940,8 +968,7 @@ fn test_config_add_codex_has_correct_domains_and_paths() -> TestResult {
     let dir = TempDir::new()?;
     expect_success(&run_halt(dir.path(), &["config", "add", "@codex"]));
 
-    let contents =
-        fs::read_to_string(dir.path().join(".pent").join("pent.toml"))?;
+    let contents = fs::read_to_string(dir.path().join(".pent").join("pent.toml"))?;
     assert!(
         contents.contains("api.openai.com"),
         "@codex missing api.openai.com: {contents}"
@@ -958,8 +985,7 @@ fn test_config_add_gemini_has_correct_domains_and_paths() -> TestResult {
     let dir = TempDir::new()?;
     expect_success(&run_halt(dir.path(), &["config", "add", "@gemini"]));
 
-    let contents =
-        fs::read_to_string(dir.path().join(".pent").join("pent.toml"))?;
+    let contents = fs::read_to_string(dir.path().join(".pent").join("pent.toml"))?;
     assert!(
         contents.contains("generativelanguage.googleapis.com"),
         "@gemini missing generativelanguage.googleapis.com: {contents}"
@@ -1061,7 +1087,9 @@ mod no_hang {
             }
         };
 
-        let stderr = err_rx.recv_timeout(Duration::from_secs(1)).unwrap_or_default();
+        let stderr = err_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap_or_default();
         (exited, stderr)
     }
 
@@ -1088,11 +1116,15 @@ mod no_hang {
         let dir = TempDir::new()?;
         let home = TempDir::new()?;
         let (ok, stderr) = pent_timeout(
-            dir.path(), home.path(),
+            dir.path(),
+            home.path(),
             &["run", "--no-config", "--", "/usr/bin/true"],
             2,
         );
-        assert!(ok, "pent run -- /usr/bin/true timed out (2s)\nstderr:\n{stderr}");
+        assert!(
+            ok,
+            "pent run -- /usr/bin/true timed out (2s)\nstderr:\n{stderr}"
+        );
         Ok(())
     }
 
@@ -1102,11 +1134,22 @@ mod no_hang {
         let dir = TempDir::new()?;
         let home = TempDir::new()?;
         let (ok, stderr) = pent_timeout(
-            dir.path(), home.path(),
-            &["run", "--no-config", "--network", "blocked", "--", "/usr/bin/true"],
+            dir.path(),
+            home.path(),
+            &[
+                "run",
+                "--no-config",
+                "--network",
+                "blocked",
+                "--",
+                "/usr/bin/true",
+            ],
             2,
         );
-        assert!(ok, "pent run --network blocked -- /usr/bin/true timed out (2s)\nstderr:\n{stderr}");
+        assert!(
+            ok,
+            "pent run --network blocked -- /usr/bin/true timed out (2s)\nstderr:\n{stderr}"
+        );
         Ok(())
     }
 
@@ -1120,11 +1163,15 @@ mod no_hang {
         let dir = TempDir::new()?;
         let home = TempDir::new()?;
         let (ok, stderr) = pent_timeout(
-            dir.path(), home.path(),
+            dir.path(),
+            home.path(),
             &["run", "--no-config", "--", "/usr/bin/curl", "--version"],
             2,
         );
-        assert!(ok, "pent run -- curl --version timed out (2s)\nstderr:\n{stderr}");
+        assert!(
+            ok,
+            "pent run -- curl --version timed out (2s)\nstderr:\n{stderr}"
+        );
         Ok(())
     }
 
@@ -1143,19 +1190,32 @@ mod no_hang {
         let dir = TempDir::new().unwrap();
         let home = TempDir::new().unwrap();
         let (ok, stderr) = pent_timeout(
-            dir.path(), home.path(),
+            dir.path(),
+            home.path(),
             &["run", "--no-config", "--", bin_s, "--version"],
             5,
         );
-        assert!(ok, "pent run -- {name} --version timed out (5s)\nstderr:\n{stderr}");
+        assert!(
+            ok,
+            "pent run -- {name} --version timed out (5s)\nstderr:\n{stderr}"
+        );
     }
 
-    #[test] #[serial(pty)]
-    fn claude_version_exits_quickly() { assert_version_exits_quickly("claude"); }
-    #[test] #[serial(pty)]
-    fn codex_version_exits_quickly()  { assert_version_exits_quickly("codex"); }
-    #[test] #[serial(pty)]
-    fn gemini_version_exits_quickly() { assert_version_exits_quickly("gemini"); }
+    #[test]
+    #[serial(pty)]
+    fn claude_version_exits_quickly() {
+        assert_version_exits_quickly("claude");
+    }
+    #[test]
+    #[serial(pty)]
+    fn codex_version_exits_quickly() {
+        assert_version_exits_quickly("codex");
+    }
+    #[test]
+    #[serial(pty)]
+    fn gemini_version_exits_quickly() {
+        assert_version_exits_quickly("gemini");
+    }
 
     // ── with-config: project pent.toml sets domain_allowlist → ProxyOnly ─────
     //
@@ -1181,9 +1241,10 @@ mod no_hang {
         .unwrap();
 
         let (ok, stderr) = pent_timeout(
-            dir.path(), home.path(),
+            dir.path(),
+            home.path(),
             &["run", "--", bin_s, "--version"],
-            5,  // proxy + veth setup may take ~1s; allow 5s total
+            5, // proxy + veth setup may take ~1s; allow 5s total
         );
         assert!(
             ok,
@@ -1193,12 +1254,21 @@ mod no_hang {
         );
     }
 
-    #[test] #[serial(netns)]
-    fn claude_proxy_mode_exits_quickly() { assert_proxy_mode_exits_quickly("claude"); }
-    #[test] #[serial(netns)]
-    fn codex_proxy_mode_exits_quickly()  { assert_proxy_mode_exits_quickly("codex"); }
-    #[test] #[serial(netns)]
-    fn gemini_proxy_mode_exits_quickly() { assert_proxy_mode_exits_quickly("gemini"); }
+    #[test]
+    #[serial(netns)]
+    fn claude_proxy_mode_exits_quickly() {
+        assert_proxy_mode_exits_quickly("claude");
+    }
+    #[test]
+    #[serial(netns)]
+    fn codex_proxy_mode_exits_quickly() {
+        assert_proxy_mode_exits_quickly("codex");
+    }
+    #[test]
+    #[serial(netns)]
+    fn gemini_proxy_mode_exits_quickly() {
+        assert_proxy_mode_exits_quickly("gemini");
+    }
 
     // ── PTY-simulated interactive sessions ────────────────────────────────────
     //
@@ -1294,9 +1364,15 @@ mod no_hang {
         loop {
             let n = unsafe { libc::read(master_fd, tmp.as_mut_ptr().cast(), tmp.len()) };
             #[allow(clippy::cast_sign_loss)]
-            if n > 0 { buf.extend_from_slice(&tmp[..n as usize]); }
-            if Instant::now() >= deadline { break; }
-            if n <= 0 { std::thread::sleep(Duration::from_millis(50)); }
+            if n > 0 {
+                buf.extend_from_slice(&tmp[..n as usize]);
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            if n <= 0 {
+                std::thread::sleep(Duration::from_millis(50));
+            }
         }
         unsafe { libc::fcntl(master_fd, libc::F_SETFL, 0) };
         buf
@@ -1316,20 +1392,31 @@ mod no_hang {
                 continue;
             }
             i += 1; // consume ESC
-            if i >= input.len() { break; }
+            if i >= input.len() {
+                break;
+            }
             match input[i] {
                 b'[' => {
                     // CSI: skip until ASCII letter (inclusive)
                     i += 1;
-                    while i < input.len() && !input[i].is_ascii_alphabetic() { i += 1; }
-                    if i < input.len() { i += 1; }
+                    while i < input.len() && !input[i].is_ascii_alphabetic() {
+                        i += 1;
+                    }
+                    if i < input.len() {
+                        i += 1;
+                    }
                 }
                 b']' => {
                     // OSC: skip until BEL (0x07) or ST (ESC \)
                     i += 1;
                     while i < input.len() {
-                        if input[i] == 0x07 { i += 1; break; }
-                        if input[i] == 0x1b { break; }
+                        if input[i] == 0x07 {
+                            i += 1;
+                            break;
+                        }
+                        if input[i] == 0x1b {
+                            break;
+                        }
                         i += 1;
                     }
                     // consume ST if present
@@ -1337,7 +1424,9 @@ mod no_hang {
                         i += 2;
                     }
                 }
-                _ => { i += 1; } // other: skip the byte after ESC
+                _ => {
+                    i += 1;
+                } // other: skip the byte after ESC
             }
         }
         out
@@ -1349,13 +1438,22 @@ mod no_hang {
     /// prints 1 status line; if the agent TUI rendered there will be more).
     /// Negative signal: known crash/error markers must be absent.
     fn looks_like_prompt(output: &[u8]) -> bool {
-        if output.is_empty() { return false; }
+        if output.is_empty() {
+            return false;
+        }
         let raw = String::from_utf8_lossy(output);
         let error_markers = [
-            "ERR_MODULE_NOT_FOUND", "Cannot find module", "Cannot find package",
-            "ENOENT", "EACCES", "Permission denied", "Privilege required",
+            "ERR_MODULE_NOT_FOUND",
+            "Cannot find module",
+            "Cannot find package",
+            "ENOENT",
+            "EACCES",
+            "Permission denied",
+            "Privilege required",
         ];
-        if error_markers.iter().any(|m| raw.contains(m)) { return false; }
+        if error_markers.iter().any(|m| raw.contains(m)) {
+            return false;
+        }
         let stripped = strip_ansi(output);
         let text = String::from_utf8_lossy(&stripped);
         text.lines().filter(|l| !l.trim().is_empty()).count() >= 2
@@ -1379,7 +1477,8 @@ mod no_hang {
         let agent_home = setup_agent_config(agent);
 
         let (master, mut child) = spawn_with_pty(
-            dir.path(), agent_home.path(),
+            dir.path(),
+            agent_home.path(),
             &["run", "--network", "unrestricted", "--", bin_s],
         );
 
@@ -1404,10 +1503,19 @@ mod no_hang {
         unsafe { libc::close(master) };
     }
 
-    #[test] #[serial(pty)]
-    fn pty_claude_interactive_exits_quickly() { assert_pty_interactive("claude"); }
-    #[test] #[serial(pty)]
-    fn pty_codex_interactive_exits_quickly()  { assert_pty_interactive("codex"); }
-    #[test] #[serial(pty)]
-    fn pty_gemini_interactive_exits_quickly() { assert_pty_interactive("gemini"); }
+    #[test]
+    #[serial(pty)]
+    fn pty_claude_interactive_exits_quickly() {
+        assert_pty_interactive("claude");
+    }
+    #[test]
+    #[serial(pty)]
+    fn pty_codex_interactive_exits_quickly() {
+        assert_pty_interactive("codex");
+    }
+    #[test]
+    #[serial(pty)]
+    fn pty_gemini_interactive_exits_quickly() {
+        assert_pty_interactive("gemini");
+    }
 }
