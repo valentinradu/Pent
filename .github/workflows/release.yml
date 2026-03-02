@@ -199,6 +199,7 @@ jobs:
         with:
           pkgname: pent
           pkgbuild: packaging/aur/PKGBUILD
+          assets: packaging/aur/pent.install
           commit_username: github-actions[bot]
           commit_email: github-actions[bot]@users.noreply.github.com
           ssh_private_key: ${{ secrets.AUR_SSH_KEY }}
