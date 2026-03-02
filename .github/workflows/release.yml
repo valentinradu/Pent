@@ -289,6 +289,18 @@ jobs:
           gpg --batch --yes --clearsign -o InRelease Release
           gpg --batch --yes -abs -o Release.gpg Release
 
+      - name: Update apt/index.html
+        run: |
+          cat > apt/index.html <<'EOF'
+          <!DOCTYPE html>
+          <html>
+          <body>
+          <h1>Pent APT repository</h1>
+          <p>See <a href="https://github.com/valentinradu/Pent">README</a> for install instructions.</p>
+          </body>
+          </html>
+          EOF
+
       - name: Commit and push gh-pages
         run: |
           git config user.name  "github-actions[bot]"

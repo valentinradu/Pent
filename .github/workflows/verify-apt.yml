@@ -23,7 +23,7 @@ jobs:
         run: |
           curl -fsSL https://valentinradu.github.io/Pent/apt/KEY.gpg \
             | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pent.gpg
-          echo "deb [arch=${{ matrix.arch }}] https://valentinradu.github.io/Pent/apt stable main" \
+          echo "deb [arch=${{ matrix.arch }}] https://valentinradu.github.io/Pent/apt ./" \
             | sudo tee /etc/apt/sources.list.d/pent.list
           sudo apt-get update
           sudo apt-get install -y pent
