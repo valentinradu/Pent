@@ -93,6 +93,7 @@ jobs:
         run: |
           docker run --rm \
             --privileged \
+            --tmpfs /tmp:exec,mode=1777 \
             pent-test \
             cargo test --test e2e_linux -- --nocapture
 
