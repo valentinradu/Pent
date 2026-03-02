@@ -5,20 +5,20 @@ Codename: stable
 Architectures: amd64 arm64
 Components: main
 Description: Pent APT repository
-Date: Mon, 02 Mar 2026 22:16:50 +0000
+Date: Mon, 02 Mar 2026 23:26:50 +0000
 MD5Sum:
  3f5f1e0ebd096384e2ad78be20162673             1166 Packages
- e6fc50801b7c235ffce2e98c049d400c              557 Packages.gz
- aa72d24ef8410feeeb913195ab8dea3d              171 Release
+ 576b95f478d7e522bd2f4059fb4fd9af              557 Packages.gz
+ 5ea5bd661087e931429e788e70a416eb              171 Release
 SHA1:
  934bcbe675e175e4fbaed327740e392fd55214d7             1166 Packages
- 9ede45b597200eec865cfef621ba761ef81467f4              557 Packages.gz
- d5ba2176b7fae161d18601b130cb6bb3257a3c38              171 Release
+ 0dfa9a65ad4e663f614a43ed241685eab2df57d8              557 Packages.gz
+ d65d36b5df65a7cdb2b699f8cc9282509214e9ae              171 Release
 SHA256:
  df3fda0048ff287da50fdfea560c57e0bf5dbc739a3ed900eea520f16a0e2831             1166 Packages
- 53efa887ac3b6f4bef3cbb151825583c49bad4af11a9a8b5a7343d613a0446c8              557 Packages.gz
- 08096a4da95b3153d2175f5e3099b960bcd0aa2cdb1f3ad4f88f760d3af7f5b5              171 Release
+ 687ca3fb80ddc519cbdea4bc7aa3ba5537bdf09ff80e5807695d0847a94f1599              557 Packages.gz
+ f003901dfb4492f7583c0f083d3634074d017c37a3e6538b50cf1118be3253e2              171 Release
 SHA512:
  0f4d04d8ff7a521e8c28b86dd8fd8a7af0ddad127794da43f08722e36f684192d717c0fd257eee22d78304584bc544065428a71dffc6a4dcd1511bc2cd6dc136             1166 Packages
- f04b5d74dd00e0326363da31eb56ad7f4877c366e29d3924921cbb70fabf467dc42e1c5dfb4f81001cf61e5181f6de85a7d4575064d9002ccd0c3c842944bfc9              557 Packages.gz
- 135bf4e7ee61949fb878d330ffc28cc63386ae6598b538862b4d0e31665a418357194222f6e0191dc0eeb1b4a69beeb40d8df643cdca65b57598d8f325ced43f              171 Release
+ 1cc9daedea09af89d914e6b15c8f3974d559c777f98a038bfad710ba346b9f033c23cf8d0560e4879a14fb01d15484972dc71996deb78b6588270a74d93f2fd2              557 Packages.gz
+ ced3f34c3affc76668fe60f5cb72a05689d34e4f3f5c4ab6c6e043ece7b1768d74a9de30e247415cf0f1e0ee9d32444cb96f71e0ccd2e37788a5c86fae5223c7              171 Release
