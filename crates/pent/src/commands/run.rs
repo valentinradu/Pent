@@ -86,7 +86,9 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
 
     let mut sandbox_child = spawn_sandboxed(&sandbox_cfg, cmd, &cmd_args)?;
 
-    let child = sandbox_child.child;
+    // `mut` is required on macOS for child.wait(); on Linux the value is moved.
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+    let mut child = sandbox_child.child;
     #[cfg(target_os = "linux")]
     let overlay_handle = sandbox_child.overlay;
 
