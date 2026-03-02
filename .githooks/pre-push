@@ -1,0 +1,10 @@
+#!/bin/sh
+set -e
+
+echo "pent: running cargo fmt check..."
+cargo fmt --all -- --check
+
+echo "pent: running cargo clippy..."
+cargo clippy --all -- -D warnings
+
+echo "pent: all checks passed."

@@ -839,9 +839,7 @@ pub fn spawn_with_landlock(
                 // same absolute path succeeds.
                 {
                     use std::os::unix::ffi::OsStrExt;
-                    if let Ok(cwd_c) =
-                        std::ffi::CString::new(cwd_path.as_os_str().as_bytes())
-                    {
+                    if let Ok(cwd_c) = std::ffi::CString::new(cwd_path.as_os_str().as_bytes()) {
                         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                         libc::chdir(cwd_c.as_ptr());
                     }
