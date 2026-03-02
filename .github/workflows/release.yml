@@ -186,8 +186,16 @@ jobs:
     steps:
       - name: Install pent from APT repo
         run: |
-          curl -fsSL https://valentinradu.github.io/Pent/apt/KEY.gpg \
-            | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pent.gpg
+          # GitHub Pages can take a few minutes to reflect a gh-pages push.
+          # Retry fetching the key up to 10 times (5 min total) before failing.
+          for i in $(seq 1 10); do
+            curl -fsSL https://valentinradu.github.io/Pent/apt/KEY.gpg \
+              | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pent.gpg \
+              && break
+            echo "Attempt $i: GitHub Pages not ready yet, retrying in 30s..."
+            sudo rm -f /etc/apt/trusted.gpg.d/pent.gpg
+            sleep 30
+          done
           echo "deb [arch=${{ matrix.arch }}] https://valentinradu.github.io/Pent/apt stable main" \
             | sudo tee /etc/apt/sources.list.d/pent.list
           sudo apt-get update
