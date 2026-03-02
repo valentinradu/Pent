@@ -3,25 +3,28 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 ![Platform: Linux | macOS](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS-blue.svg)
 
-Wrap AI coding agents, or any process, in a lightweight containment layer that restricts filesystem and network access using native OS mechanisms.
+Wrap any process in a lightweight containment layer that restricts filesystem and network access using native OS mechanisms — no containers, no VMs.
 
-```mermaid
-graph TD
-    User([User]) -->|pent run| Pent[Pent Wrapper]
-    Pent -->|Spawns| Child[Child Process]
-    
-    subgraph "Sandbox Layer (Linux Landlock / macOS Seatbelt)"
-        Child
-    end
-    
-    subgraph "Network Layer (Linux NetNS + Proxy)"
-        Child -->|DNS/TCP| Proxy[Built-in Proxy]
-        Proxy -->|Allowlist Enforcement| Internet((Internet))
-    end
-    
-    subgraph "Filesystem Layer (OverlayFS)"
-        Child -->|Filtered Access| HostFS[(Host Filesystem)]
-    end
+```
+  $ pent run -- <any-command>
+
+       ┌─────────────────────────────────────────────┐
+       │  Filesystem sandbox                         │
+       │  (Landlock + OverlayFS on Linux,            │
+       │   Seatbelt on macOS)                        │
+       │                                             │
+       │  ┌───────────────────────────────────────┐  │
+       │  │  Network sandbox  (Linux only)        │  │
+       │  │                                       │  │
+       │  │      <any-command>                    │  │
+       │  │            │  DNS + TCP               │  │
+       │  │      ┌─────▼──────┐                   │  │
+       │  │      │   proxy    │  domain allowlist  │  │
+       │  │      └─────┬──────┘                   │  │
+       │  └────────────┼───────────────────────────┘  │
+       └───────────────┼─────────────────────────────┘
+                       ▼
+                   internet
 ```
 
 ```bash
@@ -41,7 +44,7 @@ pent config show
 
 ## Why Pent?
 
-Pent is designed for developers who need to run powerful but untrusted CLI tools (like AI coding agents) without giving them the "keys to the kingdom."
+Pent is for developers who need to run powerful but untrusted CLI tools without giving them unrestricted access to the filesystem and network.
 
 | Feature | **Pent** | **Docker** | **Firejail** |
 | :--- | :--- | :--- | :--- |
@@ -63,7 +66,7 @@ Pent launches a child process inside a sandbox with two complementary controls:
 
 ## Security disclaimer
 
-**Pent is not a security tool.** It is designed to catch accidental misbehaviour, not to stop a determined adversary. Use Pent to add a reasonable guard-rail around AI coding agents operating on your workstation — not as a substitute for proper network segmentation.
+**Pent is not a security tool.** It is designed to catch accidental misbehaviour, not to stop a determined adversary. Use Pent to add a reasonable guard-rail around untrusted processes operating on your workstation — not as a substitute for proper network segmentation.
 
 ---
 
@@ -86,8 +89,8 @@ On Linux, Pent uses three mechanisms:
 ### Built-in proxy
 
 Pent includes a DNS + TCP proxy that:
-1.  **Intercepts DNS** — Returns `NXDOMAIN` for disallowed domains.
-2.  **Forwards TCP** — Only accepts connections if the destination IP matches an allowed domain.
+1. **Intercepts DNS** — Returns `NXDOMAIN` for disallowed domains.
+2. **Forwards TCP** — Only accepts connections if the destination IP matches an allowed domain.
 
 ---
 
@@ -141,7 +144,7 @@ pent run --network blocked -- curl https://example.com
 pent run --read /etc/ssl/certs -- my-app
 ```
 
-### Persistent Configuration
+### Persistent configuration
 ```bash
 # Add profiles for common tools
 pent config add --global @claude @gh @npm
@@ -169,18 +172,17 @@ pent: fix: add "/Users/alice/.ssh/id_rsa" to [sandbox.paths.read] in your pent c
 
 ---
 
-## Contributing Profiles
+## Contributing profiles
 
 Profiles are the heart of Pent's "zero-config" experience. If you use a tool that isn't covered, please contribute a profile!
 
-1.  Open `crates/pent-settings/src/profiles.rs`.
-2.  Add your tool to the `Profile` enum and `PROFILES` table.
-3.  Define the domains and paths in `profile_config`.
-4.  Submit a PR.
+1. Open `crates/pent-settings/src/profiles.rs`.
+2. Add your tool to the `Profile` enum and `PROFILES` table.
+3. Define the domains and paths in `profile_config`.
+4. Submit a PR.
 
 ---
 
 ## License
 
 MIT — see [LICENSE](LICENSE).
-
