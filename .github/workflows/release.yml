@@ -180,8 +180,12 @@ jobs:
           VERSION="${{ github.ref_name }}"
           VERSION="${VERSION#v}"
           echo "Waiting for version ${VERSION} to appear in APT Packages index..."
-          for i in $(seq 1 24); do
+          # GitHub Pages CDN sets Cache-Control: max-age=600 (10 min).
+          # Poll for up to 15 minutes; pass no-cache headers to bypass edge caches.
+          for i in $(seq 1 90); do
             if curl -sf --max-time 10 \
+              -H "Cache-Control: no-cache" \
+              -H "Pragma: no-cache" \
               "https://valentinradu.github.io/Pent/apt/Packages" \
               | grep -q "Version: ${VERSION}"; then
               echo "Version ${VERSION} found in APT repo after attempt ${i}"
