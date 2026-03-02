@@ -5,6 +5,7 @@ use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 #[derive(Parser)]
 #[command(
     name = "pent",
+    version,
     about = "Run processes under filesystem and network containment"
 )]
 pub(crate) struct Cli {
