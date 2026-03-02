@@ -1,0 +1,24 @@
+Origin: Pent
+Label: Pent
+Suite: stable
+Codename: stable
+Architectures: amd64 arm64
+Components: main
+Description: Pent APT repository
+Date: Mon, 02 Mar 2026 15:15:07 +0000
+MD5Sum:
+ ca518ddf81858d1d4be93dfb60614f63             1166 Packages
+ 7aa4636c045fd4efa2fb63b758a19715              558 Packages.gz
+ af644d8435f92ac55161efb6a0815855              171 Release
+SHA1:
+ 86b91de48574f7f98fa0cfdca139fe139d50a5d0             1166 Packages
+ ddf9d7d1ef0400fa74a63f2756ffe49df0edaf1b              558 Packages.gz
+ b25315d290f3e14c4601389383ef4e3f7bf76f38              171 Release
+SHA256:
+ 9698b19785a5f10cc383e61c7a5570d0d9c2ac6c20584a231b708001b603d0d9             1166 Packages
+ 02477cf68f4a9b3d7caee7cdc2810894ec544ee6ab619d1267a493eb3772c25c              558 Packages.gz
+ ca4a8096b4c3914fa06cc94b67be4b8dea05aef806408f715aab98f2584d8381              171 Release
+SHA512:
+ be2fc92e3f56400447fc6de39e8c3b1c8b0de58f04e8436040e4b1f3d2bd01972b9998b1546b26f53da90c951f8ec3634cc90cbf567aa4349c7b053fa2253393             1166 Packages
+ 62372951dbf8fd20e3a39383fcd7980b4252527a23dd8778a528fc05a96b847e09abd13ae0b207b0403abd78d3828e77ef3a219c121a9a1e456cc3d37e9fc9f6              558 Packages.gz
+ 38873c9dc08d91f53fabd45240f0184373516fcaafa9d146fa02e10e2d37c9d7e641fdac8bba2601683f9fdc25e0b17e2fff70d04544939a5f90c21e4454c38c              171 Release
