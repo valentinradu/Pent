@@ -47,11 +47,15 @@ install:
 	cargo install --path crates/pent --force
 	@# Install man pages (generated into man/ by build.rs during cargo build).
 	@if [ -d man ]; then \
-		if [ "$$(uname)" = "Darwin" ]; then \
+		if [ -n "$${MANPREFIX:-}" ]; then \
+			MAN_DIR="$$MANPREFIX/man1"; \
+		elif [ "$$(uname)" = "Darwin" ]; then \
 			MAN_DIR="$$(brew --prefix 2>/dev/null)/share/man/man1"; \
 			MAN_DIR=$${MAN_DIR:-/usr/local/share/man/man1}; \
-		else \
+		elif [ "$$(id -u)" = "0" ]; then \
 			MAN_DIR="/usr/local/share/man/man1"; \
+		else \
+			MAN_DIR="$$HOME/.local/share/man/man1"; \
 		fi; \
 		mkdir -p "$$MAN_DIR"; \
 		for page in man/*.1; do \
