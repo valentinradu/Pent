@@ -227,9 +227,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - arch: x86_64
-            runner: macos-13
-            asset: pent-x86_64-apple-darwin.tar.gz
           - arch: aarch64
             runner: macos-latest
             asset: pent-aarch64-apple-darwin.tar.gz
