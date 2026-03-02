@@ -21,6 +21,8 @@ FROM rust:1.87-slim-bookworm
 # ca-certificates — TLS roots for HTTPS in curl tests
 RUN apt-get update && apt-get install -y --no-install-recommends \
     iproute2 \
+    nftables \
+    iptables \
     curl \
     bash \
     ca-certificates \

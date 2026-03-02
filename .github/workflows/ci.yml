@@ -92,7 +92,7 @@ jobs:
       - name: Run agent-config smoke tests
         run: |
           docker run --rm \
-            --cap-add NET_ADMIN \
+            --privileged \
             pent-test \
             cargo test --test e2e_linux -- --nocapture
 
