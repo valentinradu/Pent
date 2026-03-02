@@ -8,27 +8,27 @@ Codename: stable
 Architectures: amd64 arm64
 Components: main
 Description: Pent APT repository
-Date: Mon, 02 Mar 2026 18:05:28 +0000
+Date: Mon, 02 Mar 2026 18:15:03 +0000
 MD5Sum:
  2bb03816c0dcf5c800f873db9c8d0870             1166 Packages
- 9945a9cc42789e3e4d1cc53b3f4a5277              557 Packages.gz
- c5ca34d413b62f6ab36a7878524876a8              171 Release
+ 7fe59a2a40f26c3ec1a785ae1a26b2f7              557 Packages.gz
+ 996820944baf6f1efab8d87c183ae665              171 Release
 SHA1:
  1ac198945e9c9ecea01e45ea1e836042315761f7             1166 Packages
- 42f59b6dbc6ac49fa08de75f95fd27dbcba82ff7              557 Packages.gz
- 3f50fe12c933625ac6107efba3124a0f1117856f              171 Release
+ ebd1777607338d11ca34eda9d09659381f30108c              557 Packages.gz
+ 6f5676dd47d174d23dd5b3e12f4d2d35895757fe              171 Release
 SHA256:
  8dc81e853b36816602c343b28aa2792a64776dc72442c11612b466b4c2fa1865             1166 Packages
- 82fd3eca91323229892b2d9667282f88cf2978c4b47e3379195ffff921833ed4              557 Packages.gz
- 1a9a02410e15e56753e8cc540677d1d405acbcc83d061e0b1439d9990e05e30d              171 Release
+ 34f2a97d4d85914d8ca7ac045ea48b634523c4cfc45930bce768ead5d2e202d6              557 Packages.gz
+ 4e42b93e46f30bd56ddbcd9b7fd2a4badd152e6121af82d4bf779fb442bbc1b1              171 Release
 SHA512:
  f40fecb262fa6e47b18fd70ee9b45923c5eca8a913acc50726347243c92b01c358cba2cf3cee23d909af3a729fd8551bf1139798f71062dfe2a02a883f5b2970             1166 Packages
- 95ae8252d7b9d7ef083a1b4e3c32b0a4928524a48eee6a050a2bed6562fe596e8f3108a685a48831beb88ce11e39379e3e123f10c5d19537773bee8cf4b92159              557 Packages.gz
- b154bc4e18d810a2ee2b011dfccae45c8e1f700aff7c4e651478e7af6ad4700c847d1e16c657cb1892fb27687186e6ea881333356ab403828595bba0be28178c              171 Release
+ b0e973a1de132f27422cddcf6f21522ec0d62ccfb9851f6d446cca338e6bd73925c0145008ce94fa4c7a946ad1da1e08caa29881083c082983ba2a53dd1c962f              557 Packages.gz
+ e8959b05c3ad8b840f70f59bbe79f69ce04b4550458c13b9a63c9b47e4d8f40e3f18fa0d14965f843c21eb79b8ed6a4726db563d5aef770829f9c74192dac51b              171 Release
 -----BEGIN PGP SIGNATURE-----
 
-iHUEARYKAB0WIQRNp7Vym4X0souOTxRtK9Lure/4yQUCaaXRaAAKCRBtK9Lure/4
-yciYAQDXtNTg1GDCE5kMJSeUM3EO4rTUbo4UFOZc4omApDVCPAEAq6lgFD8INvCe
-KrWbAyZKMOxFOCwoSKpnMMFZO1AFhgY=
-=IrH6
+iHUEARYKAB0WIQRNp7Vym4X0souOTxRtK9Lure/4yQUCaaXTpwAKCRBtK9Lure/4
+yfgrAP9rsoJHAR9YkyzOgDzaoH9J6W/sqQjGM5mWTuFk8Kws6wEAmlZIVNZ0p60K
+mBxwySc8NhiCfyiH5ayNS8n9+lHnaQ8=
+=JGfx
 -----END PGP SIGNATURE-----
