@@ -169,60 +169,7 @@ jobs:
             https://api.github.com/repos/valentinradu/homebrew-pent/dispatches \
             -d "{\"event_type\":\"pent_release_published\",\"client_payload\":{\"tag\":\"${RELEASE_TAG}\"}}"
 
-  # ── Verify release artifacts ──────────────────────────────────────────────
-  wait-for-pages:
-    name: Wait for GitHub Pages deployment
-    needs: apt
-    runs-on: ubuntu-latest
-    steps:
-      - name: Poll APT Packages index until release version appears
-        run: |
-          VERSION="${{ github.ref_name }}"
-          VERSION="${VERSION#v}"
-          echo "Waiting for version ${VERSION} to appear in APT Packages index..."
-          # GitHub Pages CDN sets Cache-Control: max-age=600 (10 min).
-          # Poll for up to 15 minutes; pass no-cache headers to bypass edge caches.
-          for i in $(seq 1 90); do
-            if curl -sf --max-time 10 \
-              -H "Cache-Control: no-cache" \
-              -H "Pragma: no-cache" \
-              "https://valentinradu.github.io/Pent/apt/Packages" \
-              | grep -q "Version: ${VERSION}"; then
-              echo "Version ${VERSION} found in APT repo after attempt ${i}"
-              exit 0
-            fi
-            echo "Attempt ${i}: not ready yet, retrying in 10s..."
-            sleep 10
-          done
-          echo "Timed out waiting for Pages deployment"
-          exit 1
-
-  verify-linux:
-    name: Verify linux via APT (${{ matrix.arch }})
-    needs: wait-for-pages
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: amd64
-            runner: ubuntu-latest
-          - arch: arm64
-            runner: ubuntu-24.04-arm
-
-    steps:
-      - name: Install pent from APT repo
-        run: |
-          curl -fsSL https://valentinradu.github.io/Pent/apt/KEY.gpg \
-            | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pent.gpg
-          echo "deb [arch=${{ matrix.arch }}] https://valentinradu.github.io/Pent/apt stable main" \
-            | sudo tee /etc/apt/sources.list.d/pent.list
-          sudo apt-get update
-          sudo apt-get install -y pent
-
-      - name: Verify
-        run: pent --version
-
+  # ── Verify macOS release artifacts ───────────────────────────────────────
   verify-macos:
     name: Verify macOS binary (${{ matrix.arch }})
     needs: release

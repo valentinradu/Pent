@@ -1,0 +1,32 @@
+name: Verify APT
+
+# Triggered automatically when GitHub Pages finishes building from gh-pages.
+# Runs immediately after the new content is live — no polling needed.
+on:
+  page_build:
+
+jobs:
+  verify-linux:
+    name: Verify linux via APT (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+
+    steps:
+      - name: Install pent from APT repo
+        run: |
+          curl -fsSL https://valentinradu.github.io/Pent/apt/KEY.gpg \
+            | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pent.gpg
+          echo "deb [arch=${{ matrix.arch }}] https://valentinradu.github.io/Pent/apt stable main" \
+            | sudo tee /etc/apt/sources.list.d/pent.list
+          sudo apt-get update
+          sudo apt-get install -y pent
+
+      - name: Verify
+        run: pent --version
