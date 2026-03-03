@@ -2481,7 +2481,10 @@ mod tests {
         std::fs::create_dir_all(&dir).map_err(|e| format!("create_dir: {e}"))?;
         let target = dir.join("to_delete.txt");
         std::fs::write(&target, "will be deleted").map_err(|e| format!("write: {e}"))?;
-        assert!(target.exists(), "pre-condition: file must exist before sandbox");
+        assert!(
+            target.exists(),
+            "pre-condition: file must exist before sandbox"
+        );
 
         let active = run_sandboxed_rw(
             temp.path(),
@@ -2509,7 +2512,10 @@ mod tests {
         let temp = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
         let target = temp.path().join("config.json");
         std::fs::write(&target, r#"{"v":1}"#).map_err(|e| format!("write: {e}"))?;
-        assert!(target.exists(), "pre-condition: file must exist before sandbox");
+        assert!(
+            target.exists(),
+            "pre-condition: file must exist before sandbox"
+        );
 
         let active = run_sandboxed_rw(
             temp.path(),
