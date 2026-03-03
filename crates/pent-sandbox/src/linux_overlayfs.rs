@@ -515,10 +515,14 @@ fn flush_file(upper_path: &Path, real_path: &Path) -> std::io::Result<()> {
 /// Start the inotify watcher thread.
 ///
 /// Watches each `upper_dir` in `overlays` (recursively) for `IN_CLOSE_WRITE`,
-/// `IN_MOVED_TO`, `IN_CREATE`, and `IN_ATTRIB` events.  A file is flushed to
-/// the real filesystem when it matches an entry in `write_set` OR lives inside
-/// a directory listed in `rw_dirs`.  `IN_ATTRIB` catches permission changes
-/// (e.g. `chmod +x`) that do not produce a `IN_CLOSE_WRITE` event.
+/// `IN_MOVED_TO`, `IN_CREATE`, `IN_ATTRIB`, and `IN_DELETE` events.  A file
+/// is flushed to the real filesystem when it matches an entry in `write_set`
+/// OR lives inside a directory listed in `rw_dirs`.
+///
+/// `IN_ATTRIB` catches permission changes (e.g. `chmod +x`) and whiteout xattr
+/// creation for pre-existing files.  `IN_DELETE` catches direct upper-layer
+/// removals for files created within the current session (no lower-layer copy,
+/// so overlayfs removes from upper directly rather than creating a whiteout).
 ///
 /// `rw_dirs` should contain every directory-type path from the `read_write`
 /// config — i.e. all entries that `is_dir()` at spawn time.  All files created
@@ -572,7 +576,11 @@ fn add_inotify_watches(
         libc::inotify_add_watch(
             inotify_fd,
             path_c.as_ptr(),
-            libc::IN_CLOSE_WRITE | libc::IN_MOVED_TO | libc::IN_CREATE | libc::IN_ATTRIB,
+            libc::IN_CLOSE_WRITE
+                | libc::IN_MOVED_TO
+                | libc::IN_CREATE
+                | libc::IN_ATTRIB
+                | libc::IN_DELETE,
         )
     };
     if wd >= 0 {
@@ -704,20 +712,28 @@ fn run_watcher(
                     } else {
                         // File write/rename/delete event: flush if in write_set or under an rw_dir.
                         let under_rw = rw_dirs.iter().any(|d| real_path.starts_with(d));
-                        if (write_set.contains(&real_path) || under_rw) && upper_path.is_file() {
-                            if is_overlay_whiteout(&upper_path) {
-                                // The sandbox deleted this file — propagate to real FS.
+                        if write_set.contains(&real_path) || under_rw {
+                            if (event.mask & libc::IN_DELETE) != 0 {
+                                // File deleted directly from upper layer (no whiteout) —
+                                // this happens when the file was created in the current
+                                // session (no lower-layer copy to hide), so overlayfs
+                                // just removes it from upper rather than creating a whiteout.
                                 let _ = flush_deletion(&real_path);
-                            } else {
-                                // Ensure parent directory exists on real FS.
-                                // The sandbox may have created new subdirectories under
-                                // an rw_dir; without this, flush_file returns ENOENT.
-                                if let Some(parent) = real_path.parent() {
-                                    if !parent.exists() {
-                                        let _ = std::fs::create_dir_all(parent);
+                            } else if upper_path.is_file() {
+                                if is_overlay_whiteout(&upper_path) {
+                                    // Pre-existing file deleted — overlayfs created a whiteout.
+                                    let _ = flush_deletion(&real_path);
+                                } else {
+                                    // Ensure parent directory exists on real FS.
+                                    // The sandbox may have created new subdirectories under
+                                    // an rw_dir; without this, flush_file returns ENOENT.
+                                    if let Some(parent) = real_path.parent() {
+                                        if !parent.exists() {
+                                            let _ = std::fs::create_dir_all(parent);
+                                        }
                                     }
+                                    let _ = flush_file(&upper_path, &real_path);
                                 }
-                                let _ = flush_file(&upper_path, &real_path);
                             }
                         }
                     }
