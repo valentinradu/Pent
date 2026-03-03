@@ -120,14 +120,17 @@ mod macos {
     }
 
     #[test]
+    #[ignore = "requires agent binary installed"]
     fn filesystem_claude() {
         test_filesystem("claude");
     }
     #[test]
+    #[ignore = "requires agent binary installed"]
     fn filesystem_codex() {
         test_filesystem("codex");
     }
     #[test]
+    #[ignore = "requires agent binary installed"]
     fn filesystem_gemini() {
         test_filesystem("gemini");
     }

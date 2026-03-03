@@ -280,14 +280,17 @@ mod linux {
     }
 
     #[test]
+    #[ignore = "requires agent binary and CAP_NET_ADMIN"]
     fn filesystem_claude() -> TestResult {
         test_filesystem("claude")
     }
     #[test]
+    #[ignore = "requires agent binary and CAP_NET_ADMIN"]
     fn filesystem_codex() -> TestResult {
         test_filesystem("codex")
     }
     #[test]
+    #[ignore = "requires agent binary and CAP_NET_ADMIN"]
     fn filesystem_gemini() -> TestResult {
         test_filesystem("gemini")
     }
@@ -362,14 +365,17 @@ mod linux {
     }
 
     #[test]
+    #[ignore = "requires agent binary and CAP_NET_ADMIN"]
     fn network_claude() -> TestResult {
         test_network("claude", "api.anthropic.com")
     }
     #[test]
+    #[ignore = "requires agent binary and CAP_NET_ADMIN"]
     fn network_codex() -> TestResult {
         test_network("codex", "api.openai.com")
     }
     #[test]
+    #[ignore = "requires agent binary and CAP_NET_ADMIN"]
     fn network_gemini() -> TestResult {
         test_network("gemini", "generativelanguage.googleapis.com")
     }

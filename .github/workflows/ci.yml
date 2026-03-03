@@ -95,7 +95,7 @@ jobs:
             --privileged \
             --tmpfs /tmp:exec,mode=1777 \
             pent-test \
-            cargo test --test e2e_linux -- --nocapture
+            cargo test --test e2e_linux -- --nocapture --include-ignored
 
   test-macos-agents:
     name: Agent configs (macOS)
@@ -119,4 +119,4 @@ jobs:
         run: cargo build --workspace --release
 
       - name: Run macOS agent config tests
-        run: cargo test --test e2e_macos -- --nocapture
+        run: cargo test --test e2e_macos -- --nocapture --include-ignored
