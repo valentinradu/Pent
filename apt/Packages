@@ -134,3 +134,37 @@ Description: Run processes under filesystem and network containment
  (Linux Landlock + network namespaces) with a built-in DNS/TCP proxy for domain
  allowlisting.
 
+Package: pent
+Version: 0.0.5
+Architecture: arm64
+Maintainer: Valentin Radu
+Installed-Size: 4161
+Filename: ./pent_0.0.5_arm64.deb
+Size: 1162108
+MD5sum: 6fee727ac8915ea8f025ee3dd2d0cce9
+SHA1: b266886b052eaf97fbdcb2688d8ba8bd0fd05526
+SHA256: c4042bda8b027ecaa7f26d3d2b770fb1e75e6e10ee24f1e4e09a41def57fab8e
+Section: utils
+Priority: optional
+Description: Run processes under filesystem and network containment
+ Wrap any process in a filesystem and network sandbox using native OS mechanisms
+ (Linux Landlock + network namespaces) with a built-in DNS/TCP proxy for domain
+ allowlisting.
+
+Package: pent
+Version: 0.0.5
+Architecture: amd64
+Maintainer: Valentin Radu
+Installed-Size: 4196
+Filename: ./pent_0.0.5_amd64.deb
+Size: 1272060
+MD5sum: ee48363171635e99e62e46bdba5a76c9
+SHA1: 84e4d3747c631fcff38217c326726c3ba2067dfa
+SHA256: 96362dcc61f735b178c37d69b0433560e3a21eae49a43f6357044f3fb9ff213b
+Section: utils
+Priority: optional
+Description: Run processes under filesystem and network containment
+ Wrap any process in a filesystem and network sandbox using native OS mechanisms
+ (Linux Landlock + network namespaces) with a built-in DNS/TCP proxy for domain
+ allowlisting.
+
