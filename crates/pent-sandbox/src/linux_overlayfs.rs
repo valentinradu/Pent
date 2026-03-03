@@ -539,9 +539,9 @@ fn flush_file(upper_path: &Path, real_path: &Path) -> std::io::Result<()> {
 /// Start the inotify watcher thread.
 ///
 /// Watches each `upper_dir` in `overlays` (recursively) for `IN_CLOSE_WRITE`,
-/// `IN_MOVED_TO`, `IN_CREATE`, `IN_ATTRIB`, and `IN_DELETE` events.  A file
-/// is flushed to the real filesystem when it matches an entry in `write_set`
-/// OR lives inside a directory listed in `rw_dirs`.
+/// `IN_MOVED_TO`, `IN_MOVED_FROM`, `IN_CREATE`, `IN_ATTRIB`, and `IN_DELETE`
+/// events.  A file is flushed to the real filesystem when it matches an entry
+/// in `write_set` OR lives inside a directory listed in `rw_dirs`.
 ///
 /// `IN_ATTRIB` catches permission changes (e.g. `chmod +x`) and whiteout xattr
 /// creation for pre-existing files.  `IN_DELETE` catches direct upper-layer
@@ -602,6 +602,7 @@ fn add_inotify_watches(
             path_c.as_ptr(),
             libc::IN_CLOSE_WRITE
                 | libc::IN_MOVED_TO
+                | libc::IN_MOVED_FROM
                 | libc::IN_CREATE
                 | libc::IN_ATTRIB
                 | libc::IN_DELETE,
@@ -742,6 +743,14 @@ fn run_watcher(
                                 // this happens when the file was created in the current
                                 // session (no lower-layer copy to hide), so overlayfs
                                 // just removes it from upper rather than creating a whiteout.
+                                let _ = flush_deletion(&real_path);
+                            } else if (event.mask & libc::IN_MOVED_FROM) != 0 {
+                                // File renamed away from this directory. If it was
+                                // upper-layer-only (no lower copy), overlayfs simply renames
+                                // it in upper with no whiteout — so IN_DELETE never fires.
+                                // Example: the Edit tool writes `file.rs.tmp.PID.TS` then
+                                // renames it to `file.rs`; the tmp file was flushed to real
+                                // FS on IN_CLOSE_WRITE and must now be deleted.
                                 let _ = flush_deletion(&real_path);
                             } else if is_overlay_whiteout(&upper_path) {
                                 // Pre-existing file deleted — overlayfs created a whiteout.

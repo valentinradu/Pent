@@ -2603,6 +2603,62 @@ mod tests {
         Ok(())
     }
 
+    /// Atomic write pattern (write tmp → rename to target) must not leave the
+    /// tmp file on the real filesystem.
+    ///
+    /// This is the Edit tool pattern: write content to `file.rs.tmp.PID.TS`,
+    /// then `rename(tmp, file.rs)`.  In overlayfs, if `tmp` has no lower-layer
+    /// copy, the rename produces only `IN_MOVED_FROM` on `tmp` — no whiteout,
+    /// no `IN_DELETE`.  Without watching `IN_MOVED_FROM` the tmp file flushed
+    /// during `IN_CLOSE_WRITE` would stay on the real FS forever.
+    #[test]
+    #[serial]
+    #[cfg(target_os = "linux")]
+    fn test_overlay_atomic_write_no_tmp_residue() -> TestResult {
+        let fake_home = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
+        let work_dir = fake_home.path().join("work");
+        std::fs::create_dir_all(&work_dir).map_err(|e| format!("mkdir work: {e}"))?;
+
+        let rw_dir = fake_home.path().join("data");
+        std::fs::create_dir_all(&rw_dir).map_err(|e| format!("mkdir rw_dir: {e}"))?;
+        let target = rw_dir.join("file.rs");
+        let tmp = rw_dir.join("file.rs.tmp.99999.1234567890");
+
+        let dot_file = fake_home.path().join(".sentinel");
+        std::fs::write(&dot_file, "").map_err(|e| format!("write sentinel: {e}"))?;
+
+        // Simulate Edit tool: write to tmp, then atomically rename to target.
+        let cmd = format!(
+            "echo 'content' > '{}' && mv '{}' '{}'",
+            tmp.display(),
+            tmp.display(),
+            target.display(),
+        );
+        let Some((mut child, overlay_handle)) =
+            spawn_with_fake_home(fake_home.path(), &work_dir, &[&dot_file], &[&rw_dir], &cmd)
+        else {
+            return Ok(());
+        };
+        let Some(handle) = overlay_handle else {
+            child.wait().ok();
+            return Ok(());
+        };
+
+        child.wait().map_err(|e| format!("wait: {e}"))?;
+        crate::linux_overlayfs::teardown(handle);
+
+        assert!(
+            target.exists(),
+            "target file must exist on real FS after atomic write"
+        );
+        assert!(
+            !tmp.exists(),
+            "tmp file must be deleted from real FS after rename: \
+             IN_MOVED_FROM must trigger flush_deletion for upper-layer-only files"
+        );
+        Ok(())
+    }
+
     /// Delete a pre-existing directory (with nested content) inside an rw_dir
     /// that lives under the overlay root.
     ///
