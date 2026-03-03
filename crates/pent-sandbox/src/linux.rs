@@ -2735,8 +2735,8 @@ mod tests {
         let rw_dir = fake_home.path().join("data");
         let target_dir = rw_dir.join("to_delete");
         let nested_file = target_dir.join("sub").join("file.txt");
-        std::fs::create_dir_all(nested_file.parent().unwrap())
-            .map_err(|e| format!("mkdir nested: {e}"))?;
+        let nested_parent = nested_file.parent().ok_or("nested file has no parent")?;
+        std::fs::create_dir_all(nested_parent).map_err(|e| format!("mkdir nested: {e}"))?;
         std::fs::write(&nested_file, "nested").map_err(|e| format!("write nested: {e}"))?;
         assert!(
             target_dir.exists(),

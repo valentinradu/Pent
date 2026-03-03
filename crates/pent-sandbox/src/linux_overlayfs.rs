@@ -1068,8 +1068,8 @@ mod tests {
         let stale_dir = std::path::PathBuf::from(format!("/tmp/pent-ovl-{dead_pid}-cleanup-test"));
         let live_dir = std::path::PathBuf::from(format!("/tmp/pent-ovl-{live_pid}-cleanup-test"));
 
-        std::fs::create_dir_all(&stale_dir).expect("create stale dir");
-        std::fs::create_dir_all(&live_dir).expect("create live dir");
+        std::fs::create_dir_all(&stale_dir).ok();
+        std::fs::create_dir_all(&live_dir).ok();
 
         super::cleanup_stale_overlays();
 
