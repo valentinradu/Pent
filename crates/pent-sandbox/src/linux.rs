@@ -2710,6 +2710,74 @@ mod tests {
         Ok(())
     }
 
+    /// Deleting a non-rw file inside the sandbox must NOT affect the real FS.
+    ///
+    /// Files and directories that are accessible (readable) but not in any
+    /// `rw_dir` or `write_set` entry are session-scoped: the overlayfs whiteout
+    /// stays in the upper layer but is never flushed back.  The real file must
+    /// survive the sandbox session intact.
+    #[test]
+    #[serial]
+    #[cfg(target_os = "linux")]
+    fn test_overlay_delete_readonly_not_flushed() -> TestResult {
+        let fake_home = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
+        let work_dir = fake_home.path().join("work");
+        std::fs::create_dir_all(&work_dir).map_err(|e| format!("mkdir work: {e}"))?;
+
+        // readonly_dir is accessible but NOT in rw_dirs — deletions must not
+        // propagate to real FS.
+        let readonly_dir = fake_home.path().join("readonly");
+        std::fs::create_dir_all(&readonly_dir).map_err(|e| format!("mkdir readonly: {e}"))?;
+        let readonly_file = readonly_dir.join("protected.txt");
+        std::fs::write(&readonly_file, "must survive").map_err(|e| format!("write: {e}"))?;
+
+        let readonly_subdir = readonly_dir.join("subdir");
+        std::fs::create_dir_all(&readonly_subdir).map_err(|e| format!("mkdir subdir: {e}"))?;
+        let readonly_nested = readonly_subdir.join("nested.txt");
+        std::fs::write(&readonly_nested, "also survives").map_err(|e| format!("write: {e}"))?;
+
+        // dot_file triggers the overlay mount; rw_dirs is empty so nothing is
+        // ever flushed back.
+        let dot_file = fake_home.path().join(".sentinel");
+        std::fs::write(&dot_file, "").map_err(|e| format!("write sentinel: {e}"))?;
+
+        let cmd = format!(
+            "rm '{}' && rm -rf '{}'",
+            readonly_file.display(),
+            readonly_subdir.display(),
+        );
+        let Some((mut child, overlay_handle)) = spawn_with_fake_home(
+            fake_home.path(),
+            &work_dir,
+            &[&dot_file],
+            &[], // no rw_dirs → nothing flushed
+            &cmd,
+        ) else {
+            return Ok(());
+        };
+        let Some(handle) = overlay_handle else {
+            child.wait().ok();
+            return Ok(());
+        };
+
+        child.wait().map_err(|e| format!("wait: {e}"))?;
+        crate::linux_overlayfs::teardown(handle);
+
+        assert!(
+            readonly_file.exists(),
+            "non-rw file deleted inside sandbox must still exist on real FS"
+        );
+        assert!(
+            readonly_subdir.exists(),
+            "non-rw directory deleted inside sandbox must still exist on real FS"
+        );
+        assert!(
+            readonly_nested.exists(),
+            "non-rw nested file deleted inside sandbox must still exist on real FS"
+        );
+        Ok(())
+    }
+
     /// `execute_access` must NOT include `ReadFile`.
     ///
     /// Paths in `paths.execute` should be execute-only: the sandboxed process
