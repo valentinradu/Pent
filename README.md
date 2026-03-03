@@ -20,11 +20,11 @@ pent config show
 
 ## Why Pent?
 
-Pent is for developers who need to run powerful but untrusted CLI tools without giving them unrestricted access to the filesystem and network.
+Pent is for developers who need to run powerful but untrusted processes without giving them unrestricted access to the filesystem and network.
 
 | | **Pent** | **Docker** | **Firejail** | **bubblewrap** |
 | :--- | :--- | :--- | :--- | :--- |
-| **Target** | CLI tools & AI agents | Services & apps | Desktop apps | Generic processes |
+| **Target** | Any process | Services & apps | Desktop apps | Any process |
 | **Platforms** | macOS & Linux | All (via VM) | Linux only | Linux only |
 | **Network control** | Domain allowlist | IP/port rules | IP/firewall | None |
 | **Filesystem control** | Path allowlist + overlayfs | Volume mounts | Path rules | Bind mounts |
