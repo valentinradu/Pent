@@ -2533,6 +2533,76 @@ mod tests {
         Ok(())
     }
 
+    /// Delete a pre-existing file inside an rw_dir that lives under the overlay
+    /// root (i.e. under `fake_home`).
+    ///
+    /// This is the scenario that exposed the char-device whiteout bug: overlayfs
+    /// only creates a `user.overlay.whiteout` xattr when USERSPACE creates the
+    /// whiteout stub.  When the kernel itself handles `unlink(2)` for a file that
+    /// exists in the lower layer, it creates a **char device (major=0, minor=0)**
+    /// whiteout instead.  The old `is_overlay_whiteout` only checked for the
+    /// xattr, so kernel-created whiteouts were silently skipped and the real file
+    /// was never deleted.
+    ///
+    /// The previous deletion tests (`test_overlay_flush_delete_file_in_rw_dir`)
+    /// used a temp dir under `/tmp`, which is outside `home_dir`.  No overlayfs
+    /// is mounted for paths outside `home_dir`, so `rm` hit the real FS directly
+    /// and no whiteout was ever produced — the bug was invisible.
+    ///
+    /// This test uses `spawn_with_fake_home` so the rw_dir IS under the overlay
+    /// root, triggering the full overlayfs whiteout path.
+    #[test]
+    #[serial]
+    #[cfg(target_os = "linux")]
+    fn test_overlay_flush_delete_under_overlay_root() -> TestResult {
+        let fake_home = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
+        let work_dir = fake_home.path().join("work");
+        std::fs::create_dir_all(&work_dir).map_err(|e| format!("mkdir work: {e}"))?;
+
+        // Place the rw_dir and the target file INSIDE fake_home so that
+        // `overlay_roots_for_accessible` computes an overlay root and
+        // overlayfs is actually mounted.
+        let rw_dir = fake_home.path().join("data");
+        std::fs::create_dir_all(&rw_dir).map_err(|e| format!("mkdir rw_dir: {e}"))?;
+        let target = rw_dir.join("to_delete.txt");
+        std::fs::write(&target, "will be deleted").map_err(|e| format!("write: {e}"))?;
+        assert!(
+            target.exists(),
+            "pre-condition: file must exist before sandbox"
+        );
+
+        // A file-level read_write entry is needed to trigger the overlay mount
+        // on fake_home (the MCA algorithm picks the parent of file entries as
+        // the overlay root).
+        let dot_file = fake_home.path().join(".sentinel");
+        std::fs::write(&dot_file, "").map_err(|e| format!("write sentinel: {e}"))?;
+
+        let Some((mut child, overlay_handle)) = spawn_with_fake_home(
+            fake_home.path(),
+            &work_dir,
+            &[&dot_file], // file entry → overlay mounted on fake_home/
+            &[&rw_dir],   // dir entry → deletions inside rw_dir are flushed
+            &format!("rm '{}'", target.display()),
+        ) else {
+            return Ok(());
+        };
+        let Some(handle) = overlay_handle else {
+            child.wait().ok();
+            return Ok(());
+        };
+
+        child.wait().map_err(|e| format!("wait: {e}"))?;
+        crate::linux_overlayfs::teardown(handle);
+
+        assert!(
+            !target.exists(),
+            "file deleted inside sandbox must be removed from real FS: \
+             char-device whiteout (major=0, minor=0) must be detected by \
+             is_overlay_whiteout, not just the user.overlay.whiteout xattr"
+        );
+        Ok(())
+    }
+
     /// `execute_access` must NOT include `ReadFile`.
     ///
     /// Paths in `paths.execute` should be execute-only: the sandboxed process

@@ -96,13 +96,30 @@ fn kernel_supports_xwhiteout() -> bool {
 // xattr helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Returns `true` if `path` is an overlayfs whiteout entry (userxattr mode).
+/// Returns `true` if `path` is an overlayfs whiteout entry.
 ///
-/// In `-o userxattr` mode the kernel represents whiteouts as zero-size regular
-/// files with the `user.overlay.whiteout` extended attribute.  Flushing such a
-/// file back to the real filesystem would truncate the real file to zero bytes,
-/// which is never the intent — whiteouts are overlay-internal bookkeeping.
+/// Two whiteout formats exist depending on kernel version and mount options:
+///
+/// 1. **Traditional (char device 0/0)**: overlayfs creates a character device
+///    with major=0, minor=0 when unlinking a file that exists in the lower
+///    layer.  This is what the kernel produces internally during `unlink(2)`
+///    inside the sandbox — regardless of the `-o userxattr` mount option.
+///
+/// 2. **Userxattr (kernel ≥ 6.7)**: a zero-size regular file with the
+///    `user.overlay.whiteout` extended attribute.  This is what *userspace*
+///    creates via `populate_upper_stubs` to pre-hide non-manifest files.
+///
+/// Both formats must be detected to correctly propagate deletions.
 fn is_overlay_whiteout(path: &Path) -> bool {
+    // Check for traditional char-device whiteout (major=0, minor=0).
+    // Use symlink_metadata so we don't follow symlinks.
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        if meta.file_type().is_char_device() && meta.rdev() == 0 {
+            return true;
+        }
+    }
+    // Check for userxattr-mode whiteout (user.overlay.whiteout xattr).
     use std::os::unix::ffi::OsStrExt;
     let Ok(path_c) = CString::new(path.as_os_str().as_bytes()) else {
         return false;
@@ -719,21 +736,21 @@ fn run_watcher(
                                 // session (no lower-layer copy to hide), so overlayfs
                                 // just removes it from upper rather than creating a whiteout.
                                 let _ = flush_deletion(&real_path);
+                            } else if is_overlay_whiteout(&upper_path) {
+                                // Pre-existing file deleted — overlayfs created a whiteout.
+                                // Two formats: char device 0/0 (traditional) or
+                                // user.overlay.whiteout xattr (userxattr mode).
+                                let _ = flush_deletion(&real_path);
                             } else if upper_path.is_file() {
-                                if is_overlay_whiteout(&upper_path) {
-                                    // Pre-existing file deleted — overlayfs created a whiteout.
-                                    let _ = flush_deletion(&real_path);
-                                } else {
-                                    // Ensure parent directory exists on real FS.
-                                    // The sandbox may have created new subdirectories under
-                                    // an rw_dir; without this, flush_file returns ENOENT.
-                                    if let Some(parent) = real_path.parent() {
-                                        if !parent.exists() {
-                                            let _ = std::fs::create_dir_all(parent);
-                                        }
+                                // Ensure parent directory exists on real FS.
+                                // The sandbox may have created new subdirectories under
+                                // an rw_dir; without this, flush_file returns ENOENT.
+                                if let Some(parent) = real_path.parent() {
+                                    if !parent.exists() {
+                                        let _ = std::fs::create_dir_all(parent);
                                     }
-                                    let _ = flush_file(&upper_path, &real_path);
                                 }
+                                let _ = flush_file(&upper_path, &real_path);
                             }
                         }
                     }
@@ -776,22 +793,25 @@ fn flush_upper_recursive(
     for entry in entries.flatten() {
         let upper_path = entry.path();
         let real_path = real_dir.join(entry.file_name());
-        if upper_path.is_file() {
+        // Check for whiteout BEFORE is_file(): char device 0/0 whiteouts are
+        // not regular files and would be silently skipped by is_file() alone.
+        if is_overlay_whiteout(&upper_path) {
             let under_rw = rw_dirs.iter().any(|d| real_path.starts_with(d));
             if write_set.contains(&real_path) || under_rw {
-                if is_overlay_whiteout(&upper_path) {
-                    // The sandbox deleted this file — propagate to real FS.
-                    let _ = flush_deletion(&real_path);
-                } else {
-                    // Ensure the parent directory exists on the real filesystem.
-                    // The sandbox may have created new subdirectories under an rw_dir.
-                    if let Some(parent) = real_path.parent() {
-                        if !parent.exists() {
-                            let _ = std::fs::create_dir_all(parent);
-                        }
+                // The sandbox deleted this file — propagate to real FS.
+                let _ = flush_deletion(&real_path);
+            }
+        } else if upper_path.is_file() {
+            let under_rw = rw_dirs.iter().any(|d| real_path.starts_with(d));
+            if write_set.contains(&real_path) || under_rw {
+                // Ensure the parent directory exists on the real filesystem.
+                // The sandbox may have created new subdirectories under an rw_dir.
+                if let Some(parent) = real_path.parent() {
+                    if !parent.exists() {
+                        let _ = std::fs::create_dir_all(parent);
                     }
-                    let _ = flush_file(&upper_path, &real_path);
                 }
+                let _ = flush_file(&upper_path, &real_path);
             }
         } else if upper_path.is_dir() {
             // If this directory is new (doesn't exist on the real FS) and is
