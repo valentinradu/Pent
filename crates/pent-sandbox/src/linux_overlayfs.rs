@@ -497,6 +497,9 @@ fn flush_deletion(real_path: &Path) -> std::io::Result<()> {
 /// created, which subsequent pent invocations will cover in their own rulesets.
 fn flush_file(upper_path: &Path, real_path: &Path) -> std::io::Result<()> {
     let content = std::fs::read(upper_path)?;
+    let upper_mode = std::fs::metadata(upper_path)
+        .map(|m| m.permissions())
+        .ok();
     let mut real_file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -504,6 +507,10 @@ fn flush_file(upper_path: &Path, real_path: &Path) -> std::io::Result<()> {
         .open(real_path)?;
     real_file.write_all(&content)?;
     real_file.sync_data()?;
+    drop(real_file);
+    if let Some(perms) = upper_mode {
+        let _ = std::fs::set_permissions(real_path, perms);
+    }
     Ok(())
 }
 
