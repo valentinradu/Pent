@@ -864,6 +864,36 @@ pub fn teardown(handle: OverlayHandle) {
     }
 }
 
+/// Remove leftover `/tmp/pent-ovl-<PID>-<N>` staging directories from
+/// sessions that were killed before teardown could run.
+///
+/// Called once at startup. Safe to call from any process: we only remove
+/// dirs whose owning PID is no longer alive (`kill(pid, 0)` → ESRCH).
+pub fn cleanup_stale_overlays() {
+    let Ok(entries) = std::fs::read_dir("/tmp") else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        // Expect: pent-ovl-<PID>-<N>
+        let Some(rest) = name.strip_prefix("pent-ovl-") else {
+            continue;
+        };
+        let Some((pid_str, _)) = rest.split_once('-') else {
+            continue;
+        };
+        let Ok(pid) = pid_str.parse::<libc::pid_t>() else {
+            continue;
+        };
+        // Check if the process is still alive.
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        if !alive {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────

@@ -17,6 +17,9 @@ async fn main() {
     //   sudo setcap cap_net_admin=eip $(which pent)
     // This allows pent to create veth pairs for network proxying without sudo.
 
+    #[cfg(target_os = "linux")]
+    pent_sandbox::cleanup_stale_overlays();
+
     let result = dispatch(cli).await;
     if let Err(e) = result {
         ui::error(e);
