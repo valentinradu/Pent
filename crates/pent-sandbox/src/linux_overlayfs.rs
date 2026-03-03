@@ -718,9 +718,9 @@ fn run_watcher(
                     let real_path = real_dir.join(filename);
 
                     if (event.mask & libc::IN_ISDIR) != 0 {
-                        // The sandbox created or renamed a directory into place.
-                        // Add a watch so we catch writes to files inside it.
                         if (event.mask & (libc::IN_CREATE | libc::IN_MOVED_TO)) != 0 {
+                            // Directory created/renamed into place: add a watch so
+                            // we catch writes to files inside it.
                             add_inotify_watches(
                                 inotify_fd,
                                 &upper_path,
@@ -733,6 +733,15 @@ fn run_watcher(
                             // file written immediately after mkdir — before our watcher
                             // thread woke up and added the watch on the new directory.
                             flush_upper_recursive(&upper_path, &real_path, &write_set, &rw_dirs);
+                        } else if (event.mask & (libc::IN_DELETE | libc::IN_MOVED_FROM)) != 0 {
+                            // Upper-layer-only directory removed or renamed away.
+                            // No whiteout is created (no lower-layer copy to hide),
+                            // so overlayfs just removes it from upper.  We must
+                            // delete the corresponding real directory ourselves.
+                            let under_rw = rw_dirs.iter().any(|d| real_path.starts_with(d));
+                            if write_set.contains(&real_path) || under_rw {
+                                let _ = flush_deletion(&real_path);
+                            }
                         }
                     } else {
                         // File write/rename/delete event: flush if in write_set or under an rw_dir.

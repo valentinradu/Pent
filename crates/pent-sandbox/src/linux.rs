@@ -2603,6 +2603,65 @@ mod tests {
         Ok(())
     }
 
+    /// An upper-layer-only directory that is deleted inside the sandbox must be
+    /// removed from the real filesystem.
+    ///
+    /// When an upper-layer-only directory is removed with `rmdir`/`rm -rf`,
+    /// overlayfs simply removes it from upper with no whiteout — it fires
+    /// `IN_DELETE | IN_ISDIR` on the parent.  Previously the `IN_ISDIR` branch
+    /// only handled creation events, so directory deletions were silently ignored
+    /// and the real directory was left behind.
+    #[test]
+    #[serial]
+    #[cfg(target_os = "linux")]
+    fn test_overlay_delete_session_created_dir() -> TestResult {
+        let fake_home = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
+        let work_dir = fake_home.path().join("work");
+        std::fs::create_dir_all(&work_dir).map_err(|e| format!("mkdir work: {e}"))?;
+
+        let rw_dir = fake_home.path().join("data");
+        std::fs::create_dir_all(&rw_dir).map_err(|e| format!("mkdir rw_dir: {e}"))?;
+
+        let dot_file = fake_home.path().join(".sentinel");
+        std::fs::write(&dot_file, "").map_err(|e| format!("write sentinel: {e}"))?;
+
+        // Reproduce the exact sequence from the manual test:
+        // mkdir sub, write sub/file, mv sub/file .., rm -rf sub
+        let sub = rw_dir.join("sub");
+        let kept = rw_dir.join("kept.txt");
+        let cmd = format!(
+            "mkdir -p '{sub}' && \
+             echo hi > '{sub}/tmp.txt' && \
+             mv '{sub}/tmp.txt' '{kept}' && \
+             rm -rf '{sub}'",
+            sub = sub.display(),
+            kept = kept.display(),
+        );
+        let Some((mut child, overlay_handle)) =
+            spawn_with_fake_home(fake_home.path(), &work_dir, &[&dot_file], &[&rw_dir], &cmd)
+        else {
+            return Ok(());
+        };
+        let Some(handle) = overlay_handle else {
+            child.wait().ok();
+            return Ok(());
+        };
+
+        child.wait().map_err(|e| format!("wait: {e}"))?;
+        crate::linux_overlayfs::teardown(handle);
+
+        assert!(
+            kept.exists(),
+            "file moved out of deleted subdir must exist on real FS"
+        );
+        assert!(
+            !sub.exists(),
+            "upper-layer-only directory deleted inside sandbox must be removed \
+             from real FS: IN_DELETE|IN_ISDIR must trigger flush_deletion"
+        );
+        Ok(())
+    }
+
     /// Atomic write pattern (write tmp → rename to target) must not leave the
     /// tmp file on the real filesystem.
     ///
