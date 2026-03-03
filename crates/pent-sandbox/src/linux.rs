@@ -2603,6 +2603,113 @@ mod tests {
         Ok(())
     }
 
+    /// Delete a pre-existing directory (with nested content) inside an rw_dir
+    /// that lives under the overlay root.
+    ///
+    /// `rm -rf dir` triggers an overlayfs opaque-directory whiteout followed by
+    /// an `IN_DELETE | IN_ISDIR` inotify event on the parent.  `flush_deletion`
+    /// must use `remove_dir_all`, not `remove_file`, to propagate this.
+    #[test]
+    #[serial]
+    #[cfg(target_os = "linux")]
+    fn test_overlay_flush_delete_dir_under_overlay_root() -> TestResult {
+        let fake_home = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
+        let work_dir = fake_home.path().join("work");
+        std::fs::create_dir_all(&work_dir).map_err(|e| format!("mkdir work: {e}"))?;
+
+        let rw_dir = fake_home.path().join("data");
+        let target_dir = rw_dir.join("to_delete");
+        let nested_file = target_dir.join("sub").join("file.txt");
+        std::fs::create_dir_all(nested_file.parent().unwrap())
+            .map_err(|e| format!("mkdir nested: {e}"))?;
+        std::fs::write(&nested_file, "nested").map_err(|e| format!("write nested: {e}"))?;
+        assert!(
+            target_dir.exists(),
+            "pre-condition: dir must exist before sandbox"
+        );
+
+        let dot_file = fake_home.path().join(".sentinel");
+        std::fs::write(&dot_file, "").map_err(|e| format!("write sentinel: {e}"))?;
+
+        let Some((mut child, overlay_handle)) = spawn_with_fake_home(
+            fake_home.path(),
+            &work_dir,
+            &[&dot_file],
+            &[&rw_dir],
+            &format!("rm -rf '{}'", target_dir.display()),
+        ) else {
+            return Ok(());
+        };
+        let Some(handle) = overlay_handle else {
+            child.wait().ok();
+            return Ok(());
+        };
+
+        child.wait().map_err(|e| format!("wait: {e}"))?;
+        crate::linux_overlayfs::teardown(handle);
+
+        assert!(
+            !target_dir.exists(),
+            "directory deleted inside sandbox must be removed from real FS: \
+             flush_deletion must handle EISDIR by falling back to remove_dir_all"
+        );
+        Ok(())
+    }
+
+    /// A file written inside the sandbox with non-default permissions must have
+    /// those permissions flushed to the real filesystem.
+    ///
+    /// Regression for the case where `flush_file` preserved content but the
+    /// flushed file ended up with default umask permissions instead of the
+    /// permissions set inside the sandbox.
+    #[test]
+    #[serial]
+    #[cfg(target_os = "linux")]
+    fn test_overlay_flush_permissions_under_overlay_root() -> TestResult {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fake_home = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
+        let work_dir = fake_home.path().join("work");
+        std::fs::create_dir_all(&work_dir).map_err(|e| format!("mkdir work: {e}"))?;
+
+        let rw_dir = fake_home.path().join("data");
+        std::fs::create_dir_all(&rw_dir).map_err(|e| format!("mkdir rw_dir: {e}"))?;
+        let target = rw_dir.join("script.sh");
+        std::fs::write(&target, "#!/bin/sh\necho hi\n").map_err(|e| format!("write: {e}"))?;
+
+        let dot_file = fake_home.path().join(".sentinel");
+        std::fs::write(&dot_file, "").map_err(|e| format!("write sentinel: {e}"))?;
+
+        // chmod 755 inside the sandbox; teardown must preserve 0o755.
+        let Some((mut child, overlay_handle)) = spawn_with_fake_home(
+            fake_home.path(),
+            &work_dir,
+            &[&dot_file],
+            &[&rw_dir],
+            &format!("chmod 755 '{}'", target.display()),
+        ) else {
+            return Ok(());
+        };
+        let Some(handle) = overlay_handle else {
+            child.wait().ok();
+            return Ok(());
+        };
+
+        child.wait().map_err(|e| format!("wait: {e}"))?;
+        crate::linux_overlayfs::teardown(handle);
+
+        let mode = std::fs::metadata(&target)
+            .map_err(|e| format!("metadata: {e}"))?
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o755,
+            "permissions set inside sandbox must be flushed to real FS: got 0o{mode:o}"
+        );
+        Ok(())
+    }
+
     /// `execute_access` must NOT include `ReadFile`.
     ///
     /// Paths in `paths.execute` should be execute-only: the sandboxed process

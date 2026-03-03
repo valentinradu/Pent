@@ -499,7 +499,14 @@ pub unsafe fn mount_overlays(overlays: &[OverlayMount]) -> std::io::Result<()> {
 /// the file may have been created and deleted entirely within the same session
 /// and never flushed to the real filesystem.
 fn flush_deletion(real_path: &Path) -> std::io::Result<()> {
+    // Try as a file first; fall back to remove_dir_all for directories.
     match std::fs::remove_file(real_path) {
+        Ok(()) => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.raw_os_error() == Some(libc::EISDIR) => {}
+        Err(e) => return Err(e),
+    }
+    match std::fs::remove_dir_all(real_path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),

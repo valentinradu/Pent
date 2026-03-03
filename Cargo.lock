@@ -477,7 +477,7 @@ dependencies = [
 
 [[package]]
 name = "pent"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "clap",
  "clap_mangen",
@@ -498,7 +498,7 @@ dependencies = [
 
 [[package]]
 name = "pent-proxy"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "pent-settings",
  "thiserror 2.0.18",
@@ -508,7 +508,7 @@ dependencies = [
 
 [[package]]
 name = "pent-sandbox"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "dirs",
  "landlock",
@@ -522,7 +522,7 @@ dependencies = [
 
 [[package]]
 name = "pent-settings"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "dirs",
  "serde",
