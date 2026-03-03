@@ -2470,6 +2470,63 @@ mod tests {
         Ok(())
     }
 
+    /// Delete a pre-existing file that lives inside an rw directory.
+    /// After teardown the file must be gone from the real filesystem.
+    #[test]
+    #[serial]
+    #[cfg(target_os = "linux")]
+    fn test_overlay_flush_delete_file_in_rw_dir() -> TestResult {
+        let temp = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
+        let dir = temp.path().join("data");
+        std::fs::create_dir_all(&dir).map_err(|e| format!("create_dir: {e}"))?;
+        let target = dir.join("to_delete.txt");
+        std::fs::write(&target, "will be deleted").map_err(|e| format!("write: {e}"))?;
+        assert!(target.exists(), "pre-condition: file must exist before sandbox");
+
+        let active = run_sandboxed_rw(
+            temp.path(),
+            &[dir.to_str().unwrap_or("")],
+            &format!("rm '{}'", target.display()),
+        );
+        if !active {
+            return Ok(());
+        }
+
+        assert!(
+            !target.exists(),
+            "file deleted inside sandbox must be removed from real FS after teardown"
+        );
+        Ok(())
+    }
+
+    /// Delete a pre-existing file that is listed directly in `read_write`
+    /// (write_set entry rather than rw_dir).  After teardown the file must be
+    /// gone from the real filesystem.
+    #[test]
+    #[serial]
+    #[cfg(target_os = "linux")]
+    fn test_overlay_flush_delete_direct_write_set_entry() -> TestResult {
+        let temp = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
+        let target = temp.path().join("config.json");
+        std::fs::write(&target, r#"{"v":1}"#).map_err(|e| format!("write: {e}"))?;
+        assert!(target.exists(), "pre-condition: file must exist before sandbox");
+
+        let active = run_sandboxed_rw(
+            temp.path(),
+            &[target.to_str().unwrap_or("")],
+            &format!("rm '{}'", target.display()),
+        );
+        if !active {
+            return Ok(());
+        }
+
+        assert!(
+            !target.exists(),
+            "write_set file deleted inside sandbox must be removed from real FS after teardown"
+        );
+        Ok(())
+    }
+
     /// `execute_access` must NOT include `ReadFile`.
     ///
     /// Paths in `paths.execute` should be execute-only: the sandboxed process
