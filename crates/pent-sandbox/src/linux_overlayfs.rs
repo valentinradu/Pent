@@ -475,6 +475,20 @@ pub unsafe fn mount_overlays(overlays: &[OverlayMount]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Delete the real file, propagating a deletion that occurred inside the sandbox.
+///
+/// Called when a whiteout entry is detected in the upper layer for a path that
+/// is in `write_set` or under an `rw_dir`. `NotFound` is treated as success —
+/// the file may have been created and deleted entirely within the same session
+/// and never flushed to the real filesystem.
+fn flush_deletion(real_path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(real_path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 /// Flush the upper-layer copy of a file back to the real path in-place.
 ///
 /// Opens the real file with `O_WRONLY | O_CREAT | O_TRUNC`. On an existing file
@@ -682,21 +696,23 @@ fn run_watcher(
                             flush_upper_recursive(&upper_path, &real_path, &write_set, &rw_dirs);
                         }
                     } else {
-                        // File write/rename event: flush if in write_set or under an rw_dir.
+                        // File write/rename/delete event: flush if in write_set or under an rw_dir.
                         let under_rw = rw_dirs.iter().any(|d| real_path.starts_with(d));
-                        if (write_set.contains(&real_path) || under_rw)
-                            && upper_path.is_file()
-                            && !is_overlay_whiteout(&upper_path)
-                        {
-                            // Ensure parent directory exists on real FS.
-                            // The sandbox may have created new subdirectories under
-                            // an rw_dir; without this, flush_file returns ENOENT.
-                            if let Some(parent) = real_path.parent() {
-                                if !parent.exists() {
-                                    let _ = std::fs::create_dir_all(parent);
+                        if (write_set.contains(&real_path) || under_rw) && upper_path.is_file() {
+                            if is_overlay_whiteout(&upper_path) {
+                                // The sandbox deleted this file — propagate to real FS.
+                                let _ = flush_deletion(&real_path);
+                            } else {
+                                // Ensure parent directory exists on real FS.
+                                // The sandbox may have created new subdirectories under
+                                // an rw_dir; without this, flush_file returns ENOENT.
+                                if let Some(parent) = real_path.parent() {
+                                    if !parent.exists() {
+                                        let _ = std::fs::create_dir_all(parent);
+                                    }
                                 }
+                                let _ = flush_file(&upper_path, &real_path);
                             }
-                            let _ = flush_file(&upper_path, &real_path);
                         }
                     }
                 }
@@ -718,14 +734,11 @@ fn final_flush_overlay(
     flush_upper_recursive(&overlay.upper_dir, &overlay.real_dir, write_set, rw_dirs);
 }
 
-/// Recursively walk the upper layer and flush files back to the real filesystem.
+/// Recursively walk the upper layer and flush file changes back to the real filesystem.
 ///
-/// A file in the upper layer is flushed when its real path is either:
-/// - Listed in `write_set` (an individual file from the `read_write` config), or
-/// - Inside a directory in `rw_dirs` (a directory from the `read_write` config).
-///
-/// Overlay whiteout entries (deleted files) are skipped — flushing them would
-/// truncate the real file to zero bytes.
+/// For each file whose real path is in `write_set` or under an `rw_dir`:
+/// - Regular file: content is flushed back in-place.
+/// - Overlay whiteout (deletion): the real file is removed.
 ///
 /// New directories created by the sandbox process are created on the real
 /// filesystem as needed before their contents are flushed.
@@ -742,19 +755,21 @@ fn flush_upper_recursive(
         let upper_path = entry.path();
         let real_path = real_dir.join(entry.file_name());
         if upper_path.is_file() {
-            // Skip overlay whiteout entries: they are zero-size files with the
-            // user.overlay.whiteout xattr that represent deletions inside the
-            // sandbox.  Flushing them would truncate the real file to zero bytes.
             let under_rw = rw_dirs.iter().any(|d| real_path.starts_with(d));
-            if (write_set.contains(&real_path) || under_rw) && !is_overlay_whiteout(&upper_path) {
-                // Ensure the parent directory exists on the real filesystem.
-                // The sandbox may have created new subdirectories under an rw_dir.
-                if let Some(parent) = real_path.parent() {
-                    if !parent.exists() {
-                        let _ = std::fs::create_dir_all(parent);
+            if write_set.contains(&real_path) || under_rw {
+                if is_overlay_whiteout(&upper_path) {
+                    // The sandbox deleted this file — propagate to real FS.
+                    let _ = flush_deletion(&real_path);
+                } else {
+                    // Ensure the parent directory exists on the real filesystem.
+                    // The sandbox may have created new subdirectories under an rw_dir.
+                    if let Some(parent) = real_path.parent() {
+                        if !parent.exists() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
                     }
+                    let _ = flush_file(&upper_path, &real_path);
                 }
-                let _ = flush_file(&upper_path, &real_path);
             }
         } else if upper_path.is_dir() {
             // If this directory is new (doesn't exist on the real FS) and is
