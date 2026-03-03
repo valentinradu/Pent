@@ -53,28 +53,17 @@ Network containment is not yet available on macOS. macOS does not expose network
 
 ### Linux — Landlock + overlayfs + network namespaces
 
-On Linux, Pent uses three mechanisms:
-
-**Landlock LSM** restricts filesystem access at the kernel level.
-
-**Overlayfs shadowing** protects parent directories by mounting a temporary layer in a private namespace. Writes to non-allowlisted paths disappear when the process exits.
-
-**Network namespaces** (`unshare(CLONE_NEWNET)`) isolate the network stack. Traffic is bridged to Pent's proxy via a `veth` pair.
+On Linux, Pent combines three kernel mechanisms. **Landlock LSM** restricts filesystem access at the kernel level. **Overlayfs shadowing** protects parent directories by mounting a temporary layer in a private namespace — writes to non-allowlisted paths disappear when the process exits. **Network namespaces** (`unshare(CLONE_NEWNET)`) isolate the network stack, with traffic bridged to Pent's proxy via a `veth` pair.
 
 ### Built-in proxy
 
-Pent includes a DNS + TCP proxy with two responsibilities:
-
-1. **DNS interception.** Returns `NXDOMAIN` for disallowed domains.
-2. **TCP forwarding.** Only accepts connections when the destination IP resolves to an allowed domain.
+Pent includes a DNS and TCP proxy. The DNS side returns `NXDOMAIN` for disallowed domains. The TCP side only forwards connections when the destination IP resolves to an allowed domain.
 
 ## Platform limitations
 
 ### macOS — network containment not yet available
 
-`--allow` and `--network proxy` are accepted on macOS but do not yet enforce network policy. Pent runs with unrestricted network access until a macOS-compatible isolation mechanism is implemented.
-
-On Linux, network policy is enforced at the kernel level via network namespaces.
+`--allow` and `--network proxy` are accepted on macOS but do not yet enforce network policy. Pent runs with unrestricted network access until a macOS-compatible isolation mechanism is implemented. On Linux, network policy is enforced at the kernel level via network namespaces.
 
 ## Installation
 
@@ -140,7 +129,7 @@ pent: [denied] filesystem: "claude" was denied "read" access to "/Users/alice/.s
 pent: fix: add "/Users/alice/.ssh/id_rsa" to [sandbox.paths.read] in your pent config
 ```
 
-**Limitation.** `--trace` only records accesses that Pent's sandbox actually intercepts and denies. It cannot tell you everything a binary will try to open before you run it. For that, use `strace`.
+`--trace` only records accesses that Pent's sandbox actually intercepts and denies. It cannot tell you everything a binary will try to open before you run it. For a complete picture, use `strace`.
 
 ### `strace` — discover all filesystem access upfront
 
@@ -152,16 +141,7 @@ strace -e trace=openat,open,stat,statx,access,faccessat \
        your-command
 ```
 
-Extract the paths it tried to open:
-```bash
-# All paths that were successfully opened
-grep -oP '"\K[^"]+(?=", O_)' strace.log | sort -u
-
-# Paths that were denied (EACCES / ENOENT worth checking)
-grep 'EACCES\|ENOENT' strace.log | grep -oP '"\K[^"]+(?=")' | sort -u
-```
-
-Then add the relevant paths to your Pent config:
+To extract the paths it tried to open, run `grep -oP '"\K[^"]+(?=", O_)' strace.log | sort -u` for successful opens and `grep 'EACCES\|ENOENT' strace.log | grep -oP '"\K[^"]+(?=")' | sort -u` for denials. Then add the relevant entries to your Pent config:
 ```toml
 [sandbox.paths]
 read  = ["/path/to/thing"]
@@ -170,12 +150,7 @@ write = ["/path/to/writable"]
 
 ## Contributing profiles
 
-Profiles are the heart of Pent's zero-config experience. If you use a tool that isn't covered, please contribute a profile!
-
-1. Open `crates/pent-settings/src/profiles.rs`.
-2. Add your tool to the `Profile` enum and `PROFILES` table.
-3. Define the domains and paths in `profile_config`.
-4. Submit a PR.
+Profiles are the heart of Pent's zero-config experience. If you use a tool that isn't covered, please contribute a profile by opening `crates/pent-settings/src/profiles.rs`, adding your tool to the `Profile` enum and `PROFILES` table, defining its domains and paths in `profile_config`, and submitting a PR.
 
 ## License
 

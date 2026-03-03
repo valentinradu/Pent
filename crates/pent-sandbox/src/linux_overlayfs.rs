@@ -1044,4 +1044,48 @@ mod tests {
         expected.sort();
         assert_eq!(roots, expected);
     }
+
+    /// cleanup_stale_overlays removes dirs whose PID is no longer alive and
+    /// leaves dirs whose PID is still running.
+    #[test]
+    fn test_cleanup_stale_overlays_removes_dead_removes_only_dead() {
+        use std::process;
+
+        // Create a stale dir (pid 1 is always init/systemd — use a dead PID instead).
+        // Fork a child, record its PID, let it exit, then create the fake dir.
+        let dead_pid = unsafe {
+            let pid = libc::fork();
+            if pid == 0 {
+                libc::_exit(0);
+            }
+            let mut status = 0i32;
+            libc::waitpid(pid, &mut status, 0);
+            pid
+        };
+
+        let live_pid = process::id();
+
+        let stale_dir = std::path::PathBuf::from(format!("/tmp/pent-ovl-{dead_pid}-cleanup-test"));
+        let live_dir = std::path::PathBuf::from(format!("/tmp/pent-ovl-{live_pid}-cleanup-test"));
+
+        std::fs::create_dir_all(&stale_dir).expect("create stale dir");
+        std::fs::create_dir_all(&live_dir).expect("create live dir");
+
+        super::cleanup_stale_overlays();
+
+        let stale_gone = !stale_dir.exists();
+        let live_kept = live_dir.exists();
+
+        // Always clean up live dir regardless of assertion outcome.
+        let _ = std::fs::remove_dir_all(&live_dir);
+
+        assert!(
+            stale_gone,
+            "stale overlay dir (dead PID {dead_pid}) must be removed"
+        );
+        assert!(
+            live_kept,
+            "live overlay dir (PID {live_pid}) must not be removed"
+        );
+    }
 }
