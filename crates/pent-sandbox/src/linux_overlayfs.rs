@@ -515,9 +515,10 @@ fn flush_file(upper_path: &Path, real_path: &Path) -> std::io::Result<()> {
 /// Start the inotify watcher thread.
 ///
 /// Watches each `upper_dir` in `overlays` (recursively) for `IN_CLOSE_WRITE`,
-/// `IN_MOVED_TO`, and `IN_CREATE` events.  A file is flushed to the real
-/// filesystem when it matches an entry in `write_set` OR lives inside a
-/// directory listed in `rw_dirs`.
+/// `IN_MOVED_TO`, `IN_CREATE`, and `IN_ATTRIB` events.  A file is flushed to
+/// the real filesystem when it matches an entry in `write_set` OR lives inside
+/// a directory listed in `rw_dirs`.  `IN_ATTRIB` catches permission changes
+/// (e.g. `chmod +x`) that do not produce a `IN_CLOSE_WRITE` event.
 ///
 /// `rw_dirs` should contain every directory-type path from the `read_write`
 /// config — i.e. all entries that `is_dir()` at spawn time.  All files created
@@ -571,7 +572,7 @@ fn add_inotify_watches(
         libc::inotify_add_watch(
             inotify_fd,
             path_c.as_ptr(),
-            libc::IN_CLOSE_WRITE | libc::IN_MOVED_TO | libc::IN_CREATE,
+            libc::IN_CLOSE_WRITE | libc::IN_MOVED_TO | libc::IN_CREATE | libc::IN_ATTRIB,
         )
     };
     if wd >= 0 {
