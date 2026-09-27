@@ -1,0 +1,4 @@
+[build]
+# The intermediate build output goes to ~/.cargo/build, outside the
+# workspace. target/ keeps only the final artifacts. This needs cargo 1.91.
+build-dir = "{cargo-cache-home}/build/{workspace-path-hash}"
