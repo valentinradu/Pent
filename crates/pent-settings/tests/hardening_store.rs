@@ -393,7 +393,6 @@ fn p5_event_logs_keep_one_event_per_line() -> TestResult {
 /// `write_failed`), so one crafted `open()` hides all later accesses,
 /// blocked attempts too, from the review.
 #[test]
-#[ignore = "OPEN H-12: an event with a non-UTF-8 path cannot be logged; pent watch then drops all later events"]
 fn p5_event_log_accepts_non_utf8_paths() -> TestResult {
     let f = Fixture::new()?;
     let n = name("tool")?;
