@@ -1028,6 +1028,23 @@ pub(crate) fn child_env(config: &SandboxConfig) -> std::collections::HashMap<Str
     e
 }
 
+/// The names of the programs that the root process of a sandboxed run
+/// runs.
+///
+/// Pent starts `/usr/bin/sandbox-exec`, which applies the profile and then
+/// runs `cmd` in the same process. The reader of the log checks the name of
+/// each report against the program that the PID runs, and the process table
+/// misses a process that lives less than one poll interval. These two names
+/// come from pent itself, so the reports of a short-lived root process also
+/// reach the recorder. See MAC-6 in `docs/security/macos.md`.
+fn root_process_names(cmd: &str) -> Vec<String> {
+    let command = Path::new(cmd)
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or(cmd);
+    vec!["sandbox-exec".to_string(), command.to_string()]
+}
+
 /// Spawn `cmd` under the run-mode profile of `config`.
 ///
 /// When [`SandboxConfig::record_events`] is set, start the log reader before
@@ -1057,7 +1074,13 @@ pub(crate) fn spawn_run(
         None
     };
     let child = spawn_with_sandbox(&profile, cmd, args, &env, &config.cwd)?;
-    let events = reader.map(|r| r.attach(child.id(), crate::macos_log::RecordMode::Run));
+    let events = reader.map(|r| {
+        r.attach(
+            child.id(),
+            &root_process_names(cmd),
+            crate::macos_log::RecordMode::Run,
+        )
+    });
     Ok(crate::SandboxChild { child, events })
 }
 
@@ -1083,6 +1106,7 @@ pub(crate) fn spawn_watched(
     let child = spawn_with_sandbox(&profile, cmd, args, &env, &config.cwd)?;
     let events = reader.attach(
         child.id(),
+        &root_process_names(cmd),
         crate::macos_log::RecordMode::Watch(options.guard.clone()),
     );
     Ok(crate::WatchedChild {
@@ -2014,6 +2038,21 @@ mod tests {
         let rules = generate_network_rules(&NetworkMode::Blocked);
         // Blocked = explicit deny
         assert!(rules.contains("(deny network*)"));
+    }
+
+    /// The root process of a run has two names: the front end and the
+    /// command. The reader needs both, because `sandbox-exec` runs the
+    /// command in the same process (MAC-6).
+    #[test]
+    fn the_root_process_has_the_name_of_the_front_end_and_of_the_command() {
+        assert_eq!(
+            root_process_names("/bin/cat"),
+            vec!["sandbox-exec".to_string(), "cat".to_string()]
+        );
+        assert_eq!(
+            root_process_names("npm"),
+            vec!["sandbox-exec".to_string(), "npm".to_string()]
+        );
     }
 
     // ========================================================================

@@ -75,6 +75,15 @@ jobs:
             echo "this kernel has no apparmor_restrict_unprivileged_userns knob"
           fi
 
+      # TEMPORARY. The macOS backend never ran before. This step reads the
+      # real shape of a Seatbelt report, the real exit status of the
+      # sandbox probe, and the real answer of the kernel to a
+      # `(deny process-exec)` rule. Remove it when the findings of
+      # docs/security/macos.md are closed.
+      - name: Diagnose Seatbelt (macOS)
+        if: runner.os == 'macOS'
+        run: bash .github/macos-diagnose.sh
+
       - name: Build
         run: cargo build --workspace --tests
 

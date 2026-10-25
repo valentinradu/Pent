@@ -43,10 +43,19 @@
 //! cannot tell this line from a real report of a path that holds the text
 //! of a marker.
 //!
-//! Guard 4 uses a source that the program does not choose: the process
-//! table. The poll of the tree reads `comm` for each PID, so the reader
-//! knows the file that each PID runs, and it drops a report whose name
-//! does not fit that file ([`names_agree`]).
+//! Guard 4 uses three sources that the program does not choose:
+//!
+//! - Pent itself. It starts the root process, so it knows the two names of
+//!   that process: `sandbox-exec` and the command
+//!   ([`ProcessTree::with_names`]).
+//! - The process table. The poll of the tree reads `comm` for each PID, so
+//!   the reader knows the file that each PID runs.
+//! - The exec reports. The kernel writes the path of the program in each
+//!   `process-exec` report, and a process that runs a new file keeps its
+//!   PID ([`ProcessTree::learn_exec`]).
+//!
+//! A PID can thus have more than one name, and the reader drops a report
+//! whose name fits none of them ([`names_agree`]).
 //!
 //! What the check holds:
 //!
@@ -60,10 +69,11 @@
 //!
 //! What the check does not hold:
 //!
-//! - A process that exits and that its parent reaps between two polls
-//!   never reaches the process table, so its reports go. macOS watch mode
-//!   is a lower bound already, because the log limits the rate of the
-//!   reports; `--append` merges more runs.
+//! - A descendant that exits and that its parent reaps between two polls
+//!   never reaches the process table, and pent knows no name of it, so its
+//!   reports go. The root process is safe, because pent knows its names.
+//!   macOS watch mode is a lower bound for this reason; `--append` merges
+//!   more runs. See MAC-6 in `docs/security/macos.md`.
 //! - A file name whose first 16 bytes are the whole name of the record and
 //!   whose rest holds a marker is refused, also when it is honest. Such a
 //!   name is a forgery or a name that nobody needs.
@@ -413,17 +423,51 @@ fn names_agree(record: &str, known: &str) -> bool {
 pub(crate) struct ProcessTree {
     known: HashSet<u32>,
     dead: HashSet<u32>,
-    names: HashMap<u32, String>,
+    names: HashMap<u32, HashSet<String>>,
 }
 
 impl ProcessTree {
-    /// Create a tree with only `root`.
+    /// Create a tree with only `root` and no name for it.
     pub(crate) fn new(root: u32) -> Self {
+        Self::with_names(root, &[])
+    }
+
+    /// Create a tree with only `root`, and with the names of the programs
+    /// that `root` runs.
+    ///
+    /// The process table is one source of the name of a process, and it
+    /// misses a process that lives less than one poll interval. Pent
+    /// itself is the second source: it starts the root process, so it
+    /// knows the program of the root before the first poll. See MAC-6 in
+    /// `docs/security/macos.md`.
+    pub(crate) fn with_names(root: u32, names: &[String]) -> Self {
+        let root_names: HashSet<String> = names.iter().filter(|n| !n.is_empty()).cloned().collect();
+        let mut map = HashMap::new();
+        if !root_names.is_empty() {
+            map.insert(root, root_names);
+        }
         Self {
             known: HashSet::from([root]),
             dead: HashSet::new(),
-            names: HashMap::new(),
+            names: map,
         }
+    }
+
+    /// Record that `pid` runs the program `name` from now on.
+    ///
+    /// The source is an accepted `process-exec` report: the kernel writes
+    /// the path of the program that the process runs, and a process that
+    /// runs a new file keeps its PID. The kernel chooses that path, not
+    /// the program, so the name is as good as the one of the process
+    /// table. Pent adds the name, and does not remove the earlier one: a
+    /// report of the same PID can arrive before or after the exec.
+    ///
+    /// A PID outside the tree learns nothing.
+    pub(crate) fn learn_exec(&mut self, pid: u32, name: &str) {
+        if name.is_empty() || !self.known.contains(&pid) {
+            return;
+        }
+        self.names.entry(pid).or_default().insert(name.to_string());
     }
 
     /// Return true if `pid` is in the tree (live or dead).
@@ -443,7 +487,7 @@ impl ProcessTree {
     pub(crate) fn name_fits(&self, pid: u32, name: &str) -> bool {
         self.names
             .get(&pid)
-            .is_some_and(|known| names_agree(name, known))
+            .is_some_and(|known| known.iter().any(|known| names_agree(name, known.as_str())))
     }
 
     /// Update the tree from a snapshot of the process table.
@@ -490,9 +534,12 @@ impl ProcessTree {
                 self.dead.insert(*pid);
             }
             // The name of a member of the tree, for the check of a report.
+            // A process that runs a new file keeps its PID, so a PID can
+            // have more than one name over the run. Each name stays: a
+            // report of the PID can arrive before or after the exec.
             if let Some(row) = present.get(pid) {
                 if !row.name.is_empty() {
-                    self.names.insert(*pid, row.name.clone());
+                    self.names.entry(*pid).or_default().insert(row.name.clone());
                 }
             }
         }
@@ -513,7 +560,7 @@ mod runtime {
 
     use pent_profile::WatchEvent;
 
-    use super::{parse_line, parse_ps_output, to_event, ProcessTree, RecordMode};
+    use super::{file_name_of, parse_line, parse_ps_output, to_event, ProcessTree, RecordMode};
     use crate::SandboxError;
 
     /// The time to wait for `log stream` to print its header.
@@ -674,7 +721,18 @@ mod runtime {
         /// Return the channel of events. The channel closes when the last
         /// process of the tree exits, after a short drain time for late log
         /// lines.
-        pub(crate) fn attach(mut self, root_pid: u32, mode: RecordMode) -> Receiver<WatchEvent> {
+        ///
+        /// `root_names` holds the names of the programs that the root
+        /// process runs: the front end `sandbox-exec` and the command of
+        /// the user. A short-lived root never reaches the process table, so
+        /// without these names the reader drops each report of it (MAC-6 in
+        /// `docs/security/macos.md`).
+        pub(crate) fn attach(
+            mut self,
+            root_pid: u32,
+            root_names: &[String],
+            mode: RecordMode,
+        ) -> Receiver<WatchEvent> {
             let (tx, rx) = std::sync::mpsc::channel();
             let (Some(lines), Some(log_proc)) = (self.lines.take(), self.log_proc.take()) else {
                 // `start` always sets both fields; with no input the channel
@@ -682,7 +740,7 @@ mod runtime {
                 return rx;
             };
             let tree = Arc::new(Mutex::new(Tree {
-                tree: ProcessTree::new(root_pid),
+                tree: ProcessTree::with_names(root_pid, root_names),
                 last_refresh: None,
             }));
 
@@ -725,6 +783,17 @@ mod runtime {
             // name that does not fit is a forgery (FUZZ-1).
             if !lock(tree).accepts(record.pid, &record.process) {
                 continue;
+            }
+            // The report of an exec names the program that the process
+            // runs from now on. The kernel writes that path, so the name
+            // is a source that the program does not choose. Without it,
+            // each report after the first exec of a process has a name
+            // that no snapshot of the process table holds yet, and the
+            // reader drops it (MAC-6).
+            if record.operation.starts_with("process-exec") && record.target.starts_with('/') {
+                lock(tree)
+                    .tree
+                    .learn_exec(record.pid, file_name_of(&record.target));
             }
             let Some(event) = to_event(&record, mode) else {
                 continue;
@@ -1091,6 +1160,45 @@ mod tests {
         assert!(!names_agree("aaaaaaaaaaaaaaaa", padded));
         // An empty known name means "pent cannot check".
         assert!(!names_agree("cat", ""));
+    }
+
+    /// MAC-6. A root process that lives less than one poll interval never
+    /// reaches the process table. Pent starts that process, so it gives
+    /// the two names of it to the tree, and the reports of the process
+    /// reach the recorder.
+    #[test]
+    fn the_names_of_the_root_come_from_pent() {
+        let names = ["sandbox-exec".to_string(), "cat".to_string()];
+        let tree = ProcessTree::with_names(10, &names);
+        assert!(tree.name_fits(10, "cat"));
+        assert!(tree.name_fits(10, "sandbox-exec"));
+        assert!(!tree.name_fits(10, "sh"));
+        // Another PID gets nothing from the names of the root.
+        assert!(!tree.name_fits(11, "cat"));
+        // A tree without names keeps the old behaviour.
+        let empty = ProcessTree::new(10);
+        assert!(!empty.name_fits(10, "cat"));
+    }
+
+    /// MAC-6. A process that runs a new file keeps its PID, and the name
+    /// of each later report is the name of the new file. The exec report
+    /// gives that name, and the earlier name stays valid for a report that
+    /// arrives late.
+    #[test]
+    fn an_exec_report_teaches_the_new_name_of_the_process() {
+        let names = ["sh".to_string()];
+        let mut tree = ProcessTree::with_names(10, &names);
+        assert!(!tree.name_fits(10, "bash"));
+        tree.learn_exec(10, "bash");
+        assert!(tree.name_fits(10, "bash"), "the new name must fit");
+        assert!(tree.name_fits(10, "sh"), "the old name must stay");
+        // A PID outside the tree learns nothing.
+        tree.learn_exec(99, "bash");
+        assert!(!tree.name_fits(99, "bash"));
+        // The process table adds a name, it does not replace one.
+        let _live = tree.update(&parse_ps_output("10 1 S /bin/zsh\n"));
+        assert!(tree.name_fits(10, "zsh"));
+        assert!(tree.name_fits(10, "bash"));
     }
 
     #[test]
