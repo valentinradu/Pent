@@ -75,7 +75,7 @@ pub use dns::{DnsServer, DnsServerConfig};
 pub use filter::{normalize_hostname, DomainFilter, DomainMatch, DomainNameError};
 pub use netaddr::PrivateDestinations;
 pub use proxy::{TcpProxy, TcpProxyConfig};
-pub use server::{ConfigError, ProxyConfig, ProxyHandle, ProxyServer};
+pub use server::{ConfigError, ProxyConfig, ProxyHandle, ProxyPolicy, ProxyServer};
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};

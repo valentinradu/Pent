@@ -91,6 +91,11 @@ pub struct SandboxConfig {
     /// When true, skip filesystem enforcement (no Landlock, no overlayfs).
     /// Network isolation is unaffected.  Used by `--no-sandbox`.
     pub no_enforcement: bool,
+
+    /// When true, record the accesses of the process tree next to the
+    /// enforcement, and return them in [`crate::SandboxChild::events`].
+    /// Used by `pent run --trace`.
+    pub record_events: bool,
 }
 
 impl SandboxConfig {
@@ -111,6 +116,7 @@ impl SandboxConfig {
             network: NetworkMode::default(),
             cwd,
             no_enforcement: false,
+            record_events: false,
         }
     }
 

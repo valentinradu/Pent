@@ -528,6 +528,7 @@ dependencies = [
 name = "pent-proxy"
 version = "0.0.5"
 dependencies = [
+ "pent-profile",
  "pent-settings",
  "thiserror 2.0.18",
  "tokio",

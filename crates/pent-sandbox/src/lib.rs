@@ -116,6 +116,12 @@ pub struct SandboxChild {
     /// Dropping this cleans up firewall/routing rules added during setup.
     #[cfg(target_os = "linux")]
     pub netns: Option<linux_netns::NetnsHandle>,
+    /// The recorded events when [`SandboxConfig::record_events`] is set
+    /// (`pent run --trace`). The recorder observes next to the enforcement.
+    /// Events that the policy denies have [`pent_profile::Outcome::Denied`].
+    ///
+    /// CONTRACT STUB: no platform fills this channel yet.
+    pub events: Option<std::sync::mpsc::Receiver<pent_profile::WatchEvent>>,
 }
 
 /// Errors that can occur during sandbox operations.
@@ -229,7 +235,10 @@ pub fn spawn_sandboxed(
             &config.env
         };
         let child = macos::spawn_with_sandbox(&profile, cmd, args, env, &config.cwd)?;
-        Ok(SandboxChild { child })
+        Ok(SandboxChild {
+            child,
+            events: None,
+        })
     }
     #[cfg(target_os = "linux")]
     {
@@ -258,6 +267,7 @@ pub fn spawn_sandboxed(
             child,
             overlay,
             netns,
+            events: None,
         })
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]

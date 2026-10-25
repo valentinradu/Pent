@@ -88,6 +88,27 @@ pub struct ProxyConfig {
     /// Optional channel for reporting trace events (violations and granted access).
     /// When set, both blocked and allowed connections send a typed [`TraceEvent`].
     pub violation_tx: Option<tokio::sync::mpsc::UnboundedSender<TraceEvent>>,
+
+    /// The policy of the proxy. Default: [`ProxyPolicy::Enforce`].
+    pub policy: ProxyPolicy,
+
+    /// Optional channel for structured events (one for each DNS query and
+    /// each connection, allowed or denied). `pent watch` uses it to record
+    /// the network access, and `pent run` to record denials.
+    pub event_tx: Option<tokio::sync::mpsc::UnboundedSender<pent_profile::WatchEvent>>,
+}
+
+/// The policy of the proxy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ProxyPolicy {
+    /// Allow only the domains on the allowlist.
+    #[default]
+    Enforce,
+    /// Allow each domain and emit an event for each request (watch mode).
+    /// The rule for destinations that are not public still applies.
+    ///
+    /// CONTRACT STUB: the proxy does not use this value yet.
+    Observe,
 }
 
 impl Default for ProxyConfig {
@@ -100,6 +121,8 @@ impl Default for ProxyConfig {
             upstream_dns: None,       // Use system resolvers
             domain_allowlist: vec![], // Populated from settings per-assistant
             violation_tx: None,
+            policy: ProxyPolicy::Enforce,
+            event_tx: None,
             dns_ttl: std::time::Duration::from_secs(300),
             dns_min_ttl: std::time::Duration::from_secs(30),
             tcp_connect_timeout: std::time::Duration::from_secs(30),

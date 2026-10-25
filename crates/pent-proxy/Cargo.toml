@@ -8,6 +8,7 @@ description = "DNS + TCP proxy with domain allowlist enforcement for pent sandbo
 
 [dependencies]
 pent-settings = { path = "../pent-settings" }
+pent-profile = { path = "../pent-profile" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
