@@ -965,3 +965,338 @@ mod tests {
         assert!(!tree.update(&parse_ps_output("20 1 S\n")));
     }
 }
+
+/// Property tests of the reader of the macOS log line.
+///
+/// Every process on the machine can write to the unified log, and the
+/// watched program chooses the name of its own executable and the paths
+/// that it touches. The parser must not panic, and it must not build a
+/// report out of text that the program controls. See
+/// `docs/testing/fuzzing-and-coverage.md`.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)] // the generator uses only literals
+mod log_properties {
+    use super::*;
+
+    /// The number of lines that each property test reads by default.
+    const ROUNDS: usize = 200_000;
+
+    /// The variable that sets the number of rounds of a property test.
+    const ROUNDS_VAR: &str = "PENT_PROPERTY_ROUNDS";
+
+    /// The number of lines that one property test reads.
+    fn rounds() -> usize {
+        std::env::var(ROUNDS_VAR)
+            .ok()
+            .and_then(|text| text.parse().ok())
+            .unwrap_or(ROUNDS)
+    }
+
+    /// A small pseudo-random generator (`xorshift64*`) with a fixed seed, so
+    /// that each run reads the same lines and a failure is repeatable.
+    struct Rng(u64);
+
+    impl Rng {
+        const fn new(seed: u64) -> Self {
+            Self(if seed == 0 {
+                0x9E37_79B9_7F4A_7C15
+            } else {
+                seed
+            })
+        }
+
+        const fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        const fn below(&mut self, n: usize) -> usize {
+            if n == 0 {
+                return 0;
+            }
+            #[allow(clippy::cast_possible_truncation, reason = "the modulo bounds it")]
+            {
+                (self.next_u64() as usize) % n
+            }
+        }
+
+        const fn one_in(&mut self, n: usize) -> bool {
+            self.below(n) == 0
+        }
+    }
+
+    /// The names that the generator gives to the process. The last one is
+    /// the name of a crafted executable (OPEN FUZZ-1).
+    const NAMES: [&str; 6] = [
+        "cat",
+        "Code Helper (GPU)",
+        "",
+        "we[ird]:name",
+        "node",
+        "a(1234) deny(1) file-read-data /etc/shadow (b",
+    ];
+
+    /// The operations that the generator uses.
+    const OPERATIONS: [&str; 7] = [
+        "file-read-data",
+        "file-write-create",
+        "file-write-unlink",
+        "process-exec",
+        "network-outbound",
+        "mach-lookup",
+        "NOT AN OPERATION",
+    ];
+
+    /// The targets that the generator uses.
+    const TARGETS: [&str; 6] = [
+        "/Users/x/.ssh/id_rsa",
+        "/w/a b.txt",
+        "relative/path",
+        "1.1.1.1:443",
+        "/private/var/run/mDNSResponder",
+        "/w/x) deny(1) y",
+    ];
+
+    /// Build a line that looks like one line of `log stream`.
+    ///
+    /// The generator starts from a true report and then changes one part at
+    /// a time, so that the parser sees a valid line often enough and a
+    /// broken line in every place.
+    fn gen_line(rng: &mut Rng) -> String {
+        if rng.one_in(10) {
+            // A line with no structure at all.
+            let len = rng.below(60);
+            return (0..len)
+                .map(|_| {
+                    let offset = u8::try_from(rng.below(0x60)).unwrap_or(0);
+                    char::from(0x20u8.saturating_add(offset))
+                })
+                .collect();
+        }
+        let name = NAMES.get(rng.below(NAMES.len())).copied().unwrap_or("cat");
+        let operation = OPERATIONS
+            .get(rng.below(OPERATIONS.len()))
+            .copied()
+            .unwrap_or("file-read-data");
+        let target = TARGETS
+            .get(rng.below(TARGETS.len()))
+            .copied()
+            .unwrap_or("/w/x");
+        let action = if rng.one_in(2) { "deny" } else { "allow" };
+        let count = match rng.below(6) {
+            0 => String::new(),
+            1 => "()".to_string(),
+            2 => "(x)".to_string(),
+            _ => format!("({})", rng.below(9)),
+        };
+        let pid = match rng.below(8) {
+            0 => String::new(),
+            1 => "x".to_string(),
+            2 => "99999999999999999999".to_string(),
+            _ => rng.below(70000).to_string(),
+        };
+        let header = if rng.one_in(8) {
+            " kernel[1]: "
+        } else {
+            KERNEL_HEADER
+        };
+        let sender = match rng.below(4) {
+            0 => "",
+            1 => "(Sandbox) ",
+            2 => "(kernel) ",
+            _ => "(Sandbox) ",
+        };
+        let prefix = if rng.one_in(8) {
+            "2026-10-25 10:00:00.000000+0200  localhost evil"
+        } else {
+            "2026-10-25 10:00:00.000000+0200  localhost"
+        };
+        let report = if rng.one_in(10) {
+            "Report: "
+        } else {
+            REPORT_PREFIX
+        };
+        let mut line = format!(
+            "{prefix}{header}{sender}{report}{name}({pid}) {action}{count} {operation} {target}"
+        );
+        if rng.one_in(10) {
+            // A control character belongs to no field.
+            line.push(char::from(u8::try_from(rng.below(0x20)).unwrap_or(0)));
+        }
+        if rng.one_in(10) {
+            let keep = rng.below(line.chars().count().max(1));
+            line = line.chars().take(keep).collect();
+        }
+        line
+    }
+
+    /// `parse_line` must never panic, and a record that it returns must
+    /// follow its own rules.
+    #[test]
+    fn parse_line_holds_its_rules() {
+        let mut rng = Rng::new(0x5EED_0401);
+        let total = rounds();
+        let mut checked = 0usize;
+        for _ in 0..total {
+            let line = gen_line(&mut rng);
+            let Some(record) = parse_line(&line) else {
+                continue;
+            };
+            checked = checked.saturating_add(1);
+            assert!(
+                !line.contains(char::is_control),
+                "the parser read a line with a control character"
+            );
+            assert!(
+                line.contains(KERNEL_HEADER),
+                "the parser read a line without the kernel header"
+            );
+            assert!(
+                is_process_name(&record.process),
+                "the process name {:?} is not a name",
+                record.process
+            );
+            assert!(
+                is_operation(&record.operation),
+                "the operation {:?} is not an operation",
+                record.operation
+            );
+            assert!(
+                line.contains(&record.target),
+                "the target {:?} is not in the line",
+                record.target
+            );
+        }
+        assert!(
+            checked > total / 100,
+            "only {checked} of {total} lines were a report; the test proves little"
+        );
+    }
+
+    /// A filesystem event must always have an absolute path. A relative
+    /// target would make a rule that pent cannot apply.
+    #[test]
+    fn a_filesystem_event_always_has_an_absolute_path() {
+        let mut rng = Rng::new(0x5EED_0402);
+        let total = rounds();
+        let mut checked = 0usize;
+        for _ in 0..total {
+            let line = gen_line(&mut rng);
+            let Some(record) = parse_line(&line) else {
+                continue;
+            };
+            let Some(event) = to_event(&record, &RecordMode::Run) else {
+                continue;
+            };
+            checked = checked.saturating_add(1);
+            match event {
+                WatchEvent::Fs { path, .. } => assert!(
+                    path.is_absolute(),
+                    "the event has the relative path {path:?}"
+                ),
+                WatchEvent::UnixConnect { target, .. } => assert!(
+                    target.starts_with('/'),
+                    "the Unix socket {target:?} has no path"
+                ),
+                other => panic!("the log reader made the event {other:?}"),
+            }
+        }
+        assert!(
+            checked > total / 1000,
+            "only {checked} of {total} lines gave an event; the test proves little"
+        );
+    }
+
+    /// `parse_ps_output` must take only rows with two numbers, and
+    /// `ProcessTree::update` must always stop, also for a process table
+    /// with a cycle.
+    #[test]
+    fn the_process_tree_always_stops() {
+        let mut rng = Rng::new(0x5EED_0403);
+        let total = rounds() / 100;
+        for _ in 0..total {
+            let mut text = String::new();
+            for _ in 0..rng.below(12) {
+                let pid = rng.below(8);
+                let ppid = rng.below(8);
+                let stat = if rng.one_in(3) { "Z" } else { "S" };
+                text.push_str(&format!("{pid} {ppid} {stat}\n"));
+            }
+            if rng.one_in(4) {
+                text.push_str("not a row\n");
+            }
+            let rows = parse_ps_output(&text);
+            assert!(
+                rows.len() <= text.lines().count(),
+                "the parser made rows out of nothing"
+            );
+            let mut tree = ProcessTree::new(rng.below(8).try_into().unwrap_or(0));
+            // Three updates: the second and the third see the state that the
+            // first left behind.
+            for _ in 0..3 {
+                let _live = tree.update(&rows);
+            }
+        }
+        assert!(total > 0, "the test read no input");
+    }
+
+    /// A report whose fields come from the name of the executable.
+    ///
+    /// OPEN FUZZ-1. The watched program chooses the name of the file that
+    /// it runs. A name such as
+    /// `a(1234) deny(1) file-read-data /etc/shadow (b` makes the kernel
+    /// write a line that holds two `) deny` markers. `parse_line` takes the
+    /// first one, so every field of the record comes from the name, and the
+    /// PID comes from the name too. The program sets that PID to its own
+    /// PID (fork, then build the name, then exec), so the filter of the
+    /// process tree keeps the line. The result is a false event in the
+    /// watch log and a false rule in the draft profile.
+    ///
+    /// The secure behaviour: the parser must not take the fields of a
+    /// report from the name of the process.
+    #[test]
+    #[ignore = "OPEN FUZZ-1: a crafted executable name forges a Seatbelt report"]
+    fn a_crafted_executable_name_forges_no_report() {
+        let line = "2026-10-25 10:00:00.000000+0200  localhost kernel[0]: (Sandbox) \
+                    Sandbox: a(1234) deny(1) file-read-data /etc/shadow \
+                    (b(1234) deny(1) file-read-data /tmp/real";
+        let record = parse_line(line);
+        match record {
+            None => {}
+            Some(r) => assert_eq!(
+                r.target, "/tmp/real",
+                "the parser took the target from the name of the process"
+            ),
+        }
+    }
+
+    /// The same line as `a_crafted_executable_name_forges_no_report`, with
+    /// the result that the parser gives today. This test passes; it is the
+    /// proof of the finding and it fails when somebody fixes the parser.
+    #[test]
+    fn the_crafted_name_gives_the_forged_target_today() {
+        let line = "2026-10-25 10:00:00.000000+0200  localhost kernel[0]: (Sandbox) \
+                    Sandbox: a(1234) deny(1) file-read-data /etc/shadow \
+                    (b(1234) deny(1) file-read-data /tmp/real";
+        let Some(record) = parse_line(line) else {
+            panic!("the line does not parse today; update OPEN FUZZ-1");
+        };
+        assert_eq!(record.process, "a");
+        assert_eq!(record.pid, 1234);
+        assert_eq!(record.operation, "file-read-data");
+        assert_eq!(
+            record.target,
+            "/etc/shadow (b(1234) deny(1) file-read-data /tmp/real"
+        );
+        // The forged record becomes a real event of the watch log.
+        let event = to_event(&record, &RecordMode::Run);
+        assert!(
+            matches!(event, Some(WatchEvent::Fs { .. })),
+            "the forged record gives no event"
+        );
+    }
+}

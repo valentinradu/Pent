@@ -2952,6 +2952,48 @@ mod tests {
         handle.abort();
     }
 
+    /// An HTTP CONNECT to a port that refuses the connection gets 502.
+    /// The client must see that the destination refused, not that the
+    /// policy blocked the name.
+    #[tokio::test]
+    async fn an_http_connect_to_a_closed_port_gets_502() {
+        // A port that nothing listens on: bind it, read the number, close.
+        let Some(closed) = get_free_port().await else {
+            return;
+        };
+        let (state, mut rx) = traced_state(&["localhost"]);
+        let config = TcpProxyConfig {
+            private_destinations: PrivateDestinations::Allow,
+            ..Default::default()
+        };
+        let Some((proxy, handle)) = start_proxy(state, config).await else {
+            return;
+        };
+        let mut client = TcpStream::connect(proxy).await.unwrap();
+        let request = format!(
+            "CONNECT localhost:{port} HTTP/1.1\r\n\r\n",
+            port = closed.port()
+        );
+        client.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), client.read_to_end(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            response.starts_with(b"HTTP/1.1 502"),
+            "the client must see 502: {}",
+            String::from_utf8_lossy(&response)
+        );
+        // The policy allowed the name; only the destination refused.
+        let messages = drain(&mut rx);
+        assert!(
+            messages.iter().any(|m| m.starts_with("access ")),
+            "the policy must allow the name: {messages:?}"
+        );
+        handle.abort();
+    }
+
     #[test]
     fn test_parse_http_connect_target_ip_literal() {
         let target = parse_http_connect_target("CONNECT [2001:db8::1]:443 HTTP/1.1").unwrap();
@@ -3477,5 +3519,262 @@ mod tests {
             )
         );
         assert!(rx.try_recv().is_err(), "exactly one event");
+    }
+}
+
+/// Property tests of the handshake readers.
+///
+/// The sandboxed program writes every byte of a SOCKS5 greeting, a SOCKS5
+/// request and an HTTP CONNECT request. The properties here hold for each
+/// of those byte strings. See `docs/testing/fuzzing-and-coverage.md`.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)] // the generator uses only literals
+mod handshake_properties {
+    use super::*;
+    use crate::test_support::{rounds, Rng};
+
+    /// The number of inputs that each property test reads by default.
+    const ROUNDS: usize = 100_000;
+
+    /// Build a byte string that looks like a SOCKS5 request.
+    fn gen_socks5_request(rng: &mut Rng) -> Vec<u8> {
+        if rng.one_in(8) {
+            let len = rng.below(40);
+            return rng.bytes(len);
+        }
+        let atyp = match rng.below(8) {
+            0 => rng.byte(),
+            1 | 2 => socks5::ATYP_IPV6,
+            3 | 4 => socks5::ATYP_DOMAIN,
+            _ => socks5::ATYP_IPV4,
+        };
+        let version = if rng.one_in(8) {
+            rng.byte()
+        } else {
+            socks5::VERSION
+        };
+        let cmd = if rng.one_in(4) {
+            rng.byte()
+        } else {
+            socks5::CMD_CONNECT
+        };
+        let mut out = vec![version, cmd, rng.byte(), atyp];
+        match atyp {
+            socks5::ATYP_IPV4 => out.extend(rng.bytes(4)),
+            socks5::ATYP_IPV6 => out.extend(rng.bytes(16)),
+            socks5::ATYP_DOMAIN => {
+                let len = rng.below(40);
+                #[allow(clippy::cast_possible_truncation, reason = "len is below 40")]
+                out.push(len as u8);
+                out.extend(rng.bytes(len));
+            }
+            _ => {
+                let len = rng.below(8);
+                out.extend(rng.bytes(len));
+            }
+        }
+        out.extend(rng.bytes(2)); // The port.
+                                  // Cut the request short sometimes, and add trailing bytes sometimes.
+        if rng.one_in(4) {
+            let keep = rng.below(out.len().max(1));
+            out.truncate(keep);
+        } else if rng.one_in(4) {
+            let len = rng.below(8);
+            out.extend(rng.bytes(len));
+        }
+        out
+    }
+
+    /// Build a byte string that looks like an HTTP CONNECT request head.
+    fn gen_http_connect(rng: &mut Rng) -> Vec<u8> {
+        if rng.one_in(8) {
+            let len = rng.below(60);
+            return rng.bytes(len);
+        }
+        const HOSTS: [&str; 8] = [
+            "example.com:443",
+            "example.com",
+            "[2001:db8::1]:443",
+            "127.0.0.1:80",
+            "::1:443",
+            ":443",
+            "a.b.c:0",
+            "example.com:99999",
+        ];
+        let method = if rng.one_in(4) { "GET" } else { "CONNECT" };
+        let host = HOSTS.get(rng.below(HOSTS.len())).copied().unwrap_or("");
+        let mut text = format!("{method} {host} HTTP/1.1\r\n");
+        for _ in 0..rng.below(4) {
+            let len = rng.below(12);
+            let value: String = (0..len)
+                .map(|_| char::from(0x20 | rng.byte() & 0x3F))
+                .collect();
+            text.push_str(&format!("X-Fuzz: {value}\r\n"));
+        }
+        if !rng.one_in(8) {
+            text.push_str("\r\n");
+        }
+        let mut out = text.into_bytes();
+        if rng.one_in(6) {
+            let at = rng.below(out.len().max(1));
+            if let Some(byte) = out.get_mut(at) {
+                *byte = rng.byte();
+            }
+        }
+        out
+    }
+
+    /// `read_socks5_request` must never panic, and the request that it
+    /// returns must hold exactly the bytes that the client sent.
+    #[tokio::test]
+    async fn socks5_request_returns_the_bytes_of_the_client() {
+        let mut rng = Rng::new(0x5EED_0101);
+        let total = rounds(ROUNDS);
+        let mut checked = 0usize;
+        for _ in 0..total {
+            let data = gen_socks5_request(&mut rng);
+            let mut reader: &[u8] = &data;
+            let Ok(request) = read_socks5_request(&mut reader).await else {
+                continue;
+            };
+            checked = checked.saturating_add(1);
+            let read = data.len().saturating_sub(reader.len());
+            assert_eq!(
+                data.first().copied(),
+                Some(socks5::VERSION),
+                "the reader accepted a request with the wrong version"
+            );
+            match &request.target {
+                Target::Ip(addr) => {
+                    let expected = match addr.ip() {
+                        IpAddr::V4(_) => 10,
+                        IpAddr::V6(_) => 22,
+                    };
+                    assert_eq!(read, expected, "the reader took the wrong number of bytes");
+                    let port = u16::from_be_bytes([
+                        *data.get(read.saturating_sub(2)).unwrap(),
+                        *data.get(read.saturating_sub(1)).unwrap(),
+                    ]);
+                    assert_eq!(addr.port(), port, "the port is not the one of the client");
+                }
+                Target::Domain { host, port } => {
+                    let len = usize::from(*data.get(4).unwrap());
+                    assert_eq!(
+                        host.len(),
+                        len,
+                        "the host is not the length that the client gave"
+                    );
+                    assert_eq!(
+                        host.as_bytes(),
+                        data.get(5..5usize.saturating_add(len)).unwrap(),
+                        "the host is not the text that the client sent"
+                    );
+                    let at = 5usize.saturating_add(len);
+                    let expected = u16::from_be_bytes([
+                        *data.get(at).unwrap(),
+                        *data.get(at.saturating_add(1)).unwrap(),
+                    ]);
+                    assert_eq!(*port, expected, "the port is not the one of the client");
+                    assert_eq!(read, at.saturating_add(2), "the reader took extra bytes");
+                }
+            }
+        }
+        assert!(
+            checked > total / 10,
+            "only {checked} of {total} inputs were a request; the test proves little"
+        );
+    }
+
+    /// An HTTP CONNECT target that the parser calls a domain must not be an
+    /// IP address. The proxy checks a domain against the allowlist and
+    /// resolves it; it checks an IP address against the DNS cache. A literal
+    /// address that reaches the domain path would take the wrong check.
+    #[tokio::test]
+    async fn http_connect_never_calls_an_address_a_domain() {
+        let mut rng = Rng::new(0x5EED_0102);
+        let total = rounds(ROUNDS);
+        let mut checked = 0usize;
+        for _ in 0..total {
+            let data = gen_http_connect(&mut rng);
+            let Some((&first, rest)) = data.split_first() else {
+                continue;
+            };
+            let mut reader: &[u8] = rest;
+            let Ok(negotiated) = negotiate_http_connect(&mut reader, first).await else {
+                continue;
+            };
+            checked = checked.saturating_add(1);
+            match &negotiated.target {
+                Target::Domain { host, .. } => {
+                    assert!(
+                        host.parse::<IpAddr>().is_err(),
+                        "the parser called the address {host:?} a domain"
+                    );
+                    let bare = host
+                        .strip_prefix('[')
+                        .and_then(|h| h.strip_suffix(']'))
+                        .unwrap_or(host);
+                    assert!(
+                        bare.parse::<IpAddr>().is_err(),
+                        "the parser called the bracketed address {host:?} a domain"
+                    );
+                }
+                Target::Ip(_) => {}
+            }
+            // The head always ends with the empty line, and the bytes after
+            // it go to the destination without a change.
+            let head_len = data.len().saturating_sub(negotiated.initial.len());
+            assert!(
+                data.get(..head_len)
+                    .is_some_and(|head| head.ends_with(b"\r\n\r\n")),
+                "the reader did not stop at the end of the head"
+            );
+            assert!(
+                head_len <= inspect::MAX_HTTP_HEAD_LEN.saturating_add(4096),
+                "the reader kept a head of {head_len} bytes"
+            );
+        }
+        assert!(
+            checked > total / 10,
+            "only {checked} of {total} inputs were a CONNECT request; the test proves little"
+        );
+    }
+
+    /// `parse_http_connect_target` must never panic, and it must accept only
+    /// a line whose first word is `CONNECT`.
+    #[test]
+    fn http_connect_target_needs_the_method() {
+        let mut rng = Rng::new(0x5EED_0103);
+        let total = rounds(ROUNDS);
+        let mut checked = 0usize;
+        for _ in 0..total {
+            let data = gen_http_connect(&mut rng);
+            let Ok(text) = std::str::from_utf8(&data) else {
+                continue;
+            };
+            let line = text.lines().next().unwrap_or("");
+            let Ok(target) = parse_http_connect_target(line) else {
+                continue;
+            };
+            checked = checked.saturating_add(1);
+            let method = line.split_whitespace().next().unwrap_or("");
+            assert!(
+                method.eq_ignore_ascii_case("CONNECT"),
+                "the parser accepted the method {method:?}"
+            );
+            // A port of 0 reaches no service, but the parser must not turn
+            // it into another port.
+            let word = line.split_whitespace().nth(1).unwrap_or("");
+            let port_text = word.rsplit_once(':').map(|(_, p)| p).unwrap_or("");
+            assert_eq!(
+                port_text.parse::<u16>().ok(),
+                Some(target.port()),
+                "the parser changed the port of {word:?}"
+            );
+        }
+        assert!(
+            checked > total / 10,
+            "only {checked} of {total} lines were a target; the test proves little"
+        );
     }
 }

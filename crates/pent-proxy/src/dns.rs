@@ -2490,4 +2490,832 @@ mod tests {
             dns_event("nx.example.com", "A", Outcome::Allowed)
         );
     }
+
+    // ========================================================================
+    // The decisions and the error paths that the coverage run found open.
+    // See docs/testing/fuzzing-and-coverage.md.
+    // ========================================================================
+
+    /// An upstream that answers with an error code is not an answer. The
+    /// server tries the next upstream. Without this rule one upstream that
+    /// answers REFUSED would block every name.
+    #[tokio::test]
+    async fn an_upstream_error_code_makes_the_server_try_the_next_one() {
+        use crate::SharedState;
+        // The first upstream answers REFUSED for every query.
+        let Some(refusing) = udp_bind_or_skip("127.0.0.1:0").await else {
+            return;
+        };
+        let Ok(first) = refusing.local_addr() else {
+            panic!("the socket of the test must have an address");
+        };
+        let refuse = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            loop {
+                let Ok((len, src)) = refusing.recv_from(&mut buf).await else {
+                    return;
+                };
+                let query = &buf[..len];
+                let Ok(question) = read_question(query, Pointers::Forbidden) else {
+                    continue;
+                };
+                let mut answer = query[..2].to_vec();
+                answer.extend_from_slice(&[0x81, 0x80 | 5]); // REFUSED
+                answer.extend_from_slice(&[0, 1, 0, 0, 0, 0, 0, 0]);
+                answer.extend_from_slice(&query[HEADER_LEN..question.end]);
+                let _ = refusing.send_to(&answer, src).await;
+            }
+        });
+        let Some((second, _task)) = fake_upstream("127.0.0.1:0").await else {
+            refuse.abort();
+            return;
+        };
+        let state = Arc::new(SharedState::new(vec!["example.com".to_string()]));
+        let config = DnsServerConfig {
+            upstream: Some(vec![first, second]),
+            resolve_timeout: Duration::from_secs(3),
+            ..Default::default()
+        };
+        let Ok(server) = DnsServer::new(config, state) else {
+            panic!("DnsServer::new must accept two upstream servers");
+        };
+        let query = build_test_dns_query("example.com", rtype::A);
+        let response = server.handle_query(&query).await.unwrap();
+        assert_eq!(rcode_of(&response), rcode::NOERROR);
+        assert_eq!(u16::from_be_bytes([response[6], response[7]]), 1);
+        refuse.abort();
+    }
+
+    /// The TCP server closes a connection that sends nothing, and it
+    /// refuses a connection above the limit. Without the limit one client
+    /// could hold every connection slot.
+    #[tokio::test]
+    async fn the_tcp_server_closes_an_empty_connection_and_holds_its_limit() {
+        use tokio::io::AsyncReadExt;
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                crate::test_support::skip("this machine cannot bind a TCP socket on the loopback");
+                return;
+            }
+            Err(err) => panic!("Failed to bind TCP listener for test: {err}"),
+        };
+        let Ok(bound) = listener.local_addr() else {
+            panic!("the listener of the test must have an address");
+        };
+        let Some((upstream, _task)) = fake_upstream("127.0.0.1:0").await else {
+            return;
+        };
+        use crate::SharedState;
+        let state = Arc::new(SharedState::new(vec!["example.com".to_string()]));
+        let config = DnsServerConfig {
+            upstream: Some(vec![upstream]),
+            // One connection at a time.
+            max_concurrent_queries: 1,
+            ..Default::default()
+        };
+        let Ok(server) = DnsServer::new(config, state) else {
+            panic!("DnsServer::new must accept the configuration");
+        };
+        let run = tokio::spawn(async move {
+            let _ = server.run_tcp_on(listener).await;
+        });
+
+        // The first connection stays open and holds the only slot.
+        let mut held = tokio::net::TcpStream::connect(bound).await.unwrap();
+        // Wait until the server took the connection and the permit.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // The second connection is above the limit: the server closes it.
+        let mut extra = tokio::net::TcpStream::connect(bound).await.unwrap();
+        let mut buf = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(5), extra.read(&mut buf)).await;
+        assert!(
+            matches!(read, Ok(Ok(0))),
+            "the server must close the connection above the limit: {read:?}"
+        );
+
+        // The first connection closes with no query, and the server frees
+        // the slot, so a new connection gets served.
+        drop(held);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let third = tokio::net::TcpStream::connect(bound).await;
+        assert!(third.is_ok(), "the server must accept a new connection");
+        held = third.unwrap();
+        drop(held);
+        run.abort();
+    }
+
+    /// Every query type has a text. The text goes into the violation
+    /// message and into the watch event, so a wrong or empty text makes
+    /// the record of the run wrong.
+    #[test]
+    fn every_query_type_has_a_text() {
+        let known = [
+            (1u16, "A"),
+            (2, "NS"),
+            (5, "CNAME"),
+            (6, "SOA"),
+            (12, "PTR"),
+            (15, "MX"),
+            (16, "TXT"),
+            (28, "AAAA"),
+            (33, "SRV"),
+            (64, "SVCB"),
+            (65, "HTTPS"),
+            (255, "ANY"),
+        ];
+        for (qtype, text) in known {
+            assert_eq!(qtype_name(qtype), text, "the type {qtype} has another text");
+        }
+        // A type that the list does not hold keeps its number.
+        assert_eq!(qtype_name(99), "TYPE99");
+        assert_eq!(qtype_name(0), "TYPE0");
+        assert_eq!(qtype_name(u16::MAX), "TYPE65535");
+    }
+
+    /// A query with an opcode that is not 0 gets NOTIMP, and the server
+    /// does not forward it. An UPDATE query (opcode 5) must never reach an
+    /// upstream server.
+    #[tokio::test]
+    async fn a_query_with_another_opcode_gets_notimp() {
+        let Some((upstream, _task)) = fake_upstream("127.0.0.1:0").await else {
+            return;
+        };
+        let (server, _state, mut rx) = server_with_upstream(upstream, &["example.com"]);
+        let mut query = build_test_dns_query("example.com", rtype::A);
+        // Opcode 5 (UPDATE) in the four bits above the recursion flag.
+        query[2] = 0x28;
+        let response = server.handle_query(&query).await.unwrap();
+        assert_eq!(rcode_of(&response), rcode::NOTIMP);
+        // The response holds no question, so the client cannot read a name
+        // that the server did not check.
+        assert_eq!(u16::from_be_bytes([response[4], response[5]]), 0);
+        assert!(response[2] & FLAG_QR != 0, "the answer has no QR bit");
+        assert!(rx.try_recv().is_err(), "a NOTIMP query makes no event");
+    }
+
+    /// A zone transfer gets NOTIMP, also for a domain that the allowlist
+    /// holds. A zone transfer would give the program the whole zone.
+    #[tokio::test]
+    async fn a_zone_transfer_gets_notimp() {
+        let Some((upstream, _task)) = fake_upstream("127.0.0.1:0").await else {
+            return;
+        };
+        let (server, _state, mut rx) = server_with_upstream(upstream, &["example.com"]);
+        for qtype in [rtype::AXFR, rtype::IXFR] {
+            let query = build_test_dns_query("example.com", qtype);
+            let response = server.handle_query(&query).await.unwrap();
+            assert_eq!(
+                rcode_of(&response),
+                rcode::NOTIMP,
+                "the query type {qtype} must get NOTIMP"
+            );
+            // The server repeats the question of the client.
+            assert_eq!(u16::from_be_bytes([response[4], response[5]]), 1);
+            assert!(rx.try_recv().is_err(), "a zone transfer makes no event");
+        }
+    }
+
+    /// A query in a class that is not IN gets NOTIMP. The allowlist has no
+    /// meaning in another class.
+    #[tokio::test]
+    async fn a_query_in_another_class_gets_notimp() {
+        let Some((upstream, _task)) = fake_upstream("127.0.0.1:0").await else {
+            return;
+        };
+        let (server, _state, _rx) = server_with_upstream(upstream, &["example.com"]);
+        let mut query = build_test_dns_query("example.com", rtype::A);
+        // The class CHAOS (3) in the last two bytes.
+        let len = query.len();
+        query[len - 2] = 0x00;
+        query[len - 1] = 0x03;
+        let response = server.handle_query(&query).await.unwrap();
+        assert_eq!(rcode_of(&response), rcode::NOTIMP);
+    }
+
+    /// A question whose name is not a valid host name gets NXDOMAIN, the
+    /// server reports a violation, and the event holds the name in
+    /// lowercase without the trailing dot.
+    #[tokio::test]
+    async fn a_name_that_is_not_a_host_name_is_blocked() {
+        let Some((upstream, _task)) = fake_upstream("127.0.0.1:0").await else {
+            return;
+        };
+        // The allowlist holds "*", so only the shape of the name blocks it.
+        let (server, _state, mut rx) = server_with_upstream(upstream, &["**"]);
+        // A label with a character that a host name cannot hold.
+        let query = build_test_dns_query("BAD$NAME.example", rtype::A);
+        let response = server.handle_query(&query).await.unwrap();
+        assert_eq!(rcode_of(&response), rcode::NXDOMAIN);
+        let Ok(crate::TraceEvent::Violation(message)) = rx.try_recv() else {
+            panic!("the server must report a violation");
+        };
+        assert!(
+            message.contains("BAD$NAME.example"),
+            "the message must name the query: {message}"
+        );
+    }
+
+    /// The SERVFAIL answer of an internal error is a response, and it
+    /// repeats the question of the client.
+    #[test]
+    fn the_servfail_answer_repeats_the_question() {
+        let query = build_test_dns_query("example.com", rtype::A);
+        let response = DnsServer::build_servfail_response(&query);
+        assert_eq!(rcode_of(&response), rcode::SERVFAIL);
+        assert!(response[2] & FLAG_QR != 0, "the answer has no QR bit");
+        assert_eq!(u16::from_be_bytes([response[4], response[5]]), 1);
+        assert_eq!(&response[HEADER_LEN..], &query[HEADER_LEN..]);
+        // A query that holds no question gives a header with no question.
+        let short = DnsServer::build_servfail_response(&query[..HEADER_LEN]);
+        assert_eq!(u16::from_be_bytes([short[4], short[5]]), 0);
+        assert_eq!(short.len(), HEADER_LEN);
+    }
+
+    /// With no upstream server the query fails with `DnsResolution`, and
+    /// the name of the domain is in the error.
+    #[tokio::test]
+    async fn a_server_without_an_upstream_cannot_resolve() {
+        use crate::SharedState;
+        let config = DnsServerConfig {
+            upstream: Some(vec![]),
+            ..Default::default()
+        };
+        let state = Arc::new(SharedState::new(vec!["example.com".to_string()]));
+        let Ok(server) = DnsServer::new(config, state) else {
+            panic!("DnsServer::new must accept an empty upstream list");
+        };
+        let query = build_test_dns_query("example.com", rtype::A);
+        match server.handle_query(&query).await {
+            Err(ProxyError::DnsResolution { domain, .. }) => {
+                assert_eq!(domain, "example.com");
+            }
+            other => panic!("the server must report a resolution error: {other:?}"),
+        }
+    }
+
+    /// The server ignores an upstream datagram that does not match the
+    /// query, and it takes the one that does. A remote host that guesses
+    /// the port must also guess the transaction ID and the question.
+    #[tokio::test]
+    async fn the_server_ignores_an_upstream_datagram_that_does_not_match() {
+        let Some(socket) = udp_bind_or_skip("127.0.0.1:0").await else {
+            return;
+        };
+        let Ok(upstream) = socket.local_addr() else {
+            panic!("the socket of the test must have an address");
+        };
+        // The fake upstream answers twice: first with a wrong transaction
+        // ID, then with the right one.
+        let task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let Ok((len, src)) = socket.recv_from(&mut buf).await else {
+                return;
+            };
+            let query = buf[..len].to_vec();
+            let mut spoof = query.clone();
+            spoof[0] ^= 0xFF;
+            spoof[2] = FLAG_QR;
+            spoof[3] = 0;
+            let _ = socket.send_to(&spoof, src).await;
+            let Some(answer) = fake_answer(&query) else {
+                return;
+            };
+            let _ = socket.send_to(&answer, src).await;
+        });
+        let (server, _state, _rx) = server_with_upstream(upstream, &["example.com"]);
+        let query = build_test_dns_query("example.com", rtype::A);
+        let response = server.handle_query(&query).await.unwrap();
+        assert_eq!(rcode_of(&response), rcode::NOERROR);
+        assert_eq!(u16::from_be_bytes([response[6], response[7]]), 1);
+        task.abort();
+    }
+
+    /// The server never answers a message that already has the QR bit. An
+    /// answer to an answer makes a loop between two servers.
+    #[tokio::test]
+    async fn the_server_does_not_answer_a_response() {
+        let Some(socket) = udp_bind_or_skip("127.0.0.1:0").await else {
+            return;
+        };
+        let Ok(bound) = socket.local_addr() else {
+            panic!("the socket of the test must have an address");
+        };
+        let Some((upstream, _task)) = fake_upstream("127.0.0.1:0").await else {
+            return;
+        };
+        let (server, _state, _rx) = server_with_upstream(upstream, &["example.com"]);
+        let run = tokio::spawn(async move {
+            let _ = server.run_on(socket).await;
+        });
+        let Some(client) = udp_bind_or_skip("127.0.0.1:0").await else {
+            run.abort();
+            return;
+        };
+        // A message with the QR bit: the server must stay silent.
+        let mut message = build_test_dns_query("example.com", rtype::A);
+        message[2] = FLAG_QR;
+        let _ = client.send_to(&message, bound).await;
+        let mut buf = [0u8; 512];
+        let answer =
+            tokio::time::timeout(Duration::from_millis(300), client.recv_from(&mut buf)).await;
+        assert!(answer.is_err(), "the server answered a response");
+        // The same server still answers a real query, so the test proves
+        // the rule and not a dead server.
+        let query = build_test_dns_query("example.com", rtype::A);
+        let _ = client.send_to(&query, bound).await;
+        let (len, _) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
+            .await
+            .expect("the server must answer a query")
+            .expect("the client must receive the answer");
+        assert_eq!(rcode_of(&buf[..len]), rcode::NOERROR);
+        run.abort();
+    }
+
+    /// The TCP server answers a query with the two-byte length prefix, and
+    /// it closes the connection when the client sends a response.
+    #[tokio::test]
+    async fn the_tcp_server_answers_and_closes_on_a_response() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                crate::test_support::skip("this machine cannot bind a TCP socket on the loopback");
+                return;
+            }
+            Err(err) => panic!("Failed to bind TCP listener for test: {err}"),
+        };
+        let Ok(bound) = listener.local_addr() else {
+            panic!("the listener of the test must have an address");
+        };
+        let Some((upstream, _task)) = fake_upstream("127.0.0.1:0").await else {
+            return;
+        };
+        let (server, _state, _rx) = server_with_upstream(upstream, &["example.com"]);
+        let run = tokio::spawn(async move {
+            let _ = server.run_tcp_on(listener).await;
+        });
+
+        let query = build_test_dns_query("example.com", rtype::A);
+        let mut stream = tokio::net::TcpStream::connect(bound).await.unwrap();
+        let mut framed = u16::try_from(query.len()).unwrap().to_be_bytes().to_vec();
+        framed.extend_from_slice(&query);
+        stream.write_all(&framed).await.unwrap();
+        let mut len_buf = [0u8; 2];
+        stream.read_exact(&mut len_buf).await.unwrap();
+        let mut answer = vec![0u8; usize::from(u16::from_be_bytes(len_buf))];
+        stream.read_exact(&mut answer).await.unwrap();
+        assert_eq!(rcode_of(&answer), rcode::NOERROR);
+
+        // A message with the QR bit closes the connection.
+        let mut response = build_test_dns_query("example.com", rtype::A);
+        response[2] = FLAG_QR;
+        let mut framed = u16::try_from(response.len())
+            .unwrap()
+            .to_be_bytes()
+            .to_vec();
+        framed.extend_from_slice(&response);
+        stream.write_all(&framed).await.unwrap();
+        let mut tail = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut tail)).await;
+        assert!(
+            matches!(read, Ok(Ok(0))),
+            "the server must close the connection: {read:?}"
+        );
+        run.abort();
+    }
+}
+
+/// Property tests of the DNS wire parser and the DNS builder.
+///
+/// A hostile program chooses every byte of a query, and a hostile upstream
+/// server chooses every byte of a response. The properties here hold for
+/// each of those byte strings. See `docs/testing/fuzzing-and-coverage.md`.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)] // the generator uses only literals
+mod wire_properties {
+    use super::*;
+    use crate::test_support::{rounds, Rng};
+
+    /// The number of messages that each property test reads by default.
+    const ROUNDS: usize = 200_000;
+
+    /// Append a domain name to `out`.
+    ///
+    /// The generator writes normal labels, labels that are too long, labels
+    /// with the reserved length bits, and compression pointers, so that the
+    /// parser sees every label type.
+    fn push_name(rng: &mut Rng, out: &mut Vec<u8>) {
+        let labels = rng.below(6);
+        for _ in 0..labels {
+            match rng.below(16) {
+                0 => {
+                    // A compression pointer to a random place.
+                    let target = rng.below(out.len().max(1));
+                    #[allow(clippy::cast_possible_truncation, reason = "the pointer is 14 bits")]
+                    let hi = 0xC0 | ((target >> 8) & 0x3F) as u8;
+                    #[allow(clippy::cast_possible_truncation, reason = "the low byte")]
+                    let lo = (target & 0xFF) as u8;
+                    out.push(hi);
+                    out.push(lo);
+                    return;
+                }
+                1 => {
+                    // A length byte with a reserved bit pattern.
+                    out.push(0x40 | rng.byte() & 0x3F);
+                }
+                2 => {
+                    // A label that says more bytes than the message holds.
+                    out.push(0x3F);
+                    let len = rng.below(10);
+                    out.extend(rng.bytes(len));
+                    return;
+                }
+                3 => {
+                    // A label at the limit of 63 bytes, to reach the length
+                    // check of a name of 253 characters.
+                    out.push(63);
+                    out.extend(std::iter::repeat_n(b'a', 63));
+                }
+                _ => {
+                    let len = rng.below(20);
+                    #[allow(clippy::cast_possible_truncation, reason = "len is below 20")]
+                    out.push(len as u8);
+                    if rng.one_in(2) {
+                        // A label that a host name can hold, so that the
+                        // test reaches the normalization and the builder.
+                        const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789-_";
+                        for _ in 0..len {
+                            let at = rng.below(ALPHABET.len());
+                            out.push(*ALPHABET.get(at).unwrap_or(&b'a'));
+                        }
+                    } else {
+                        out.extend(rng.bytes(len));
+                    }
+                }
+            }
+        }
+        out.push(0);
+    }
+
+    /// The shape of a generated message.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Shape {
+        /// A message as a client sends it.
+        Query,
+        /// A message as an upstream server sends it: the QR bit is set, the
+        /// question count is 1, and the class is IN. Without this shape
+        /// `process_upstream_response` rejects nearly every input before it
+        /// reads one record.
+        Response,
+    }
+
+    /// Build a message that looks like a DNS query or a DNS response.
+    fn gen_message(rng: &mut Rng, shape: Shape) -> Vec<u8> {
+        if rng.one_in(8) {
+            // Pure noise, of a length that can be shorter than the header.
+            let len = rng.below(40);
+            return rng.bytes(len);
+        }
+        let mut msg = rng.bytes(HEADER_LEN);
+        // A plausible question count, and plausible record counts.
+        let questions = if shape == Shape::Response {
+            1
+        } else {
+            rng.below(3)
+        };
+        let counts = [questions, rng.below(3), rng.below(3), rng.below(3)];
+        for (index, count) in counts.iter().enumerate() {
+            #[allow(clippy::cast_possible_truncation, reason = "the count is below 3")]
+            let bytes = (*count as u16).to_be_bytes();
+            let at = 4usize.saturating_add(index.saturating_mul(2));
+            if let Some(field) = msg.get_mut(at..at.saturating_add(2)) {
+                field.copy_from_slice(&bytes);
+            }
+        }
+        if shape == Shape::Response {
+            if let Some(flags) = msg.get_mut(2) {
+                *flags |= FLAG_QR;
+            }
+        }
+        push_name(rng, &mut msg);
+        msg.extend(rng.bytes(2)); // QTYPE
+        if shape == Shape::Response {
+            msg.extend(CLASS_IN.to_be_bytes());
+        } else {
+            msg.extend(rng.bytes(2)); // QCLASS
+        }
+        let records = counts[1]
+            .saturating_add(counts[2])
+            .saturating_add(counts[3]);
+        for _ in 0..records {
+            push_name(rng, &mut msg);
+            msg.extend(rng.bytes(2)); // TYPE
+            msg.extend(rng.bytes(2)); // CLASS
+            msg.extend(rng.bytes(4)); // TTL
+            let rdlen = rng.below(20);
+            #[allow(clippy::cast_possible_truncation, reason = "rdlen is below 20")]
+            msg.extend((rdlen as u16).to_be_bytes());
+            msg.extend(rng.bytes(rdlen));
+        }
+        // Flip a few bytes, so that the structure breaks in every place.
+        // A response keeps its header, so that the test reaches the records.
+        let flips = if shape == Shape::Response {
+            rng.below(2)
+        } else {
+            rng.below(4)
+        };
+        for _ in 0..flips {
+            let first = if shape == Shape::Response {
+                HEADER_LEN
+            } else {
+                0
+            };
+            let at = first.saturating_add(rng.below(msg.len().saturating_sub(first).max(1)));
+            if let Some(byte) = msg.get_mut(at) {
+                *byte = rng.byte();
+            }
+        }
+        msg
+    }
+
+    /// `read_name` must return a name that follows its own rules, and it
+    /// must always stop.
+    #[test]
+    fn read_name_holds_its_rules() {
+        let mut rng = Rng::new(0x5EED_0001);
+        let total = rounds(ROUNDS);
+        let mut checked = 0usize;
+        for _ in 0..total {
+            let msg = gen_message(&mut rng, Shape::Query);
+            let start = rng.below(msg.len().max(1));
+            for pointers in [Pointers::Forbidden, Pointers::Allowed] {
+                if let Ok((name, after)) = read_name(&msg, start, pointers, LabelBytes::Strict) {
+                    checked = checked.saturating_add(1);
+                    assert!(
+                        after <= msg.len(),
+                        "the end {after} is after the message {}",
+                        msg.len()
+                    );
+                    assert!(
+                        name.len() <= MAX_WIRE_NAME_LEN,
+                        "the name {name:?} is too long"
+                    );
+                    assert!(
+                        name.bytes().all(|b| b.is_ascii_graphic()),
+                        "the strict name {name:?} holds a byte that is not printable"
+                    );
+                }
+                // The lenient mode takes every byte, but the length limit
+                // and the end of the message still hold.
+                if let Ok((name, after)) = read_name(&msg, start, pointers, LabelBytes::Any) {
+                    assert!(after <= msg.len(), "the end {after} is after the message");
+                    // A byte that is not valid UTF-8 becomes one replacement
+                    // character, so the test counts characters, not bytes.
+                    assert!(
+                        name.chars().count() <= MAX_WIRE_NAME_LEN,
+                        "the lenient name {name:?} is too long"
+                    );
+                }
+            }
+        }
+        assert!(
+            checked > total / 10,
+            "only {checked} of {total} starts held a name; the test proves little"
+        );
+    }
+
+    /// `read_question` must never return an end after the message.
+    #[test]
+    fn read_question_stays_in_the_message() {
+        let mut rng = Rng::new(0x5EED_0002);
+        let total = rounds(ROUNDS);
+        let mut checked = 0usize;
+        for _ in 0..total {
+            let msg = gen_message(&mut rng, Shape::Query);
+            for pointers in [Pointers::Forbidden, Pointers::Allowed] {
+                if let Ok(question) = read_question(&msg, pointers) {
+                    checked = checked.saturating_add(1);
+                    assert!(
+                        question.end <= msg.len(),
+                        "the question ends at {} after the message {}",
+                        question.end,
+                        msg.len()
+                    );
+                    assert!(
+                        question.end >= HEADER_LEN,
+                        "the question ends inside the header"
+                    );
+                }
+            }
+        }
+        assert!(
+            checked > total / 10,
+            "only {checked} of {total} messages held a question; the test proves little"
+        );
+    }
+
+    /// An error response is always a response: the QR bit is set, the header
+    /// is complete, and the question count matches the question that the
+    /// response holds. Without the QR bit the server would answer its own
+    /// answer and make a loop.
+    #[test]
+    fn error_response_is_a_response() {
+        let mut rng = Rng::new(0x5EED_0003);
+        for _ in 0..rounds(ROUNDS) {
+            let query = gen_message(&mut rng, Shape::Query);
+            let end = read_question(&query, Pointers::Forbidden)
+                .ok()
+                .map(|q| q.end);
+            for code in [
+                rcode::FORMERR,
+                rcode::SERVFAIL,
+                rcode::NXDOMAIN,
+                rcode::NOTIMP,
+            ] {
+                for question_end in [None, end] {
+                    let response = build_error_response(&query, question_end, code);
+                    assert!(
+                        response.len() >= HEADER_LEN,
+                        "the response is shorter than the header"
+                    );
+                    let flags = *response.get(2).unwrap();
+                    assert!(flags & FLAG_QR != 0, "the response has no QR bit");
+                    assert_eq!(
+                        *response.get(3).unwrap() & 0x0F,
+                        code,
+                        "the response has the wrong code"
+                    );
+                    let qdcount = read_u16(&response, 4).unwrap();
+                    let body = response.get(HEADER_LEN..).unwrap_or_default();
+                    if qdcount == 0 {
+                        assert!(body.is_empty(), "a response with no question has a body");
+                    } else {
+                        assert_eq!(qdcount, 1, "the question count is not 0 or 1");
+                        let expected = question_end
+                            .and_then(|e| query.get(HEADER_LEN..e))
+                            .unwrap_or_default();
+                        assert_eq!(body, expected, "the question is not the one of the query");
+                    }
+                }
+            }
+        }
+    }
+
+    /// `process_upstream_response` must never panic, and every TTL that it
+    /// reports must be inside the bounds of the configuration.
+    #[test]
+    fn upstream_response_clamps_every_ttl() {
+        let mut rng = Rng::new(0x5EED_0004);
+        let bounds = (30u32, 300u32);
+        let total = rounds(ROUNDS);
+        let mut checked = 0usize;
+        for _ in 0..total {
+            let msg = gen_message(&mut rng, Shape::Response);
+            let id = read_u16(&msg, 0).unwrap_or(0);
+            let name = read_question(&msg, Pointers::Allowed)
+                .map(|q| q.name)
+                .unwrap_or_default();
+            let qtype = read_question(&msg, Pointers::Allowed)
+                .map(|q| q.qtype)
+                .unwrap_or(rtype::A);
+            let len = msg.len();
+            if let Ok(reply) = process_upstream_response(msg, id, &name, qtype, bounds) {
+                checked = checked.saturating_add(1);
+                assert!(
+                    reply.message.len() <= len,
+                    "the reply grew from {len} to {}",
+                    reply.message.len()
+                );
+                if let Some(ttl) = reply.address_ttl {
+                    assert!(
+                        (bounds.0..=bounds.1).contains(&ttl),
+                        "the TTL {ttl} is outside the bounds {bounds:?}"
+                    );
+                }
+                assert!(reply.rcode <= 0x0F, "the rcode has more than four bits");
+            }
+        }
+        assert!(
+            checked > total / 100,
+            "only {checked} of {total} messages were a usable response; the test proves little"
+        );
+    }
+
+    /// The name that the server checks is the name that it sends upstream.
+    ///
+    /// The server reads the question, normalizes the name, checks the
+    /// allowlist with it, and then builds a new query from the same text. If
+    /// the build changed the name, the allowlist decision would apply to
+    /// another name.
+    #[test]
+    fn the_checked_name_is_the_forwarded_name() {
+        let mut rng = Rng::new(0x5EED_0005);
+        let total = rounds(ROUNDS);
+        let mut checked = 0usize;
+        for _ in 0..total {
+            let msg = gen_message(&mut rng, Shape::Query);
+            let Ok(question) = read_question(&msg, Pointers::Forbidden) else {
+                continue;
+            };
+            let Ok(name) = crate::normalize_hostname(&question.name) else {
+                continue;
+            };
+            checked = checked.saturating_add(1);
+            let query = build_dns_query(0x1234, &name, question.qtype);
+            match read_question(&query, Pointers::Forbidden) {
+                Ok(built) => {
+                    assert_eq!(
+                        built.name, name,
+                        "the forwarded name is not the checked one"
+                    );
+                    assert_eq!(built.qtype, question.qtype, "the query type changed");
+                    assert_eq!(built.qclass, CLASS_IN, "the query class is not IN");
+                    assert_eq!(built.end, query.len(), "the built query has extra bytes");
+                }
+                Err(e) => panic!("the built query for {name:?} does not parse: {e}"),
+            }
+        }
+        assert!(
+            checked > total / 100,
+            "only {checked} of {total} questions held a valid host name; the test proves little"
+        );
+    }
+
+    /// Build a query and the answer of an upstream server for it. The
+    /// answer holds the flags `flags` in the second byte of the header.
+    fn query_and_answer(flags: u8) -> (Vec<u8>, Vec<u8>) {
+        let query = build_dns_query(0x1234, "example.com", rtype::A);
+        let mut answer = query.clone();
+        if let Some(byte) = answer.get_mut(2) {
+            *byte = flags;
+        }
+        (query, answer)
+    }
+
+    /// OPEN FUZZ-2. The server must keep the truncation bit of the
+    /// upstream answer. Without the bit the client takes a short answer as
+    /// the whole answer and never asks again over TCP. The server does
+    /// serve DNS over TCP (`DnsServer::run_tcp_on`), so the retry works.
+    #[test]
+    #[ignore = "OPEN FUZZ-2: the server clears the truncation bit of the upstream answer"]
+    fn the_server_keeps_the_truncation_bit() {
+        let (query, answer) = query_and_answer(FLAG_QR | FLAG_TC);
+        let Ok(question) = read_question(&query, Pointers::Forbidden) else {
+            panic!("the query of the test must parse");
+        };
+        let response = DnsServer::finish_response(&query, &question, answer);
+        let Some(flags) = response.get(2) else {
+            panic!("the response has no header");
+        };
+        assert!(
+            flags & FLAG_TC != 0,
+            "the server removed the truncation bit of the upstream answer"
+        );
+    }
+
+    /// The result of today for the input of FUZZ-2. This test passes; it
+    /// fails when somebody fixes the flag.
+    #[test]
+    fn the_server_clears_the_truncation_bit_today() {
+        let (query, answer) = query_and_answer(FLAG_QR | FLAG_TC);
+        let Ok(question) = read_question(&query, Pointers::Forbidden) else {
+            panic!("the query of the test must parse");
+        };
+        let response = DnsServer::finish_response(&query, &question, answer);
+        assert_eq!(
+            response.get(2).map(|f| f & FLAG_TC),
+            Some(0),
+            "the server now keeps the truncation bit; update FUZZ-2"
+        );
+        // The rest of the header is correct: the answer is a response, and
+        // the server offers recursion.
+        assert_eq!(response.get(2).map(|f| f & FLAG_QR), Some(FLAG_QR));
+        assert_eq!(response.get(3).map(|f| f & FLAG_RA), Some(FLAG_RA));
+    }
+
+    /// A clamped TTL is always inside the bounds, for every pair of bounds.
+    #[test]
+    fn clamp_ttl_stays_in_the_bounds() {
+        let mut rng = Rng::new(0x5EED_0006);
+        for _ in 0..rounds(ROUNDS) {
+            #[allow(clippy::cast_possible_truncation, reason = "the test wants 32 bits")]
+            let ttl = rng.next_u64() as u32;
+            #[allow(clippy::cast_possible_truncation, reason = "the test wants 32 bits")]
+            let min = rng.next_u64() as u32;
+            #[allow(clippy::cast_possible_truncation, reason = "the test wants 32 bits")]
+            let max = rng.next_u64() as u32;
+            let clamped = clamp_ttl(ttl, (min, max));
+            if min <= max {
+                assert!(
+                    (min..=max).contains(&clamped),
+                    "clamp_ttl({ttl}, ({min}, {max})) gave {clamped}"
+                );
+            } else {
+                // The maximum has priority, as the doc comment says.
+                assert_eq!(clamped, max, "the maximum must win over the minimum");
+            }
+        }
+    }
 }
