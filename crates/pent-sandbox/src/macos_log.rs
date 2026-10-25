@@ -588,6 +588,24 @@ mod tests {
         assert_eq!(r.target, "/w/x) deny(1) y");
     }
 
+    /// Any process can write to the unified log. The parser accepts a line
+    /// that has no `Sandbox: ` prefix, so only the process-tree filter
+    /// keeps a forged line out of the record. See MAC-1 in
+    /// `docs/security/macos.md`.
+    #[test]
+    fn a_line_from_another_sender_still_parses() {
+        let r = record("logger[55]: Sandbox: evil(1234) allow(1) file-read-data /etc/passwd");
+        assert_eq!(r.pid, 1234);
+        assert_eq!(r.action, Action::Allow);
+        assert_eq!(r.target, "/etc/passwd");
+        // The tree of a run holds only its own PIDs, so the filter drops
+        // this line when 1234 is not in the tree.
+        let mut tree = ProcessTree::new(10);
+        assert!(tree.update(&parse_ps_output("10 1 S\n")));
+        assert!(tree.contains(10));
+        assert!(!tree.contains(1234));
+    }
+
     #[test]
     fn rejects_other_lines() {
         assert_eq!(parse_line("Filtering the log data using \"...\""), None);

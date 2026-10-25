@@ -650,7 +650,7 @@ fn test_execute_flag_allows_binary() -> TestResult {
     // also be listed under --read for execve to succeed. The test finds
     // `true` in PATH: some systems (NixOS) do not have /usr/bin/true.
     let Some(bin) = common::e2e::which("true") else {
-        println!("SKIP: true is not in PATH");
+        common::e2e::skip("test_execute_flag_allows_binary", "true is not in PATH");
         return Ok(());
     };
     // Run the path in PATH: on NixOS it is a link to a multi-call binary,
@@ -695,7 +695,10 @@ fn test_execute_flag_allows_binary() -> TestResult {
             || stderr.contains("overlayfs")
             || stderr.contains("user namespace"))
     {
-        println!("SKIP: overlay sandbox not available: {stderr}");
+        common::e2e::skip(
+            "test_execute_flag_allows_binary",
+            &format!("the overlay sandbox is not available: {stderr}"),
+        );
         return Ok(());
     }
     assert!(
@@ -858,7 +861,7 @@ mod no_hang {
     #[test]
     fn system_curl_version_exits_quickly() -> TestResult {
         if common::e2e::which("curl").is_none() {
-            println!("SKIP: curl is not in PATH");
+            crate::common::e2e::skip("system_curl_version_exits_quickly", "curl is not in PATH");
             return Ok(());
         }
         let dir = TempDir::new()?;
@@ -884,7 +887,7 @@ mod no_hang {
     #[allow(clippy::unwrap_used)] // infrastructure helper: to_str() only fails on non-UTF-8 paths
     fn assert_version_exits_quickly(name: &str) {
         let Some(bin) = detect_binary(name) else {
-            println!("SKIP: {name} not found in PATH or ~/.local/bin");
+            crate::common::e2e::skip_optional(name, "not in PATH or ~/.local/bin");
             return;
         };
         let bin_s = bin.to_str().unwrap();
@@ -922,7 +925,7 @@ mod no_hang {
     #[allow(clippy::unwrap_used)] // infrastructure helper: to_str()/TempDir failures are hard errors
     fn assert_proxy_mode_exits_quickly(name: &str) {
         let Some(bin) = detect_binary(name) else {
-            println!("SKIP: {name} not found in PATH or ~/.local/bin");
+            crate::common::e2e::skip_optional(name, "not in PATH or ~/.local/bin");
             return;
         };
         let bin_s = bin.to_str().unwrap();
@@ -1147,7 +1150,7 @@ mod no_hang {
     #[allow(clippy::panic, clippy::unwrap_used)] // infrastructure helper: PTY test failure should panic with a clear message
     fn assert_pty_interactive(agent: &str) {
         let Some(bin) = detect_binary(agent) else {
-            println!("SKIP: {agent} not found");
+            crate::common::e2e::skip_optional(agent, "not in PATH or ~/.local/bin");
             return;
         };
         let bin_s = bin.to_str().unwrap();
