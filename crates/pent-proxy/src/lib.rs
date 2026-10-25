@@ -879,6 +879,112 @@ mod tests {
         assert_eq!(cache.len(), 2);
     }
 
+    /// The cache is not empty after an insert.
+    #[test]
+    fn test_resolution_cache_is_not_empty_after_an_insert() {
+        let cache = ResolutionCache::new();
+        let ip: std::net::IpAddr = "1.2.3.4"
+            .parse()
+            .expect("the test builds a valid IPv4 address");
+        cache.insert(ResolvedAddress {
+            domain: "example.com".to_string(),
+            addresses: vec![ip],
+            expires_at: std::time::Instant::now() + std::time::Duration::from_secs(300),
+        });
+        assert!(!cache.is_empty());
+        assert_eq!(cache.len(), 1);
+    }
+
+    /// `IpEntry::last_inserted` gives the time of the newest mapping, not
+    /// the time of the first one. The eviction uses this time.
+    #[test]
+    fn test_ip_entry_last_inserted_is_the_newest_mapping() {
+        let early = std::time::Instant::now();
+        let late = early + std::time::Duration::from_secs(1);
+        let expires = early + std::time::Duration::from_secs(300);
+        let entry = IpEntry {
+            domains: vec![
+                DomainEntry {
+                    domain: "a.example".to_string(),
+                    expires_at: expires,
+                    inserted_at: early,
+                },
+                DomainEntry {
+                    domain: "b.example".to_string(),
+                    expires_at: expires,
+                    inserted_at: late,
+                },
+            ],
+        };
+        assert_eq!(entry.last_inserted(), Some(late));
+        assert_eq!(IpEntry::default().last_inserted(), None);
+    }
+
+    /// An entry whose expiry is exactly the time of the check has expired:
+    /// `insert` must drop it, and `lookup` and `lookup_all` must not
+    /// report it.
+    ///
+    /// With the seam the body reads:
+    ///
+    /// ```text
+    /// let now = std::time::Instant::now();
+    /// let cache = ResolutionCache::new();
+    /// cache.insert_at(ResolvedAddress { expires_at: now, .. }, now);
+    /// assert!(cache.lookup_at(&ip, now).is_none());
+    /// assert!(cache.lookup_all_at(&ip, now).is_empty());
+    /// ```
+    ///
+    /// Today `ResolutionCache` reads `Instant::now()` itself, so a test
+    /// cannot make the expiry of an entry equal to the time of the check.
+    #[test]
+    #[ignore = "NEEDS SEAM: ResolutionCache must take the current time as a parameter \
+                (insert_at, lookup_at, lookup_all_at), with the public methods passing \
+                Instant::now()"]
+    fn test_resolution_cache_drops_an_entry_that_expires_at_the_time_of_the_check() {}
+
+    /// A full cache removes the address with the oldest insertion time. An
+    /// address that the cache saw again keeps its place.
+    #[test]
+    fn test_resolution_cache_evicts_the_address_with_the_oldest_insertion() {
+        const CAPACITY: u8 = 8;
+        let cache = ResolutionCache::new_with_max(usize::from(CAPACITY));
+        let ip = |n: u8| -> std::net::IpAddr {
+            format!("10.0.0.{n}")
+                .parse()
+                .expect("the test builds a valid IPv4 address")
+        };
+        let insert = |n: u8| {
+            cache.insert(ResolvedAddress {
+                domain: format!("d{n}.example"),
+                addresses: vec![ip(n)],
+                expires_at: std::time::Instant::now() + std::time::Duration::from_secs(300),
+            });
+        };
+        for n in 0..CAPACITY {
+            insert(n);
+        }
+        // Each address except the first one gets a new insertion time.
+        for n in 1..CAPACITY {
+            insert(n);
+        }
+        insert(100);
+
+        assert_eq!(
+            cache.lookup(&ip(0)),
+            None,
+            "the address with the oldest insertion time must go"
+        );
+        for n in 1..CAPACITY {
+            assert_eq!(
+                cache.lookup(&ip(n)),
+                Some(format!("d{n}.example")),
+                "the address that the cache saw again must stay"
+            );
+        }
+        assert_eq!(cache.lookup(&ip(100)), Some("d100.example".to_string()));
+        assert_eq!(cache.len(), usize::from(CAPACITY));
+    }
+
     #[test]
     fn test_resolution_cache_evicts_expired_before_oldest() {
         // When inserting into a full cache, expired entries are evicted first,
@@ -1000,5 +1106,35 @@ mod tests {
             Err(ProxyError::InvalidDomain(DomainNameError::NonAscii(_)))
         ));
         assert!(state.allowlist().is_empty());
+    }
+
+    /// `SharedState::lookup_resolved_all` gives each domain that the DNS
+    /// server resolved to an address.
+    ///
+    /// No code of pent calls this function now. It is part of the public
+    /// API, so it keeps a test.
+    #[test]
+    fn test_shared_state_reports_each_domain_of_an_address() {
+        let state = SharedState::new(vec!["a.example".to_string(), "b.example".to_string()]);
+        let shared: std::net::IpAddr = "203.0.113.9"
+            .parse()
+            .expect("the test builds a valid IPv4 address");
+        let other: std::net::IpAddr = "203.0.113.10"
+            .parse()
+            .expect("the test builds a valid IPv4 address");
+        for domain in ["a.example", "b.example"] {
+            state.insert_resolved(ResolvedAddress {
+                domain: domain.to_string(),
+                addresses: vec![shared],
+                expires_at: std::time::Instant::now() + std::time::Duration::from_secs(300),
+            });
+        }
+        let mut found = state.lookup_resolved_all(&shared);
+        found.sort();
+        assert_eq!(
+            found,
+            vec!["a.example".to_string(), "b.example".to_string()]
+        );
+        assert!(state.lookup_resolved_all(&other).is_empty());
     }
 }
