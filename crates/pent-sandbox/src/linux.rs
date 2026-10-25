@@ -590,6 +590,13 @@ impl ProcIsolation {
     /// The caller prints one warning for each line.
     #[must_use]
     pub fn warning_lines(self) -> Vec<String> {
+        self.warning_lines_from(&hidden_proc_paths_here())
+    }
+
+    /// The lines of [`ProcIsolation::warning_lines`], for the layout in
+    /// `hidden`. The tests give the layout as data, so the lines do not
+    /// follow the host of the test.
+    fn warning_lines_from(self, hidden: &[String]) -> Vec<String> {
         let Self::Shared(denial) = self else {
             return Vec::new();
         };
@@ -597,13 +604,12 @@ impl ProcIsolation {
             "pent cannot give the command a private /proc: the kernel refuses the mount \
              with {denial}"
         )];
-        let hidden = hidden_proc_paths_here();
         if hidden.is_empty() {
             lines.push("the kernel of this host refuses a new proc mount".to_string());
         } else {
             lines.push(format!(
                 "a mount hides a part of /proc ({}), as a container runtime does",
-                short_list(&hidden)
+                short_list(hidden)
             ));
         }
         lines.push(
@@ -3393,7 +3399,10 @@ mod tests {
 
     #[test]
     fn a_shared_proc_names_what_the_command_can_see() {
-        let lines = ProcIsolation::Shared(ProcDenial(libc::EPERM)).warning_lines();
+        // The layout comes from the data of the test, not from the host, so
+        // the lines are the same on each machine.
+        let hidden = hidden_proc_paths(CONTAINER_MOUNTINFO);
+        let lines = ProcIsolation::Shared(ProcDenial(libc::EPERM)).warning_lines_from(&hidden);
         let text = lines.join("\n");
         assert!(
             text.contains("private /proc"),
@@ -3408,6 +3417,10 @@ mod tests {
         assert!(
             !text.contains("Operation not permitted"),
             "the warning must not read like a denied access:\n{text}"
+        );
+        assert!(
+            text.contains("/proc/acpi"),
+            "the warning must name the mount that hides a part of /proc:\n{text}"
         );
         assert!(
             text.contains("PID namespace of this host"),
