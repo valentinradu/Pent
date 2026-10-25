@@ -41,6 +41,14 @@
 //!
 //! - **SOCKS5**: Standard SOCKS5 proxy protocol (CONNECT command only)
 //! - **HTTP CONNECT**: `CONNECT host:port HTTP/1.1`
+//! - **Plain HTTP**: `GET http://host/path HTTP/1.1`, the absolute form
+//!   that a client sends for an `http://` URL when `HTTP_PROXY` names the
+//!   proxy. The proxy forwards the request and sends no reply of its own,
+//!   so the destination reaches the same checks as a tunnel and each
+//!   refusal becomes a violation and a watch event. The new head of the
+//!   request asks the server to close the connection after its answer
+//!   ([`forward_head`]), because the proxy checks the destination one
+//!   time: a connection must carry one request only.
 //!
 
 use crate::inspect::{self, Inspect};
@@ -101,11 +109,23 @@ impl Default for TcpProxyConfig {
     }
 }
 
+/// The hint that each refusal of a destination that is not public
+/// carries. The user who does not know the setting sees the reason and
+/// the fix in the same line.
+const PRIVATE_HINT: &str =
+    "Set private_destinations = \"allow\" in ~/.config/pent/pent.toml to permit it.";
+
 /// The proxy protocol of a client connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Protocol {
+    /// SOCKS5 with the `CONNECT` command.
     Socks5,
+    /// HTTP `CONNECT`: the proxy makes a tunnel and answers `200`.
     HttpConnect,
+    /// A plain HTTP proxy request in the absolute form
+    /// (`GET http://host/path HTTP/1.1`). The proxy forwards the request
+    /// and sends no reply of its own.
+    Http,
 }
 
 impl std::fmt::Display for Protocol {
@@ -113,17 +133,29 @@ impl std::fmt::Display for Protocol {
         f.write_str(match self {
             Self::Socks5 => "SOCKS5",
             Self::HttpConnect => "CONNECT",
+            Self::Http => "HTTP",
         })
     }
 }
 
 impl Protocol {
     /// The protocol as it appears in a watch event.
+    ///
+    /// A plain HTTP request takes the label of HTTP `CONNECT`: the event
+    /// names the transport of the destination, and the summary groups the
+    /// two the same way.
     const fn net_protocol(self) -> NetProtocol {
         match self {
             Self::Socks5 => NetProtocol::Socks5,
-            Self::HttpConnect => NetProtocol::HttpConnect,
+            Self::HttpConnect | Self::Http => NetProtocol::HttpConnect,
         }
+    }
+
+    /// True when the proxy sends its own reply before it relays. A plain
+    /// HTTP request carries the answer of the server, so the proxy adds
+    /// nothing to it.
+    const fn sends_own_reply(self) -> bool {
+        !matches!(self, Self::Http)
     }
 }
 
@@ -618,7 +650,7 @@ impl TcpProxy {
                     if let Some((addr, reason)) = rejected {
                         self.state.report_violation(format!(
                             "network: {protocol} connection to \"{name}\" port {port} blocked: \
-                             the domain resolves to the {reason} address {}",
+                             the domain resolves to the {reason} address {}. {PRIVATE_HINT}",
                             addr.ip()
                         ));
                         return Err(ProxyError::NonPublicDestination {
@@ -678,7 +710,8 @@ impl TcpProxy {
     fn check_public(&self, protocol: Protocol, dest: &SocketAddr) -> Result<()> {
         if let Some(reason) = self.non_public_reason(dest.ip()) {
             self.state.report_violation(format!(
-                "network: {protocol} connection to {} port {} blocked: the address is {reason}",
+                "network: {protocol} connection to {} port {} blocked: the address is \
+                 {reason}. {PRIVATE_HINT}",
                 dest.ip(),
                 dest.port()
             ));
@@ -917,7 +950,7 @@ async fn send_failure(client: &mut TcpStream, protocol: Protocol, failure: Failu
                 .write_all(&build_socks5_error(failure.socks5_code()))
                 .await
         }
-        Protocol::HttpConnect => client.write_all(failure.http_response()).await,
+        Protocol::HttpConnect | Protocol::Http => client.write_all(failure.http_response()).await,
     };
     // The proxy closes the connection after a failure. If the client does not
     // get the reply, it sees the close, thus the write error is not important.
@@ -927,7 +960,13 @@ async fn send_failure(client: &mut TcpStream, protocol: Protocol, failure: Failu
 }
 
 /// Send the success reply to the client.
+///
+/// A plain HTTP proxy request gets no reply from the proxy: the answer of
+/// the server is the answer of the request.
 async fn send_success(client: &mut TcpStream, protocol: Protocol, dest: &TcpStream) -> Result<()> {
+    if !protocol.sends_own_reply() {
+        return Ok(());
+    }
     let reply = match protocol {
         Protocol::Socks5 => {
             let local_addr = dest.local_addr().unwrap_or_else(|_| {
@@ -936,7 +975,9 @@ async fn send_success(client: &mut TcpStream, protocol: Protocol, dest: &TcpStre
             });
             build_socks5_response(local_addr)
         }
-        Protocol::HttpConnect => b"HTTP/1.1 200 Connection established\r\n\r\n".to_vec(),
+        Protocol::HttpConnect | Protocol::Http => {
+            b"HTTP/1.1 200 Connection established\r\n\r\n".to_vec()
+        }
     };
     client
         .write_all(&reply)
@@ -1104,10 +1145,15 @@ where
     Ok(Socks5Request { cmd, target })
 }
 
-/// Read an HTTP CONNECT request (the first byte was already read).
+/// Read an HTTP request of a client (the first byte was already read).
 ///
-/// Reads the full `CONNECT host:port HTTP/1.1\r\n…\r\n\r\n` request. The
-/// bytes after the end of the headers go into [`Negotiated::initial`].
+/// Two forms arrive here. `CONNECT host:port HTTP/1.1` asks for a tunnel;
+/// the bytes after the end of the headers go into
+/// [`Negotiated::initial`]. Every other request line is a plain proxy
+/// request in the absolute form (`GET http://host/path HTTP/1.1`), which a
+/// client sends for an `http://` URL when `HTTP_PROXY` names the proxy.
+/// The proxy then forwards the whole request, so the destination reaches
+/// the same checks and each refusal becomes a recorded event.
 async fn negotiate_http_connect<S>(
     client: &mut S,
     first_byte: u8,
@@ -1157,16 +1203,28 @@ where
         )
     })?;
     let first_line = header.lines().next().unwrap_or("");
-    let target = parse_http_connect_target(first_line).map_err(|e| HandshakeError {
+    let connect_error = match parse_http_connect_target(first_line) {
+        Ok(target) => {
+            return Ok(Negotiated {
+                protocol: Protocol::HttpConnect,
+                target,
+                initial,
+            })
+        }
+        Err(e) => e,
+    };
+    // Not a CONNECT: try the absolute form of a plain proxy request.
+    let target = parse_http_forward_target(first_line).map_err(|_| HandshakeError {
         protocol: Protocol::HttpConnect,
         failure: Some(Failure::General),
-        error: e,
+        error: connect_error,
     })?;
-
+    let mut forward = forward_head(header).into_bytes();
+    forward.extend_from_slice(&initial);
     Ok(Negotiated {
-        protocol: Protocol::HttpConnect,
+        protocol: Protocol::Http,
         target,
-        initial,
+        initial: forward,
     })
 }
 
@@ -1205,6 +1263,123 @@ fn parse_http_connect_target(line: &str) -> Result<Target> {
         host: host.to_string(),
         port,
     })
+}
+
+/// The default port of an `http` URL.
+const HTTP_DEFAULT_PORT: u16 = 80;
+
+/// Parse the request line of a plain HTTP proxy request into a [`Target`].
+///
+/// The form is `METHOD http://host[:port][/path] HTTP/1.x`, the
+/// absolute form of RFC 9112. A client sends it for an `http://` URL when
+/// `HTTP_PROXY` names the proxy. Without a port the target takes port 80.
+///
+/// # Errors
+/// Returns `ProxyError::Internal` when the line is not an absolute-form
+/// request for the `http` scheme, or when the port is not a number.
+fn parse_http_forward_target(line: &str) -> Result<Target> {
+    let mut parts = line.split_whitespace();
+    let method = parts.next().unwrap_or("");
+    let uri = parts.next().unwrap_or("");
+    if method.is_empty() || method.eq_ignore_ascii_case("CONNECT") {
+        return Err(ProxyError::Internal(format!(
+            "not a plain HTTP proxy request: {method:?}"
+        )));
+    }
+    let scheme = uri.get(..7).unwrap_or_default();
+    if !scheme.eq_ignore_ascii_case("http://") {
+        return Err(ProxyError::Internal(format!(
+            "the proxy forwards only an absolute http:// request: {uri:?}"
+        )));
+    }
+    let rest = uri.get(7..).unwrap_or_default();
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    // RFC 9110 permits userinfo in a URI; it is not part of the authority
+    // that the proxy connects to.
+    let authority = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let (host, port_text) = split_authority(authority);
+    if host.is_empty() {
+        return Err(ProxyError::Internal(format!(
+            "the request names no host: {uri:?}"
+        )));
+    }
+    let port = match port_text {
+        Some(text) => text
+            .parse::<u16>()
+            .map_err(|_| ProxyError::Internal(format!("invalid port: {text:?}")))?,
+        None => HTTP_DEFAULT_PORT,
+    };
+    let unbracketed = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(ip) = unbracketed.parse::<IpAddr>() {
+        return Ok(Target::Ip(SocketAddr::new(ip, port)));
+    }
+    Ok(Target::Domain {
+        host: host.to_string(),
+        port,
+    })
+}
+
+/// Split an authority into the host and the port.
+///
+/// An IPv6 literal holds colons, so the host of a bracketed authority
+/// ends at the bracket. Returns `None` for the port when the authority has
+/// none.
+fn split_authority(authority: &str) -> (&str, Option<&str>) {
+    if authority.starts_with('[') {
+        if let Some(end) = authority.find(']') {
+            let host = authority.get(..=end).unwrap_or(authority);
+            let rest = authority.get(end.saturating_add(1)..).unwrap_or_default();
+            return (host, rest.strip_prefix(':'));
+        }
+        return (authority, None);
+    }
+    match authority.rsplit_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (authority, None),
+    }
+}
+
+/// Rewrite the head of a plain HTTP proxy request for the destination.
+///
+/// The proxy checks the destination one time, when the connection starts,
+/// so the connection must carry one request only. The new head drops each
+/// `Connection` and `Proxy-Connection` header of the client and asks the
+/// server to close the connection after its answer. A client that then
+/// sends a request for another host on the same connection reaches no
+/// second destination.
+///
+/// The request line keeps the absolute form. An HTTP/1.1 server must
+/// accept it (RFC 9112, section 3.2.2).
+fn forward_head(head: &str) -> String {
+    /// The headers that the proxy replaces. The names are lowercase.
+    const DROP: [&str; 2] = ["connection:", "proxy-connection:"];
+    let mut out = String::with_capacity(head.len().saturating_add(19));
+    let mut dropping = false;
+    for (index, line) in head.split_inclusive("\r\n").enumerate() {
+        let text = line.trim_end_matches(['\r', '\n']);
+        if index > 0 && text.is_empty() {
+            break; // The end of the head.
+        }
+        // A line that starts with a space belongs to the header above it.
+        if index > 0 && text.starts_with([' ', '\t']) {
+            if !dropping {
+                out.push_str(line);
+            }
+            continue;
+        }
+        let lower = text.to_ascii_lowercase();
+        dropping = index > 0 && DROP.iter().any(|name| lower.starts_with(name));
+        if !dropping {
+            out.push_str(line);
+        }
+    }
+    out.push_str("Connection: close\r\n\r\n");
+    out
 }
 
 /// Build SOCKS5 success response.
@@ -3050,6 +3225,93 @@ mod tests {
                 host: "Example.com".to_string(),
                 port: 443
             }
+        );
+    }
+
+    /// DIFF-8. A client with `HTTP_PROXY` sends an `http://` URL as a
+    /// plain proxy request. The proxy must read the destination from the
+    /// absolute form, so the destination reaches the checks and each
+    /// refusal becomes a recorded event.
+    #[test]
+    fn a_plain_http_request_names_the_destination() {
+        let target = parse_http_forward_target("GET http://example.com/a?b HTTP/1.1").unwrap();
+        assert_eq!(
+            target,
+            Target::Domain {
+                host: "example.com".to_string(),
+                port: 80
+            }
+        );
+        let target = parse_http_forward_target("POST http://example.com:8080/ HTTP/1.1").unwrap();
+        assert_eq!(
+            target,
+            Target::Domain {
+                host: "example.com".to_string(),
+                port: 8080
+            }
+        );
+        // No path at all, and the scheme in capitals.
+        let target = parse_http_forward_target("HEAD HTTP://example.com HTTP/1.1").unwrap();
+        assert_eq!(
+            target,
+            Target::Domain {
+                host: "example.com".to_string(),
+                port: 80
+            }
+        );
+        // Userinfo is not part of the destination.
+        let target = parse_http_forward_target("GET http://user:pw@10.0.0.1/ HTTP/1.1").unwrap();
+        assert_eq!(target, Target::Ip("10.0.0.1:80".parse().unwrap()));
+        let target = parse_http_forward_target("GET http://[2001:db8::1]/x HTTP/1.1").unwrap();
+        assert_eq!(target, Target::Ip("[2001:db8::1]:80".parse().unwrap()));
+        let target = parse_http_forward_target("GET http://[2001:db8::1]:8080/ HTTP/1.1").unwrap();
+        assert_eq!(target, Target::Ip("[2001:db8::1]:8080".parse().unwrap()));
+    }
+
+    /// A line that is not an absolute-form `http` request keeps the old
+    /// answer of the proxy.
+    #[test]
+    fn a_request_that_the_proxy_cannot_forward_is_refused() {
+        for line in [
+            "CONNECT example.com:443 HTTP/1.1",
+            "GET / HTTP/1.1",
+            "GET https://example.com/ HTTP/1.1",
+            "GET http:// HTTP/1.1",
+            "GET http://example.com:x/ HTTP/1.1",
+            "",
+        ] {
+            assert!(
+                parse_http_forward_target(line).is_err(),
+                "the proxy must not forward {line:?}"
+            );
+        }
+    }
+
+    /// The proxy checks the destination one time, so the connection must
+    /// carry one request only.
+    #[test]
+    fn the_forwarded_head_asks_the_server_to_close() {
+        let head = "GET http://example.com/ HTTP/1.1\r\n\
+                    Host: example.com\r\n\
+                    Proxy-Connection: Keep-Alive\r\n\
+                    Connection: keep-alive\r\n\
+                    X-Fold: a\r\n\
+                    \tb\r\n\
+                    \r\n";
+        let out = forward_head(head);
+        assert_eq!(
+            out,
+            "GET http://example.com/ HTTP/1.1\r\n\
+             Host: example.com\r\n\
+             X-Fold: a\r\n\
+             \tb\r\n\
+             Connection: close\r\n\r\n"
+        );
+        // A continuation line of a header that the proxy drops goes too.
+        let head = "GET http://example.com/ HTTP/1.1\r\nConnection: a\r\n b\r\nHost: e\r\n\r\n";
+        assert_eq!(
+            forward_head(head),
+            "GET http://example.com/ HTTP/1.1\r\nHost: e\r\nConnection: close\r\n\r\n"
         );
     }
 

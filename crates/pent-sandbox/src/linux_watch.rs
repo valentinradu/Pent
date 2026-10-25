@@ -11,12 +11,22 @@
 //! - An exec guard (`sudo`, ...): `PR_SET_NO_NEW_PRIVS` makes setuid
 //!   binaries fail. Pent only marks the attempt.
 //!
-//! A bind mount needs a target that exists. For a write guard on a path that
-//! does not exist when the child starts (for example `~/.zshrc`), the
-//! supervisor denies the create or the write itself with EACCES and reports
-//! `Outcome::Blocked`. Another thread of the process can race that check, so
-//! it stops accidents, not a hostile program. A read guard on a path that
-//! does not exist needs no protection: there is nothing to read.
+//! A mount cannot hold every rule. A bind mount needs a target that
+//! exists, and it covers one inode. Two shapes get no mount:
+//!
+//! - A path that does not exist when the child starts, for example
+//!   `~/.zshrc`, or a key that the program makes during the run.
+//! - A file below a guarded directory that a symbolic link reaches, for
+//!   example `~/.ssh/linked/id_rsa` where `linked` points at
+//!   `~/keystore`. The walk of the directory does not follow the link, so
+//!   the mask never covers the name that the program uses.
+//!
+//! For these the supervisor refuses the call itself with EACCES and
+//! reports `Outcome::Blocked` (see [`Judge::denies`]). Another thread of
+//! the process can change the path after that check, so it stops
+//! accidents, not a hostile program. The mounts stay the first layer, and
+//! they have no race. The two layers together keep the report of the
+//! summary and the answer of the kernel in agreement.
 //!
 //! # The recorder
 //!
@@ -130,28 +140,32 @@ pub(crate) struct GuardPlan {
     /// with these rules. A rule on a path that did not exist at the start is
     /// not in this list.
     pub(crate) effective: Vec<GuardRule>,
-    /// The write rules on paths that did not exist at the start. A bind mount
-    /// cannot enforce them, so the supervisor denies a write or a create on
-    /// these paths itself (see [`Judge::denies`]).
+    /// The rules that no mount enforces. A mount needs a target that exists
+    /// and covers one inode, so it cannot hold a path that the program makes
+    /// during the run, and it cannot hold each name that reaches one inode.
+    /// The supervisor refuses these accesses itself (see [`Judge::denies`]).
     pub(crate) unenforced: Vec<GuardRule>,
 }
 
 impl GuardPlan {
-    /// Add the mount for `rule` on the existing `path`. Skip a path that does
-    /// not exist.
-    fn add_existing(&mut self, rule: &GuardRule, path: &Path) {
+    /// Add the mount for `rule` on the existing `path`.
+    ///
+    /// Returns `false` when the path does not exist, or when pent cannot
+    /// resolve it. The caller then puts the rule in
+    /// [`GuardPlan::unenforced`].
+    fn add_existing(&mut self, rule: &GuardRule, path: &Path) -> bool {
         let Ok(meta) = std::fs::metadata(path) else {
-            return;
+            return false;
         };
         let Ok(real) = std::fs::canonicalize(path) else {
-            return;
+            return false;
         };
         let is_dir = meta.is_dir();
         match rule.access {
             GuardAccess::Read if is_dir => self.mask_dirs.push(real.clone()),
             GuardAccess::Read => self.mask_files.push(real.clone()),
             GuardAccess::Write => self.ro_binds.push(real.clone()),
-            GuardAccess::ExecName => return,
+            GuardAccess::ExecName => return false,
         }
         let mut add_rule = |p: &Path| {
             let target = if is_dir {
@@ -172,6 +186,7 @@ impl GuardPlan {
         if real != path {
             add_rule(&real);
         }
+        true
     }
 
     /// Sort the mount lists, remove duplicates, and remove each mask below a
@@ -233,6 +248,16 @@ fn walk_guard_dir(dir: &Path, depth: u32, budget: &mut usize, visit: &mut impl F
 
 /// Compute the mounts for the guard `rules`. The function looks at the
 /// filesystem: only paths that exist get a mount.
+///
+/// A rule that the mounts cannot hold goes to [`GuardPlan::unenforced`],
+/// and the supervisor refuses the access itself. Two shapes need this:
+///
+/// - A path that does not exist when the child starts. A bind mount needs
+///   a target, so a file that the program makes during the run has none.
+/// - A [`GuardTarget::FilesInDir`] rule. The walk sees only the files of
+///   today, and it does not follow a symbolic link, so a key below
+///   `~/.ssh/linked` (a link to `~/keystore`) gets no mask under the name
+///   that the program uses.
 #[must_use]
 pub(crate) fn plan_guard(rules: &[GuardRule]) -> GuardPlan {
     let mut plan = GuardPlan::default();
@@ -245,10 +270,8 @@ pub(crate) fn plan_guard(rules: &[GuardRule]) -> GuardPlan {
                 GuardAccess::Read | GuardAccess::Write,
                 GuardTarget::Exact(p) | GuardTarget::Subtree(p),
             ) => {
-                if rule.access == GuardAccess::Write && std::fs::symlink_metadata(p).is_err() {
+                if !plan.add_existing(rule, p) {
                     plan.unenforced.push(rule.clone());
-                } else {
-                    plan.add_existing(rule, p);
                 }
             }
             (GuardAccess::Read | GuardAccess::Write, GuardTarget::FilesInDir { dir, .. }) => {
@@ -265,6 +288,9 @@ pub(crate) fn plan_guard(rules: &[GuardRule]) -> GuardPlan {
                 for path in &found {
                     plan.add_existing(rule, path);
                 }
+                // The mounts hold the names of today only. The supervisor
+                // holds the whole rule.
+                plan.unenforced.push(rule.clone());
             }
             // A target that does not fit the access has no effect.
             _ => {}
@@ -964,12 +990,12 @@ impl RecorderChild {
 
 /// How the recorder decides the outcome of an event.
 pub(crate) enum Judge {
-    /// Watch mode: the rules that the guard mounts enforce, and the write
-    /// rules on paths that did not exist at the start.
+    /// Watch mode: the rules that the guard mounts enforce, and the rules
+    /// that the supervisor enforces itself.
     Guard {
         /// The rules that the mounts enforce.
         enforced: Vec<GuardRule>,
-        /// The write rules that the supervisor enforces.
+        /// The rules that the supervisor enforces.
         unenforced: Vec<GuardRule>,
     },
     /// `pent run --trace`: the prediction of the Landlock policy.
@@ -985,26 +1011,26 @@ impl Judge {
             } => {
                 let access = guard_access(op);
                 classify(enforced, path, access)
-                    .or_else(|| {
-                        (access == GuardAccess::Write)
-                            .then(|| classify(unenforced, path, access))
-                            .flatten()
-                    })
+                    .or_else(|| classify(unenforced, path, access))
                     .map_or(Outcome::Allowed, Outcome::Blocked)
             }
             Self::Policy(policy) => policy.predict(op, path, is_dir),
         }
     }
 
-    /// Return true if the supervisor must deny the call. This is a write to
-    /// a guarded path that has no mount, because it did not exist at the
-    /// start (for example `~/.zshrc`). Another thread of the process can
-    /// race this check, so it stops accidents, not a hostile program.
+    /// Return true if the supervisor must refuse the call. This is an
+    /// access to a guarded path that has no mount: a path that did not
+    /// exist at the start (for example `~/.zshrc` or a key that the
+    /// program makes), or a name that reaches a key through a symbolic
+    /// link below the guarded directory.
+    ///
+    /// Another thread of the process can change the path after this
+    /// check, so it stops accidents, not a hostile program. The mounts
+    /// stay the first layer, and they have no race.
     fn denies(&self, op: FsOp, path: &Path) -> bool {
         match self {
             Self::Guard { unenforced, .. } => {
-                let access = guard_access(op);
-                access == GuardAccess::Write && classify(unenforced, path, access).is_some()
+                classify(unenforced, path, guard_access(op)).is_some()
             }
             Self::Policy(_) => false,
         }
@@ -2957,7 +2983,9 @@ mod tests {
         Ok(())
     }
 
-    /// The walk does not follow a symbolic link to another directory.
+    /// The walk does not follow a symbolic link to another directory, so
+    /// the mounts cover no key behind the link. The supervisor must refuse
+    /// the read instead (DIFF-5).
     #[test]
     fn guard_plan_does_not_follow_a_link_out_of_the_directory() -> TestResult {
         let tmp = tempfile::tempdir()?;
@@ -2979,6 +3007,57 @@ mod tests {
         }];
         let plan = plan_guard(&rules);
         assert!(plan.mask_files.is_empty(), "{:?}", plan.mask_files);
+        let judge = Judge::Guard {
+            enforced: plan.effective,
+            unenforced: plan.unenforced,
+        };
+        let linked = ssh.join("link/id_rsa");
+        assert_eq!(
+            judge.fs(FsOp::Read, &linked, false),
+            Outcome::Blocked(GuardClass::Credential)
+        );
+        assert!(
+            judge.denies(FsOp::Read, &linked),
+            "the summary says blocked, so the supervisor must refuse the read"
+        );
+        Ok(())
+    }
+
+    /// A key that the program makes during the run has no mount, because
+    /// the file does not exist when the child starts. The supervisor must
+    /// refuse the read (DIFF-6).
+    #[test]
+    fn guard_plan_refuses_a_key_made_during_the_run() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        let root = std::fs::canonicalize(tmp.path())?;
+        let ssh = root.join(".ssh");
+        std::fs::create_dir(&ssh)?;
+        let rules = vec![GuardRule {
+            class: GuardClass::Credential,
+            access: GuardAccess::Read,
+            target: GuardTarget::FilesInDir {
+                dir: ssh.clone(),
+                prefix: "id_".into(),
+                exclude_suffix: Some(".pub".into()),
+            },
+        }];
+        let plan = plan_guard(&rules);
+        assert!(plan.mask_files.is_empty(), "{:?}", plan.mask_files);
+        let judge = Judge::Guard {
+            enforced: plan.effective,
+            unenforced: plan.unenforced,
+        };
+        let new_key = ssh.join("id_new");
+        // The program may make the file; only the read is a credential
+        // read.
+        assert!(!judge.denies(FsOp::Create, &new_key));
+        assert_eq!(
+            judge.fs(FsOp::Read, &new_key, false),
+            Outcome::Blocked(GuardClass::Credential)
+        );
+        assert!(judge.denies(FsOp::Read, &new_key));
+        // The public key is not a credential.
+        assert!(!judge.denies(FsOp::Read, &ssh.join("id_new.pub")));
         Ok(())
     }
 

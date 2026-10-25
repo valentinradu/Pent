@@ -39,7 +39,7 @@
 //! No lightweight alternative exists for process sandboxing on macOS.
 
 use crate::{NetworkMode, SandboxConfig, SandboxError};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Check if sandbox-exec is available on this system.
 ///
@@ -812,7 +812,10 @@ fn excluded_name_regex(pattern: &str, suffix: &str) -> Option<String> {
 /// An exact path gives a `literal` filter, a subtree gives `subpath`, and a
 /// file name pattern gives a `regex`. A binary name gives the regex
 /// `/<name>$`. Each path rule is added for the canonical path and also for
-/// the original path if it is different.
+/// the original path if it is different. A rule on a directory (a subtree
+/// or a file name pattern) is added for the real directory of each
+/// symbolic link below it too (see [`guard_dir_variants`]): Seatbelt
+/// matches the path that the kernel resolves.
 ///
 /// A file name pattern gives two or four rules for each form of the
 /// directory path: a deny for a direct child of the directory, a deny for a
@@ -837,14 +840,14 @@ fn add_guard_rules(
             GuardAccess::ExecName => "process-exec",
         };
         match &rule.target {
-            GuardTarget::Exact(path) | GuardTarget::Subtree(path) => {
-                let filter = if matches!(rule.target, GuardTarget::Exact(_)) {
-                    "literal"
-                } else {
-                    "subpath"
-                };
+            GuardTarget::Exact(path) => {
                 for variant in path_variants(path) {
-                    push_rule(profile, RuleAction::Deny, op, filter, &variant)?;
+                    push_rule(profile, RuleAction::Deny, op, "literal", &variant)?;
+                }
+            }
+            GuardTarget::Subtree(path) => {
+                for variant in guard_dir_variants(path) {
+                    push_rule(profile, RuleAction::Deny, op, "subpath", &variant)?;
                 }
             }
             GuardTarget::FilesInDir {
@@ -856,7 +859,7 @@ fn add_guard_rules(
                 let excepted = exclude_suffix
                     .as_deref()
                     .and_then(|suffix| excluded_name_regex(prefix, suffix));
-                for variant in path_variants(dir) {
+                for variant in guard_dir_variants(dir) {
                     let dir_regex = regex_escape(&variant);
                     for depth in GUARD_DEPTH_FORMS {
                         push_rule(
@@ -892,6 +895,93 @@ fn add_guard_rules(
         }
     }
     Ok(())
+}
+
+/// The maximum depth of the walk that looks for a symbolic link below a
+/// guarded directory.
+const GUARD_LINK_DEPTH: u32 = 8;
+
+/// The maximum number of entries that the walk of one guarded directory
+/// looks at. A directory with more entries is not a store of credentials,
+/// and the walk must not hold the start of the program.
+const GUARD_LINK_ENTRIES: usize = 4096;
+
+/// Return the directories that a guard rule on `dir` must cover.
+///
+/// Seatbelt matches the path that the kernel resolves, so a deny rule on
+/// `~/.ssh` does not cover `~/.ssh/linked/id_rsa` when `linked` is a
+/// symbolic link to `~/keystore`: the kernel sees `~/keystore/id_rsa`.
+/// The list therefore holds the forms of `dir` itself ([`path_variants`])
+/// and the real directory of each symbolic link below `dir` that leaves
+/// the tree of `dir`.
+///
+/// The walk reads the filesystem one time, before the child starts. A link
+/// that the program makes during the run is not in the list; Seatbelt
+/// decides at the time of the access, and the deny rules of `dir` still
+/// hold for each name below `dir` that stays in the tree of `dir`.
+fn guard_dir_variants(dir: &Path) -> Vec<String> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut budget = GUARD_LINK_ENTRIES;
+    let root = canonical_or_original_path(dir);
+    collect_link_dirs(dir, &root, GUARD_LINK_DEPTH, &mut budget, &mut dirs);
+    let mut variants = path_variants(dir);
+    for target in dirs {
+        for form in path_variants(&target) {
+            if !variants.contains(&form) {
+                variants.push(form);
+            }
+        }
+    }
+    variants
+}
+
+/// Add to `out` the real directory of each symbolic link below `dir` that
+/// points outside `root`.
+///
+/// The walk does not follow a link: it reads the type of each entry with
+/// `symlink_metadata`, and it recurses only into a real directory.
+/// `budget` limits the number of entries.
+fn collect_link_dirs(
+    dir: &Path,
+    root: &Path,
+    depth: u32,
+    budget: &mut usize,
+    out: &mut Vec<PathBuf>,
+) {
+    if depth == 0 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if *budget == 0 {
+            return;
+        }
+        *budget = budget.saturating_sub(1);
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.is_dir() {
+            collect_link_dirs(&path, root, depth.saturating_sub(1), budget, out);
+        } else if meta.is_symlink() {
+            let Ok(target) = std::fs::canonicalize(&path) else {
+                continue;
+            };
+            // A link that stays in the tree of the rule needs no own rule.
+            if target.starts_with(root) || !target.is_dir() || out.contains(&target) {
+                continue;
+            }
+            out.push(target);
+        }
+    }
+}
+
+/// Return the canonical form of `path`, or `path` itself when pent cannot
+/// resolve it.
+fn canonical_or_original_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Return the canonical form of `path` and also the original form if it is
@@ -1729,6 +1819,63 @@ mod tests {
             .find("(allow file-read-data (with report))")
             .unwrap();
         assert!(deny_at > allow_at);
+    }
+
+    /// DIFF-5. `~/.ssh/linked` is a symbolic link to `~/keystore`.
+    /// Seatbelt matches the path that the kernel resolves, so a rule on
+    /// `~/.ssh` alone does not cover `~/keystore/id_rsa`. The profile must
+    /// hold the real directory too, for a file name pattern and for a
+    /// subtree.
+    #[test]
+    fn the_watch_profile_covers_a_key_behind_a_symbolic_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let ssh = root.join(".ssh");
+        let store = root.join("keystore");
+        std::fs::create_dir(&ssh).unwrap();
+        std::fs::create_dir(&store).unwrap();
+        std::fs::write(store.join("id_rsa"), "k").unwrap();
+        std::os::unix::fs::symlink(&store, ssh.join("linked")).unwrap();
+        let profile = watch_profile(&[
+            rule(
+                GuardAccess::Read,
+                GuardTarget::FilesInDir {
+                    dir: ssh.clone(),
+                    prefix: "id_".to_string(),
+                    exclude_suffix: Some(".pub".to_string()),
+                },
+            ),
+            rule(GuardAccess::Read, GuardTarget::Subtree(ssh.clone())),
+        ]);
+        // The name `keystore` holds no character that a regular
+        // expression gives a meaning to, so the end of the rule is the
+        // plain text.
+        assert!(
+            profile.contains(r#"/keystore/id_[^/]*$"))"#),
+            "the pattern rule must cover the real directory of the link: {profile}"
+        );
+        assert!(
+            profile.contains(&format!(
+                r#"(deny file-read-data (subpath "{}"))"#,
+                store.to_string_lossy()
+            )),
+            "the subtree rule must cover the real directory of the link: {profile}"
+        );
+    }
+
+    /// A link that stays inside the guarded directory needs no own rule:
+    /// the rule on the directory already covers the target.
+    #[test]
+    fn a_link_inside_the_guarded_directory_adds_no_rule() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let ssh = root.join(".ssh");
+        std::fs::create_dir_all(ssh.join("old")).unwrap();
+        std::os::unix::fs::symlink(ssh.join("old"), ssh.join("link")).unwrap();
+        assert_eq!(
+            guard_dir_variants(&ssh),
+            vec![ssh.to_string_lossy().into_owned()]
+        );
     }
 
     #[test]

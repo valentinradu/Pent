@@ -17,7 +17,7 @@
 //! # Every process can write to the unified log
 //!
 //! The watched program can call `os_log` or run `/usr/bin/logger`, so the
-//! text of a line proves nothing. The reader has three guards (see MAC-1 in
+//! text of a line proves nothing. The reader has four guards (see MAC-1 in
 //! `docs/security/macos.md`):
 //!
 //! 1. The predicate takes only the messages of the kernel
@@ -29,6 +29,44 @@
 //!    name which looks like the header cannot reach the fields, because
 //!    `log` always writes `[<pid>]: ` after the name of the process.
 //! 3. The reader keeps only the lines of the process tree of the run.
+//! 4. The reader keeps only a line whose process name fits the program
+//!    that the PID runs ([`ProcessTree::name_fits`]).
+//!
+//! # The name of the process (FUZZ-1)
+//!
+//! The kernel writes the name of the file that the program runs, and the
+//! program chooses that name. A file named
+//! `a(1234) deny(1) file-read-data /etc/shadow (b` puts a second `) deny`
+//! marker in the line. [`parse_line`] reads the first marker, so each
+//! field of the record comes from the name, and the program also chooses
+//! the PID (fork, build the name with that PID, exec). The text alone
+//! cannot tell this line from a real report of a path that holds the text
+//! of a marker.
+//!
+//! Guard 4 uses a source that the program does not choose: the process
+//! table. The poll of the tree reads `comm` for each PID, so the reader
+//! knows the file that each PID runs, and it drops a report whose name
+//! does not fit that file ([`names_agree`]).
+//!
+//! What the check holds:
+//!
+//! - A forged name is longer than the name in the record, because the
+//!   payload of the forgery comes after the first marker. The two differ,
+//!   so the record goes.
+//! - A real report agrees, also when the kernel cuts a long name to the
+//!   16 bytes of `p_comm`: the check accepts the cut form.
+//! - A report of a PID whose program pent never read cannot be checked,
+//!   so it goes too.
+//!
+//! What the check does not hold:
+//!
+//! - A process that exits and that its parent reaps between two polls
+//!   never reaches the process table, so its reports go. macOS watch mode
+//!   is a lower bound already, because the log limits the rate of the
+//!   reports; `--append` merges more runs.
+//! - A file name whose first 16 bytes are the whole name of the record and
+//!   whose rest holds a marker is refused, also when it is honest. Such a
+//!   name is a forgery or a name that nobody needs.
 //!
 //! [`LogReader`] starts `log stream` before the spawn of the child, keeps
 //! only the lines of the PIDs of the child tree, and sends one
@@ -277,8 +315,8 @@ pub(crate) fn to_event(record: &SeatbeltRecord, mode: &RecordMode) -> Option<Wat
     Some(event)
 }
 
-/// One row of `ps -A -o pid=,ppid=,stat=`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// One row of `ps -A -o pid=,ppid=,stat=,comm=`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PsRow {
     /// The process ID.
     pub(crate) pid: u32,
@@ -286,22 +324,83 @@ pub(crate) struct PsRow {
     pub(crate) ppid: u32,
     /// True if the process exited and its parent did not reap it yet.
     pub(crate) zombie: bool,
+    /// The file name of the program that the process runs, without the
+    /// directory. It is empty when the row has no command column.
+    pub(crate) name: String,
 }
 
-/// Parse the output of `ps -A -o pid=,ppid=,stat=`.
+/// Split the first field from `text`. Return the field and the rest
+/// without its leading spaces.
+fn next_field(text: &str) -> Option<(&str, &str)> {
+    let text = text.trim_start();
+    if text.is_empty() {
+        return None;
+    }
+    match text.find(char::is_whitespace) {
+        Some(end) => Some((text.get(..end)?, text.get(end..)?.trim_start())),
+        None => Some((text, "")),
+    }
+}
+
+/// The file name of `path`: the text after the last `/`.
+fn file_name_of(path: &str) -> &str {
+    path.rsplit_once('/').map_or(path, |(_, name)| name)
+}
+
+/// Parse the output of `ps -A -o pid=,ppid=,stat=,comm=`.
 ///
-/// A row without a state column is a live process.
+/// A row without a state column is a live process. The command is the
+/// last column, and it holds the whole path of the program, which can
+/// hold spaces (`/Applications/X.app/Contents/MacOS/Code Helper (GPU)`),
+/// so the row keeps the rest of the line as the command.
 pub(crate) fn parse_ps_output(output: &str) -> Vec<PsRow> {
     output
         .lines()
         .filter_map(|line| {
-            let mut fields = line.split_whitespace();
-            let pid = fields.next()?.parse().ok()?;
-            let ppid = fields.next()?.parse().ok()?;
-            let zombie = fields.next().is_some_and(|stat| stat.starts_with('Z'));
-            Some(PsRow { pid, ppid, zombie })
+            let (pid, rest) = next_field(line)?;
+            let (ppid, rest) = next_field(rest)?;
+            let pid = pid.parse().ok()?;
+            let ppid = ppid.parse().ok()?;
+            let (stat, command) = next_field(rest).unwrap_or(("", ""));
+            Some(PsRow {
+                pid,
+                ppid,
+                zombie: stat.starts_with('Z'),
+                name: file_name_of(command).to_string(),
+            })
         })
         .collect()
+}
+
+/// The number of bytes that `p_comm`, the accounting name of a process on
+/// macOS, holds. The kernel cuts a longer file name to this length.
+const COMM_LEN: usize = 16;
+
+/// Return true when the name `record` of a Seatbelt report can be the name
+/// of the program `known` that the process table gives.
+///
+/// The two agree when they are the same text. They also agree when
+/// `record` is the first [`COMM_LEN`] bytes of `known`, because the kernel
+/// cuts a long name to that length in `p_comm`.
+///
+/// The cut form is the one that a forged name uses: a program that runs a
+/// file named `a(1234) deny(1) file-read-data /etc/shadow (b` makes the
+/// kernel write a line in which the first marker is in the name, so
+/// [`parse_line`] reads `a` as the name. Thus pent refuses the cut form
+/// when the rest of the known name holds a marker: such a name is either a
+/// forgery or a file name that nobody needs.
+fn names_agree(record: &str, known: &str) -> bool {
+    if known.is_empty() {
+        // Pent knows no name for the process, so it cannot check.
+        return false;
+    }
+    if record == known {
+        return true;
+    }
+    let Some(rest) = known.strip_prefix(record) else {
+        return false;
+    };
+    record.len() == COMM_LEN && find_marker(rest).is_none()
 }
 
 /// The PIDs of the child and its descendants.
@@ -314,6 +413,7 @@ pub(crate) fn parse_ps_output(output: &str) -> Vec<PsRow> {
 pub(crate) struct ProcessTree {
     known: HashSet<u32>,
     dead: HashSet<u32>,
+    names: HashMap<u32, String>,
 }
 
 impl ProcessTree {
@@ -322,6 +422,7 @@ impl ProcessTree {
         Self {
             known: HashSet::from([root]),
             dead: HashSet::new(),
+            names: HashMap::new(),
         }
     }
 
@@ -330,11 +431,30 @@ impl ProcessTree {
         self.known.contains(&pid)
     }
 
+    /// Return true when `name`, the process name of a Seatbelt report, is
+    /// the name of the program that `pid` runs.
+    ///
+    /// The program chooses the text of its own name, so the name in a
+    /// report proves nothing by itself. The process table is the second
+    /// source: it tells which file each PID runs. A report whose name does
+    /// not fit that file is a forgery, and a report of a PID whose name
+    /// pent never read cannot be checked. Both are dropped (FUZZ-1 in
+    /// `docs/security/fuzzing.md`).
+    pub(crate) fn name_fits(&self, pid: u32, name: &str) -> bool {
+        self.names
+            .get(&pid)
+            .is_some_and(|known| names_agree(name, known))
+    }
+
     /// Update the tree from a snapshot of the process table.
     ///
     /// Add the children of each live member, mark the members that are not
     /// in the table (or are zombies) as dead, and return true if a member is
     /// still live.
+    ///
+    /// The snapshot also gives the name of the program of each member. A
+    /// process that runs a new file keeps its PID, so the newest snapshot
+    /// wins (see [`ProcessTree::name_fits`]).
     pub(crate) fn update(&mut self, rows: &[PsRow]) -> bool {
         let mut children: HashMap<u32, Vec<&PsRow>> = HashMap::new();
         let mut present: HashMap<u32, &PsRow> = HashMap::new();
@@ -368,6 +488,12 @@ impl ProcessTree {
         for pid in &self.known {
             if !live.contains(pid) {
                 self.dead.insert(*pid);
+            }
+            // The name of a member of the tree, for the check of a report.
+            if let Some(row) = present.get(pid) {
+                if !row.name.is_empty() {
+                    self.names.insert(*pid, row.name.clone());
+                }
             }
         }
         !live.is_empty()
@@ -433,7 +559,7 @@ mod runtime {
         fn refresh(&mut self) -> bool {
             self.last_refresh = Some(Instant::now());
             match Command::new("/bin/ps")
-                .args(["-A", "-o", "pid=,ppid=,stat="])
+                .args(["-A", "-o", "pid=,ppid=,stat=,comm="])
                 .stderr(Stdio::null())
                 .output()
             {
@@ -447,10 +573,13 @@ mod runtime {
             }
         }
 
-        /// Return true if `pid` is in the tree. Refresh first if the PID is
-        /// not known and the last refresh is not too recent.
-        fn contains(&mut self, pid: u32) -> bool {
-            if self.tree.contains(pid) {
+        /// Return true if `pid` is in the tree and `name` is the name of
+        /// the program that `pid` runs. Refresh first when the tree does
+        /// not answer both and the last refresh is not too recent: the
+        /// process can be new, or it can have run a new file after the
+        /// last poll.
+        fn accepts(&mut self, pid: u32, name: &str) -> bool {
+            if self.tree.contains(pid) && self.tree.name_fits(pid, name) {
                 return true;
             }
             if self
@@ -458,10 +587,10 @@ mod runtime {
                 .is_none_or(|t| t.elapsed() >= MIN_REFRESH_GAP)
             {
                 // The poll thread uses the result for the liveness check;
-                // here only the new PIDs matter.
+                // here only the new PIDs and the new names matter.
                 let _alive = self.refresh();
             }
-            self.tree.contains(pid)
+            self.tree.contains(pid) && self.tree.name_fits(pid, name)
         }
     }
 
@@ -590,8 +719,11 @@ mod runtime {
                 continue;
             };
             // The reports of other sandboxed processes on the system are
-            // also in the log. Keep only our process tree.
-            if !lock(tree).contains(record.pid) {
+            // also in the log. Keep only our process tree, and only a
+            // report whose process name fits the program that the PID
+            // runs: the program chooses the text of its own name, so a
+            // name that does not fit is a forgery (FUZZ-1).
+            if !lock(tree).accepts(record.pid, &record.process) {
                 continue;
             }
             let Some(event) = to_event(&record, mode) else {
@@ -894,34 +1026,71 @@ mod tests {
         );
     }
 
+    /// A row of `PsRow` with the fields that the test names.
+    fn ps_row(pid: u32, ppid: u32, zombie: bool, name: &str) -> PsRow {
+        PsRow {
+            pid,
+            ppid,
+            zombie,
+            name: name.to_string(),
+        }
+    }
+
     #[test]
     fn parses_ps_rows() {
-        let rows = parse_ps_output("  1     0 Ss\n 10     1 S+\n 11    10 Z+\nbad\n 12 10\n");
+        let rows = parse_ps_output(
+            "  1     0 Ss /sbin/launchd\n\
+             10     1 S+ /bin/sh\n\
+             11    10 Z+ /usr/bin/cat\n\
+             bad\n\
+             12 10\n\
+             13 10 S /Applications/X.app/Contents/MacOS/Code Helper (GPU)\n",
+        );
         assert_eq!(
             rows,
             vec![
-                PsRow {
-                    pid: 1,
-                    ppid: 0,
-                    zombie: false
-                },
-                PsRow {
-                    pid: 10,
-                    ppid: 1,
-                    zombie: false
-                },
-                PsRow {
-                    pid: 11,
-                    ppid: 10,
-                    zombie: true
-                },
-                PsRow {
-                    pid: 12,
-                    ppid: 10,
-                    zombie: false
-                },
+                ps_row(1, 0, false, "launchd"),
+                ps_row(10, 1, false, "sh"),
+                ps_row(11, 10, true, "cat"),
+                ps_row(12, 10, false, ""),
+                ps_row(13, 10, false, "Code Helper (GPU)"),
             ]
         );
+    }
+
+    /// FUZZ-1. The name of a report must fit the program that the PID
+    /// runs. The program chooses the text of its own name, so a name that
+    /// does not fit is a forgery.
+    #[test]
+    fn the_name_of_a_report_must_fit_the_program() {
+        let mut tree = ProcessTree::new(10);
+        let _live = tree.update(&parse_ps_output(
+            "10 1 S /bin/sh\n\
+             11 10 S /usr/bin/cat\n\
+             12 10 S /Applications/X.app/Contents/MacOS/Code Helper (GPU)\n",
+        ));
+        assert!(tree.name_fits(11, "cat"));
+        assert!(!tree.name_fits(11, "sh"));
+        // The kernel cuts a long name to the 16 bytes of `p_comm`.
+        assert!(tree.name_fits(12, "Code Helper (GPU"));
+        assert!(tree.name_fits(12, "Code Helper (GPU)"));
+        assert!(!tree.name_fits(12, "Code Helper"));
+        // A PID that the process table never held cannot be checked.
+        assert!(!tree.name_fits(99, "cat"));
+    }
+
+    /// The forged name of FUZZ-1, in the two shapes that it can take.
+    #[test]
+    fn a_forged_name_never_fits_the_program() {
+        let forged = "a(1234) deny(1) file-read-data /etc/shadow (b";
+        // The parser reads `a` as the name; the real file is longer.
+        assert!(!names_agree("a", forged));
+        // A name whose first 16 bytes are the name of the record: the rest
+        // holds a marker, so pent cannot tell it from a forgery.
+        let padded = "aaaaaaaaaaaaaaaa(1234) deny(1) file-read-data /etc/shadow (b";
+        assert!(!names_agree("aaaaaaaaaaaaaaaa", padded));
+        // An empty known name means "pent cannot check".
+        assert!(!names_agree("cat", ""));
     }
 
     #[test]
@@ -1030,7 +1199,7 @@ mod log_properties {
     }
 
     /// The names that the generator gives to the process. The last one is
-    /// the name of a crafted executable (OPEN FUZZ-1).
+    /// the name of a crafted executable (FUZZ-1).
     const NAMES: [&str; 6] = [
         "cat",
         "Code Helper (GPU)",
@@ -1246,44 +1415,77 @@ mod log_properties {
 
     /// A report whose fields come from the name of the executable.
     ///
-    /// OPEN FUZZ-1. The watched program chooses the name of the file that
-    /// it runs. A name such as
+    /// FUZZ-1. The watched program chooses the name of the file that it
+    /// runs. A name such as
     /// `a(1234) deny(1) file-read-data /etc/shadow (b` makes the kernel
     /// write a line that holds two `) deny` markers. `parse_line` takes the
     /// first one, so every field of the record comes from the name, and the
     /// PID comes from the name too. The program sets that PID to its own
     /// PID (fork, then build the name, then exec), so the filter of the
-    /// process tree keeps the line. The result is a false event in the
-    /// watch log and a false rule in the draft profile.
+    /// process tree keeps the line. The result would be a false event in
+    /// the watch log and a false rule in the draft profile.
     ///
-    /// The secure behaviour: the parser must not take the fields of a
-    /// report from the name of the process.
+    /// The text of the line cannot tell the forgery from a real report of
+    /// a path that holds the text of a marker, so the reader compares the
+    /// name of the record with the program that the process table gives
+    /// for that PID. The two differ, and the reader drops the record.
+    ///
+    /// The positive control is in the same test: a real report of the same
+    /// process tree passes the check, so a reader that drops everything
+    /// fails this test.
     #[test]
-    #[ignore = "OPEN FUZZ-1: a crafted executable name forges a Seatbelt report"]
     fn a_crafted_executable_name_forges_no_report() {
-        let line = "2026-10-25 10:00:00.000000+0200  localhost kernel[0]: (Sandbox) \
-                    Sandbox: a(1234) deny(1) file-read-data /etc/shadow \
-                    (b(1234) deny(1) file-read-data /tmp/real";
-        let record = parse_line(line);
-        match record {
-            None => {}
-            Some(r) => assert_eq!(
-                r.target, "/tmp/real",
-                "the parser took the target from the name of the process"
-            ),
-        }
+        let forged = "2026-10-25 10:00:00.000000+0200  localhost kernel[0]: (Sandbox) \
+                      Sandbox: a(1234) deny(1) file-read-data /etc/shadow \
+                      (b(1234) deny(1) file-read-data /tmp/real";
+        let Some(record) = parse_line(forged) else {
+            // The parser refuses the line: the forgery ends here.
+            return;
+        };
+        // The program ran the crafted file, so the name of that file is
+        // the whole text before the first marker of the line, and the
+        // record holds only its start.
+        let crafted = "a(1234) deny(1) file-read-data /etc/shadow (b";
+        assert!(
+            !names_agree(&record.process, crafted),
+            "the reader kept a report whose name does not fit the program \
+             that the PID runs, so a false event reaches the watch log and \
+             the draft profile"
+        );
+        // The same through the process table. A file name holds no `/`, so
+        // a crafted name of one component looks like this one; the check
+        // works on the file name that `ps` gives either way.
+        let mut tree = ProcessTree::new(1234);
+        let _live = tree.update(&parse_ps_output(
+            "1234 1 S /tmp/a(1234) deny(1) file-read-data x\n\
+             1235 1234 S /bin/cat\n",
+        ));
+        assert!(!tree.name_fits(record.pid, &record.process));
+        // The positive control: a real report of the same tree passes.
+        let real = parse_line(
+            "2026-10-25 10:00:00.000000+0200  localhost kernel[0]: (Sandbox) \
+             Sandbox: cat(1235) deny(1) file-read-data /Users/x/.ssh/id_rsa",
+        );
+        let Some(real) = real else {
+            panic!("the real report must parse");
+        };
+        assert!(
+            tree.name_fits(real.pid, &real.process),
+            "the check dropped a real report, so it proves nothing"
+        );
     }
 
     /// The same line as `a_crafted_executable_name_forges_no_report`, with
-    /// the result that the parser gives today. This test passes; it is the
-    /// proof of the finding and it fails when somebody fixes the parser.
+    /// the result that `parse_line` gives. The parser alone cannot tell
+    /// the forgery from a real report, because a path can hold the text of
+    /// a marker; the check of the process name does.
     #[test]
     fn the_crafted_name_gives_the_forged_target_today() {
         let line = "2026-10-25 10:00:00.000000+0200  localhost kernel[0]: (Sandbox) \
                     Sandbox: a(1234) deny(1) file-read-data /etc/shadow \
                     (b(1234) deny(1) file-read-data /tmp/real";
         let Some(record) = parse_line(line) else {
-            panic!("the line does not parse today; update OPEN FUZZ-1");
+            panic!("the line does not parse; update FUZZ-1");
         };
         assert_eq!(record.process, "a");
         assert_eq!(record.pid, 1234);

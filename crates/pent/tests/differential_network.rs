@@ -140,15 +140,15 @@ printf 'CODE=%s\n' "$code"
         Ok(())
     }
 
-    /// The proxy must tell pent about every connection that it refuses.
+    /// DIFF-8. The proxy must tell pent about every connection that it
+    /// refuses.
     ///
     /// A domain that the allowlist does not hold reaches the trace log and
-    /// the list of the denied accesses. A destination that is not public,
-    /// and an address written as a number, reach neither, so
-    /// `pent trust NAME --review` never shows them and the user has no
-    /// hint why the connection failed.
+    /// the list of the denied accesses. Before the fix a destination that
+    /// is not public reached neither, because a client sends an `http://`
+    /// URL as a plain proxy request and the proxy answered 400 before any
+    /// check of the destination.
     #[test]
-    #[ignore = "OPEN DIFF-8: the proxy refuses a destination that is not public and records nothing"]
     fn diff_8_a_refused_destination_is_not_recorded() -> TestResult {
         let test = "net_diff_8_silent_refusal";
         if !ready(test) {

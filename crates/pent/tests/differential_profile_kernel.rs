@@ -38,7 +38,7 @@ mod fs_table {
         have_tools, sandbox_ready, stderr, stdout, BoxError, TestEnv, TestResult,
     };
     use super::differential::{
-        fs_closed, fs_open, resolve, Access, FsCase, Verdict, EXECUTED, GREETING, MARKER, RAN,
+        fs_closed, fs_rows, resolve, Access, FsCase, Verdict, EXECUTED, GREETING, MARKER, RAN,
         WROTE,
     };
 
@@ -282,28 +282,40 @@ printf 'rc=%s\n' "$?"
         run_rows(test, &fs_closed())
     }
 
-    /// A profile entry that names a symbolic link must give access to the
-    /// file. Today it gives access to neither the link nor its target.
+    /// DIFF-2. A profile entry that names a symbolic link must give
+    /// access to the file. Before the fix it gave access to neither the
+    /// link nor its target.
     #[test]
-    #[ignore = "OPEN DIFF-2: a profile entry that names a symbolic link gives access to nothing"]
     fn diff_2_a_profile_entry_that_names_a_symbolic_link() -> TestResult {
         let test = "fs_diff_2_symlink";
         if !ready(test) {
             return Ok(());
         }
-        run_rows(test, &fs_open("DIFF-2"))
+        run_rows(
+            test,
+            &fs_rows(&[
+                "symlink-the-named-link",
+                "symlink-the-target-by-its-own-name",
+            ]),
+        )
     }
 
-    /// A profile has three lists, and `read` is not `execute`. A rule that
-    /// gives read access must not let the program run the file.
+    /// DIFF-4. A profile has three lists, and `read` is not `execute`. A
+    /// rule that gives read access must not let the program run the file.
     #[test]
-    #[ignore = "OPEN DIFF-4: a read rule also gives execute"]
     fn diff_4_a_read_rule_also_gives_execute() -> TestResult {
         let test = "fs_diff_4_read_gives_execute";
         if !ready(test) {
             return Ok(());
         }
-        run_rows(test, &fs_open("DIFF-4"))
+        run_rows(
+            test,
+            &fs_rows(&[
+                "read-rule-does-not-run",
+                "execute-rule-run",
+                "read-write-rule-run",
+            ]),
+        )
     }
 
     /// A rule that gives read access must not let the program change what
@@ -350,13 +362,13 @@ printf 'rc=%s\n' "$?"
         Ok(())
     }
 
-    /// The kernel must tell pent about every access that it blocks.
+    /// DIFF-1. The kernel must tell pent about every access that it
+    /// blocks.
     ///
-    /// `pent run --trace` records a Landlock denial. It records nothing
-    /// when the overlay hides the path: the program gets `ENOENT`, and the
-    /// review never sees the access.
+    /// `pent run --trace` records a Landlock denial. Before the fix it
+    /// recorded nothing when the overlay hid the path: the program got
+    /// `ENOENT`, and the review never saw the access.
     #[test]
-    #[ignore = "OPEN DIFF-1: a read that the overlay hides is not recorded as a denial"]
     fn diff_1_a_hidden_path_is_not_a_recorded_denial() -> TestResult {
         let test = "fs_diff_1_hidden_denial";
         if !ready(test) {
@@ -426,7 +438,7 @@ printf 'rc=%s\n' "$?"
         ids.dedup();
         assert_eq!(
             ids,
-            vec!["DIFF-2", "DIFF-4"],
+            Vec::<&str>::new(),
             "a row of FS_CASES names a disagreement without an ignored test \
              in this file"
         );

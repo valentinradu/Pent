@@ -85,6 +85,12 @@ pub mod access {
     /// All rights. The ruleset mask removes the rights that the kernel does
     /// not support.
     pub const ALL: u64 = (1 << 16) - 1;
+    /// All rights except execution. The parent directory of an overlay
+    /// mount takes this: the overlay shows only the paths of the profile,
+    /// and the right to run one of them must come from the rule of its own
+    /// entry (`execute`, `read_write`, a `PATH` directory or a system
+    /// path), not from the overlay. See `add_ruleset_rules` in `linux.rs`.
+    pub const ALL_NO_EXECUTE: u64 = ALL & !EXECUTE;
 }
 
 /// Landlock scope flags (ABI v6).

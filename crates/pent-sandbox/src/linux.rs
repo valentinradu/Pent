@@ -292,9 +292,19 @@ impl RuleSink for PreparedRuleset {
 /// policy. The policy has the same rules as the real ruleset (see
 /// `add_ruleset_rules`). Landlock binds a rule to an inode, so the policy
 /// keeps the canonical path of each rule and also the path as written.
+///
+/// Landlock is not the only layer that refuses an access. Below an overlay
+/// mount, the upper layer hides each path that the profile does not name,
+/// and the program gets `ENOENT` instead of `EACCES`. The policy holds the
+/// overlay mount points and the paths that the overlay shows, so that such
+/// a read becomes a recorded denial too (see [`AccessPolicy::hidden`]).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct AccessPolicy {
     rules: Vec<(PathBuf, u64)>,
+    /// The mount point of each overlay.
+    overlay_roots: Vec<PathBuf>,
+    /// The paths that the overlay shows below a mount point.
+    shown: Vec<PathBuf>,
 }
 
 impl RuleSink for AccessPolicy {
@@ -311,6 +321,55 @@ impl RuleSink for AccessPolicy {
 }
 
 impl AccessPolicy {
+    /// Tell the policy which paths the overlay shows.
+    ///
+    /// `roots` are the mount points and `shown` is the accessible set that
+    /// `linux_overlayfs::setup_overlay_dirs` uses. The function keeps the
+    /// canonical form of each path and also the path as written, because
+    /// the recorder does not resolve the symbolic links of a path.
+    fn set_overlay(&mut self, roots: &HashSet<PathBuf>, shown: &HashSet<PathBuf>) {
+        let both = |out: &mut Vec<PathBuf>, path: &Path| {
+            out.push(path.to_path_buf());
+            if let Ok(real) = std::fs::canonicalize(path) {
+                if real != path {
+                    out.push(real);
+                }
+            }
+        };
+        for root in roots {
+            both(&mut self.overlay_roots, root);
+        }
+        for path in shown {
+            both(&mut self.shown, path);
+        }
+    }
+
+    /// Return true when the upper layer of an overlay hides `path`.
+    ///
+    /// `populate_upper_stubs` in `linux_overlayfs.rs` makes a stub for
+    /// each entry below a mount point that the accessible set neither
+    /// covers nor leads to. A path below such an entry is not there for
+    /// the child, so a read of it gives `ENOENT` and no Landlock denial.
+    ///
+    /// The answer has one limit: the upper layer is writable, so a child
+    /// that makes a file of its own at a hidden name can read that file
+    /// back. The policy calls such a read a denial too. The report stays
+    /// true, because the file of the host stays hidden: the child reads
+    /// its own content, never the content that the overlay hides.
+    fn hidden(&self, path: &Path) -> bool {
+        if !self
+            .overlay_roots
+            .iter()
+            .any(|root| path.starts_with(root) && path != root)
+        {
+            return false;
+        }
+        !self
+            .shown
+            .iter()
+            .any(|p| path.starts_with(p) || p.starts_with(path))
+    }
+
     /// Return the Landlock rights that the policy grants for `path`. Landlock
     /// adds the rights of all rules on the path and on its ancestors.
     fn rights(&self, path: &Path) -> u64 {
@@ -331,6 +390,14 @@ impl AccessPolicy {
         is_dir: bool,
     ) -> pent_profile::Outcome {
         use pent_profile::FsOp;
+        // The overlay answers before Landlock. A read or an execution of a
+        // path that the upper layer hides gives `ENOENT`, which is a
+        // denial that the user must see (DIFF-1). A write or a create goes
+        // to the upper layer and works inside the run, so it stays a
+        // Landlock question.
+        if matches!(op, FsOp::Read | FsOp::Exec) && self.hidden(path) {
+            return pent_profile::Outcome::Denied;
+        }
         let (subject, needed) = match op {
             FsOp::Read if is_dir => (path, access::READ_DIR),
             FsOp::Read => (path, access::READ_FILE),
@@ -478,8 +545,11 @@ fn add_ruleset_rules(
     }
     // Overlay parent directories: inside the namespace, writes go to the
     // upper layer; the watcher of the parent flushes write-listed files.
+    // The rule gives no execution: a `read` entry is not an `execute`
+    // entry, and the overlay must not turn one into the other (DIFF-4).
+    // The right to run a file comes from the rule of its own entry.
     for dir in overlay_dirs {
-        ruleset.add_rule(dir, access::ALL);
+        ruleset.add_rule(dir, access::ALL_NO_EXECUTE);
     }
     // PATH directories and system libraries: the dynamic linker must open()
     // binaries and shared libraries, so these get ReadFile too.
@@ -2234,6 +2304,16 @@ pub(crate) fn spawn_linux(
     }
     accessible.extend(write_set.iter().cloned());
     accessible.extend(compute_accessible_set(config, path_dirs));
+    // A profile entry can name a symbolic link. The overlay shows only
+    // the paths of this set, and Landlock binds a rule to an inode, so an
+    // entry that names a link needs the file that the link reaches too;
+    // without it the entry gives access to nothing (DIFF-2). The messages
+    // keep the path as the user wrote it.
+    let resolved: Vec<PathBuf> = accessible
+        .iter()
+        .filter_map(|p| std::fs::canonicalize(p).ok().filter(|real| real != p))
+        .collect();
+    accessible.extend(resolved);
 
     let home_dir: PathBuf = std::env::var("HOME")
         .map(PathBuf::from)
@@ -2425,6 +2505,7 @@ pub(crate) fn spawn_linux(
                 None => {
                     let mut policy = AccessPolicy::default();
                     add_ruleset_rules(&mut policy, config, path_dirs, &write_set, &overlay_dirs);
+                    policy.set_overlay(&overlay_dirs, &accessible);
                     crate::linux_watch::Judge::Policy(policy)
                 }
             })
@@ -4740,6 +4821,38 @@ mod tests {
         assert_eq!(
             policy.predict(FsOp::Exec, Path::new("/var/x"), false),
             denied
+        );
+        Ok(())
+    }
+
+    /// DIFF-1. A read that the overlay hides must be a recorded denial.
+    /// Landlock permits the path, because the rule of the overlay mount
+    /// point covers the whole home directory; the upper layer hides each
+    /// path that the profile does not name.
+    #[test]
+    fn access_policy_reports_a_path_that_the_overlay_hides() -> TestResult {
+        use pent_profile::{FsOp, Outcome};
+        let tmp = tempfile::tempdir()?;
+        let home = std::fs::canonicalize(tmp.path())?;
+        let open = home.join("open.txt");
+        let secret = home.join("secret.txt");
+        std::fs::write(&open, "o")?;
+        std::fs::write(&secret, "s")?;
+        let mut policy = AccessPolicy::default();
+        // The rule of the overlay mount point, as `add_ruleset_rules`
+        // makes it.
+        policy.add_rule(&home, access::ALL_NO_EXECUTE);
+        let roots: HashSet<PathBuf> = [home.clone()].into_iter().collect();
+        let shown: HashSet<PathBuf> = [open.clone()].into_iter().collect();
+        policy.set_overlay(&roots, &shown);
+        assert_eq!(policy.predict(FsOp::Read, &open, false), Outcome::Allowed);
+        assert_eq!(policy.predict(FsOp::Read, &secret, false), Outcome::Denied);
+        // The mount point itself and a parent of a shown path stay open.
+        assert_eq!(policy.predict(FsOp::Read, &home, true), Outcome::Allowed);
+        // A write goes to the upper layer and works inside the run.
+        assert_eq!(
+            policy.predict(FsOp::Write, &secret, false),
+            Outcome::Allowed
         );
         Ok(())
     }

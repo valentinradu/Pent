@@ -258,20 +258,23 @@ pub const FS_CASES: &[FsCase] = &[
         verdict: Verdict::Deny,
         ..FS
     },
-    // A symbolic link.
+    // A symbolic link. The entry names the link, and the rule must give
+    // the file (DIFF-2).
     FsCase {
         id: "symlink-the-named-link",
         profile: P_SYMLINK,
         target: "link.txt",
         symlink: Some(("link.txt", "real.txt")),
-        open: Some("DIFF-2"),
         ..FS
     },
+    // The same file under its own name. Landlock binds a rule to an
+    // inode, so a rule that gives the file through the link gives the
+    // file under each name that reaches it. The access is the same
+    // content, and the user named that content.
     FsCase {
         id: "symlink-the-target-by-its-own-name",
         profile: P_SYMLINK,
         target: "real.txt",
-        verdict: Verdict::Deny,
         symlink: Some(("link.txt", "real.txt")),
         ..FS
     },
@@ -350,6 +353,15 @@ pub const FS_CASES: &[FsCase] = &[
         access: Access::Write,
         ..FS
     },
+    // A `read_write` rule on a directory keeps the right to run a file of
+    // that directory. Only a `read` rule loses it (DIFF-4).
+    FsCase {
+        id: "read-write-rule-run",
+        profile: P_RW,
+        target: "rw/f.txt",
+        access: Access::Execute,
+        ..FS
+    },
     // Execute.
     FsCase {
         id: "execute-rule-run",
@@ -378,7 +390,6 @@ pub const FS_CASES: &[FsCase] = &[
         target: "bin/tool",
         access: Access::Execute,
         verdict: Verdict::Deny,
-        open: Some("DIFF-4"),
         ..FS
     },
     // A Unix socket.
@@ -729,25 +740,24 @@ pub const GUARD_CASES: &[GuardCase] = &[
         path: ".ssh/old/more/id_rsa",
         ..GUARD
     },
-    // Through a symbolic link.
+    // Through a symbolic link. The Linux supervisor refuses the read,
+    // because no mask covers the name that the program uses; the macOS
+    // profile holds a deny rule for the real directory of the link,
+    // because Seatbelt matches the path that the kernel resolves.
     GuardCase {
         id: "key-through-a-symbolic-link",
         path: ".ssh/linked/id_rsa",
         link_dir: Some((".ssh/linked", "keystore")),
-        open_linux: Some("DIFF-5"),
-        // Seatbelt matches the real path too, so the deny rule on
-        // `~/.ssh` does not cover `~/keystore/id_rsa` either.
-        open_macos: Some("DIFF-5"),
         ..GUARD
     },
     // A key that the program makes during the run. The Linux backend
-    // masks only the children that exist when the child starts; Seatbelt
-    // decides at the time of the access.
+    // masks only the children that exist when the child starts, so the
+    // supervisor refuses the read; Seatbelt decides at the time of the
+    // access.
     GuardCase {
         id: "key-made-during-the-run",
         path: ".ssh/id_new",
         make_in_run: true,
-        open_linux: Some("DIFF-6"),
         ..GUARD
     },
     // The other credential shapes.
@@ -973,6 +983,24 @@ pub fn fs_open(id: &str) -> Vec<&'static FsCase> {
     FS_CASES.iter().filter(|c| c.open == Some(id)).collect()
 }
 
+/// The rows of [`FS_CASES`] with these names.
+///
+/// A test of a closed finding names its rows, so the test keeps its rows
+/// after the fix moves them out of [`fs_open`].
+///
+/// # Panics
+/// Panics when a name is not in the table.
+#[must_use]
+pub fn fs_rows(ids: &[&str]) -> Vec<&'static FsCase> {
+    let rows: Vec<&'static FsCase> = FS_CASES.iter().filter(|c| ids.contains(&c.id)).collect();
+    assert_eq!(
+        rows.len(),
+        ids.len(),
+        "FS_CASES does not hold each row of {ids:?}"
+    );
+    rows
+}
+
 /// The rows of [`GUARD_CASES`] that have no open disagreement on this
 /// platform.
 #[must_use]
@@ -991,6 +1019,25 @@ pub fn guard_open(id: &str) -> Vec<&'static GuardCase> {
         .iter()
         .filter(|c| c.open_here() == Some(id))
         .collect()
+}
+
+/// The rows of [`GUARD_CASES`] with these names.
+///
+/// A test of a closed finding names its rows, so the test keeps its rows
+/// after the fix moves them out of [`guard_open`].
+///
+/// # Panics
+/// Panics when a name is not in the table.
+#[must_use]
+pub fn guard_rows(ids: &[&str]) -> Vec<&'static GuardCase> {
+    let rows: Vec<&'static GuardCase> =
+        GUARD_CASES.iter().filter(|c| ids.contains(&c.id)).collect();
+    assert_eq!(
+        rows.len(),
+        ids.len(),
+        "GUARD_CASES does not hold each row of {ids:?}"
+    );
+    rows
 }
 
 /// Every disagreement that [`GUARD_CASES`] states on this platform, sorted
