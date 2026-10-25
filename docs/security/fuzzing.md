@@ -25,7 +25,7 @@ test that fails holds the secure assertion and has the mark
 
 | ID | Severity | One line | State | Test |
 |----|----------|----------|-------|------|
-| FUZZ-1 | Medium | A crafted executable name forged a Seatbelt report, so a false access reached the watch log and the draft profile. | **Fixed** (`COMMIT-FUZZ-1`) | `a_crafted_executable_name_forges_no_report` |
+| FUZZ-1 | Medium | A crafted executable name forged a Seatbelt report, so a false access reached the watch log and the draft profile. | **Fixed** (`315e979`) | `a_crafted_executable_name_forges_no_report` |
 | FUZZ-2 | Low | The DNS server clears the truncation bit of an upstream answer, so the client never retries over TCP and loses records. | **Open** | `the_server_clears_the_truncation_bit_today` |
 | FUZZ-3 | Informational | The documentation of the domain filter states a pattern form (`*.*.example.com`) that the code rejects. | **Open** | `a_pattern_with_two_wildcards_is_rejected` |
 
@@ -34,7 +34,7 @@ buffer, loop forever, or overflow an integer.
 
 ### FUZZ-1 — a crafted executable name forges a Seatbelt report (Medium)
 
-**State: fixed** in `COMMIT-FUZZ-1`. The platform is macOS only.
+**State: fixed** in `315e979`. The platform is macOS only.
 
 **Where.** `parse_line` in `crates/pent-sandbox/src/macos_log.rs`.
 

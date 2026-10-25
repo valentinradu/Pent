@@ -1199,7 +1199,7 @@ mod log_properties {
     }
 
     /// The names that the generator gives to the process. The last one is
-    /// the name of a crafted executable (OPEN FUZZ-1).
+    /// the name of a crafted executable (FUZZ-1).
     const NAMES: [&str; 6] = [
         "cat",
         "Code Helper (GPU)",
@@ -1485,7 +1485,7 @@ mod log_properties {
                     Sandbox: a(1234) deny(1) file-read-data /etc/shadow \
                     (b(1234) deny(1) file-read-data /tmp/real";
         let Some(record) = parse_line(line) else {
-            panic!("the line does not parse today; update OPEN FUZZ-1");
+            panic!("the line does not parse; update FUZZ-1");
         };
         assert_eq!(record.process, "a");
         assert_eq!(record.pid, 1234);

@@ -1,6 +1,8 @@
 # Differential tests: the profile, the summary and the kernel
 
-Status: review of commit `69cdc99` (2026-10-25).
+Status: review of commit `69cdc99` (2026-10-25). DIFF-1, DIFF-2, DIFF-4,
+DIFF-5, DIFF-6, DIFF-7 and DIFF-8 have a fix; each section names its
+commit. DIFF-3 and DIFF-9 stay open.
 
 Pent describes one policy three times:
 
@@ -84,7 +86,7 @@ proof of the finding.
 ### DIFF-1 — a read that the overlay hides is not a recorded denial
 
 **Severity:** Medium. **Wrong description:** the summary. **Fixed** in
-`COMMIT-DIFF-1`.
+`deb8ad3`.
 
 **Test:** `differential_profile_kernel.rs`,
 `diff_1_a_hidden_path_is_not_a_recorded_denial`. The test runs now, and
@@ -119,7 +121,7 @@ the child made itself makes no event.
 ### DIFF-2 — a profile entry that names a symbolic link gives access to nothing
 
 **Severity:** Medium. **Wrong description:** the kernel. **Fixed** in
-`COMMIT-DIFF-2`.
+`3a754ae`.
 
 **Test:** `differential_profile_kernel.rs`,
 `diff_2_a_profile_entry_that_names_a_symbolic_link`. Rows
@@ -173,7 +175,7 @@ word "read".
 ### DIFF-4 — a `read` rule also gives execute
 
 **Severity:** Medium. **Wrong description:** the kernel. **Fixed** in
-`COMMIT-DIFF-4`.
+`20af17e`.
 
 **Test:** `differential_profile_kernel.rs`,
 `diff_4_a_read_rule_also_gives_execute`. Rows `read-rule-does-not-run`,
@@ -205,7 +207,7 @@ behaviour of a `read_write` entry on a directory.
 
 ### DIFF-5 — the guard misses a private key behind a symbolic link
 
-**Severity:** High. **Wrong description:** the kernel. **Fixed** in `COMMIT-DIFF-5-6`.
+**Severity:** High. **Wrong description:** the kernel. **Fixed** in `c71b515`.
 
 **Test:** `differential_guard.rs`, `diff_5_a_key_behind_a_symbolic_link`.
 Row `key-through-a-symbolic-link`. The test runs now, and
@@ -250,7 +252,7 @@ of the profile.
 
 ### DIFF-6 — the guard misses a private key that the program makes
 
-**Severity:** High. **Wrong description:** the kernel. **Fixed** in `COMMIT-DIFF-5-6`.
+**Severity:** High. **Wrong description:** the kernel. **Fixed** in `c71b515`.
 
 **Test:** `differential_guard.rs`, `diff_6_a_key_made_during_the_run`. Row
 `key-made-during-the-run`. The test runs now, and
@@ -308,7 +310,8 @@ guard rule to the blocked section, and never show it in a normal section.
 
 ### DIFF-8 — the proxy refuses a destination and records nothing
 
-**Severity:** Medium. **Wrong description:** the summary.
+**Severity:** Medium. **Wrong description:** the summary. **Fixed** in
+`8d1b11f`.
 
 **Test:** `differential_network.rs`,
 `diff_8_a_refused_destination_is_not_recorded`. The test runs now.
