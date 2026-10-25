@@ -494,7 +494,7 @@ dependencies = [
 
 [[package]]
 name = "pent"
-version = "0.0.5"
+version = "0.1.0"
 dependencies = [
  "clap",
  "clap_mangen",
@@ -516,7 +516,7 @@ dependencies = [
 
 [[package]]
 name = "pent-profile"
-version = "0.0.5"
+version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -527,7 +527,7 @@ dependencies = [
 
 [[package]]
 name = "pent-proxy"
-version = "0.0.5"
+version = "0.1.0"
 dependencies = [
  "pent-profile",
  "pent-settings",
@@ -539,7 +539,7 @@ dependencies = [
 
 [[package]]
 name = "pent-sandbox"
-version = "0.0.5"
+version = "0.1.0"
 dependencies = [
  "dirs",
  "libc",
@@ -553,7 +553,7 @@ dependencies = [
 
 [[package]]
 name = "pent-settings"
-version = "0.0.5"
+version = "0.1.0"
 dependencies = [
  "dirs",
  "libc",
