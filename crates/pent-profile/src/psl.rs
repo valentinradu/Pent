@@ -11,6 +11,14 @@
 //! suffix is the last label (`com`, `org`, `dev`, ...). Thus an unknown
 //! multi-label suffix can give a registrable domain that is too wide. The
 //! review shows each wildcard to the user, so the user can reject it.
+//!
+//! The entries come from the list of 2026-10-22 (commit `8437e52`), except
+//! the six that [`FORMER_SUFFIXES`] names. To update the subset, compare it
+//! with <https://publicsuffix.org/list/public_suffix_list.dat>.
+//!
+//! The subset has no wildcard rule (`*.replit.dev`). A suffix with such a
+//! rule goes into [`NO_WILDCARD_BELOW`] instead, so pent makes no wildcard
+//! at any depth below it.
 
 /// Multi-label public suffixes. Single-label suffixes (`com`, `uk`, ...) do
 /// not need an entry: the last label is always a public suffix.
@@ -144,12 +152,66 @@ const MULTI_LABEL_SUFFIXES: &[&str] = &[
     "pythonanywhere.com",
     "digitaloceanspaces.com",
     "ondigitalocean.app",
+    // Tunnels and preview hosts. Each customer gets one name below the
+    // suffix, so a wildcard on the suffix allows all other customers.
+    "trycloudflare.com",
+    "ngrok.dev",
+    "ngrok-free.dev",
+    "ap.ngrok.io",
+    "au.ngrok.io",
+    "eu.ngrok.io",
+    "in.ngrok.io",
+    "jp.ngrok.io",
+    "sa.ngrok.io",
+    "us.ngrok.io",
+    "githubpreview.dev",
+    "app.github.dev",
+    "csb.app",
+    "hf.space",
+    "streamlit.app",
+    "edgecompute.app",
+    "freetls.fastly.net",
+    "codeberg.page",
+    "srht.site",
+    "gitbook.io",
+    "translate.goog",
+    "myshopify.com",
+    "supabase.co",
+    "amplifyapp.com",
+    "ts.net",
+    // Dynamic DNS. Each customer gets one name.
+    "duckdns.org",
+    "ddns.net",
+    "hopto.org",
+    "dynv6.net",
+];
+
+/// Suffixes that the public suffix list of 2026-10-22 does not have, but
+/// that give one name to each customer. Pent treats them as public
+/// suffixes, so it never makes a wildcard that covers another customer.
+/// Each one was in the list before, or the service works the same way as a
+/// service in the list.
+const FORMER_SUFFIXES: &[&str] = &[
+    "loca.lt",
+    "mooo.com",
+    "gitpod.io",
+    "github.dev",
+    "webcontainer.io",
+    "neocities.org",
 ];
 
 /// Domains below which pent never makes a wildcard, at any depth. The
 /// platform gives names at many levels to unrelated customers (for example
 /// `bucket.s3.us-east-1.amazonaws.com`), and the subset cannot list them all.
-const NO_WILDCARD_BELOW: &[&str] = &["amazonaws.com"];
+///
+/// The public suffix list writes such a platform with a wildcard rule
+/// (`*.replit.dev`, `*.azurecontainer.io`, `*.airflow.<region>.on.aws`).
+const NO_WILDCARD_BELOW: &[&str] = &[
+    "amazonaws.com",
+    "on.aws",
+    "azurecontainer.io",
+    "replit.dev",
+];
 
 /// Return the byte offsets where each suffix of `name` starts: 0, then the
 /// offset after each dot.
@@ -167,7 +229,9 @@ pub fn public_suffix(name: &str) -> &str {
     // The first match is the longest suffix, because the offsets grow.
     suffix_starts(name)
         .filter_map(|start| name.get(start..))
-        .find(|suffix| MULTI_LABEL_SUFFIXES.contains(suffix))
+        .find(|suffix| {
+            MULTI_LABEL_SUFFIXES.contains(suffix) || FORMER_SUFFIXES.contains(suffix)
+        })
         .unwrap_or_else(|| name.rsplit('.').next().unwrap_or(name))
 }
 
@@ -244,6 +308,46 @@ mod tests {
         assert!(is_public_suffix("s3.amazonaws.com"));
         assert!(!is_public_suffix("example.com"));
         assert_eq!(public_suffix("bucket.s3.amazonaws.com"), "s3.amazonaws.com");
+    }
+
+    #[test]
+    fn common_services_give_no_wildcard_on_the_suffix() {
+        for suffix in [
+            "trycloudflare.com",
+            "loca.lt",
+            "ngrok.dev",
+            "duckdns.org",
+            "gitpod.io",
+            "app.github.dev",
+            "csb.app",
+            "webcontainer.io",
+            "hf.space",
+            "myshopify.com",
+            "ts.net",
+            "supabase.co",
+            "translate.goog",
+        ] {
+            assert!(is_public_suffix(suffix), "{suffix}");
+            assert!(!wildcard_allowed(suffix), "{suffix}");
+            let name = format!("tenant.{suffix}");
+            assert_eq!(registrable_domain(&name), Some(name.as_str()), "{suffix}");
+        }
+    }
+
+    /// A platform with a wildcard rule in the public suffix list gets no
+    /// wildcard at any depth.
+    #[test]
+    fn platforms_with_a_wildcard_rule_give_no_wildcard() {
+        for domain in [
+            "replit.dev",
+            "tenant.replit.dev",
+            "azurecontainer.io",
+            "x.azurecontainer.io",
+            "on.aws",
+            "service.region.on.aws",
+        ] {
+            assert!(!wildcard_allowed(domain), "{domain}");
+        }
     }
 
     #[test]

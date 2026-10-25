@@ -843,7 +843,6 @@ const MISSING_PUBLIC_SUFFIXES: &[&str] = &[
 ];
 
 #[test]
-#[ignore = "OPEN H-5: the PSL subset misses common tunnel and hosting suffixes; the summary makes wildcards on them"]
 fn p3_no_wildcard_on_common_public_suffix_services() {
     let widened: Vec<(&str, Vec<String>)> = MISSING_PUBLIC_SUFFIXES
         .iter()
