@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use pent_profile::ProfileName;
+use pent_profile::{safe_lines, ProfileName};
 use pent_settings::{ProfileStatus, ProfileStore};
 
 use crate::cli::{ProfileArgs, ProfileSubcommand, TrustArgs, UntrustArgs};
@@ -56,9 +56,12 @@ fn trust_draft(
         }
     };
 
+    // The file can hold a control character or a format character from an
+    // event or from a hand edit. The user must see the true text.
+    let shown = safe_lines(&text);
     eprintln!("The {label} of \"{name}\" ({}):\n", path.display());
-    eprint!("{text}");
-    if !text.ends_with('\n') {
+    eprint!("{shown}");
+    if !shown.ends_with('\n') {
         eprintln!();
     }
     eprintln!();
@@ -75,7 +78,9 @@ fn trust_draft(
             return Ok(());
         }
     }
-    let profile = store.trust(name)?;
+    // Trust the bytes that pent printed, not the bytes of a new read: the
+    // file can change between the question and the answer.
+    let profile = store.trust_exact(name, text.as_bytes())?;
     ui::ok(format!("trusted \"{name}\" ({})", profile.display()));
     Ok(())
 }
@@ -155,13 +160,15 @@ fn list(store: &ProfileStore) -> Result<(), CliError> {
 }
 
 fn show(store: &ProfileStore, name: &ProfileName) -> Result<(), CliError> {
+    // The file can hold a control character or a format character from an
+    // event or from a hand edit. `safe_lines` escapes them.
     if let Some(text) = store.read_profile_text(name)? {
         let loaded = store.load(name)?;
         ui::status(
             "profile",
             format!("{} ({})", loaded.path.display(), loaded.status),
         );
-        print!("{text}");
+        print!("{}", safe_lines(&text));
         return Ok(());
     }
     if let Some(text) = store.read_draft_text(name)? {
@@ -169,7 +176,7 @@ fn show(store: &ProfileStore, name: &ProfileName) -> Result<(), CliError> {
             "draft",
             format!("{} (not trusted)", store.draft_path(name).display()),
         );
-        print!("{text}");
+        print!("{}", safe_lines(&text));
         return Ok(());
     }
     Err(CliError::Other(format!(

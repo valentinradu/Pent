@@ -85,7 +85,9 @@ pub enum WatchEvent {
     Fs {
         /// The operation.
         op: FsOp,
-        /// The absolute path.
+        /// The absolute path. See [`path_json`] for the JSON form of a path
+        /// that is not valid UTF-8.
+        #[serde(with = "path_json")]
         path: PathBuf,
         /// The process.
         process: ProcessInfo,
@@ -155,9 +157,102 @@ impl WatchEvent {
     }
 }
 
+/// The JSON form of the path of a [`WatchEvent::Fs`] event.
+///
+/// A path that is valid UTF-8 is a JSON string, as a plain `PathBuf` is.
+/// `serde_json` cannot encode a path that is not valid UTF-8, and the Linux
+/// recorder reads the raw bytes of each path, so a program can make such a
+/// path. Pent writes it as an object with the raw bytes
+/// (`{"bytes":[47,255]}`). Thus one crafted path cannot stop the log and
+/// hide the later accesses.
+///
+/// The decoder reads both forms, so pent also reads the logs of an earlier
+/// version.
+pub mod path_json {
+    use std::fmt;
+    use std::path::{Path, PathBuf};
+
+    use serde::de::{Error as _, IgnoredAny, MapAccess, Visitor};
+    use serde::ser::SerializeMap as _;
+    use serde::{Deserializer, Serializer};
+
+    /// The field name of the raw bytes form.
+    const BYTES_FIELD: &str = "bytes";
+
+    /// Write `path` as a JSON string, or as `{"bytes":[...]}`.
+    ///
+    /// # Errors
+    /// Returns the error of the serializer.
+    pub fn serialize<S: Serializer>(path: &Path, serializer: S) -> Result<S::Ok, S::Error> {
+        if let Some(text) = path.to_str() {
+            return serializer.serialize_str(text);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt as _;
+            let mut map = serializer.serialize_map(Some(1))?;
+            map.serialize_entry(BYTES_FIELD, path.as_os_str().as_bytes())?;
+            map.end()
+        }
+        // On a platform without raw path bytes, a lossy string is the only
+        // form. Such a platform has no recorder yet.
+        #[cfg(not(unix))]
+        {
+            serializer.serialize_str(&path.to_string_lossy())
+        }
+    }
+
+    /// Read a path from a JSON string or from `{"bytes":[...]}`.
+    ///
+    /// # Errors
+    /// Returns an error when the value is neither form, or when the object
+    /// has no `bytes` field.
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<PathBuf, D::Error> {
+        deserializer.deserialize_any(PathVisitor)
+    }
+
+    /// The visitor of [`deserialize`].
+    struct PathVisitor;
+
+    impl<'de> Visitor<'de> for PathVisitor {
+        type Value = PathBuf;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a path as a string, or an object with the field \"bytes\"")
+        }
+
+        fn visit_str<E: serde::de::Error>(self, text: &str) -> Result<Self::Value, E> {
+            Ok(PathBuf::from(text))
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            let mut bytes: Option<Vec<u8>> = None;
+            while let Some(key) = map.next_key::<String>()? {
+                if key == BYTES_FIELD {
+                    bytes = Some(map.next_value()?);
+                } else {
+                    // An unknown field comes from a later version.
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+            let bytes = bytes.ok_or_else(|| A::Error::missing_field(BYTES_FIELD))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStringExt as _;
+                Ok(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+            }
+            #[cfg(not(unix))]
+            {
+                Ok(PathBuf::from(String::from_utf8_lossy(&bytes).into_owned()))
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn json_round_trip() -> Result<(), serde_json::Error> {
@@ -191,6 +286,42 @@ mod tests {
             let line = e.to_json_line()?;
             assert_eq!(WatchEvent::from_json_line(&line)?, e);
         }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_path_that_is_not_utf8_round_trips() -> Result<(), serde_json::Error> {
+        use std::os::unix::ffi::OsStringExt as _;
+        let path = PathBuf::from(std::ffi::OsString::from_vec(
+            b"/home/u/\xff\xfe/x".to_vec(),
+        ));
+        let event = WatchEvent::Fs {
+            op: FsOp::Read,
+            path,
+            process: ProcessInfo {
+                pid: 3,
+                name: "tool".to_string(),
+            },
+            outcome: Outcome::Allowed,
+        };
+        let line = event.to_json_line()?;
+        assert!(line.contains("\"bytes\""), "{line}");
+        assert!(!line.contains('\n'), "{line}");
+        assert_eq!(WatchEvent::from_json_line(&line)?, event);
+        Ok(())
+    }
+
+    /// A log of an earlier version holds the path as a plain string.
+    #[test]
+    fn a_path_as_a_plain_string_still_reads() -> Result<(), serde_json::Error> {
+        let line = "{\"type\":\"fs\",\"op\":\"read\",\"path\":\"/a/b\",\
+                    \"process\":{\"pid\":1,\"name\":\"p\"},\"outcome\":{\"kind\":\"allowed\"}}";
+        let event = WatchEvent::from_json_line(line)?;
+        assert!(
+            matches!(&event, WatchEvent::Fs { path, .. } if path == Path::new("/a/b")),
+            "{event:?}"
+        );
         Ok(())
     }
 }

@@ -13,8 +13,8 @@ use std::os::unix::fs::{symlink, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
 use pent_profile::{
-    classify, guard_rules, FsOp, GuardAccess, GuardClass, NetProtocol, Outcome, ProcessInfo,
-    ProfileName, WatchEvent,
+    classify, guard_rules, guard_rules_with, FsOp, GuardAccess, GuardClass, NetProtocol, Outcome,
+    ProcessInfo, ProfileName, WatchEvent,
 };
 use pent_settings::{PentDirs, ProfileStatus, ProfileStore, TrustStatus, TrustStore, WatchRunMode};
 
@@ -99,7 +99,6 @@ fn p5_store_files_are_0600_and_new_dirs_are_0700() -> TestResult {
 /// `TrustStore::save` is public. When it makes the parent directory, the
 /// directory must get the mode 0700, as the profile store does.
 #[test]
-#[ignore = "OPEN H-7: TrustStore::save creates a missing parent directory with the umask mode (0755), not 0700"]
 fn p5_trust_store_save_makes_a_private_dir() -> TestResult {
     let root = tempfile::tempdir()?;
     let dir = root.path().join("new");
@@ -171,7 +170,6 @@ fn p5_symlink_at_trust_store_path_is_replaced_not_followed() -> TestResult {
 /// symbolic link at that name sends the write (and the `chmod 0600`) to the
 /// target of the link.
 #[test]
-#[ignore = "OPEN H-8: the atomic write follows a symlink at the predictable temporary file name"]
 fn p5_symlink_at_temporary_file_is_not_followed() -> TestResult {
     let f = Fixture::new()?;
     let n = name("tool")?;
@@ -194,7 +192,6 @@ fn p5_symlink_at_temporary_file_is_not_followed() -> TestResult {
 /// `O_NOFOLLOW`. A symbolic link at the log path makes pent append JSON to
 /// the target.
 #[test]
-#[ignore = "OPEN H-9: the event logs follow a symlink at the log path and append to its target"]
 fn p5_symlink_at_event_log_is_not_followed() -> TestResult {
     let f = Fixture::new()?;
     let n = name("tool")?;
@@ -284,12 +281,11 @@ fn p5_profile_replaced_by_a_symlink_is_not_applied() -> TestResult {
     Ok(())
 }
 
-/// `pent trust NAME` shows the draft text, asks, then calls
-/// `ProfileStore::trust`, which reads the draft again. A change between the
-/// two reads is trusted without the user seeing it. The store has no API
-/// that trusts only the bytes that the user saw.
+/// `pent trust NAME` shows the draft text, asks, then trusts it.
+/// `ProfileStore::trust` reads the draft again, so a change between the two
+/// reads goes into the profile without the user seeing it.
+/// `ProfileStore::trust_exact` trusts only the bytes that the caller shows.
 #[test]
-#[ignore = "OPEN H-10: pent trust reads the draft twice; the trusted bytes can differ from the shown bytes"]
 fn p5_trust_moves_the_bytes_that_the_user_saw() -> TestResult {
     let f = Fixture::new()?;
     let n = name("tool")?;
@@ -300,8 +296,11 @@ fn p5_trust_moves_the_bytes_that_the_user_saw() -> TestResult {
         f.store.draft_path(&n),
         "[network]\ndomains = [\"*.evil.example\"]\n",
     )?;
-    let profile = f.store.trust(&n)?;
-    assert_eq!(fs::read_to_string(profile)?, shown);
+    let profile = f.store.trust_exact(&n, shown.as_bytes())?;
+    assert_eq!(fs::read_to_string(&profile)?, shown);
+    // The profile is trusted, and the draft is gone.
+    assert_eq!(f.store.load(&n)?.status, ProfileStatus::Trusted);
+    assert!(!f.store.draft_path(&n).exists());
     Ok(())
 }
 
@@ -312,7 +311,6 @@ fn p5_trust_moves_the_bytes_that_the_user_saw() -> TestResult {
 /// when they are set. Then the profiles, the trust store and the drafts are
 /// in other directories, and the guard does not block writes to them.
 #[test]
-#[ignore = "OPEN H-11: the watch guard protects only the default pent dirs; with XDG_CONFIG_HOME or XDG_STATE_HOME set, the watched program can write profiles and the trust store"]
 fn p5_guard_protects_pent_files_in_xdg_dirs() -> TestResult {
     let home = Path::new("/home/u");
     let dirs = PentDirs {
@@ -321,7 +319,13 @@ fn p5_guard_protects_pent_files_in_xdg_dirs() -> TestResult {
     };
     let store = ProfileStore::new(dirs.clone());
     let n = name("tool")?;
-    let rules = guard_rules(home);
+    // `pent watch` gives the real pent directories to the guard.
+    let rules = guard_rules_with(home, &[dirs.config.clone(), dirs.state.clone()]);
+    // The default rules alone do not cover these paths.
+    assert_eq!(
+        classify(&guard_rules(home), &dirs.trust_store(), GuardAccess::Write),
+        None
+    );
     for path in [
         dirs.trust_store(),
         store.profile_path(&n),
@@ -389,7 +393,6 @@ fn p5_event_logs_keep_one_event_per_line() -> TestResult {
 /// `write_failed`), so one crafted `open()` hides all later accesses,
 /// blocked attempts too, from the review.
 #[test]
-#[ignore = "OPEN H-12: an event with a non-UTF-8 path cannot be logged; pent watch then drops all later events"]
 fn p5_event_log_accepts_non_utf8_paths() -> TestResult {
     let f = Fixture::new()?;
     let n = name("tool")?;

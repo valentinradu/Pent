@@ -235,8 +235,12 @@ impl Summary {
 ///   single written files.
 /// - The summary never makes a rule on a top-level directory, on the home
 ///   directory or its parents, or on a broad home directory (`~/.config`,
-///   `~/.local/share`, `~/.cache`, ...). It uses the child instead. Grouping
-///   never makes a rule on the workspace or on a parent of the workspace.
+///   `~/.local/share`, `~/.cache`, ...). It uses the child instead. The
+///   summary makes no rule on the workspace or on a parent of the workspace.
+///   This limit holds for each rule, also for a rule that comes from one
+///   direct access: `open("~")` gives no rule, and `mkdir ~/.config` gives
+///   no rule. A file directly in a broad directory (`~/.apprc`) keeps its
+///   own rule.
 /// - An exec gives execute on the directory of the binary. When the path has
 ///   a version directory (`versions/2.1.3`), the rule goes above it, so an
 ///   update of the program does not need a new rule.
@@ -439,18 +443,43 @@ fn repo_root(path: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-/// The paths of the context, checked once.
-/// Return the paths that the guard rules for `access` name.
-fn guard_paths(home: &Path, access: GuardAccess) -> Vec<PathBuf> {
-    guard_rules(home)
-        .into_iter()
-        .filter(|r| r.access == access)
-        .filter_map(|r| match r.target {
-            GuardTarget::Exact(p) | GuardTarget::Subtree(p) => Some(p),
-            GuardTarget::FilesInDir { dir, .. } => Some(dir),
-            GuardTarget::BinaryName(_) => None,
-        })
-        .collect()
+/// The paths that the guard rules for `access` protect: the directories
+/// (the root of a subtree, the directory of a file pattern) and the single
+/// files.
+fn guard_paths(home: &Path, access: GuardAccess) -> GuardPaths {
+    let mut paths = GuardPaths::default();
+    for rule in guard_rules(home) {
+        if rule.access != access {
+            continue;
+        }
+        match rule.target {
+            GuardTarget::Exact(p) => paths.files.push(p),
+            GuardTarget::Subtree(p) => paths.dirs.push(p),
+            GuardTarget::FilesInDir { dir, .. } => paths.dirs.push(dir),
+            GuardTarget::BinaryName(_) => {}
+        }
+    }
+    paths
+}
+
+/// The paths that the guard rules of one access protect.
+#[derive(Default)]
+struct GuardPaths {
+    /// The directories. A rule on such a directory, or on a parent of one,
+    /// is too wide: it gives access to the files that the guard protects.
+    dirs: Vec<PathBuf>,
+    /// The single files. A rule on a parent of such a file is too wide. A
+    /// rule on the file itself is not: it gives no more than the one file,
+    /// and the guard still stops the access that it covers.
+    files: Vec<PathBuf>,
+}
+
+impl GuardPaths {
+    /// Return true if a rule on `path` would include a protected path.
+    fn covered_by_a_rule_on(&self, path: &Path) -> bool {
+        self.dirs.iter().any(|g| g.starts_with(path))
+            || self.files.iter().any(|g| g.starts_with(path) && g != path)
+    }
 }
 
 struct Env {
@@ -459,12 +488,11 @@ struct Env {
     covered: Vec<PathBuf>,
     /// The guard rules for the home directory.
     guard: Vec<GuardRule>,
-    /// The paths of the read guard rules. No directory rule can contain one
-    /// of them.
-    guarded_read: Vec<PathBuf>,
-    /// The paths of the write guard rules. No read-write directory rule can
-    /// contain one of them.
-    guarded_write: Vec<PathBuf>,
+    /// The paths of the read guard rules. No rule can include one of them.
+    guarded_read: GuardPaths,
+    /// The paths of the write guard rules. No read-write rule can include
+    /// one of them.
+    guarded_write: GuardPaths,
 }
 
 impl Env {
@@ -500,7 +528,7 @@ impl Env {
     /// Return true if a directory is too broad for a rule.
     fn is_broad(&self, dir: &Path) -> bool {
         dir.components().count() <= 2
-            || self.guarded_read.iter().any(|g| g.starts_with(dir))
+            || self.guarded_read.covered_by_a_rule_on(dir)
             || self.home.as_ref().is_some_and(|home| {
                 home.starts_with(dir) || BROAD_HOME_DIRS.iter().any(|r| dir == home.join(r))
             })
@@ -514,12 +542,25 @@ impl Env {
     /// Return true if a directory is too broad for a read-write rule: it is
     /// broad, or it contains a path that the guard protects from writes.
     fn is_broad_for_write(&self, dir: &Path) -> bool {
-        self.is_broad(dir) || self.guarded_write.iter().any(|g| g.starts_with(dir))
+        self.is_broad(dir) || self.guarded_write.covered_by_a_rule_on(dir)
     }
 
     /// Return true if grouping can make a read-write rule on `dir`.
     fn can_group_for_write(&self, dir: &Path) -> bool {
         self.can_group(dir) && !self.is_broad_for_write(dir)
+    }
+
+    /// Return true if a rule on `path` with `access` is too wide.
+    ///
+    /// The limit holds for every rule, not only for a rule that the grouping
+    /// makes. One access on a broad directory (`open("~")`,
+    /// `mkdir ~/.config`) must give no rule on it. The accesses below the
+    /// directory keep their own rules.
+    fn is_too_wide(&self, access: FsAccess, path: &Path) -> bool {
+        match access {
+            FsAccess::ReadWrite => self.is_broad_for_write(path),
+            FsAccess::Read | FsAccess::Execute => self.is_broad(path),
+        }
     }
 
     fn is_cache(&self, path: &Path) -> bool {
@@ -696,17 +737,15 @@ fn fs_items(fs: &FsLog, env: &Env, order: &[String]) -> Vec<Item> {
         let Some(dir) = path.parent() else {
             continue;
         };
-        if env.is_broad_for_write(dir) {
-            // A temporary file in a broad directory gets no rule: its next
-            // name is not known. A broad directory that the program makes
-            // (for example `~/.local/share` in a new home) gets no rule: the
-            // rule goes on the child.
-            if !fs.is_transient(path) && !env.is_broad(path) {
-                rw.insert(path.clone());
-            }
-        } else {
+        if env.can_group_for_write(dir) {
             rw_dirs.insert(dir.to_path_buf());
             rw.insert(dir.to_path_buf());
+        } else if !fs.is_transient(path) {
+            // A directory that is too wide for a rule (a broad directory,
+            // the workspace or a parent of it) gets no rule. The file keeps
+            // its own rule. A temporary file gets no rule: its next name is
+            // not known.
+            rw.insert(path.clone());
         }
     }
     // Writes to existing files: two or more files in one directory give the
@@ -730,9 +769,20 @@ fn fs_items(fs: &FsLog, env: &Env, order: &[String]) -> Vec<Item> {
             rw.insert(dir.to_path_buf());
         }
     }
-    let rw = group(&rw, |p| rw_dirs.contains(p), |d| env.can_group_for_write(d));
+    // Every final rule keeps the limit of the grouping, also a rule that
+    // comes from one direct access. A rule that is too wide goes away before
+    // the next step, so it does not hide a narrower rule below it.
+    let rw: BTreeSet<PathBuf> = group(&rw, |p| rw_dirs.contains(p), |d| env.can_group_for_write(d))
+        .into_iter()
+        .filter(|p| !env.is_too_wide(FsAccess::ReadWrite, p))
+        .collect();
 
-    let exec: BTreeSet<PathBuf> = fs.execs.keys().map(|b| env.exec_dir(b)).collect();
+    let exec: BTreeSet<PathBuf> = fs
+        .execs
+        .keys()
+        .map(|b| env.exec_dir(b))
+        .filter(|p| !env.is_too_wide(FsAccess::Execute, p))
+        .collect();
 
     let wider_exists = |path: &Path| path.ancestors().any(|a| rw.contains(a) || exec.contains(a));
     let read: BTreeSet<PathBuf> = fs
@@ -741,7 +791,10 @@ fn fs_items(fs: &FsLog, env: &Env, order: &[String]) -> Vec<Item> {
         .map(|p| env.cache_root(p).unwrap_or_else(|| p.clone()))
         .filter(|p| !wider_exists(p))
         .collect();
-    let read = group(&read, |_| true, |d| env.can_group(d));
+    let read: BTreeSet<PathBuf> = group(&read, |_| true, |d| env.can_group(d))
+        .into_iter()
+        .filter(|p| !env.is_too_wide(FsAccess::Read, p))
+        .collect();
 
     let mut rules: BTreeSet<(FsAccess, PathBuf)> = BTreeSet::new();
     rules.extend(rw.into_iter().map(|p| (FsAccess::ReadWrite, p)));

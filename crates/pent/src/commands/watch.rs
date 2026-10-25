@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use pent_profile::{guard_rules, WatchEvent};
+use pent_profile::{guard_rules_with, WatchEvent};
 use pent_proxy::ProxyPolicy;
 use pent_sandbox::{
     build_env, spawn_watched, SandboxConfig, SandboxError, SandboxPaths, WatchOptions,
@@ -102,8 +102,13 @@ pub(crate) async fn watch(args: WatchArgs, cwd: PathBuf) -> Result<(), CliError>
     )
     .with_network(proxy.network.clone())
     .with_env(build_env(&[]));
+    // The guard protects the files of pent at their real place, also when
+    // $XDG_CONFIG_HOME or $XDG_STATE_HOME points outside of the defaults.
     let options = WatchOptions {
-        guard: guard_rules(&home),
+        guard: guard_rules_with(
+            &home,
+            &[store.dirs().config.clone(), store.dirs().state.clone()],
+        ),
     };
 
     let mut signals = SignalRelay::install()?;
@@ -141,14 +146,16 @@ pub(crate) async fn watch(args: WatchArgs, cwd: PathBuf) -> Result<(), CliError>
     forward_std(watched.events, event_tx.clone(), |e| e);
     forward_tokio(net_rx, event_tx, |e| e, &stop);
 
-    let mut write_failed = false;
+    // One event that pent cannot write must not stop the log: the rest of
+    // the run would be invisible in the review, the blocked attempts too.
+    // Pent skips the event, counts it, and warns one time.
+    let mut skipped: usize = 0;
     let mut sink = |event: WatchEvent| {
-        if write_failed {
-            return;
-        }
         if let Err(e) = log.append(&event) {
-            write_failed = true;
-            ui::warn(format!("cannot record an event: {e}"));
+            if skipped == 0 {
+                ui::warn(format!("cannot record an access: {e}; pent goes on"));
+            }
+            skipped = skipped.saturating_add(1);
         }
     };
     let (status, rest) =
@@ -158,6 +165,11 @@ pub(crate) async fn watch(args: WatchArgs, cwd: PathBuf) -> Result<(), CliError>
     proxy.shutdown().await;
     if drain(rest, FINAL_DRAIN, &mut sink).await.is_some() {
         ui::warn("the recorder did not finish in time; a process of the command can still run");
+    }
+    if skipped > 0 {
+        ui::warn(format!(
+            "pent did not record {skipped} accesses; the summary does not show them"
+        ));
     }
     drop(log);
     if !status.success() {
