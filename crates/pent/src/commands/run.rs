@@ -565,7 +565,8 @@ async fn setup_proxy(
     };
 
     if wants_proxy {
-        let mut proxy_config = ProxyConfig::try_from(&config.proxy).map_err(CliError::Other)?;
+        let mut proxy_config =
+            ProxyConfig::try_from(&config.proxy).map_err(|e| CliError::Other(e.to_string()))?;
         proxy_config.violation_tx = violation_tx;
         // On Linux, ProxyOnly routes child traffic from a separate network
         // namespace through a veth pair. Both the TCP proxy and DNS server must
