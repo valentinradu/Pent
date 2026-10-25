@@ -733,11 +733,6 @@ impl FsLog {
     }
 }
 
-/// Return true if a rule with access `wide` includes access `narrow`.
-fn includes(wide: FsAccess, narrow: FsAccess) -> bool {
-    wide == narrow || (narrow == FsAccess::Read && wide != FsAccess::Read)
-}
-
 /// Replace each group of at least [`DIR_THRESHOLD`] entries in one directory
 /// with one rule on the directory. Only the candidates for which `counts`
 /// returns true make a directory an entry of its parent.
@@ -863,14 +858,20 @@ fn fs_items(fs: &FsLog, env: &Env, order: &[String]) -> Vec<Item> {
     rules.extend(exec.into_iter().map(|p| (FsAccess::Execute, p)));
     rules.extend(read.into_iter().map(|p| (FsAccess::Read, p)));
 
+    // A rule that a rule above it already gives. The grouping can leave
+    // such a rule, for example a write to a file in a directory that is
+    // itself read-write.
+    //
+    // The condition looks only for the same access. A read below a
+    // read-write rule or below an execute rule goes away earlier, with
+    // `wider_exists`. That filter must stay before the grouping, because a
+    // read that stays counts for the grouping of the directory above it
+    // and widens the read rule. The test
+    // `a_read_below_a_read_write_rule_does_not_widen_a_read_rule` holds
+    // that order.
     let hidden = |access: FsAccess, path: &Path| {
-        path.ancestors().any(|a| {
-            [FsAccess::Read, FsAccess::ReadWrite, FsAccess::Execute]
-                .into_iter()
-                .filter(|&wide| includes(wide, access))
-                .filter(|&wide| a != path || wide != access)
-                .any(|wide| rules.contains(&(wide, a.to_path_buf())))
-        })
+        path.ancestors()
+            .any(|a| a != path && rules.contains(&(access, a.to_path_buf())))
     };
 
     let mut items = Vec::new();
@@ -1418,6 +1419,35 @@ mod tests {
             .map(|i| fs(Read, &format!("/home/u/.tool/f{i}"), "tool"))
             .collect();
         assert_eq!(run(&four), vec!["r ~/.tool | read by tool"]);
+    }
+
+    /// A read below a read-write rule must not widen the read rules.
+    ///
+    /// The summary drops such a read before the grouping. Without that
+    /// filter the dropped reads count for the grouping of the directory
+    /// above, and the profile gets a read rule on the whole directory in
+    /// place of a rule for each file.
+    #[test]
+    fn a_read_below_a_read_write_rule_does_not_widen_a_read_rule() {
+        let mut events = vec![
+            fs(Write, "/home/u/.tool/cache/one", "tool"),
+            fs(Write, "/home/u/.tool/cache/two", "tool"),
+        ];
+        for file in ["a", "b", "c", "d"] {
+            events.push(fs(Read, &format!("/home/u/.tool/cache/{file}"), "tool"));
+        }
+        for file in ["x", "y", "z"] {
+            events.push(fs(Read, &format!("/home/u/.tool/{file}"), "tool"));
+        }
+        assert_eq!(
+            run(&events),
+            vec![
+                "rw ~/.tool/cache | edits files",
+                "r ~/.tool/x | read by tool",
+                "r ~/.tool/y | read by tool",
+                "r ~/.tool/z | read by tool",
+            ]
+        );
     }
 
     #[test]
