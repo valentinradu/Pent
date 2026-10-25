@@ -310,6 +310,22 @@ mod tests {
         Ok(())
     }
 
+    /// A path that is neither a string nor an object gets an error that
+    /// names the two forms, so the user can repair the log.
+    #[test]
+    fn the_error_for_a_path_of_another_type_names_the_two_forms() {
+        let line = "{\"type\":\"fs\",\"op\":\"read\",\"path\":5,\
+                    \"process\":{\"pid\":1,\"name\":\"p\"},\"outcome\":{\"kind\":\"allowed\"}}";
+        let message = match WatchEvent::from_json_line(line) {
+            Ok(event) => format!("a number must not parse as a path: {event:?}"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            message.contains("a path as a string, or an object with the field \"bytes\""),
+            "{message}"
+        );
+    }
+
     /// A log of an earlier version holds the path as a plain string.
     #[test]
     fn a_path_as_a_plain_string_still_reads() -> Result<(), serde_json::Error> {
