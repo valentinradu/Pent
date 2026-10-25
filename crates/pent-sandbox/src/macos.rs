@@ -1218,6 +1218,10 @@ pub fn spawn_with_sandbox(
 ) -> Result<std::process::Child, SandboxError> {
     use std::process::{Command, Stdio};
 
+    // The profile is the whole policy of the run. With `-v` the user, and
+    // a test, can read the text that the kernel gets.
+    tracing::debug!(%profile, "the Seatbelt profile of the run");
+
     let mut command = Command::new("/usr/bin/sandbox-exec");
     command.arg("-p");
     command.arg(profile);

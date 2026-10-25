@@ -195,7 +195,9 @@ mod macos {
             stderr(&out)
         );
 
-        let out = env.pent(&["run", "--profile", "p", "--", script])?;
+        // `-v` makes pent log the profile that it gives to the kernel, so
+        // a failure shows the rule that lets the program run (MAC-4).
+        let out = env.pent(&["-v", "run", "--profile", "p", "--", script])?;
         // When the binary runs, the next question is whether the kernel
         // denies this path at all. The probe is a profile of the same
         // shape as the one that pent writes: `(allow default)`, then
