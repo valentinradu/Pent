@@ -13,10 +13,14 @@
 //! only on macOS where `sandbox-exec` is available. They are skipped at
 //! runtime on other platforms or when `sandbox-exec` is absent.
 
+mod common;
+
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
 use tempfile::TempDir;
+
+use common::{Xdg, PENT, TEST_PROFILE};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -24,24 +28,20 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 // Infrastructure
 // ============================================================================
 
-/// Path to the compiled `pent` binary, injected by Cargo at compile time.
-const PENT: &str = env!("CARGO_BIN_EXE_pent");
-
 /// Invoke `pent` with the given arguments in `cwd` and return the full Output.
 ///
-/// A `config` subcommand reads the global config and writes the trust store.
-/// For these commands, `HOME` and `XDG_CONFIG_HOME` point into `cwd/.test-home`,
-/// thus the test does not read or change the real user config.
+/// `XDG_CONFIG_HOME` and `XDG_STATE_HOME` point into `cwd/.test-home`, thus
+/// the test does not read or change the real user config.
 #[allow(clippy::panic)] // infrastructure helper: spawn failure is a hard test setup error
 fn run_pent(cwd: &Path, args: &[&str]) -> Output {
-    let mut cmd = Command::new(PENT);
-    cmd.args(args).current_dir(cwd).env_remove("PENT_LOG"); // keep test output clean
-    if args.first() == Some(&"config") {
-        let home = cwd.join(".test-home");
-        cmd.env("HOME", &home)
-            .env("XDG_CONFIG_HOME", home.join(".config"));
-    }
-    cmd.output()
+    let home = cwd.join(".test-home");
+    Command::new(PENT)
+        .args(args)
+        .current_dir(cwd)
+        .env_remove("PENT_LOG") // keep test output clean
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_STATE_HOME", home.join(".local/state"))
+        .output()
         .unwrap_or_else(|e| panic!("Failed to spawn pent binary: {e}"))
 }
 
@@ -103,19 +103,26 @@ fn sys_exec_args() -> Vec<String> {
     ]
 }
 
-/// Invoke `pent run --no-config [extra_args] -- [cmd_args]` in `workspace`.
-#[allow(clippy::panic)] // infrastructure helper: spawn failure is a hard test setup error
+/// Invoke `pent run --profile pent-test [extra_args] -- [cmd_args]` in
+/// `workspace`.
+///
+/// The profile is empty and trusted, in temporary XDG directories. `HOME`
+/// stays the real home directory, so that the tests can place files outside
+/// the sandbox defaults.
+#[allow(clippy::panic)] // infrastructure helper: setup failure is a hard test setup error
 fn sandboxed_run(workspace: &Path, extra_args: &[String], cmd_args: &[&str]) -> Output {
-    let mut args: Vec<String> = vec!["run".into(), "--no-config".into()];
+    let xdg = Xdg::new().unwrap_or_else(|e| panic!("cannot make the XDG directories: {e}"));
+    xdg.install_profile(TEST_PROFILE, "")
+        .unwrap_or_else(|e| panic!("cannot install the test profile: {e}"));
+    let mut args: Vec<String> = vec!["run".into(), "--profile".into(), TEST_PROFILE.into()];
     args.extend_from_slice(extra_args);
     args.push("--".into());
     for a in cmd_args {
         args.push((*a).to_string());
     }
-    Command::new(PENT)
+    xdg.apply(&mut Command::new(PENT))
         .args(&args)
         .current_dir(workspace)
-        .env_remove("PENT_LOG")
         .output()
         .unwrap_or_else(|e| panic!("Failed to spawn pent: {e}"))
 }
@@ -136,13 +143,17 @@ fn home_path(name: &str) -> Option<std::path::PathBuf> {
 // ============================================================================
 
 #[test]
-fn test_config_init_creates_project_config() -> TestResult {
+fn test_config_init_creates_global_config() -> TestResult {
     let dir = TempDir::new()?;
     let out = run_pent(dir.path(), &["config", "init"]);
     expect_success(&out);
 
-    let config_path = dir.path().join(".pent").join("pent.toml");
-    assert!(config_path.exists(), ".pent/pent.toml was not created");
+    let config_path = dir.path().join(".test-home/.config/pent/pent.toml");
+    assert!(config_path.exists(), "pent.toml was not created");
+    assert!(
+        !dir.path().join(".pent").exists(),
+        "pent has no project config now"
+    );
     let contents = fs::read_to_string(&config_path)?;
     assert!(
         toml::from_str::<toml::Value>(&contents).is_ok(),
@@ -218,36 +229,6 @@ fn test_config_show_without_config_file_uses_defaults() -> TestResult {
     let json: serde_json::Value = serde_json::from_str(&stdout)?;
     assert!(json.get("sandbox").is_some());
     assert!(json.get("proxy").is_some());
-    Ok(())
-}
-
-#[test]
-fn test_config_project_overrides_domain_allowlist() -> TestResult {
-    let dir = TempDir::new()?;
-
-    // Write a project config with a specific domain
-    let dot_pent = dir.path().join(".pent");
-    fs::create_dir_all(&dot_pent)?;
-    fs::write(
-        dot_pent.join("pent.toml"),
-        "[proxy]\ndomain_allowlist = [\"project-domain.example\"]\n",
-    )?;
-    // Pent applies a project config only after the user trusts it.
-    expect_success(&run_pent(dir.path(), &["config", "trust", "--yes"]));
-
-    let out = run_pent(dir.path(), &["config", "show", "--format", "json"]);
-    let stdout = expect_success(&out);
-    let json: serde_json::Value = serde_json::from_str(&stdout)?;
-
-    let allowlist = json["proxy"]["domain_allowlist"]
-        .as_array()
-        .ok_or("domain_allowlist should be an array")?;
-    assert!(
-        allowlist
-            .iter()
-            .any(|v| v.as_str() == Some("project-domain.example")),
-        "Expected project-domain.example in allowlist, got: {allowlist:?}"
-    );
     Ok(())
 }
 
@@ -609,188 +590,6 @@ fn test_run_env_explicit_kv_sets_variable() -> TestResult {
 }
 
 // ============================================================================
-// G. Run — --no-config flag
-// ============================================================================
-
-#[test]
-fn test_run_no_config_ignores_project_config() -> TestResult {
-    if !sandbox_available() {
-        return Ok(());
-    }
-
-    let dir = TempDir::new()?;
-
-    // Create a project config that requests blocked networking.
-    // With --no-config this should be ignored and defaults apply.
-    let dot_pent = dir.path().join(".pent");
-    fs::create_dir_all(&dot_pent)?;
-    fs::write(
-        dot_pent.join("pent.toml"),
-        "[sandbox.network]\nmode = \"blocked\"\n",
-    )?;
-
-    // sandboxed_run already passes --no-config; echo should succeed even
-    // though the project config requests blocked networking.
-    let out = sandboxed_run(dir.path(), &sys_exec_args(), &["/bin/echo", "no-config"]);
-    let stdout = expect_success(&out);
-    assert!(stdout.contains("no-config"));
-    Ok(())
-}
-
-// ============================================================================
-// H. Run — extra config file via --config flag
-// ============================================================================
-
-// ============================================================================
-// I. Profile add / rm commands
-// ============================================================================
-
-#[test]
-fn test_config_add_creates_config_if_missing() -> TestResult {
-    let dir = TempDir::new()?;
-    let config_path = dir.path().join(".pent").join("pent.toml");
-    assert!(!config_path.exists());
-
-    let out = run_pent(dir.path(), &["config", "add", "@cargo"]);
-    expect_success(&out);
-
-    assert!(config_path.exists(), "config should be created by add");
-    Ok(())
-}
-
-#[test]
-fn test_config_add_writes_domains() -> TestResult {
-    let dir = TempDir::new()?;
-    let out = run_pent(dir.path(), &["config", "add", "@npm"]);
-    expect_success(&out);
-
-    let config_path = dir.path().join(".pent").join("pent.toml");
-    let contents = fs::read_to_string(&config_path)?;
-    assert!(
-        contents.contains("registry.npmjs.org"),
-        "Expected registry.npmjs.org in config after adding @npm: {contents}"
-    );
-    Ok(())
-}
-
-#[test]
-fn test_config_add_npm_also_adds_node() -> TestResult {
-    let dir = TempDir::new()?;
-    let out = run_pent(dir.path(), &["config", "add", "@npm"]);
-    expect_success(&out);
-
-    // @npm depends on @node; @node adds traversal: ~ on all platforms
-    let config_path = dir.path().join(".pent").join("pent.toml");
-    let contents = fs::read_to_string(&config_path)?;
-    assert!(
-        contents.contains("\"~\""),
-        "Expected traversal '~' from @node profile after adding @npm: {contents}"
-    );
-
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("@node"),
-        "Expected '@node' in add stderr: {stderr}"
-    );
-    Ok(())
-}
-
-#[test]
-fn test_config_add_deduplicates() -> TestResult {
-    let dir = TempDir::new()?;
-    expect_success(&run_pent(dir.path(), &["config", "add", "@npm"]));
-    expect_success(&run_pent(dir.path(), &["config", "add", "@npm"]));
-
-    let config_path = dir.path().join(".pent").join("pent.toml");
-    let contents = fs::read_to_string(&config_path)?;
-    let count = contents.matches("registry.npmjs.org").count();
-    assert_eq!(
-        count, 1,
-        "registry.npmjs.org should appear exactly once: {contents}"
-    );
-    Ok(())
-}
-
-#[test]
-fn test_config_rm_removes_domains() -> TestResult {
-    let dir = TempDir::new()?;
-    expect_success(&run_pent(dir.path(), &["config", "add", "@npm"]));
-    expect_success(&run_pent(dir.path(), &["config", "rm", "@npm"]));
-
-    let config_path = dir.path().join(".pent").join("pent.toml");
-    let contents = fs::read_to_string(&config_path)?;
-    assert!(
-        !contents.contains("registry.npmjs.org"),
-        "registry.npmjs.org should be removed after rm @npm: {contents}"
-    );
-    Ok(())
-}
-
-#[test]
-fn test_config_rm_node_blocked_by_gemini() -> TestResult {
-    let dir = TempDir::new()?;
-    expect_success(&run_pent(dir.path(), &["config", "add", "@gemini"]));
-
-    let out = run_pent(dir.path(), &["config", "rm", "@node"]);
-    expect_failure(&out);
-
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("@gemini") || stderr.contains("depends"),
-        "Expected error mentioning @gemini dependency: {stderr}"
-    );
-    Ok(())
-}
-
-#[test]
-fn test_config_rm_gemini_node_together_succeeds() -> TestResult {
-    let dir = TempDir::new()?;
-    expect_success(&run_pent(dir.path(), &["config", "add", "@gemini"]));
-
-    let out = run_pent(dir.path(), &["config", "rm", "@gemini", "@node"]);
-    expect_success(&out);
-
-    let config_path = dir.path().join(".pent").join("pent.toml");
-    let contents = fs::read_to_string(&config_path)?;
-    assert!(
-        !contents.contains("generativelanguage.googleapis.com"),
-        "gemini domains should be removed: {contents}"
-    );
-    Ok(())
-}
-
-#[test]
-fn test_config_add_multiple_profiles() -> TestResult {
-    let dir = TempDir::new()?;
-    let out = run_pent(dir.path(), &["config", "add", "@npm", "@cargo", "@gh"]);
-    expect_success(&out);
-
-    let config_path = dir.path().join(".pent").join("pent.toml");
-    let contents = fs::read_to_string(&config_path)?;
-    assert!(
-        contents.contains("registry.npmjs.org"),
-        "npm domain missing"
-    );
-    assert!(contents.contains("crates.io"), "cargo domain missing");
-    assert!(contents.contains("github.com"), "gh domain missing");
-    Ok(())
-}
-
-#[test]
-fn test_config_add_unknown_profile_fails() -> TestResult {
-    let dir = TempDir::new()?;
-    let out = run_pent(dir.path(), &["config", "add", "@not-a-real-profile"]);
-    expect_failure(&out);
-
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("unknown") || stderr.contains("@not-a-real-profile"),
-        "Expected error about unknown profile: {stderr}"
-    );
-    Ok(())
-}
-
-// ============================================================================
 // J. MCP server accessibility — localhost connectivity in proxy_only mode
 // ============================================================================
 
@@ -837,48 +636,6 @@ fn test_proxy_mode_allows_localhost_mcp_connection() -> TestResult {
     Ok(())
 }
 
-#[test]
-fn test_run_extra_config_merges_domain_allowlist() -> TestResult {
-    // Verify that an additional config file passed via --config is merged into
-    // the effective configuration. We test this at the `config show` level.
-    let dir = TempDir::new()?;
-    let extra_cfg = dir.path().join("extra.toml");
-    fs::write(
-        &extra_cfg,
-        "[proxy]\ndomain_allowlist = [\"extra-domain.example\"]\n",
-    )?;
-
-    // Write a project config with a base domain
-    let dot_pent = dir.path().join(".pent");
-    fs::create_dir_all(&dot_pent)?;
-    fs::write(
-        dot_pent.join("pent.toml"),
-        "[proxy]\ndomain_allowlist = [\"base-domain.example\"]\n",
-    )?;
-    // Pent applies a project config only after the user trusts it.
-    expect_success(&run_pent(dir.path(), &["config", "trust", "--yes"]));
-
-    // `pent run --config extra.toml --no-config echo` would skip project config
-    // but load the extra one. Instead we test via a `run` that exits immediately.
-    // Simpler: use `config show` (no --config option on config show, so test
-    // via the run command's config loading indirectly).
-    //
-    // For now, just verify the project config is reflected in config show.
-    let out = run_pent(dir.path(), &["config", "show", "--format", "json"]);
-    let stdout = expect_success(&out);
-    let json: serde_json::Value = serde_json::from_str(&stdout)?;
-    let allowlist = json["proxy"]["domain_allowlist"]
-        .as_array()
-        .ok_or("domain_allowlist should be an array")?;
-    assert!(
-        allowlist
-            .iter()
-            .any(|v| v.as_str() == Some("base-domain.example")),
-        "Expected base-domain.example in allowlist, got: {allowlist:?}"
-    );
-    Ok(())
-}
-
 // ============================================================================
 // K. Run — --execute flag
 // ============================================================================
@@ -897,11 +654,9 @@ fn test_execute_flag_allows_binary() -> TestResult {
         println!("SKIP: /usr/bin/true does not exist on this system");
         return Ok(());
     }
-    let out = run_pent(
+    let out = sandboxed_run(
         std::path::Path::new("/tmp"),
         &[
-            "run",
-            "--no-config",
             "--network",
             "unrestricted",
             "--execute",
@@ -916,9 +671,9 @@ fn test_execute_flag_allows_binary() -> TestResult {
             "/lib",
             "--read",
             "/lib64",
-            "--",
-            "/usr/bin/true",
-        ],
+        ]
+        .map(String::from),
+        &["/usr/bin/true"],
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     // Skip if the sandbox itself cannot be set up (overlay requires privileges).
@@ -933,118 +688,6 @@ fn test_execute_flag_allows_binary() -> TestResult {
     assert!(
         out.status.success(),
         "pent --execute /usr/bin --read /usr/bin -- /usr/bin/true should succeed\nstderr: {stderr}",
-    );
-    Ok(())
-}
-
-// ============================================================================
-// N. Profile content verification (all platforms)
-// ============================================================================
-
-#[test]
-fn test_config_add_claude_has_correct_domains_and_paths() -> TestResult {
-    let dir = TempDir::new()?;
-    expect_success(&run_pent(dir.path(), &["config", "add", "@claude"]));
-
-    let contents = fs::read_to_string(dir.path().join(".pent").join("pent.toml"))?;
-    assert!(
-        contents.contains("api.anthropic.com"),
-        "@claude missing api.anthropic.com: {contents}"
-    );
-    assert!(
-        contents.contains("statsig.anthropic.com"),
-        "@claude missing statsig.anthropic.com: {contents}"
-    );
-    assert!(
-        contents.contains("~/.claude\""),
-        "@claude missing ~/.claude path: {contents}"
-    );
-    assert!(
-        contents.contains("~/.local/share/claude"),
-        "@claude missing ~/.local/share/claude: {contents}"
-    );
-    assert!(
-        contents.contains("api.github.com"),
-        "@claude missing api.github.com (marketplace): {contents}"
-    );
-    assert!(
-        contents.contains("raw.githubusercontent.com"),
-        "@claude missing raw.githubusercontent.com (marketplace): {contents}"
-    );
-    Ok(())
-}
-
-#[test]
-#[cfg(target_os = "macos")]
-fn test_config_add_claude_has_macos_app_support_path() -> TestResult {
-    let dir = TempDir::new()?;
-    expect_success(&run_pent(dir.path(), &["config", "add", "@claude"]));
-
-    let contents = fs::read_to_string(dir.path().join(".pent").join("pent.toml"))?;
-    assert!(
-        contents.contains("Application Support/claude"),
-        "@claude missing ~/Library/Application Support/claude on macOS: {contents}"
-    );
-    Ok(())
-}
-
-#[test]
-fn test_config_add_codex_has_correct_domains_and_paths() -> TestResult {
-    let dir = TempDir::new()?;
-    expect_success(&run_pent(dir.path(), &["config", "add", "@codex"]));
-
-    let contents = fs::read_to_string(dir.path().join(".pent").join("pent.toml"))?;
-    assert!(
-        contents.contains("api.openai.com"),
-        "@codex missing api.openai.com: {contents}"
-    );
-    assert!(
-        contents.contains("~/.codex"),
-        "@codex missing ~/.codex path: {contents}"
-    );
-    Ok(())
-}
-
-#[test]
-fn test_config_add_gemini_has_correct_domains_and_paths() -> TestResult {
-    let dir = TempDir::new()?;
-    expect_success(&run_pent(dir.path(), &["config", "add", "@gemini"]));
-
-    let contents = fs::read_to_string(dir.path().join(".pent").join("pent.toml"))?;
-    assert!(
-        contents.contains("generativelanguage.googleapis.com"),
-        "@gemini missing generativelanguage.googleapis.com: {contents}"
-    );
-    assert!(
-        contents.contains("~/.gemini") || contents.contains("gemini-cli"),
-        "@gemini missing data path (~/.gemini or gemini-cli): {contents}"
-    );
-    Ok(())
-}
-
-#[test]
-fn test_config_add_output_shows_file_path() -> TestResult {
-    let dir = TempDir::new()?;
-    let out = run_pent(dir.path(), &["config", "add", "@cargo"]);
-    expect_success(&out);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("pent.toml"),
-        "Expected pent.toml path in add stderr: {stderr}"
-    );
-    Ok(())
-}
-
-#[test]
-fn test_config_rm_output_shows_file_path() -> TestResult {
-    let dir = TempDir::new()?;
-    expect_success(&run_pent(dir.path(), &["config", "add", "@cargo"]));
-    let out = run_pent(dir.path(), &["config", "rm", "@cargo"]);
-    expect_success(&out);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("pent.toml"),
-        "Expected pent.toml path in rm stderr: {stderr}"
     );
     Ok(())
 }
@@ -1070,10 +713,10 @@ mod no_hang {
     /// Spawn `pent` with `args` in `dir`; kill it if it has not exited after
     /// `timeout_secs`.  Returns `(finished_before_deadline, stderr_text)`.
     ///
-    /// `home` must be an empty temp dir — it is set as `$HOME` so the real
-    /// `~/.config/pent/pent.toml` global config is invisible to pent.
-    /// `XDG_CONFIG_HOME` and `XDG_DATA_HOME` are also cleared so they cannot
-    /// override the isolated home.
+    /// `home` must be a temp dir from [`profile_home`] — it is set as `$HOME`
+    /// so the real `~/.config/pent` is invisible to pent.
+    /// `XDG_CONFIG_HOME`, `XDG_STATE_HOME` and `XDG_DATA_HOME` are also
+    /// cleared so they cannot override the isolated home.
     /// stdout is discarded (`Stdio::null`) — we only capture stderr for
     /// diagnostics.  stderr is drained in a background thread so the child
     /// can never block on a full pipe.
@@ -1084,6 +727,7 @@ mod no_hang {
             .current_dir(dir)
             .env("HOME", home)
             .env_remove("XDG_CONFIG_HOME")
+            .env_remove("XDG_STATE_HOME")
             .env_remove("XDG_DATA_HOME")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -1118,6 +762,28 @@ mod no_hang {
         (exited, stderr)
     }
 
+    /// Make a temp `$HOME` with the trusted profile `name` (content `toml`).
+    #[allow(clippy::unwrap_used, clippy::panic)] // infrastructure helper: setup failures are hard test setup errors
+    fn profile_home(name: &str, toml: &str) -> TempDir {
+        let home = TempDir::new().unwrap();
+        let drafts = home.path().join(".local/state/pent/drafts");
+        fs::create_dir_all(&drafts).unwrap();
+        fs::write(drafts.join(format!("{name}.toml")), toml).unwrap();
+        let status = Command::new(PENT)
+            .args(["trust", name, "--yes"])
+            .env("HOME", home.path())
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("XDG_STATE_HOME")
+            .env_remove("XDG_DATA_HOME")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap_or_else(|e| panic!("pent trust {name}: {e}"));
+        assert!(status.success(), "pent trust {name} --yes failed");
+        home
+    }
+
     /// Find `name` via `which`; fall back to `~/.local/bin/<name>`.
     fn detect_binary(name: &str) -> Option<std::path::PathBuf> {
         if let Ok(out) = Command::new("which").arg(name).output() {
@@ -1139,11 +805,11 @@ mod no_hang {
     #[test]
     fn system_true_exits_quickly() -> TestResult {
         let dir = TempDir::new()?;
-        let home = TempDir::new()?;
+        let home = profile_home(TEST_PROFILE, "");
         let (ok, stderr) = pent_timeout(
             dir.path(),
             home.path(),
-            &["run", "--no-config", "--", "/usr/bin/true"],
+            &["run", "--profile", TEST_PROFILE, "--", "/usr/bin/true"],
             2,
         );
         assert!(
@@ -1157,13 +823,14 @@ mod no_hang {
     #[test]
     fn system_true_blocked_network_exits_quickly() -> TestResult {
         let dir = TempDir::new()?;
-        let home = TempDir::new()?;
+        let home = profile_home(TEST_PROFILE, "");
         let (ok, stderr) = pent_timeout(
             dir.path(),
             home.path(),
             &[
                 "run",
-                "--no-config",
+                "--profile",
+                TEST_PROFILE,
                 "--network",
                 "blocked",
                 "--",
@@ -1186,11 +853,18 @@ mod no_hang {
             return Ok(());
         }
         let dir = TempDir::new()?;
-        let home = TempDir::new()?;
+        let home = profile_home(TEST_PROFILE, "");
         let (ok, stderr) = pent_timeout(
             dir.path(),
             home.path(),
-            &["run", "--no-config", "--", "/usr/bin/curl", "--version"],
+            &[
+                "run",
+                "--profile",
+                TEST_PROFILE,
+                "--",
+                "/usr/bin/curl",
+                "--version",
+            ],
             2,
         );
         assert!(
@@ -1213,11 +887,11 @@ mod no_hang {
         };
         let bin_s = bin.to_str().unwrap();
         let dir = TempDir::new().unwrap();
-        let home = TempDir::new().unwrap();
+        let home = profile_home(TEST_PROFILE, "");
         let (ok, stderr) = pent_timeout(
             dir.path(),
             home.path(),
-            &["run", "--no-config", "--", bin_s, "--version"],
+            &["run", "--profile", TEST_PROFILE, "--", bin_s, "--version"],
             5,
         );
         assert!(
@@ -1242,10 +916,9 @@ mod no_hang {
         assert_version_exits_quickly("gemini");
     }
 
-    // ── with-config: project pent.toml sets domain_allowlist → ProxyOnly ─────
+    // ── with a profile: the profile has domains → ProxyOnly ─────────────────
     //
-    // The project config lives only in the temp `dir` (.pent/pent.toml).
-    // The isolated `home` ensures no global config is loaded on top of it.
+    // The profile lives only in the isolated `home`.
 
     #[allow(clippy::unwrap_used)] // infrastructure helper: to_str()/TempDir failures are hard errors
     fn assert_proxy_mode_exits_quickly(name: &str) {
@@ -1256,23 +929,15 @@ mod no_hang {
         let bin_s = bin.to_str().unwrap();
 
         let dir = TempDir::new().unwrap();
-        let home = TempDir::new().unwrap();
-        let dot_pent = dir.path().join(".pent");
-        fs::create_dir_all(&dot_pent).unwrap();
-        fs::write(
-            dot_pent.join("pent.toml"),
-            "[proxy]\ndomain_allowlist = [\"api.anthropic.com\"]\n",
-        )
-        .unwrap();
-        // Pent applies a project config only after the user trusts it.
-        let (trusted, trust_stderr) =
-            pent_timeout(dir.path(), home.path(), &["config", "trust", "--yes"], 5);
-        assert!(trusted, "pent config trust --yes failed:\n{trust_stderr}");
+        let home = profile_home(
+            TEST_PROFILE,
+            "[network]\ndomains = [\"api.anthropic.com\"]\n",
+        );
 
         let (ok, stderr) = pent_timeout(
             dir.path(),
             home.path(),
-            &["run", "--", bin_s, "--version"],
+            &["run", "--profile", TEST_PROFILE, "--", bin_s, "--version"],
             5, // proxy + veth setup may take ~1s; allow 5s total
         );
         assert!(
@@ -1304,11 +969,12 @@ mod no_hang {
     // Isolation model:
     //   HOME            = real test-process HOME  (so ~/.npm-global, ~/.local/share/claude
     //                     etc. are reachable by the sandboxed binary)
-    //   XDG_CONFIG_HOME = fresh TempDir with @{agent} profile installed
+    //   XDG_CONFIG_HOME = fresh TempDir with the {agent} profile installed
     //   cwd             = fresh empty TempDir
     //
-    // Each test runs `pent config add --global @{agent}` into a temp HOME before
-    // spawning pent, so the agent's paths and network profile are active.
+    // Each test installs and trusts the {agent} profile (common::agent_profile)
+    // in a temp HOME before it spawns pent, so the agent's paths and network
+    // rules are active.
     //
     // Test flow:
     //   1. Wait up to 8s for PTY output that looks like a started TUI:
@@ -1352,9 +1018,10 @@ mod no_hang {
         let child = Command::new(PENT)
             .args(args)
             .current_dir(dir)
-            // Use the agent_home so the @{agent} global config is visible.
+            // Use the agent_home so the {agent} profile is visible.
             .env("HOME", agent_home)
             .env_remove("XDG_CONFIG_HOME")
+            .env_remove("XDG_STATE_HOME")
             .env_remove("XDG_DATA_HOME")
             .env_remove("PENT_LOG")
             .stdin(unsafe { Stdio::from_raw_fd(slave) })
@@ -1366,22 +1033,10 @@ mod no_hang {
         (master, child)
     }
 
-    /// Install the `@{agent}` global profile into a fresh temp HOME.
+    /// Install the trusted `{agent}` profile into a fresh temp HOME.
     /// Returns the TempDir (keep alive) — its path is used as HOME.
-    #[allow(clippy::unwrap_used, clippy::panic)] // infrastructure helper: config setup failures are hard test setup errors
     fn setup_agent_config(agent: &str) -> TempDir {
-        let home = TempDir::new().unwrap();
-        let status = Command::new(PENT)
-            .args(["config", "add", "--global", &format!("@{agent}")])
-            .env("HOME", home.path())
-            .env_remove("XDG_CONFIG_HOME")
-            .env_remove("XDG_DATA_HOME")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .unwrap_or_else(|e| panic!("pent config add @{agent}: {e}"));
-        assert!(status.success(), "pent config add --global @{agent} failed");
-        home
+        profile_home(agent, &common::agent_profile(agent))
     }
 
     /// Poll `master_fd` (non-blocking) for up to `timeout`.  Returns what arrived.
@@ -1488,7 +1143,7 @@ mod no_hang {
         text.lines().filter(|l| !l.trim().is_empty()).count() >= 2
     }
 
-    /// Core PTY TUI-start test: install `@{agent}` profile into a temp HOME,
+    /// Core PTY TUI-start test: install the `{agent}` profile into a temp HOME,
     /// spawn `pent run --network unrestricted -- <binary>` with a PTY, and
     /// confirm the TUI renders (≥ 2 non-empty lines after ANSI strip, no crash
     /// markers).  Then kill pent.  This test is purely about sandbox access —
@@ -1508,7 +1163,15 @@ mod no_hang {
         let (master, mut child) = spawn_with_pty(
             dir.path(),
             agent_home.path(),
-            &["run", "--network", "unrestricted", "--", bin_s],
+            &[
+                "run",
+                "--profile",
+                agent,
+                "--network",
+                "unrestricted",
+                "--",
+                bin_s,
+            ],
         );
 
         // Step 1: wait up to 8 s for the TUI to render.
