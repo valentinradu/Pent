@@ -105,6 +105,9 @@ impl UnixAddr {
 pub(crate) struct UnixPolicy {
     /// The canonical form of each path of the allowlist.
     allowed: Vec<PathBuf>,
+    /// The number of paths that the profile named. A path that does not
+    /// exist yet has no canonical form, so `allowed` can be shorter.
+    named: usize,
 }
 
 impl UnixPolicy {
@@ -117,13 +120,19 @@ impl UnixPolicy {
             .collect();
         allowed.sort();
         allowed.dedup();
-        Self { allowed }
+        Self {
+            allowed,
+            named: paths.len(),
+        }
     }
 
-    /// True if the allowlist has no path. The child then reaches no Unix
-    /// socket, and the filter refuses `socket(AF_UNIX, ...)` already.
-    pub(crate) fn is_empty(&self) -> bool {
-        self.allowed.is_empty()
+    /// True if the profile names no Unix socket. The child then needs no
+    /// Unix socket of its own, and the filter refuses the whole family.
+    ///
+    /// The test uses the paths of the profile, not the paths that exist:
+    /// a daemon can make its socket after the start of the child.
+    pub(crate) fn names_nothing(&self) -> bool {
+        self.named == 0
     }
 
     /// The canonical path to connect to, if `addr` is on the allowlist.
@@ -457,7 +466,7 @@ mod tests {
         let _listener = UnixListener::bind(&real)?;
         std::os::unix::fs::symlink(&real, dir.join("link.sock"))?;
         let policy = UnixPolicy::new(std::slice::from_ref(&real));
-        assert!(!policy.is_empty());
+        assert!(!policy.names_nothing());
         assert!(policy.permits(&UnixAddr::Path(real.clone())));
         assert!(policy.permits(&UnixAddr::Path(dir.join("link.sock"))));
         assert!(!policy.permits(&UnixAddr::Path(dir.join("other.sock"))));
@@ -467,7 +476,11 @@ mod tests {
             policy.outcome(&UnixAddr::Abstract("n".into())),
             Outcome::Denied
         );
-        assert!(UnixPolicy::new(&[dir.join("missing.sock")]).is_empty());
+        // A path that does not exist yet still counts as a named socket.
+        let pending = UnixPolicy::new(&[dir.join("missing.sock")]);
+        assert!(!pending.names_nothing());
+        assert!(!pending.permits(&UnixAddr::Path(dir.join("missing.sock"))));
+        assert!(UnixPolicy::new(&[]).names_nothing());
         Ok(())
     }
 

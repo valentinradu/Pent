@@ -892,7 +892,7 @@ pub(crate) fn start_recorder(plan: RecorderPlan) -> Result<RecorderSetup, Sandbo
     // The filter then removes the family, which closes the ways that the
     // supervisor cannot watch (`sendto`, and a change of the address family
     // after the test).
-    let socket_rule = if plan.unix.enforces() && plan.unix.policy().is_empty() {
+    let socket_rule = if plan.unix.enforces() && plan.unix.policy().names_nothing() {
         UnixSocketRule::Refuse
     } else {
         UnixSocketRule::Allow

@@ -2439,6 +2439,10 @@ pub(crate) fn spawn_linux(
     // Drop the parent copy of the socket end of the child. The supervisor
     // then sees EOF if the child died before it sent the listener.
     let events = recorder.map(crate::linux_watch::RecorderSetup::into_events);
+    // A recorder that only controls the Unix socket connections makes no
+    // event. The caller gets no channel, so it starts no reader. The
+    // supervisor then sends into a closed channel and ignores the error.
+    let events = if record { events } else { None };
 
     let mut child = spawn_result.map_err(SandboxError::SpawnFailed)?;
     // `spawn` returns after the `exec` of the child, so the child has sent
