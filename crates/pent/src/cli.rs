@@ -71,6 +71,12 @@ pub(crate) struct RunArgs {
     #[arg(long = "traverse", value_name = "PATH")]
     pub traverse: Vec<PathBuf>,
 
+    /// Let the command connect to this Unix socket for this run. The rule
+    /// is strong: a program that reaches the socket of an agent can use the
+    /// key of that agent (repeatable)
+    #[arg(long = "unix-socket", value_name = "PATH")]
+    pub unix_socket: Vec<PathBuf>,
+
     /// Allow or set an environment variable (KEY or KEY=VALUE; repeatable)
     #[arg(long = "env", value_name = "KEY[=VALUE]")]
     pub env: Vec<String>,
@@ -118,6 +124,17 @@ pub(crate) struct WatchArgs {
     /// Do not ask before the start (for scripts)
     #[arg(long, short = 'y')]
     pub yes: bool,
+
+    /// Network containment mode. This flag has precedence over --allow.
+    /// Without it and without --allow, the network is open: the proxy
+    /// observes each request and allows each domain
+    #[arg(long, value_enum)]
+    pub network: Option<NetworkModeArg>,
+
+    /// Add a domain to the proxy allowlist for this run. The proxy then
+    /// enforces the allowlist and refuses each other domain (repeatable)
+    #[arg(long = "allow", value_name = "DOMAIN")]
+    pub allow: Vec<String>,
 
     /// Command and arguments to record
     #[arg(trailing_var_arg = true, required = true, value_name = "COMMAND")]

@@ -275,6 +275,18 @@ impl SandboxPaths {
     }
 }
 
+/// Expand a leading `~` component in `path` to the home directory of the
+/// user.
+///
+/// The path does not change when the home directory is not known or when the
+/// first component is not `~`. Use this function for a list that
+/// [`SandboxPaths`] does not hold, for example the Unix sockets of a
+/// profile.
+#[must_use]
+pub fn expand_home(path: &Path) -> PathBuf {
+    expand_tilde(path, dirs::home_dir().as_deref())
+}
+
 /// Expand a leading `~` component in `path` to `home`.
 ///
 /// The path does not change when `home` is `None` or when the first component
