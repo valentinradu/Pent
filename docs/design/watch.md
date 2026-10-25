@@ -134,9 +134,21 @@ and answers `SECCOMP_USER_NOTIF_FLAG_CONTINUE`. The filter returns `ENOSYS` for
 `io_uring_setup`, because seccomp does not see io_uring operations. Runtimes
 then use normal syscalls.
 
-The recorder observes only. Pent never uses seccomp-notify for enforcement: the
-path is in the memory of the process, and another thread can change it after
-the check.
+For a path the recorder observes only. Pent never uses seccomp-notify to
+enforce a path rule: the path is in the memory of the process, and another
+thread can change it after the check.
+
+`connect` is the exception. The supervisor does not answer `CONTINUE`
+there; in `pent run` it makes each permitted connection itself and gives
+the connected socket to the child, so no thread can change the address
+after the check. Watch mode does not enforce the list: it marks each
+connection with the decision that `pent run` would make, and the review
+proposes the path (the `unix_sockets` key of the profile).
+
+The child of a watch run also gets a PID namespace and a private `proc`,
+as a `pent run` child does, so the program sees only the processes of the
+sandbox. PID 1 of the namespace waits up to five seconds for the orphans
+of the program, so their events still reach the recorder.
 
 **macOS (filesystem).** A Seatbelt profile that allows each operation
 `(with report)`, plus the guard denies. Pent reads the reports from

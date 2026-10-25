@@ -17,59 +17,99 @@ message when the sandbox or `python3` is not available.
 
 | ID | Severity | Attack | State | Test |
 |----|----------|--------|-------|------|
-| LS-1 | High | The child connects to a path Unix socket outside its profile. | Open in part | `test_unix_socket_connect_outside_profile` |
+| LS-1 | High | The child connects to a path Unix socket outside its profile. | Fixed | `test_unix_socket_connect_outside_profile` |
 | LS-2 | Low | The child reads and changes host files under `/tmp`. | Fixed | `test_tmp_not_shared_with_host` |
 | LS-3 | Medium | The child reads the command line of a host process. | Fixed | `test_proc_cmdline_of_host_process_denied` |
 
 ### LS-1 — Path Unix socket connect bypasses the file allowlist
 
-**Severity: high. State: open in part.**
+**Severity: high. State: fixed.**
 
-**The attack.** Landlock does not control `connect(2)` on a Unix socket that
-has a path. The kernel also needs no file right to walk through a directory.
-So the child connects to any socket file whose path it can resolve, even when
-the socket is outside the profile and the directory is not on the allowlist.
+**The attack.** Landlock does not control `connect(2)` on a Unix socket
+that has a path. The kernel also needs no file right to walk through a
+directory. So the child connected to any socket file whose path it could
+resolve, even when the socket was outside the profile and the directory was
+not on the allowlist.
 
-The test proves this: the child reads a secret from a victim socket in a host
-directory that no profile names. A read of a plain file in the same directory
-is denied, but the socket connect succeeds.
+**The fix.** The supervisor makes each permitted connection itself. A
+check that answers `SECCOMP_USER_NOTIF_FLAG_CONTINUE` would not close the
+hole: the kernel reads the address again after the answer, so another
+thread of the child could change it. The code is
+`crates/pent-sandbox/src/linux_unixconn.rs`.
 
-**What is fixed.** Pent hides the directories that hold the dangerous
-sockets, not the names of the sockets. An empty tmpfs covers `/tmp`,
-`/var/tmp` and `/run` in the mount namespace of the child (see LS-2). This
-removes the socket of a terminal multiplexer, the system message bus, the
-`tailscaled` LocalAPI socket, the Docker and Podman sockets, the sockets of
-the host resolvers, and every socket that a daemon puts there in the future.
+1. The filter traps `connect(2)`. The supervisor reads the address one
+   time from the memory of the child.
+2. For an address family that is not `AF_UNIX` the supervisor answers
+   `CONTINUE`, as before.
+3. For an `AF_UNIX` address it never answers `CONTINUE` again. It resolves
+   a relative path against `/proc/<pid>/cwd` and compares the canonical
+   form with `SandboxConfig::unix_sockets`, which comes from the
+   `unix_sockets` key of the profile. A path that does not canonicalize is
+   refused.
+4. For a path on the list the supervisor reads the kind of the socket of
+   the child (`/proc/<pid>/fd/<fd>` gives the inode, `/proc/<pid>/net/unix`
+   gives the type), makes its own socket of that kind, connects it to the
+   canonical path, and gives it to the child with
+   `SECCOMP_IOCTL_NOTIF_ADDFD` and `SECCOMP_ADDFD_FLAG_SETFD`. The new
+   descriptor takes the number of the descriptor of the child, and the
+   answer carries the value 0. The supervisor does not use
+   `SECCOMP_ADDFD_FLAG_SEND`: that flag makes the system call return the
+   number of the new descriptor, and `connect(2)` must return 0. The child
+   waits in the notification during both steps, and a task that dies makes
+   both of them fail with `ENOENT`.
+5. Every other `AF_UNIX` address, an abstract name included, gets
+   `EACCES`.
 
-For the sockets that no private directory covers, pent covers each one with
-a read-only bind mount of `/dev/null`. The lists are `ESCAPE_SOCKETS`,
-`RESOLVER_SOCKETS` and `HOME_AGENT_SOCKETS` in
-`crates/pent-sandbox/src/linux.rs`. They hold the system message bus, the
-container sockets, the resolver and `tailscaled` sockets (only when the
-network is not `unrestricted`), and the agent sockets of the home directory
-(`~/.gnupg/S.gpg-agent*`, `~/.gnupg/S.dirmngr*`, `~/.ssh/agent.*`). Pent
-skips a mask when the configuration names the path (`is_explicitly_allowed`).
-The lists stay as data in one place, so a user setting can extend them later.
+The control needs the supervisor, so `pent run` starts the recorder also
+without `--trace`. Without `--trace` the filter traps only `connect` and
+the recorder makes no event. The cost is one notification for each
+connection of the child.
 
-**What stays open.** A fixed list of sockets can never be complete: the
-`tailscaled` socket proves it, and the next daemon with a dial or an exec
-operation proves it again. A socket in a directory that no private tmpfs
-covers is still reachable, and a socket that the profile names is still
-usable. Masking is the robust method today, because seccomp-notify cannot
-check the address safely: another thread of the program can change the
-address after the supervisor reads it and before the kernel uses it
-(a time-of-check to time-of-use race).
+**The second layer.** With an empty allowlist the child needs no Unix
+socket of its own. The filter then refuses `socket(AF_UNIX, ...)` with
+`EAFNOSUPPORT` in the BPF program. The domain of `socket(2)` is a
+register, so no thread can change it after the test. This closes the two
+ways that the `connect` control alone leaves open: a program with two
+threads that shows another address family to the supervisor and `AF_UNIX`
+to the kernel, and `sendto(2)`, which carries an address too. The default
+profile names no socket, so the default has neither way. `socketpair(2)`
+is another system call and stays allowed, so the usual IPC of a runtime
+keeps working.
 
-**The evidence.** `test_unix_socket_connect_outside_profile`. The child
-receives `VICTIM_SECRET` from a socket in the `outside/` directory. The test
-keeps its `#[ignore]` with the state above.
+**What the new descriptor cannot keep.** The socket of the child goes
+away and the socket of the supervisor takes its number:
 
-**The recommended fix.** Add a `connect(2)` filter to the supervisor. The
-filter cannot read the path from a pointer argument, so the supervisor must
-block the call and not let the kernel re-read the address: it answers the
-notification with an error for an `AF_UNIX` address that the allowlist does
-not hold, and it never answers `CONTINUE` for a path that it had to read from
-the memory of the child. Allow the proxy and DNS loopback sockets.
+- `SO_PEERCRED` on the other side names pent, not the child. The user and
+  the group are the same; the process identifier is not.
+- Socket options and a `bind(2)` before the `connect(2)` are lost.
+- A blocking connection ends after five seconds with `ETIMEDOUT`, where
+  the kernel would wait. The limit stops one notification from holding the
+  supervisor. A non-blocking socket keeps its timing: the supervisor
+  connects without blocking and passes `EAGAIN` back.
+- A refused call gives `EACCES`, also for a path that does not exist,
+  where the kernel would give `ENOENT`.
+- A socket that exists only in the private `/tmp` of the child has no host
+  path, so the profile cannot name it and the child cannot reach it.
+
+**What stays open.** With a non-empty allowlist, the two ways above come
+back for a hostile program: the address family is a value in memory, and
+`sendto(2)` is not trapped. A profile that names a socket thus trusts the
+program not to race the supervisor. The next step is a trap on `sendto`
+and a `socket(AF_UNIX)` trap that marks each Unix socket of the child.
+
+**The lower layer stays.** The private tmpfs over `/tmp`, `/var/tmp` and
+`/run` and the masks of `ESCAPE_SOCKETS`, `RESOLVER_SOCKETS` and
+`HOME_AGENT_SOCKETS` keep their place: they also hide the socket from a
+program that only lists a directory.
+
+**The evidence.** `test_unix_socket_connect_outside_profile` (no
+`#[ignore]` any more), and in `crates/pent-sandbox/src/linux_watch.rs`:
+`unix_connect_to_a_socket_on_the_list_works`,
+`unix_connect_outside_the_list_gets_eacces`,
+`unix_connect_to_an_abstract_name_is_refused`,
+`unix_connect_works_for_a_datagram_socket`,
+`a_tcp_connect_is_not_affected` and
+`an_empty_list_refuses_the_unix_family`.
 
 ### LS-2 — `/tmp` is read-write and shared with the host
 
@@ -194,8 +234,26 @@ What this changes, and how pent keeps it correct:
   supervisor closes every descriptor that it inherited, so the error pipe of
   `Command::spawn` ends and the spawn returns.
 
-Watch mode takes no PID namespace. It must not change how the program runs,
-and an orphan of the program must keep its events.
+Watch mode takes the PID namespace too. The first reason against it does
+not hold: the seccomp filter goes to each descendant, and
+`SECCOMP_IOCTL_NOTIF_RECV` names the task in the PID namespace of the
+reader, which is pent on the host. Thus an orphan that PID 1 of the
+sandbox adopts still makes events, and each event names the right
+process.
+
+The second reason does hold, and the fix is one line of policy. In run
+mode PID 1 exits with the command, and the kernel then ends every other
+process of the namespace. In watch mode that would end an orphan before
+it makes its events. Thus PID 1 of a watch run waits for the remaining
+processes before it exits, at most five seconds (`Orphans::Wait` in
+`linux.rs`). Five seconds is the limit that the CLI already gives to the
+last events of a watch run. A run without an orphan waits not at all: the
+first `waitpid` with `WNOHANG` gives `ECHILD`.
+
+The evidence for watch mode: `watch_proc_shows_only_the_sandbox` and
+`watch_keeps_the_events_of_a_double_forked_grandchild` in
+`crates/pent-sandbox/src/linux_watch.rs`, next to the older
+`watch_keeps_the_events_of_an_orphan`.
 
 **The evidence.** `test_proc_cmdline_of_host_process_denied`,
 `test_background_process_does_not_outlive_pent`,
@@ -239,6 +297,7 @@ Each test below passes. It guards a defense that works.
 | A read of a file outside the profile is denied. | `test_read_outside_profile_denied` |
 | A write of a file outside the profile is denied. | `test_write_outside_profile_denied` |
 | A connect to an abstract Unix socket of a host process fails. | `test_abstract_unix_socket_blocked` |
+| A connect to a path Unix socket outside the profile fails. | `test_unix_socket_connect_outside_profile` |
 | The user runtime directory `/run/user/<uid>` is an empty directory. | `test_runtime_dir_masked` |
 | A host file under `/tmp` is not visible. | `test_tmp_not_shared_with_host` |
 | A host socket in `/tmp` is not reachable. | `test_tmp_unix_socket_unreachable` |
@@ -254,6 +313,9 @@ Each test below passes. It guards a defense that works.
 
 ## The next step
 
-LS-1 is the only finding that stays open. Filter `connect(2)` on an
-`AF_UNIX` address in the supervisor, and keep the mask lists as the layer
-below it.
+Every finding of this report is fixed. The open points are smaller:
+
+- H-14 (above): `guard_rules_with` moves only the `PentFiles` rules to the
+  XDG directories of the session.
+- With a non-empty `unix_sockets` list, `sendto(2)` and the address family
+  of `connect(2)` stay time-of-check values (see LS-1).

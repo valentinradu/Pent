@@ -28,11 +28,12 @@
 //! outlives the command. `unshare(CLONE_NEWPID)` does not move the caller,
 //! so the `pre_exec` hook forks twice; see [`fork_pid_namespace`].
 //!
-//! Watch mode (`SpawnMode::Watch`) creates a user namespace and a mount
-//! namespace, but no PID namespace: it must not change how the program
-//! runs, and an orphan of the program must keep its events. It applies no
-//! Landlock, no overlay and no masks. The mount namespace holds the private
-//! directories and the mounts of the watch guard (see `linux_watch.rs`).
+//! Watch mode (`SpawnMode::Watch`) creates the same three namespaces. It
+//! applies no Landlock, no overlay and no masks. The mount namespace holds
+//! the private directories and the mounts of the watch guard (see
+//! `linux_watch.rs`). The PID namespace of watch mode differs in one
+//! point: PID 1 waits for the orphans of the program before it exits, so
+//! that the recorder gets their events (see [`Orphans`]).
 //!
 //! # Landlock architecture
 //!
@@ -294,15 +295,6 @@ impl RuleSink for PreparedRuleset {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct AccessPolicy {
     rules: Vec<(PathBuf, u64)>,
-    /// The paths that the private mounts hide (a connection to a socket
-    /// below them fails).
-    hidden: Vec<PathBuf>,
-    /// The paths that pent binds back inside a private directory. A path
-    /// below one of them stays reachable, also when a hidden path covers it.
-    visible: Vec<PathBuf>,
-    /// True if a connection to an abstract Unix socket outside the sandbox
-    /// fails (a new network namespace, or the Landlock scope of ABI v6).
-    abstract_denied: bool,
 }
 
 impl RuleSink for AccessPolicy {
@@ -354,24 +346,6 @@ impl AccessPolicy {
             pent_profile::Outcome::Allowed
         } else {
             pent_profile::Outcome::Denied
-        }
-    }
-
-    /// Predict the result of a `connect()` to the Unix socket `target` (a
-    /// path, or `@name` for an abstract socket).
-    #[must_use]
-    pub(crate) fn predict_unix(&self, target: &str) -> pent_profile::Outcome {
-        let denied = if target.starts_with('@') {
-            self.abstract_denied
-        } else {
-            let path = Path::new(target);
-            self.hidden.iter().any(|h| path.starts_with(h))
-                && !self.visible.iter().any(|v| path.starts_with(v))
-        };
-        if denied {
-            pent_profile::Outcome::Denied
-        } else {
-            pent_profile::Outcome::Allowed
         }
     }
 }
@@ -969,14 +943,66 @@ fn supervise_outer(init: libc::pid_t, status_fd: libc::c_int) -> ! {
     exit_like(status)
 }
 
+/// What PID 1 of the new namespace does with a process that outlives the
+/// command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Orphans {
+    /// End it. PID 1 exits with the command, and the kernel then ends
+    /// every other process of the namespace. `pent run` takes this: no
+    /// background process of the sandbox outlives the command.
+    End,
+    /// Wait for it, at most [`ORPHAN_GRACE_STEPS`] steps. `pent watch`
+    /// takes this: an orphan of the program must keep its events, and the
+    /// recorder reports an event only while the task runs.
+    Wait,
+}
+
+/// The length of one step of the wait for the orphans, in milliseconds.
+const ORPHAN_STEP_MS: libc::c_long = 50;
+
+/// The number of steps that PID 1 waits for the orphans in watch mode.
+/// 100 steps of 50 milliseconds are five seconds, the same limit that the
+/// CLI gives to the last events of a watch run.
+const ORPHAN_GRACE_STEPS: u32 = 100;
+
+/// Wait for the remaining children of this process, at most
+/// `ORPHAN_GRACE_STEPS` steps. Async-signal-safe: `waitpid` and
+/// `nanosleep` are both on the list.
+fn wait_for_orphans() {
+    let pause = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: ORPHAN_STEP_MS.saturating_mul(1_000_000),
+    };
+    for _ in 0..ORPHAN_GRACE_STEPS {
+        // SAFETY: waitpid(2) on the children of this process, with a null
+        // status pointer.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let done = unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) };
+        if done < 0 {
+            return; // ECHILD: no child is left.
+        }
+        if done > 0 {
+            continue; // Reap the next one at once.
+        }
+        // SAFETY: nanosleep(2) with a valid timespec and no remainder.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe { libc::nanosleep(&raw const pause, std::ptr::null_mut()) };
+    }
+}
+
 /// The supervisor that is PID 1 of the new PID namespace. It reaps the
 /// orphans of the session. When it exits, the kernel ends every other
-/// process of the namespace, so no background process of the sandbox
-/// outlives the command.
+/// process of the namespace.
+///
+/// With [`Orphans::Wait`] it first gives the orphans their time, so that
+/// the recorder of watch mode gets their events.
 ///
 /// Async-signal-safe; it never returns.
-fn supervise_init(command: libc::pid_t, status_fd: libc::c_int) -> ! {
+fn supervise_init(command: libc::pid_t, status_fd: libc::c_int, orphans: Orphans) -> ! {
     let status = wait_and_reap(command);
+    if orphans == Orphans::Wait {
+        wait_for_orphans();
+    }
     // The outer supervisor needs the real status; see `supervise_outer`.
     // Nothing can answer a failure here, and the exit code below still
     // carries the reason.
@@ -1004,7 +1030,7 @@ fn supervise_init(command: libc::pid_t, status_fd: libc::c_int) -> ! {
 ///
 /// # Errors
 /// Returns the OS error of `pipe2(2)`, of `fork(2)` or of `prctl(2)`.
-fn fork_pid_namespace() -> std::io::Result<()> {
+fn fork_pid_namespace(orphans: Orphans) -> std::io::Result<()> {
     // The pipe that carries the wait status of the command from PID 1 of
     // the namespace to the stub; see `supervise_outer`.
     let mut pipe_fds = [-1 as libc::c_int; 2];
@@ -1039,7 +1065,7 @@ fn fork_pid_namespace() -> std::io::Result<()> {
     }
     if command > 0 {
         close_inherited_fds(write_fd);
-        supervise_init(command, write_fd);
+        supervise_init(command, write_fd, orphans);
     }
     // The command keeps no end of the status pipe.
     // SAFETY: close(2) on descriptors that `pipe2` made.
@@ -1859,6 +1885,8 @@ struct ChildPlan {
     bring_up_lo: bool,
     /// Set `PR_SET_NO_NEW_PRIVS` and install the TIOCSTI filter.
     no_new_privs: bool,
+    /// What PID 1 of the new namespace does with an orphan of the command.
+    orphans: Orphans,
     /// `None` when enforcement is off (`--no-sandbox`) and in watch mode.
     ruleset: Option<PreparedRuleset>,
     /// The seccomp recorder (watch mode and `--trace`).
@@ -1907,7 +1935,7 @@ impl ChildPlan {
             }
             if self.unshare_flags & libc::CLONE_NEWPID != 0 {
                 // Only the command returns here; see `fork_pid_namespace`.
-                fork_pid_namespace()?;
+                fork_pid_namespace(self.orphans)?;
             }
         }
 
@@ -2059,7 +2087,14 @@ pub(crate) enum SpawnMode<'a> {
     Sandbox,
     /// Watch mode: no Landlock, no overlay and no masks. The child gets the
     /// mounts of the watch guard, and the recorder always runs.
-    Watch(&'a crate::linux_watch::GuardPlan),
+    Watch {
+        /// The mounts of the watch guard.
+        guard: &'a crate::linux_watch::GuardPlan,
+        /// The Unix socket paths of the profile. Watch mode does not
+        /// enforce them; it marks each connection with the decision that
+        /// `pent run` would make.
+        unix_sockets: &'a [PathBuf],
+    },
 }
 
 /// The result of [`spawn_linux`].
@@ -2095,9 +2130,12 @@ pub(crate) fn spawn_linux(
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
-    let guard = match mode {
-        SpawnMode::Sandbox => None,
-        SpawnMode::Watch(plan) => Some(plan),
+    let (guard, unix_sockets) = match mode {
+        SpawnMode::Sandbox => (None, config.unix_sockets.as_slice()),
+        SpawnMode::Watch {
+            guard,
+            unix_sockets,
+        } => (Some(guard), unix_sockets),
     };
     let watch = guard.is_some();
     let enforce = !watch && !config.no_enforcement;
@@ -2205,11 +2243,18 @@ pub(crate) fn spawn_linux(
         NetworkMode::Unrestricted => 0,
         _ => libc::CLONE_NEWNET,
     };
-    // A new PID namespace hides the processes of the host and ends the
-    // background processes of the session. Watch mode does not take it: it
-    // must not change how the program runs, and an orphan of the program
-    // must keep its events.
-    let pid_flag = if enforce { libc::CLONE_NEWPID } else { 0 };
+    // A new PID namespace hides the processes of the host, so the child
+    // cannot read `/proc/<pid>/cmdline` of another process of the user.
+    // Watch mode takes it too: the seccomp filter goes to each descendant,
+    // and `SECCOMP_IOCTL_NOTIF_RECV` names the task in the namespace of
+    // the reader, so an orphan that PID 1 of the sandbox adopts keeps its
+    // events. Only the end differs; see `Orphans`.
+    let pid_flag = if enforce || watch {
+        libc::CLONE_NEWPID
+    } else {
+        0
+    };
+    let orphans = if watch { Orphans::Wait } else { Orphans::End };
     let unshare_flags = if enforce || watch {
         libc::CLONE_NEWUSER | libc::CLONE_NEWNS | net_flag | pid_flag
     } else if net_flag != 0 {
@@ -2309,28 +2354,36 @@ pub(crate) fn spawn_linux(
     // The recorder. The supervisor thread starts before `spawn`: the child
     // sends the listener file descriptor during `spawn`, and its `execve`
     // waits for an answer from the supervisor.
-    let recorder = if record {
-        let judge = match guard {
-            Some(plan) => crate::linux_watch::Judge::Guard {
-                enforced: plan.effective.clone(),
-                unenforced: plan.unenforced.clone(),
-            },
-            None => {
-                let mut policy = AccessPolicy::default();
-                add_ruleset_rules(&mut policy, config, path_dirs, &write_set, &overlay_dirs);
-                policy.hidden = mask_dirs
-                    .iter()
-                    .chain(&mask_files)
-                    .chain(&private.covered)
-                    .cloned()
-                    .collect();
-                policy.visible.clone_from(&private.visible);
-                policy.abstract_denied = net_flag != 0
-                    || (enforce && crate::linux_landlock::abi_version().is_ok_and(|abi| abi >= 6));
-                crate::linux_watch::Judge::Policy(policy)
-            }
+    //
+    // The supervisor also controls each `connect(2)` to a Unix socket, so
+    // it runs with enforcement too, even without `--trace`. It then traps
+    // only `connect` and makes no event. The cost is one notification for
+    // each connection of the child.
+    let unix_policy = crate::linux_unixconn::UnixPolicy::new(unix_sockets);
+    let unix = if enforce {
+        crate::linux_unixconn::UnixControl::Enforce(unix_policy)
+    } else {
+        crate::linux_unixconn::UnixControl::Observe(unix_policy)
+    };
+    let recorder = if record || enforce {
+        let judge = if record {
+            Some(match guard {
+                Some(plan) => crate::linux_watch::Judge::Guard {
+                    enforced: plan.effective.clone(),
+                    unenforced: plan.unenforced.clone(),
+                },
+                None => {
+                    let mut policy = AccessPolicy::default();
+                    add_ruleset_rules(&mut policy, config, path_dirs, &write_set, &overlay_dirs);
+                    crate::linux_watch::Judge::Policy(policy)
+                }
+            })
+        } else {
+            None
         };
-        Some(crate::linux_watch::start_recorder(judge)?)
+        Some(crate::linux_watch::start_recorder(
+            crate::linux_watch::RecorderPlan { judge, unix },
+        )?)
     } else {
         None
     };
@@ -2352,6 +2405,7 @@ pub(crate) fn spawn_linux(
             None
         },
         bring_up_lo: config.network == NetworkMode::LocalhostOnly || is_proxy,
+        orphans,
         no_new_privs: ruleset.is_some() || recorder.is_some(),
         ruleset,
         recorder: recorder.as_ref().map(|r| r.child.clone()),
@@ -2385,6 +2439,10 @@ pub(crate) fn spawn_linux(
     // Drop the parent copy of the socket end of the child. The supervisor
     // then sees EOF if the child died before it sent the listener.
     let events = recorder.map(crate::linux_watch::RecorderSetup::into_events);
+    // A recorder that only controls the Unix socket connections makes no
+    // event. The caller gets no channel, so it starts no reader. The
+    // supervisor then sends into a closed channel and ignores the error.
+    let events = if record { events } else { None };
 
     let mut child = spawn_result.map_err(SandboxError::SpawnFailed)?;
     // `spawn` returns after the `exec` of the child, so the child has sent
@@ -4297,23 +4355,6 @@ mod tests {
     }
 
     #[test]
-    fn test_policy_predict_unix_with_a_visible_path() {
-        let policy = AccessPolicy {
-            hidden: vec![PathBuf::from("/tmp")],
-            visible: vec![PathBuf::from("/tmp/ws")],
-            ..AccessPolicy::default()
-        };
-        assert_eq!(
-            policy.predict_unix("/tmp/host.sock"),
-            pent_profile::Outcome::Denied
-        );
-        assert_eq!(
-            policy.predict_unix("/tmp/ws/app.sock"),
-            pent_profile::Outcome::Allowed
-        );
-    }
-
-    #[test]
     fn test_is_explicitly_allowed() {
         let mask = Path::new("/run/user/1000");
         let ancestor_only = vec![PathBuf::from("/"), PathBuf::from("/run")];
@@ -4578,12 +4619,6 @@ mod tests {
             policy.predict(FsOp::Exec, Path::new("/var/x"), false),
             denied
         );
-        policy.hidden = vec![PathBuf::from("/run/user/1000")];
-        assert_eq!(policy.predict_unix("/run/user/1000/bus"), denied);
-        assert_eq!(policy.predict_unix("/tmp/x.sock"), allowed);
-        assert_eq!(policy.predict_unix("@abstract"), allowed);
-        policy.abstract_denied = true;
-        assert_eq!(policy.predict_unix("@abstract"), denied);
         Ok(())
     }
 }

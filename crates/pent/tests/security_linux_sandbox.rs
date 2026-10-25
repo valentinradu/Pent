@@ -680,22 +680,13 @@ fn test_signal_status_passes_through_the_namespace() -> TestResult {
     Ok(())
 }
 
-// ============================================================================
-// Open findings — these tests assert the secure behaviour and currently fail.
-// Each is `#[ignore]` with its finding ID so the suite stays green.
-// ============================================================================
-
-/// LS-1: the child must not connect to a path-based Unix socket outside its
-/// profile. Landlock does not control `connect(2)` on a path socket, and the
-/// kernel needs no file right to walk through a directory. A private tmpfs
-/// now hides every socket under `/tmp`, `/var/tmp` and `/run`, and a mask
-/// hides the agent sockets of the home directory. A socket in any other
-/// directory stays reachable, and this test proves it.
+/// LS-1: the child must not connect to a path Unix socket outside its
+/// profile. Landlock does not control `connect(2)` on a path socket, and
+/// the kernel needs no file right to walk through a directory. The
+/// supervisor now controls each connection: it makes a permitted
+/// connection itself, and the profile here names no socket, so the filter
+/// refuses the family `AF_UNIX` already in the BPF program.
 #[test]
-#[ignore = "OPEN VULN LS-1 (partial): /tmp, /var/tmp, /run and the home agent \
-            sockets are hidden; a path socket in another directory is still \
-            reachable, because Landlock does not control connect(2). The full \
-            fix is a connect(2) filter in the supervisor"]
 fn test_unix_socket_connect_outside_profile() -> TestResult {
     let Some(py) = python3() else {
         eprintln!("skip: no python3");
