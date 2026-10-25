@@ -10,22 +10,29 @@
 //!
 //! # Namespaces
 //!
-//! With enforcement, the child always creates a user namespace and a mount
-//! namespace (and a network namespace unless the network is `Unrestricted`):
+//! With enforcement, the child always creates a user namespace, a mount
+//! namespace and a PID namespace (and a network namespace unless the
+//! network is `Unrestricted`):
 //! - `LocalhostOnly`: new network namespace, the child brings up loopback.
 //! - `ProxyOnly`: new network namespace; the child brings up loopback and
 //!   makes the proxy listeners in it (see `linux_proxynet.rs`).
 //! - `Blocked`: new network namespace with no interfaces.
 //! - `Unrestricted`: no network namespace.
 //!
-//! The private mount namespace hides the Unix sockets that Landlock cannot
-//! control (`/run/user/<uid>`, the Docker and Podman sockets) and makes
-//! `<workspace>/.pent` read-only.
+//! The private mount namespace gives the child its own `/tmp`, `/var/tmp`
+//! and `/run`, hides the Unix sockets that Landlock cannot control, and
+//! makes `<workspace>/.pent` read-only.
 //!
-//! Watch mode (`SpawnMode::Watch`) also creates a user namespace and a
-//! mount namespace, but applies no Landlock, no overlay and no masks. The
-//! mount namespace holds only the mounts of the watch guard (see
-//! `linux_watch.rs`).
+//! The PID namespace holds a private `proc` mount, so the child sees only
+//! the processes of the sandbox, and no background process of the sandbox
+//! outlives the command. `unshare(CLONE_NEWPID)` does not move the caller,
+//! so the `pre_exec` hook forks twice; see [`fork_pid_namespace`].
+//!
+//! Watch mode (`SpawnMode::Watch`) creates a user namespace and a mount
+//! namespace, but no PID namespace: it must not change how the program
+//! runs, and an orphan of the program must keep its events. It applies no
+//! Landlock, no overlay and no masks. The mount namespace holds the private
+//! directories and the mounts of the watch guard (see `linux_watch.rs`).
 //!
 //! # Landlock architecture
 //!
@@ -379,8 +386,8 @@ pub fn check_available() -> Result<(), SandboxError> {
 }
 
 /// Check that this user can create a user namespace with a network
-/// namespace in it. The sandbox and watch mode need both, and no other
-/// privilege.
+/// namespace and a PID namespace in it. The sandbox needs all three, and no
+/// other privilege.
 ///
 /// The check forks a short-lived child that calls `unshare`.
 ///
@@ -399,7 +406,9 @@ pub fn check_user_namespaces() -> Result<(), SandboxError> {
     if pid == 0 {
         // SAFETY: unshare(2) with integer flags.
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-        let ok = unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) } == 0;
+        let ok = unsafe {
+            libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET | libc::CLONE_NEWPID)
+        } == 0;
         let code = if ok {
             0
         } else {
@@ -437,7 +446,8 @@ pub fn check_user_namespaces() -> Result<(), SandboxError> {
     };
     Err(SandboxError::SandboxUnavailable {
         reason: format!(
-            "this user cannot create a user namespace and a network namespace: {}",
+            "this user cannot create a user namespace, a network namespace and a PID \
+             namespace: {}",
             std::io::Error::from_raw_os_error(errno)
         ),
         remediation: "Let unprivileged users create user namespaces: set the sysctl \
@@ -774,6 +784,279 @@ fn cloexec_inherited_fds() {
     }
 }
 
+// ── The supervisors of the PID namespace ───────────────────────────────────
+
+/// The process that the supervisor of this process waits for. A signal
+/// handler reaches only a static, so the PID lives here.
+static SUPERVISED_PID: AtomicI32 = AtomicI32::new(0);
+
+/// The signals that a supervisor passes on.
+///
+/// The terminal sends `SIGINT`, `SIGQUIT` and `SIGWINCH` to the whole
+/// process group. A process group holds its members across a PID namespace,
+/// so the command gets these signals directly and needs no relay. The other
+/// signals come from `kill`, and pent sends them to the direct child.
+const FORWARDED_SIGNALS: [libc::c_int; 4] = [
+    libc::SIGTERM,
+    libc::SIGHUP,
+    libc::SIGUSR1,
+    libc::SIGUSR2,
+];
+
+/// Pass the signal to the supervised process. Async-signal-safe.
+extern "C" fn forward_signal(sig: libc::c_int) {
+    let pid = SUPERVISED_PID.load(Ordering::Relaxed);
+    if pid > 0 {
+        // SAFETY: kill(2) with integer arguments only.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe { libc::kill(pid, sig) };
+    }
+}
+
+/// Install [`forward_signal`] for each signal of [`FORWARDED_SIGNALS`].
+/// Async-signal-safe.
+fn install_signal_forwarders() {
+    for sig in FORWARDED_SIGNALS {
+        // SAFETY: a zeroed `sigaction` is a valid, empty structure, and the
+        // code below fills each field that `sigaction(2)` reads.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let mut act: libc::sigaction = unsafe { std::mem::zeroed() };
+        act.sa_sigaction = forward_signal as *const () as usize;
+        act.sa_flags = libc::SA_RESTART;
+        // SAFETY: `act` is a valid, writable structure, and then a valid
+        // structure that sigaction(2) reads.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe {
+            libc::sigemptyset(&raw mut act.sa_mask);
+            libc::sigaction(sig, &raw const act, std::ptr::null_mut());
+        }
+    }
+}
+
+/// Close every inherited descriptor above the standard three, except
+/// `keep`.
+///
+/// A supervisor must not keep the error pipe of `Command::spawn` open: the
+/// parent reads that pipe until every copy of it is closed, and it holds
+/// the spawn until then. Async-signal-safe.
+fn close_inherited_fds(keep: libc::c_int) {
+    let ranges = [(3, keep.saturating_sub(1)), (keep.saturating_add(1), i32::MAX)];
+    let mut ok = true;
+    for (first, last) in ranges {
+        if first > last {
+            continue;
+        }
+        // SAFETY: close_range(2) with integer arguments only.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let ret = unsafe { libc::syscall(libc::SYS_close_range, first as u32, last as u32, 0u32) };
+        ok = ok && ret == 0;
+    }
+    if ok {
+        return;
+    }
+    for fd in 3..4096 {
+        if fd == keep {
+            continue;
+        }
+        // SAFETY: close(2) on a number; EBADF for a closed number is
+        // harmless.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe { libc::close(fd) };
+    }
+}
+
+/// End this process like the wait status `status`. Async-signal-safe; it
+/// never returns.
+fn exit_like(status: libc::c_int) -> ! {
+    if libc::WIFEXITED(status) {
+        // SAFETY: _exit(2) with an integer argument.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe { libc::_exit(libc::WEXITSTATUS(status)) };
+    }
+    if libc::WIFSIGNALED(status) {
+        let sig = libc::WTERMSIG(status);
+        // SAFETY: a zeroed `sigaction` is a valid, empty structure. The
+        // default action must apply, and the signal must not be blocked,
+        // so that `raise` ends this process with the same reason.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe {
+            let mut act: libc::sigaction = std::mem::zeroed();
+            act.sa_sigaction = libc::SIG_DFL;
+            libc::sigemptyset(&raw mut act.sa_mask);
+            libc::sigaction(sig, &raw const act, std::ptr::null_mut());
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&raw mut set);
+            libc::sigaddset(&raw mut set, sig);
+            libc::sigprocmask(libc::SIG_UNBLOCK, &raw const set, std::ptr::null_mut());
+            libc::raise(sig);
+            // `raise` returned, so the default action does not end this
+            // process. Use the convention of the shell.
+            libc::_exit(128_i32.saturating_add(sig));
+        }
+    }
+    // SAFETY: _exit(2) with an integer argument.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    unsafe { libc::_exit(1) };
+}
+
+/// Wait for `pid`, pass the signals on to it, and reap every other child.
+/// Returns the wait status of `pid`. Async-signal-safe.
+fn wait_and_reap(pid: libc::pid_t) -> libc::c_int {
+    SUPERVISED_PID.store(pid, Ordering::Relaxed);
+    install_signal_forwarders();
+    loop {
+        let mut status: libc::c_int = 0;
+        // SAFETY: waitpid(2) on the children of this process, with a
+        // writable status.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let done = unsafe { libc::waitpid(-1, &raw mut status, 0) };
+        if done == pid {
+            return status;
+        }
+        if done < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            // ECHILD: the supervised process is gone and left no status.
+            write_stderr_static(b"pent: the sandbox supervisor lost the command\n");
+            // SAFETY: _exit(2) with an integer argument.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            unsafe { libc::_exit(1) };
+        }
+    }
+}
+
+/// Read all of `buf` from `fd`. Returns the number of bytes.
+/// Async-signal-safe.
+fn read_all_fd(fd: libc::c_int, buf: &mut [u8]) -> usize {
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        let Some(rest) = buf.get_mut(filled..) else {
+            break;
+        };
+        // SAFETY: `rest` is a valid, writable slice of `rest.len()` bytes.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let n = unsafe { libc::read(fd, rest.as_mut_ptr().cast(), rest.len()) };
+        if n < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
+        if n == 0 {
+            break;
+        }
+        filled = filled.saturating_add(n.unsigned_abs());
+    }
+    filled
+}
+
+/// The supervisor that stays in the old PID namespace. It is the direct
+/// child of pent, so its status is the status that pent reports.
+///
+/// PID 1 of the new namespace cannot end itself with a signal (the kernel
+/// drops a signal with the default action for the init of a namespace), so
+/// it sends the wait status of the command through `status_fd`, and this
+/// supervisor ends itself with that status.
+///
+/// Async-signal-safe; it never returns.
+fn supervise_outer(init: libc::pid_t, status_fd: libc::c_int) -> ! {
+    let status = wait_and_reap(init);
+    let mut buf = [0u8; 4];
+    if read_all_fd(status_fd, &mut buf) == buf.len() {
+        exit_like(libc::c_int::from_ne_bytes(buf));
+    }
+    exit_like(status)
+}
+
+/// The supervisor that is PID 1 of the new PID namespace. It reaps the
+/// orphans of the session. When it exits, the kernel ends every other
+/// process of the namespace, so no background process of the sandbox
+/// outlives the command.
+///
+/// Async-signal-safe; it never returns.
+fn supervise_init(command: libc::pid_t, status_fd: libc::c_int) -> ! {
+    let status = wait_and_reap(command);
+    // The outer supervisor needs the real status; see `supervise_outer`.
+    // Nothing can answer a failure here, and the exit code below still
+    // carries the reason.
+    let _ = write_all_fd(status_fd, &status.to_ne_bytes());
+    exit_like(status)
+}
+
+/// Make the two supervisors of the new PID namespace. Only the command
+/// returns from this function; each supervisor ends its process.
+///
+/// `unshare(CLONE_NEWPID)` does not move the caller, so the first child of
+/// the caller is PID 1 of the new namespace. The command must not be that
+/// PID 1: the kernel drops each signal that has the default action for the
+/// init of a namespace, so `kill` and the terminal could not stop the
+/// command. Thus pent forks twice:
+///
+/// 1. the stub, in the old namespace: it is the direct child of pent, and
+///    it passes the status and the signals of PID 1;
+/// 2. PID 1 of the new namespace: it reaps the orphans of the session and
+///    passes the status and the signals of the command;
+/// 3. the command, PID 2.
+///
+/// Each step gets `PR_SET_PDEATHSIG`, so the whole namespace ends when pent
+/// ends. Async-signal-safe.
+///
+/// # Errors
+/// Returns the OS error of `pipe2(2)`, of `fork(2)` or of `prctl(2)`.
+fn fork_pid_namespace() -> std::io::Result<()> {
+    // The pipe that carries the wait status of the command from PID 1 of
+    // the namespace to the stub; see `supervise_outer`.
+    let mut pipe_fds = [-1 as libc::c_int; 2];
+    // SAFETY: pipe2(2) writes two descriptors into a valid array.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    if unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(last_err(b"pent: the status pipe of the sandbox failed\n"));
+    }
+    let (read_fd, write_fd) = (pipe_fds[0], pipe_fds[1]);
+    // SAFETY: fork(2) has no preconditions. The child uses only
+    // async-signal-safe calls.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let init = unsafe { libc::fork() };
+    if init < 0 {
+        return Err(last_err(b"pent: fork for the PID namespace failed\n"));
+    }
+    if init > 0 {
+        close_inherited_fds(read_fd);
+        supervise_outer(init, read_fd);
+    }
+    // SAFETY: prctl(2) with integer arguments only. `fork` clears the
+    // parent-death signal, so each step sets it again.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) } != 0 {
+        return Err(last_err(b"pent: prctl(PR_SET_PDEATHSIG) failed\n"));
+    }
+    // SAFETY: as above.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let command = unsafe { libc::fork() };
+    if command < 0 {
+        return Err(last_err(b"pent: fork of the command failed\n"));
+    }
+    if command > 0 {
+        close_inherited_fds(write_fd);
+        supervise_init(command, write_fd);
+    }
+    // The command keeps no end of the status pipe.
+    // SAFETY: close(2) on descriptors that `pipe2` made.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    unsafe {
+        libc::close(read_fd);
+        libc::close(write_fd);
+    }
+    // SAFETY: prctl(2) with integer arguments only.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) } != 0 {
+        return Err(last_err(b"pent: prctl(PR_SET_PDEATHSIG) failed\n"));
+    }
+    Ok(())
+}
+
 /// Mount flags that a bind mount inherits and must keep on a remount.
 ///
 /// A remount that drops a flag of a mount from a less privileged mount
@@ -878,6 +1161,9 @@ struct PrivateBind {
 struct MountPlan {
     /// Make the mount tree private (only in a new mount namespace).
     make_private: bool,
+    /// Mount a new `proc` on `/proc`. This needs a new PID namespace, and
+    /// it then shows only the processes of the sandbox.
+    private_proc: bool,
     /// Empty tmpfs mounts over the directories of [`PRIVATE_DIRS`].
     private_dirs: Vec<PrivateMount>,
     /// The mounts that restore what the session needs inside the private
@@ -1427,6 +1713,27 @@ impl MountPlan {
             return Err(last_err(b"pent: mount --make-rprivate / failed\n"));
         }
 
+        if self.private_proc {
+            // A new `proc` shows only the processes of the PID namespace of
+            // the process that mounts it. The mount comes before the
+            // private directories: their bind mounts go through
+            // `/proc/self/fd`.
+            // SAFETY: mount(2) with static NUL-terminated strings.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            let ret = unsafe {
+                libc::mount(
+                    c"proc".as_ptr(),
+                    c"/proc".as_ptr(),
+                    c"proc".as_ptr(),
+                    libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+                    std::ptr::null(),
+                )
+            };
+            if ret != 0 {
+                return Err(last_err(b"pent: cannot mount a private /proc\n"));
+            }
+        }
+
         // The private temporary and runtime directories, and the mounts
         // that restore what the session needs in them (the `resolv.conf` of
         // the proxy among them).
@@ -1598,6 +1905,10 @@ impl ChildPlan {
             }
             if self.unshare_flags & libc::CLONE_NEWUSER != 0 {
                 setup_userns_mappings(&self.uid_map, &self.gid_map)?;
+            }
+            if self.unshare_flags & libc::CLONE_NEWPID != 0 {
+                // Only the command returns here; see `fork_pid_namespace`.
+                fork_pid_namespace()?;
             }
         }
 
@@ -1895,8 +2206,13 @@ pub(crate) fn spawn_linux(
         NetworkMode::Unrestricted => 0,
         _ => libc::CLONE_NEWNET,
     };
+    // A new PID namespace hides the processes of the host and ends the
+    // background processes of the session. Watch mode does not take it: it
+    // must not change how the program runs, and an orphan of the program
+    // must keep its events.
+    let pid_flag = if enforce { libc::CLONE_NEWPID } else { 0 };
     let unshare_flags = if enforce || watch {
-        libc::CLONE_NEWUSER | libc::CLONE_NEWNS | net_flag
+        libc::CLONE_NEWUSER | libc::CLONE_NEWNS | net_flag | pid_flag
     } else if net_flag != 0 {
         let ns = if is_proxy { libc::CLONE_NEWNS } else { 0 };
         libc::CLONE_NEWUSER | net_flag | ns
@@ -1911,6 +2227,7 @@ pub(crate) fn spawn_linux(
 
     let mut mounts = MountPlan {
         make_private: has_mntns,
+        private_proc: pid_flag != 0,
         ..MountPlan::default()
     };
     // The private temporary and runtime directories. The child keeps the

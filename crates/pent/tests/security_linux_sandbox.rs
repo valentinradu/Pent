@@ -565,6 +565,118 @@ fn test_workspace_under_tmp_still_works() -> TestResult {
     Ok(())
 }
 
+/// LS-3: the child must not read the command line of a host process of the
+/// same user. `/proc/<pid>/cmdline` is world-readable, and a command line
+/// often holds a token or a password. The child runs in a new PID
+/// namespace with its own `proc` mount, so it sees only the processes of
+/// the sandbox.
+#[test]
+fn test_proc_cmdline_of_host_process_denied() -> TestResult {
+    let Some(py) = python3() else {
+        eprintln!("skip: no python3");
+        return Ok(());
+    };
+    let h = Harness::new("python3", EMPTY_PROFILE)?;
+    let (mut victim, pid) = spawn_victim(&py, &h)?;
+    let probe = h.script(
+        "c.py",
+        &format!(
+            "d=b''\ntry:\n    d=open('/proc/{pid}/cmdline','rb').read()\nexcept Exception as e:\n    print('CMDLINE_DENIED', e)\nprint('CMDLINE_SECRET' if b'TOPSECRET_ARG' in d else 'CMDLINE_EMPTY')\n"
+        ),
+    )?;
+    let out = h.run(&[py.to_str().unwrap(), "-I", probe.to_str().unwrap()])?;
+    victim.kill().ok();
+    victim.wait().ok();
+    if sandbox_unavailable(&out) {
+        eprintln!("skip: sandbox not available on this host");
+        return Ok(());
+    }
+    let text = combined(&out);
+    assert!(
+        !text.contains("CMDLINE_SECRET"),
+        "LS-3: the child read the command line of a host process:\n{text}"
+    );
+    Ok(())
+}
+
+/// LS-3: a background process of the child must not outlive pent. The
+/// kernel ends every process of a PID namespace when the init of that
+/// namespace exits.
+#[test]
+fn test_background_process_does_not_outlive_pent() -> TestResult {
+    let h = Harness::new("sh", EMPTY_PROFILE)?;
+    let marker = h.workspace.join("alive");
+    // The background process writes the marker every 200 ms for 30 s.
+    let script = h.script(
+        "probe.sh",
+        &format!(
+            "( i=0; while [ $i -lt 150 ]; do echo $i > '{}'; sleep 0.2; i=$((i+1)); done ) &\n\
+             echo STARTED\n",
+            marker.display()
+        ),
+    )?;
+    let out = h.run(&["sh", script.to_str().unwrap()])?;
+    if sandbox_unavailable(&out) {
+        eprintln!("skip: sandbox not available on this host");
+        return Ok(());
+    }
+    let text = combined(&out);
+    assert!(text.contains("STARTED"), "the probe did not start:\n{text}");
+    // Pent has exited. The marker must stop to change.
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    let first = std::fs::read_to_string(&marker).unwrap_or_default();
+    std::thread::sleep(std::time::Duration::from_millis(800));
+    let second = std::fs::read_to_string(&marker).unwrap_or_default();
+    assert_eq!(
+        first, second,
+        "LS-3: a background process of the child still runs after pent exited"
+    );
+    Ok(())
+}
+
+/// The PID namespace must not change the exit status that pent reports.
+/// The command is PID 2 of the namespace, and two supervisors pass the
+/// status on.
+#[test]
+fn test_exit_status_passes_through_the_namespace() -> TestResult {
+    let h = Harness::new("sh", EMPTY_PROFILE)?;
+    let script = h.script("probe.sh", "exit 42\n")?;
+    let out = h.run(&["sh", script.to_str().unwrap()])?;
+    if sandbox_unavailable(&out) {
+        eprintln!("skip: sandbox not available on this host");
+        return Ok(());
+    }
+    assert_eq!(
+        out.status.code(),
+        Some(42),
+        "pent did not report the exit code of the command: {}",
+        combined(&out)
+    );
+    Ok(())
+}
+
+/// The PID namespace must not change the signal that pent re-raises. A
+/// command that a signal ends must end pent with the same signal.
+#[test]
+fn test_signal_status_passes_through_the_namespace() -> TestResult {
+    use std::os::unix::process::ExitStatusExt as _;
+    let h = Harness::new("sh", EMPTY_PROFILE)?;
+    let script = h.script("probe.sh", "kill -TERM $$\nsleep 5\n")?;
+    let out = h.run(&["sh", script.to_str().unwrap()])?;
+    if sandbox_unavailable(&out) {
+        eprintln!("skip: sandbox not available on this host");
+        return Ok(());
+    }
+    assert_eq!(
+        out.status.signal(),
+        Some(libc::SIGTERM),
+        "pent did not re-raise the signal of the command: {:?} {}",
+        out.status,
+        combined(&out)
+    );
+    Ok(())
+}
+
 // ============================================================================
 // Open findings — these tests assert the secure behaviour and currently fail.
 // Each is `#[ignore]` with its finding ID so the suite stays green.
@@ -620,40 +732,6 @@ fn test_unix_socket_connect_outside_profile() -> TestResult {
     assert!(
         !text.contains("VICTIM_SECRET"),
         "LS-1: the child connected to a Unix socket outside its profile:\n{text}"
-    );
-    Ok(())
-}
-
-/// LS-3: the child must not read the command line of a host process of the
-/// same user. `/proc/<pid>/cmdline` is world-readable and the full `/proc` is
-/// granted read access, so the child reads the arguments of every host
-/// process (which can hold tokens or passwords).
-#[test]
-#[ignore = "OPEN VULN LS-3: /proc grants read of other host processes' cmdline"]
-fn test_proc_cmdline_of_host_process_denied() -> TestResult {
-    let Some(py) = python3() else {
-        eprintln!("skip: no python3");
-        return Ok(());
-    };
-    let h = Harness::new("python3", EMPTY_PROFILE)?;
-    let (mut victim, pid) = spawn_victim(&py, &h)?;
-    let probe = h.script(
-        "c.py",
-        &format!(
-            "d=b''\ntry:\n    d=open('/proc/{pid}/cmdline','rb').read()\nexcept Exception as e:\n    print('CMDLINE_DENIED', e)\nprint('CMDLINE_SECRET' if b'TOPSECRET_ARG' in d else 'CMDLINE_EMPTY')\n"
-        ),
-    )?;
-    let out = h.run(&[py.to_str().unwrap(), "-I", probe.to_str().unwrap()])?;
-    victim.kill().ok();
-    victim.wait().ok();
-    if sandbox_unavailable(&out) {
-        eprintln!("skip: sandbox not available on this host");
-        return Ok(());
-    }
-    let text = combined(&out);
-    assert!(
-        !text.contains("CMDLINE_SECRET"),
-        "LS-3: the child read the command line of a host process:\n{text}"
     );
     Ok(())
 }
