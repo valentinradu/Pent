@@ -33,6 +33,7 @@
 //!
 
 use crate::{normalize_hostname, ProxyError, Result, SharedState};
+use pent_profile::{Outcome, WatchEvent};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -652,7 +653,10 @@ impl DnsServer {
     ///
     /// # Behavior
     /// * Answers FORMERR if the query does not have exactly one valid question
-    /// * Checks the domain against the allowlist
+    /// * Checks the domain against the policy (in observe mode, the policy
+    ///   permits each valid name)
+    /// * Sends one watch event for each query with a valid question that the
+    ///   server does not reject as not implemented
     /// * If allowed: forwards the query type to upstream, caches A/AAAA
     ///   answers, returns the upstream answer
     /// * If blocked: returns NXDOMAIN response
@@ -688,13 +692,15 @@ impl DnsServer {
 
         // Check domain against allowlist (ASCII case-insensitive). The server
         // forwards the same normalized name that it checks.
+        // In observe mode, the policy permits each valid name.
         let name = match normalize_hostname(&question.name) {
-            Ok(name) if self.state.is_allowed(&name) => name,
+            Ok(name) if self.state.is_permitted(&name) => name,
             Ok(name) => {
                 self.state.report_violation(format!(
                     "network: DNS query for \"{name}\" ({type_name}) blocked: \
                      the domain is not in the allowlist"
                 ));
+                self.emit_dns(name, type_name, Outcome::Denied);
                 return Ok(respond(rcode::NXDOMAIN));
             }
             Err(e) => {
@@ -702,12 +708,19 @@ impl DnsServer {
                     "network: DNS query for {:?} ({type_name}) blocked: {e}",
                     question.name
                 ));
+                // The name is not valid, thus it has no normalized form. The
+                // event uses the lowercase name without the trailing dot.
+                let raw = question.name.trim_end_matches('.').to_ascii_lowercase();
+                self.emit_dns(raw, type_name, Outcome::Denied);
                 return Ok(respond(rcode::NXDOMAIN));
             }
         };
         self.state.report_access(format!(
             "network: DNS query for \"{name}\" ({type_name}) allowed"
         ));
+        // The event records the policy decision. An upstream failure after
+        // this point does not change the outcome.
+        self.emit_dns(name.clone(), type_name, Outcome::Allowed);
 
         let reply = self.query_upstream(&name, question.qtype).await?;
 
@@ -723,6 +736,15 @@ impl DnsServer {
         }
 
         Ok(Self::finish_response(query, &question, reply.message))
+    }
+
+    /// Send a watch event for one DNS query.
+    fn emit_dns(&self, name: String, qtype: String, outcome: Outcome) {
+        self.state.emit(WatchEvent::Dns {
+            name,
+            qtype,
+            outcome,
+        });
     }
 
     /// Change an upstream response into the response for the client.
@@ -1870,5 +1892,108 @@ mod tests {
             .unwrap();
         assert_eq!(buf[0], 0x01);
         run.abort();
+    }
+
+    // ========================================================================
+    // Watch Event Tests
+    // ========================================================================
+
+    fn watched_server(
+        upstream: SocketAddr,
+        allowlist: &[&str],
+        policy: crate::ProxyPolicy,
+    ) -> (
+        DnsServer,
+        Arc<SharedState>,
+        tokio::sync::mpsc::UnboundedReceiver<WatchEvent>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = Arc::new(
+            SharedState::new(allowlist.iter().map(|s| (*s).to_string()).collect())
+                .with_policy(policy)
+                .with_event_tx(Some(tx)),
+        );
+        let config = DnsServerConfig {
+            upstream: Some(vec![upstream]),
+            resolve_timeout: Duration::from_secs(3),
+            ..Default::default()
+        };
+        let server = DnsServer::new(config, Arc::clone(&state)).unwrap();
+        (server, state, rx)
+    }
+
+    fn dns_event(name: &str, qtype: &str, outcome: Outcome) -> WatchEvent {
+        WatchEvent::Dns {
+            name: name.to_string(),
+            qtype: qtype.to_string(),
+            outcome,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_observe_answers_unlisted_name_and_emits_event() {
+        let Some((upstream, _task)) = fake_upstream("127.0.0.1:0").await else {
+            return;
+        };
+        let (server, state, mut rx) =
+            watched_server(upstream, &["allowed.example"], crate::ProxyPolicy::Observe);
+        let query = build_test_dns_query("Unlisted.Example.com", rtype::A);
+        let response = server.handle_query(&query).await.unwrap();
+        assert_eq!(rcode_of(&response), rcode::NOERROR);
+        let ip: IpAddr = "93.184.216.34".parse().unwrap();
+        assert_eq!(
+            state.cache.lookup(&ip),
+            Some("unlisted.example.com".to_string())
+        );
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            dns_event("unlisted.example.com", "A", Outcome::Allowed)
+        );
+        assert!(rx.try_recv().is_err(), "exactly one event");
+
+        let query = build_test_dns_query("unlisted.example.com", 65);
+        let response = server.handle_query(&query).await.unwrap();
+        assert_eq!(rcode_of(&response), rcode::NOERROR);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            dns_event("unlisted.example.com", "HTTPS", Outcome::Allowed)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_enforce_emits_dns_events_with_outcome() {
+        let Some((upstream, _task)) = fake_upstream("127.0.0.1:0").await else {
+            return;
+        };
+        let (server, _state, mut rx) = watched_server(
+            upstream,
+            &["example.com", "nx.example.com"],
+            crate::ProxyPolicy::Enforce,
+        );
+
+        let query = build_test_dns_query("blocked.test", rtype::AAAA);
+        let response = server.handle_query(&query).await.unwrap();
+        assert_eq!(rcode_of(&response), rcode::NXDOMAIN);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            dns_event("blocked.test", "AAAA", Outcome::Denied)
+        );
+
+        let query = build_test_dns_query("example.com", rtype::A);
+        let response = server.handle_query(&query).await.unwrap();
+        assert_eq!(rcode_of(&response), rcode::NOERROR);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            dns_event("example.com", "A", Outcome::Allowed)
+        );
+
+        // An upstream NXDOMAIN does not change the policy outcome.
+        let query = build_test_dns_query("nx.example.com", rtype::A);
+        let response = server.handle_query(&query).await.unwrap();
+        assert_eq!(rcode_of(&response), rcode::NXDOMAIN);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            dns_event("nx.example.com", "A", Outcome::Allowed)
+        );
     }
 }

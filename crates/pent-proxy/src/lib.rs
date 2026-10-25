@@ -407,8 +407,14 @@ pub struct SharedState {
     /// Optional channel for reporting trace events (violations and granted access).
     violation_tx: Option<tokio::sync::mpsc::UnboundedSender<TraceEvent>>,
 
-    /// The number of trace events that the proxy could not send, because the
-    /// receiver was closed.
+    /// The policy of the proxy (enforce the allowlist, or observe only).
+    policy: ProxyPolicy,
+
+    /// Optional channel for structured watch events.
+    event_tx: Option<tokio::sync::mpsc::UnboundedSender<pent_profile::WatchEvent>>,
+
+    /// The number of trace events and watch events that the proxy could not
+    /// send, because the receiver was closed.
     dropped_events: AtomicU64,
 
     /// Total number of proxy connections ever accepted (DNS queries + TCP
@@ -466,8 +472,52 @@ impl SharedState {
             filter: std::sync::RwLock::new(filter),
             cache: ResolutionCache::new(),
             violation_tx,
+            policy: ProxyPolicy::Enforce,
+            event_tx: None,
             dropped_events: AtomicU64::new(0),
             connections_accepted: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Set the policy of the proxy.
+    #[must_use]
+    pub const fn with_policy(mut self, policy: ProxyPolicy) -> Self {
+        self.policy = policy;
+        self
+    }
+
+    /// Set the channel for structured watch events. The proxy sends one
+    /// event for each DNS query and each TCP connection attempt.
+    #[must_use]
+    pub fn with_event_tx(
+        mut self,
+        event_tx: Option<tokio::sync::mpsc::UnboundedSender<pent_profile::WatchEvent>>,
+    ) -> Self {
+        self.event_tx = event_tx;
+        self
+    }
+
+    /// The policy of the proxy.
+    pub const fn policy(&self) -> ProxyPolicy {
+        self.policy
+    }
+
+    /// Check if the policy permits a domain. In observe mode, the policy
+    /// permits each domain. In enforce mode, the domain must be on the
+    /// allowlist.
+    pub fn is_permitted(&self, domain: &str) -> bool {
+        match self.policy {
+            ProxyPolicy::Observe => true,
+            ProxyPolicy::Enforce => self.is_allowed(domain),
+        }
+    }
+
+    /// Send a watch event, and count it if the receiver is closed.
+    pub fn emit(&self, event: pent_profile::WatchEvent) {
+        if let Some(tx) = &self.event_tx {
+            if tx.send(event).is_err() {
+                self.dropped_events.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -490,8 +540,8 @@ impl SharedState {
         self.send_event(TraceEvent::Access(message));
     }
 
-    /// The number of trace events that the proxy could not deliver, because
-    /// the receiver of the trace channel was closed.
+    /// The number of trace events and watch events that the proxy could not
+    /// deliver, because the receiver of the channel was closed.
     pub fn dropped_trace_events(&self) -> u64 {
         self.dropped_events.load(Ordering::Relaxed)
     }
@@ -515,7 +565,7 @@ impl SharedState {
     /// Insert a resolved address into the cache.
     ///
     /// This is the canonical way for the DNS server to populate the cache.
-    /// The DNS server has already verified the domain is allowed before calling this.
+    /// The DNS server calls it only for a domain that the policy permits.
     pub fn insert_resolved(&self, resolved: ResolvedAddress) {
         self.cache.insert(resolved);
     }
