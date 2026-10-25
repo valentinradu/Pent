@@ -5,10 +5,14 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+#[cfg(target_os = "linux")]
+use pent_proxy::ExternalListeners;
 use pent_proxy::{ProxyConfig, ProxyHandle, ProxyPolicy, ProxyServer, TraceEvent};
 #[cfg(target_os = "linux")]
 use pent_sandbox::teardown_overlay;
 use pent_sandbox::NetworkMode;
+#[cfg(target_os = "linux")]
+use pent_sandbox::ProxyListeners;
 use pent_settings::ProxySettings;
 use tokio::signal::unix::{signal, Signal, SignalKind};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -27,6 +31,26 @@ pub(crate) struct ProxySession {
 }
 
 impl ProxySession {
+    /// Give the proxy the listeners that the child made in its network
+    /// namespace (Linux). Call this right after the spawn. Connections that
+    /// arrive before the call wait in the queue of the listener.
+    ///
+    /// # Errors
+    /// Returns an error if the spawn returned no listeners, or if the proxy
+    /// cannot use them.
+    #[cfg(target_os = "linux")]
+    pub fn attach(&self, listeners: Option<ProxyListeners>) -> Result<(), CliError> {
+        let listeners = listeners.ok_or_else(|| {
+            CliError::Other("the sandbox did not make the proxy listeners".to_string())
+        })?;
+        self.handle.attach_listeners(ExternalListeners {
+            tcp: listeners.tcp,
+            dns_udp: listeners.dns_udp,
+            dns_tcp: Some(listeners.dns_tcp),
+        })?;
+        Ok(())
+    }
+
     /// Stop the proxy. A failure is not fatal: pent shows a warning.
     pub async fn shutdown(self) {
         if let Err(e) = self.handle.shutdown().await {
@@ -45,13 +69,12 @@ pub(crate) struct ProxyChannels {
 
 /// Start the proxy with `domains` and `policy`.
 ///
-/// On Linux, `ProxyOnly` routes the traffic of the child from a separate
-/// network namespace through a veth pair. The child's loopback is isolated,
-/// so the TCP proxy and the DNS server listen on the host side of the veth.
-/// Pent creates the veth first, then binds to its outer address only. Other
-/// hosts on the LAN cannot reach this address (the host firewall drops
-/// packets to it from other interfaces). `spawn_sandboxed` uses the prepared
-/// veth because `proxy_addr` is on its outer address.
+/// On Linux, the proxy has no host listener. The child unshares its network
+/// namespace and makes the listeners there (127.0.0.1:3128 for SOCKS5 and
+/// HTTP CONNECT, 127.0.0.1:53 for DNS). Then it sends them to pent. Call
+/// [`ProxySession::attach`] after the spawn. The child can reach only its
+/// own loopback, so all its traffic goes through the proxy. No privilege is
+/// necessary.
 ///
 /// On macOS, the proxy listens on loopback. The Seatbelt profile lets the
 /// child reach only the proxy port.
@@ -69,22 +92,25 @@ pub(crate) async fn start_proxy(
     config.policy = policy;
     config.violation_tx = channels.trace;
     config.event_tx = channels.events;
+    let server = ProxyServer::new(config)?;
+
     #[cfg(target_os = "linux")]
-    {
-        let outer_ip = pent_sandbox::prepare_proxy_network()?;
-        let bind_addr = std::net::SocketAddr::new(std::net::IpAddr::V4(outer_ip), 0);
-        config.proxy_bind_addr = bind_addr;
-        config.dns_bind_addr = bind_addr;
-    }
-    let handle = ProxyServer::new(config)?.start().await?;
-    let (Some(proxy_addr), Some(dns_addr)) = (handle.proxy_addr(), handle.dns_addr()) else {
-        return Err(CliError::Other("the proxy has no listener".to_string()));
+    let (handle, proxy_addr, dns_port) = (
+        server.start_unbound()?,
+        pent_sandbox::child_proxy_addr(),
+        pent_sandbox::CHILD_DNS_PORT,
+    );
+    #[cfg(not(target_os = "linux"))]
+    let (handle, proxy_addr, dns_port) = {
+        let handle = server.start().await?;
+        let (Some(proxy_addr), Some(dns_addr)) = (handle.proxy_addr(), handle.dns_addr()) else {
+            return Err(CliError::Other("the proxy has no listener".to_string()));
+        };
+        (handle, proxy_addr, dns_addr.port())
     };
-    let dns_port = dns_addr.port();
     tracing::debug!(
-        http_proxy = %format!("http://127.0.0.1:{}", proxy_addr.port()),
-        socks5_proxy = %format!("socks5h://127.0.0.1:{}", proxy_addr.port()),
-        dns = %dns_addr,
+        proxy = %proxy_addr,
+        dns_port,
         "proxy started (HTTP CONNECT + SOCKS5h on same port); DNS resolved server-side"
     );
     Ok(ProxySession {
@@ -388,25 +414,20 @@ impl Teardown for () {
 }
 
 /// The Linux resources of one session.
-///
-/// `N` is the network namespace handle type of `pent-sandbox`. Dropping it
-/// removes the firewall and routing rules.
 #[cfg(target_os = "linux")]
-pub(crate) struct LinuxResources<N> {
+pub(crate) struct LinuxResources {
     pub overlay: Option<pent_sandbox::OverlayHandle>,
-    pub netns: Option<N>,
     /// Show the writes that the overlay discards (trace mode).
     pub trace: bool,
 }
 
 #[cfg(target_os = "linux")]
-impl<N> Teardown for LinuxResources<N> {
+impl Teardown for LinuxResources {
     fn teardown(self) {
         if let Some(handle) = self.overlay {
             let report = teardown_overlay(handle);
             show_overlay_report(&report, self.trace);
         }
-        drop(self.netns);
     }
 }
 

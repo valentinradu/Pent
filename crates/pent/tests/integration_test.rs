@@ -938,12 +938,12 @@ mod no_hang {
             dir.path(),
             home.path(),
             &["run", "--profile", TEST_PROFILE, "--", bin_s, "--version"],
-            5, // proxy + veth setup may take ~1s; allow 5s total
+            5, // the proxy setup takes much less than 1s; allow 5s total
         );
         assert!(
             ok,
             "pent run (proxy mode) -- {name} --version timed out (5s)\n\
-             hint: pent may be hanging in veth/nft setup or the child is \
+             hint: pent may be hanging in the proxy setup or the child is \
              not routing through the proxy\nstderr:\n{stderr}",
         );
     }

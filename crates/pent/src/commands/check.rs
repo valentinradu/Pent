@@ -25,6 +25,17 @@ pub(crate) async fn check(cwd: PathBuf) -> Result<(), CliError> {
         }
     }
 
+    // On Linux, the sandbox, the network containment and watch mode need
+    // unprivileged user namespaces.
+    #[cfg(target_os = "linux")]
+    match pent_sandbox::check_user_namespaces() {
+        Ok(()) => ui::ok("user namespaces"),
+        Err(e) => {
+            ui::error(format!("user namespaces: {e}"));
+            all_ok = false;
+        }
+    }
+
     // 3. Proxy smoke-test
     let proxy_config = ProxyConfig::default();
     match ProxyServer::new(proxy_config) {

@@ -72,7 +72,7 @@
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc;
@@ -576,14 +576,6 @@ fn unix_target(sun_path: &[u8], resolve: impl FnOnce(&[u8]) -> Option<PathBuf>) 
 
 // ── The child side ──────────────────────────────────────────────────────────
 
-/// A `cmsghdr` with room for one file descriptor (`CMSG_SPACE(4)`).
-#[repr(C)]
-struct FdCmsg {
-    hdr: libc::cmsghdr,
-    fd: libc::c_int,
-    pad: libc::c_int,
-}
-
 /// The data that the `pre_exec` hook needs to install the recorder.
 #[derive(Clone)]
 pub(crate) struct RecorderChild {
@@ -629,7 +621,7 @@ impl RecorderChild {
         // SAFETY: `fd` and `self.sock` are open file descriptors of this
         // process.
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-        let sent = unsafe { send_fd(self.sock, fd) };
+        let sent = unsafe { crate::linux_fdpass::send_fds(self.sock, &[fd]) };
         // SAFETY: close the copies of this process; the parent has the
         // listener now, and `exec` does not need the socket.
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
@@ -639,125 +631,6 @@ impl RecorderChild {
         }
         sent
     }
-}
-
-/// Send the file descriptor `fd` over the Unix socket `sock` with
-/// `SCM_RIGHTS`. Async-signal-safe.
-///
-/// # Safety
-/// `sock` and `fd` must be open file descriptors.
-unsafe fn send_fd(sock: RawFd, fd: RawFd) -> std::io::Result<()> {
-    let mut byte = [0u8; 1];
-    let mut iov = libc::iovec {
-        iov_base: byte.as_mut_ptr().cast(),
-        iov_len: byte.len(),
-    };
-    // SAFETY: `FdCmsg` and `msghdr` are plain C structs; all zero bytes is a
-    // valid value for them.
-    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-    let (mut cmsg, mut msg) = unsafe {
-        (
-            std::mem::zeroed::<FdCmsg>(),
-            std::mem::zeroed::<libc::msghdr>(),
-        )
-    };
-    // CMSG_LEN(sizeof(int)): the header and one descriptor.
-    cmsg.hdr.cmsg_len =
-        (std::mem::size_of::<libc::cmsghdr>() + std::mem::size_of::<libc::c_int>()) as _;
-    cmsg.hdr.cmsg_level = libc::SOL_SOCKET;
-    cmsg.hdr.cmsg_type = libc::SCM_RIGHTS;
-    cmsg.fd = fd;
-    msg.msg_iov = &raw mut iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = (&raw mut cmsg).cast();
-    msg.msg_controllen = std::mem::size_of::<FdCmsg>() as _;
-    loop {
-        // SAFETY: `msg` points to valid buffers that live until the call
-        // returns.
-        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-        let n = unsafe { libc::sendmsg(sock, &raw const msg, libc::MSG_NOSIGNAL) };
-        if n >= 0 {
-            return Ok(());
-        }
-        let err = std::io::Error::last_os_error();
-        if err.kind() != std::io::ErrorKind::Interrupted {
-            return Err(err);
-        }
-    }
-}
-
-/// Receive one file descriptor from `sock`. Returns `Ok(None)` at EOF (the
-/// child died before it sent the descriptor).
-fn recv_fd(sock: &OwnedFd) -> std::io::Result<Option<OwnedFd>> {
-    let mut byte = [0u8; 1];
-    let mut iov = libc::iovec {
-        iov_base: byte.as_mut_ptr().cast(),
-        iov_len: byte.len(),
-    };
-    // SAFETY: `FdCmsg` and `msghdr` are plain C structs; all zero bytes is a
-    // valid value for them.
-    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-    let (mut cmsg, mut msg) = unsafe {
-        (
-            std::mem::zeroed::<FdCmsg>(),
-            std::mem::zeroed::<libc::msghdr>(),
-        )
-    };
-    msg.msg_iov = &raw mut iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = (&raw mut cmsg).cast();
-    msg.msg_controllen = std::mem::size_of::<FdCmsg>() as _;
-    let n = loop {
-        // SAFETY: `msg` points to valid, writable buffers that live until
-        // the call returns.
-        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-        let n = unsafe { libc::recvmsg(sock.as_raw_fd(), &raw mut msg, libc::MSG_CMSG_CLOEXEC) };
-        if n >= 0 {
-            break n;
-        }
-        let err = std::io::Error::last_os_error();
-        if err.kind() != std::io::ErrorKind::Interrupted {
-            return Err(err);
-        }
-    };
-    if n == 0 {
-        return Ok(None);
-    }
-    let min_len = std::mem::size_of::<libc::cmsghdr>() + std::mem::size_of::<libc::c_int>();
-    if msg.msg_flags & libc::MSG_CTRUNC != 0
-        || msg.msg_controllen < min_len as _
-        || cmsg.hdr.cmsg_level != libc::SOL_SOCKET
-        || cmsg.hdr.cmsg_type != libc::SCM_RIGHTS
-        || cmsg.fd < 0
-    {
-        return Err(std::io::Error::from_raw_os_error(libc::EPROTO));
-    }
-    // SAFETY: the kernel installed a new descriptor (with O_CLOEXEC) that
-    // this process owns.
-    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-    Ok(Some(unsafe { OwnedFd::from_raw_fd(cmsg.fd) }))
-}
-
-/// Create a `SOCK_SEQPACKET` socket pair with `O_CLOEXEC`.
-fn seqpacket_pair() -> Result<(OwnedFd, OwnedFd), SandboxError> {
-    let mut fds = [0 as libc::c_int; 2];
-    // SAFETY: socketpair writes two file descriptors into `fds`.
-    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-    let ret = unsafe {
-        libc::socketpair(
-            libc::AF_UNIX,
-            libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
-            0,
-            fds.as_mut_ptr(),
-        )
-    };
-    if ret != 0 {
-        return Err(SandboxError::SpawnFailed(std::io::Error::last_os_error()));
-    }
-    // SAFETY: socketpair succeeded, so both numbers are new file descriptors
-    // that this process owns.
-    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
 }
 
 // ── The parent side ─────────────────────────────────────────────────────────
@@ -818,7 +691,7 @@ impl RecorderSetup {
 /// `SpawnFailed` if the socket pair or the thread cannot be created.
 pub(crate) fn start_recorder(judge: Judge) -> Result<RecorderSetup, SandboxError> {
     let filter = native_filter()?;
-    let (parent_sock, child_sock) = seqpacket_pair()?;
+    let (parent_sock, child_sock) = crate::linux_fdpass::seqpacket_pair()?;
     let (tx, rx) = mpsc::channel();
     std::thread::Builder::new()
         .name("pent-recorder".to_string())
@@ -836,8 +709,16 @@ pub(crate) fn start_recorder(judge: Judge) -> Result<RecorderSetup, SandboxError
 
 /// The body of the supervisor thread.
 fn supervise(sock: &OwnedFd, judge: Judge, tx: &mpsc::Sender<WatchEvent>) {
-    let listener = match recv_fd(sock) {
-        Ok(Some(fd)) => fd,
+    let listener = match crate::linux_fdpass::recv_fds(sock) {
+        Ok(Some(fds)) => {
+            // The child sends exactly one descriptor. `recv_fds` checks
+            // that the count byte matches, so more than one is not possible
+            // from the hook; take the first and close the rest.
+            let Some(fd) = fds.into_iter().next() else {
+                return;
+            };
+            fd
+        }
         Ok(None) => return,
         Err(e) => {
             // The listener closes with the socket. Then the recorded system
@@ -1412,7 +1293,7 @@ pub(crate) fn spawn_watched(
         child: SandboxChild {
             child: spawned.child,
             overlay: spawned.overlay,
-            netns: spawned.netns,
+            proxy_listeners: spawned.proxy_listeners,
             events: None,
         },
         events,
@@ -1758,20 +1639,6 @@ mod tests {
             judge.fs(FsOp::Exec, Path::new("/usr/bin/sudo"), false),
             Outcome::Blocked(GuardClass::PrivilegeEscalation)
         );
-        Ok(())
-    }
-
-    #[test]
-    fn fd_passes_over_the_socket_pair() -> TestResult {
-        let (a, b) = seqpacket_pair()?;
-        let file = std::fs::File::open("/proc/self/status")?;
-        // SAFETY: both descriptors are open.
-        let sent = unsafe { send_fd(b.as_raw_fd(), file.as_raw_fd()) };
-        assert!(sent.is_ok(), "{sent:?}");
-        let got = recv_fd(&a)?;
-        assert!(got.is_some());
-        drop(b);
-        assert!(recv_fd(&a)?.is_none(), "EOF after the peer closes");
         Ok(())
     }
 

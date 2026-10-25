@@ -2,7 +2,8 @@
 //!
 //! Provides filesystem and network containment using native OS mechanisms:
 //! - macOS: sandbox-exec with SBPL profiles
-//! - Linux: Landlock LSM for filesystem, network namespaces for network
+//! - Linux: Landlock LSM for filesystem, network namespaces for network.
+//!   No privileges are necessary: pent uses unprivileged user namespaces.
 //!
 //! # Example
 //!
@@ -47,7 +48,10 @@ mod linux;
 mod linux_landlock;
 
 #[cfg(target_os = "linux")]
-mod linux_netns;
+mod linux_fdpass;
+
+#[cfg(target_os = "linux")]
+mod linux_proxynet;
 
 #[cfg(target_os = "linux")]
 mod linux_overlayfs;
@@ -58,14 +62,16 @@ mod linux_watch;
 pub use config::{system_default_paths, SandboxConfig};
 pub use env::{build_env, resolve_path_directories, resolve_path_dirs_from};
 #[cfg(target_os = "linux")]
-pub use linux::compute_accessible_set;
+pub use linux::check_user_namespaces;
 #[cfg(target_os = "linux")]
-pub use linux_netns::{cleanup_stale_netns, prepare_proxy_network};
+pub use linux::compute_accessible_set;
 #[cfg(target_os = "linux")]
 pub use linux_overlayfs::{
     cleanup_stale_overlays, DiscardKind, DiscardedWrite, FlushError, FlushFailure, OverlayHandle,
     OverlayTeardownReport,
 };
+#[cfg(target_os = "linux")]
+pub use linux_proxynet::{child_proxy_addr, ProxyListeners, CHILD_DNS_PORT, CHILD_PROXY_PORT};
 pub use pent_settings::{Mount, NetworkMode, SandboxPaths, SandboxSettings};
 
 use std::process::Child;
@@ -85,7 +91,8 @@ pub struct WatchOptions {
 
 /// A process that runs in watch mode.
 pub struct WatchedChild {
-    /// The child and the platform resources (network namespace on Linux).
+    /// The child and the platform resources (the overlay and the proxy
+    /// listeners on Linux).
     pub child: SandboxChild,
     /// The recorded events. The channel closes when the last process of the
     /// tree exits and the recorder has sent all events.
@@ -146,10 +153,11 @@ pub struct SandboxChild {
     /// Pass this to [`teardown_overlay`] after `child.wait()` returns.
     #[cfg(target_os = "linux")]
     pub overlay: Option<linux_overlayfs::OverlayHandle>,
-    /// Anonymous network namespace handle for `ProxyOnly` mode on Linux.
-    /// Dropping this cleans up firewall/routing rules added during setup.
+    /// The proxy listeners for `ProxyOnly` mode on Linux. The child made
+    /// them in its network namespace before `exec`. Give them to the proxy;
+    /// the child can reach nothing else.
     #[cfg(target_os = "linux")]
-    pub netns: Option<linux_netns::NetnsHandle>,
+    pub proxy_listeners: Option<ProxyListeners>,
     /// The recorded events when [`SandboxConfig::record_events`] is set
     /// (`pent run --trace`). The recorder observes next to the enforcement.
     /// Events that the policy denies have [`pent_profile::Outcome::Denied`].
@@ -183,13 +191,9 @@ pub enum SandboxError {
     #[error("Failed to spawn process: {0}")]
     SpawnFailed(#[from] std::io::Error),
 
-    /// Network namespace setup failed.
+    /// The setup of the sandbox network failed.
     #[error("Network setup failed: {0}")]
     NetworkSetupFailed(String),
-
-    /// Operation requires elevated privileges.
-    #[error("Privilege required: {0}")]
-    PrivilegeRequired(String),
 }
 
 /// Spawn a command in a sandbox, returning a [`SandboxChild`] handle.
@@ -280,7 +284,7 @@ pub fn spawn_sandboxed(
         Ok(SandboxChild {
             child: spawned.child,
             overlay: spawned.overlay,
-            netns: spawned.netns,
+            proxy_listeners: spawned.proxy_listeners,
             events: spawned.events,
         })
     }
@@ -399,27 +403,6 @@ pub(crate) fn binary_grant_dirs(
     dirs
 }
 
-/// Clean up Linux sandbox resources created by `spawn_sandboxed`.
-///
-/// Called after `child.wait()` to remove the named network namespace
-/// (created for `ProxyOnly` mode): `pent-{pid}`.
-///
-/// Keyed by the *parent* process ID (`std::process::id()`).
-///
-/// # Errors
-/// Returns `NetworkSetupFailed` if the network namespace cannot be deleted.
-/// Non-Linux platforms always return `Ok(())`.
-#[cfg(target_os = "linux")]
-pub const fn delete_sandbox_netns(_pid: u32) -> Result<(), SandboxError> {
-    Ok(())
-}
-
-/// No-op on non-Linux platforms.
-#[cfg(not(target_os = "linux"))]
-pub const fn delete_sandbox_netns(_pid: u32) -> Result<(), SandboxError> {
-    Ok(())
-}
-
 /// Flush write-listed files from the overlay upper layer back to the real
 /// filesystem inodes and clean up staging directories.
 ///
@@ -478,13 +461,6 @@ mod tests {
         };
         assert!(err.to_string().contains("Landlock"));
         assert!(err.to_string().contains("5.19"));
-    }
-
-    #[test]
-    fn test_sandbox_error_privilege() {
-        let err =
-            SandboxError::PrivilegeRequired("Network namespace requires CAP_NET_ADMIN".to_string());
-        assert!(err.to_string().contains("CAP_NET_ADMIN"));
     }
 
     #[test]

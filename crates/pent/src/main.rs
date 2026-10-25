@@ -14,17 +14,8 @@ async fn main() {
     let run_mode = matches!(cli.command, Command::Run(_) | Command::Watch(_));
     setup_tracing(cli.verbose, run_mode);
 
-    // Note: CAP_NET_ADMIN should be set on the pent binary via:
-    //   sudo setcap cap_net_admin=eip $(which pent)
-    // This allows pent to create veth pairs for network proxying without sudo.
-
     #[cfg(target_os = "linux")]
-    {
-        pent_sandbox::cleanup_stale_overlays();
-        // Remove the veth pairs and firewall rules of pent processes that died
-        // without cleanup (for example after SIGKILL).
-        pent_sandbox::cleanup_stale_netns();
-    }
+    pent_sandbox::cleanup_stale_overlays();
 
     let result = dispatch(cli).await;
     if let Err(e) = result {

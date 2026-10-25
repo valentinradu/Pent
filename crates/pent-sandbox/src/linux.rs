@@ -13,8 +13,8 @@
 //! With enforcement, the child always creates a user namespace and a mount
 //! namespace (and a network namespace unless the network is `Unrestricted`):
 //! - `LocalhostOnly`: new network namespace, the child brings up loopback.
-//! - `ProxyOnly`: new network namespace; the parent moves a veth into it and
-//!   configures it.
+//! - `ProxyOnly`: new network namespace; the child brings up loopback and
+//!   makes the proxy listeners in it (see `linux_proxynet.rs`).
 //! - `Blocked`: new network namespace with no interfaces.
 //! - `Unrestricted`: no network namespace.
 //!
@@ -50,8 +50,7 @@
 //! use async-signal-safe functions. Thus the parent prepares all data before
 //! `fork`: the Landlock ruleset file descriptor and its rules as C strings,
 //! the UID and GID maps, the mount targets and the working directory. The
-//! `pre_exec` hook uses only raw system calls on this data. The parent
-//! configures the `ProxyOnly` network of the child from a helper thread.
+//! `pre_exec` hook uses only raw system calls on this data.
 //!
 //! The overlayfs helpers (`linux_overlayfs::setup_overlay_dirs` and
 //! `mount_overlays`) still allocate in the child. They run only when write
@@ -65,11 +64,9 @@
 //! well-known sockets.
 
 use crate::linux_landlock::{access, PreparedRuleset};
-use crate::linux_netns::write_stderr_static;
 use crate::{NetworkMode, SandboxConfig, SandboxError};
 use std::collections::HashSet;
 use std::ffi::CString;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 
 #[cfg(test)]
@@ -123,6 +120,16 @@ const ESCAPE_SOCKETS: &[&str] = &[
     "/run/docker.sock",
     "/var/run/docker.sock",
     "/run/podman/podman.sock",
+];
+
+/// Unix sockets of host resolvers. A query through them goes to the network
+/// of the host, past the proxy. When the network is not `Unrestricted`, the
+/// child hides each one that exists, like [`ESCAPE_SOCKETS`]. Then the C
+/// library uses `/etc/resolv.conf`.
+const RESOLVER_SOCKETS: &[&str] = &[
+    "/run/nscd/socket",
+    "/var/run/nscd/socket",
+    "/run/systemd/resolve/io.systemd.Resolve",
 ];
 
 /// Compute the set of paths the sandboxed process is allowed to read/execute.
@@ -271,6 +278,77 @@ pub fn check_available() -> Result<(), SandboxError> {
     crate::linux_landlock::abi_version().map(|_| ())
 }
 
+/// Check that this user can create a user namespace with a network
+/// namespace in it. The sandbox and watch mode need both, and no other
+/// privilege.
+///
+/// The check forks a short-lived child that calls `unshare`.
+///
+/// # Errors
+/// * `SandboxUnavailable` with a remediation if the kernel refuses.
+/// * `SpawnFailed` if the fork or the wait fails.
+pub fn check_user_namespaces() -> Result<(), SandboxError> {
+    // SAFETY: the child of the fork calls only the async-signal-safe
+    // unshare(2) and _exit(2), so the fork is safe in a multithreaded
+    // process.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err(SandboxError::SpawnFailed(std::io::Error::last_os_error()));
+    }
+    if pid == 0 {
+        // SAFETY: unshare(2) with integer flags.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let ok = unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) } == 0;
+        let code = if ok {
+            0
+        } else {
+            // The exit code carries the error number (all are below 256).
+            std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EPERM)
+                & 0xff
+        };
+        // SAFETY: _exit(2) ends the child without the atexit handlers of the
+        // parent.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe { libc::_exit(code) };
+    }
+    let mut status: libc::c_int = 0;
+    loop {
+        // SAFETY: waitpid(2) on our own child with a valid status pointer.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let ret = unsafe { libc::waitpid(pid, &raw mut status, 0) };
+        if ret == pid {
+            break;
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::Interrupted {
+            return Err(SandboxError::SpawnFailed(err));
+        }
+    }
+    if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
+        return Ok(());
+    }
+    let errno = if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else {
+        libc::EPERM
+    };
+    Err(SandboxError::SandboxUnavailable {
+        reason: format!(
+            "this user cannot create a user namespace and a network namespace: {}",
+            std::io::Error::from_raw_os_error(errno)
+        ),
+        remediation: "Let unprivileged users create user namespaces: set the sysctl \
+                      user.max_user_namespaces above 0, and kernel.unprivileged_userns_clone \
+                      to 1 where it exists. On Ubuntu 24.04 and later, also set \
+                      kernel.apparmor_restrict_unprivileged_userns to 0, or add an AppArmor \
+                      profile for pent"
+            .to_string(),
+    })
+}
+
 /// Add all filesystem rules for `config` to `ruleset`.
 ///
 /// * `write_set` - write-listed files that an overlay covers (skipped here;
@@ -357,6 +435,16 @@ pub fn build_landlock_ruleset(
 
 // ── Raw helpers for the pre_exec hook ──────────────────────────────────────
 
+/// Write a static message to the error output. Async-signal-safe.
+pub(crate) fn write_stderr_static(msg: &'static [u8]) {
+    // SAFETY: write(2) on fd 2 with a static buffer is async-signal-safe.
+    // The result is ignored because no other channel for the error exists.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    unsafe {
+        libc::write(libc::STDERR_FILENO, msg.as_ptr().cast(), msg.len());
+    }
+}
+
 /// Return the last OS error. `std::io::Error::last_os_error` does not
 /// allocate, so this is async-signal-safe.
 fn last_err(msg: &'static [u8]) -> std::io::Error {
@@ -387,35 +475,6 @@ fn write_all_fd(fd: libc::c_int, mut buf: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Fill `buf` from `fd`. Retries on EINTR. Returns `Ok(false)` on EOF before
-/// any byte. Async-signal-safe.
-fn read_exact_fd(fd: libc::c_int, buf: &mut [u8]) -> std::io::Result<bool> {
-    let mut done = 0usize;
-    while done < buf.len() {
-        let Some(rest) = buf.get_mut(done..) else {
-            break;
-        };
-        // SAFETY: `rest` is a valid, writable slice for `rest.len()` bytes.
-        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-        let n = unsafe { libc::read(fd, rest.as_mut_ptr().cast(), rest.len()) };
-        if n < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(err);
-        }
-        if n == 0 {
-            if done == 0 {
-                return Ok(false);
-            }
-            return Err(std::io::Error::from_raw_os_error(libc::EPIPE));
-        }
-        done = done.saturating_add(n.unsigned_abs());
-    }
-    Ok(true)
-}
-
 /// Open `path` for writing and write all of `buf` to it. Async-signal-safe.
 fn write_proc_file(path: &std::ffi::CStr, buf: &[u8]) -> std::io::Result<()> {
     // SAFETY: `path` is a valid NUL-terminated string.
@@ -433,7 +492,8 @@ fn write_proc_file(path: &std::ffi::CStr, buf: &[u8]) -> std::io::Result<()> {
 
 /// Bring up the loopback interface in the current network namespace.
 ///
-/// Called after `unshare(CLONE_NEWNET)` for `LocalhostOnly`. Async-signal-safe.
+/// Called after `unshare(CLONE_NEWNET)` for `LocalhostOnly` and `ProxyOnly`.
+/// Async-signal-safe.
 fn bring_up_loopback() -> std::io::Result<()> {
     const IFNAMSIZ: usize = 16;
     const IFF_UP: i16 = 0x1;
@@ -519,8 +579,8 @@ fn setup_userns_mappings(uid_map: &[u8], gid_map: &[u8]) -> std::io::Result<()> 
 
 /// Clear the inheritable capability set and make the process dumpable.
 ///
-/// The pent binary can carry `cap_net_admin=eip` file capabilities. These
-/// have two effects that break the user namespace setup:
+/// A binary with file capabilities (for example an old install with
+/// `setcap`) has two problems with the user namespace setup:
 ///
 /// 1. The process is not dumpable. Its `/proc/self` files belong to root,
 ///    so the writes to `uid_map` fail with EACCES. `PR_SET_DUMPABLE` fixes
@@ -580,7 +640,7 @@ fn prepare_caps_for_userns() -> std::io::Result<()> {
 
 /// Mark all file descriptors from 3 up as close-on-exec, so that file
 /// descriptors of the embedding program that are not `O_CLOEXEC` do not leak
-/// into the child. The sync pipes and the ruleset stay usable until `exec`.
+/// into the child. The socket pairs and the ruleset stay usable until `exec`.
 /// Async-signal-safe.
 fn cloexec_inherited_fds() {
     const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
@@ -710,7 +770,12 @@ fn mask_targets(config: &SandboxConfig, uid: libc::uid_t) -> (Vec<PathBuf>, Vec<
         }
     }
     let mut files: Vec<PathBuf> = Vec::new();
-    for s in ESCAPE_SOCKETS {
+    let resolvers: &[&str] = if config.network == NetworkMode::Unrestricted {
+        &[]
+    } else {
+        RESOLVER_SOCKETS
+    };
+    for s in ESCAPE_SOCKETS.iter().chain(resolvers) {
         let p = Path::new(s);
         let Ok(real) = std::fs::canonicalize(p) else {
             continue;
@@ -761,20 +826,9 @@ impl MountPlan {
 
         if let Some(src) = &self.resolv {
             // MS_BIND follows a symbolic link at the target, so this also
-            // covers a /etc/resolv.conf that points into /run.
-            // SAFETY: mount(2) with NUL-terminated strings that the parent
-            // prepared.
-            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-            let ret = unsafe {
-                libc::mount(
-                    src.as_ptr(),
-                    c"/etc/resolv.conf".as_ptr(),
-                    std::ptr::null(),
-                    libc::MS_BIND,
-                    std::ptr::null(),
-                )
-            };
-            if ret != 0 {
+            // covers a /etc/resolv.conf that points into /run. The mount is
+            // read-only: the file is shared with other pent processes.
+            if bind_readonly(src, c"/etc/resolv.conf", 0).is_err() {
                 write_stderr_static(
                     b"pent: bind-mount /etc/resolv.conf failed; DNS may not work\n",
                 );
@@ -893,8 +947,8 @@ struct ChildPlan {
     unshare_flags: libc::c_int,
     uid_map: Vec<u8>,
     gid_map: Vec<u8>,
-    /// ProxyOnly sync pipes: (ready write end, go read end).
-    proxy_sync: Option<(libc::c_int, libc::c_int)>,
+    /// `ProxyOnly`: make the proxy listeners and send them to the parent.
+    proxy_sockets: Option<crate::linux_proxynet::ProxySocketsChild>,
     overlays: Vec<super::linux_overlayfs::OverlayMount>,
     accessible: HashSet<PathBuf>,
     mounts: MountPlan,
@@ -914,8 +968,9 @@ impl ChildPlan {
     /// Order matters:
     /// 1. Parent-death signal and close-on-exec for inherited fds.
     /// 2. All namespace work while `/proc/self` is still writable: unshare,
-    ///    UID/GID maps, the ProxyOnly handshake, overlay and private mounts,
-    ///    loopback.
+    ///    UID/GID maps, overlay and private mounts, loopback, and the proxy
+    ///    listeners (the child still has all capabilities in its user
+    ///    namespace).
     /// 3. `PR_SET_NO_NEW_PRIVS`, the seccomp filter and Landlock.
     /// 4. The seccomp filter of the recorder as the last step: after it, the
     ///    supervisor in the parent must answer each recorded system call.
@@ -949,32 +1004,6 @@ impl ChildPlan {
             }
         }
 
-        if let Some((ready_w, go_r)) = self.proxy_sync {
-            // Send our PID to the helper thread of the parent. The thread
-            // moves the inner veth into our network namespace, configures
-            // it, and then sends one byte.
-            // SAFETY: getpid has no preconditions.
-            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-            let pid = unsafe { libc::getpid() };
-            let sent = write_all_fd(ready_w, &pid.to_ne_bytes());
-            // SAFETY: close our copy of the pipe end; exec closes it anyway.
-            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-            unsafe { libc::close(ready_w) };
-            sent.map_err(|_| last_err(b"pent: cannot send the PID to the parent\n"))?;
-            let mut go = [0u8; 1];
-            let got = read_exact_fd(go_r, &mut go);
-            // SAFETY: as above.
-            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-            unsafe { libc::close(go_r) };
-            match got {
-                Ok(true) if go == *b"1" => {}
-                _ => {
-                    write_stderr_static(b"pent: the parent did not configure the network\n");
-                    return Err(std::io::Error::from_raw_os_error(libc::ENETDOWN));
-                }
-            }
-        }
-
         if !self.overlays.is_empty() {
             // These helpers live in linux_overlayfs.rs. They create the
             // upper/work directories inside the user namespace (doing so in
@@ -1002,6 +1031,13 @@ impl ChildPlan {
 
         if self.bring_up_lo {
             bring_up_loopback()?;
+        }
+        if let Some(proxy) = self.proxy_sockets {
+            // SAFETY: we are in the pre_exec hook, in the new network
+            // namespace, and `lo` is up.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            unsafe { proxy.create_and_send() }
+                .map_err(|_| last_err(b"pent: cannot make the proxy listeners\n"))?;
         }
 
         if self.no_new_privs {
@@ -1033,30 +1069,15 @@ impl ChildPlan {
     }
 }
 
-/// Create a pipe with `O_CLOEXEC` and return (read end, write end).
-fn cloexec_pipe() -> Result<(OwnedFd, OwnedFd), SandboxError> {
-    let mut fds = [0i32; 2];
-    // SAFETY: pipe2 writes two file descriptors into `fds`.
-    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-        return Err(SandboxError::SpawnFailed(std::io::Error::last_os_error()));
-    }
-    // SAFETY: pipe2 succeeded, so both numbers are new file descriptors
-    // that this process owns.
-    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
-}
-
 /// Add the proxy variables to the environment of the child.
 fn proxy_env(
     env: &std::collections::HashMap<String, String>,
-    outer_ip: std::net::Ipv4Addr,
-    port: u16,
+    addr: std::net::SocketAddr,
 ) -> std::collections::HashMap<String, String> {
-    let http_url = format!("http://{outer_ip}:{port}");
+    let http_url = format!("http://{addr}");
     // socks5h = hostname resolved by the proxy, so the sandboxed process
     // never calls getaddrinfo for external hosts — DNS stays on the proxy side.
-    let socks_url = format!("socks5h://{outer_ip}:{port}");
+    let socks_url = format!("socks5h://{addr}");
     let no_proxy = "localhost,127.0.0.1,::1";
     let mut e = env.clone();
     e.insert("HTTP_PROXY".to_string(), http_url.clone());
@@ -1072,7 +1093,7 @@ fn proxy_env(
     // Route git-over-SSH through the SOCKS5 proxy (nc -X 5 = SOCKS5).
     e.insert(
         "GIT_SSH_COMMAND".to_string(),
-        format!("ssh -o ProxyCommand='nc -X 5 -x {outer_ip}:{port} %h %p'"),
+        format!("ssh -o ProxyCommand='nc -X 5 -x {addr} %h %p'"),
     );
     // Signal to the sandboxed process that it is running inside a proxy sandbox.
     // Claude Code checks this flag to activate its own proxy-aware networking.
@@ -1093,13 +1114,13 @@ fn proxy_env(
 /// exits.
 ///
 /// # Returns
-/// `(child_handle, overlay_handle, netns_handle)` — `overlay_handle` is `Some`
+/// `(child_handle, overlay_handle, proxy_listeners)` — `overlay_handle` is `Some`
 /// when overlayfs is in use; pass it to [`super::linux_overlayfs::teardown`]
 /// after the child exits.
 ///
 /// # Errors
 /// * `SandboxUnavailable` - If Landlock unavailable
-/// * `NetworkSetupFailed` / `PrivilegeRequired` - If the proxy network fails
+/// * `NetworkSetupFailed` - If the proxy listeners do not arrive
 /// * `SpawnFailed` - If spawn fails
 ///
 /// Only the tests use this form; the crate calls [`spawn_linux`].
@@ -1114,12 +1135,12 @@ pub fn spawn_with_landlock(
     (
         std::process::Child,
         Option<super::linux_overlayfs::OverlayHandle>,
-        Option<super::linux_netns::NetnsHandle>,
+        Option<super::linux_proxynet::ProxyListeners>,
     ),
     SandboxError,
 > {
     let spawned = spawn_linux(config, cmd, args, env, path_dirs, SpawnMode::Sandbox)?;
-    Ok((spawned.child, spawned.overlay, spawned.netns))
+    Ok((spawned.child, spawned.overlay, spawned.proxy_listeners))
 }
 
 /// The kind of a Linux spawn.
@@ -1140,8 +1161,8 @@ pub(crate) struct Spawned {
     pub child: std::process::Child,
     /// The overlay handle (only with enforcement and write-listed files).
     pub overlay: Option<super::linux_overlayfs::OverlayHandle>,
-    /// The network namespace handle for `ProxyOnly`.
-    pub netns: Option<super::linux_netns::NetnsHandle>,
+    /// The proxy listeners that the child made for `ProxyOnly`.
+    pub proxy_listeners: Option<super::linux_proxynet::ProxyListeners>,
     /// The events of the recorder, if it runs.
     pub events: Option<std::sync::mpsc::Receiver<pent_profile::WatchEvent>>,
 }
@@ -1153,7 +1174,7 @@ pub(crate) struct Spawned {
 ///
 /// # Errors
 /// * `SandboxUnavailable` - If Landlock is unavailable (sandbox mode)
-/// * `NetworkSetupFailed` / `PrivilegeRequired` - If the proxy network fails
+/// * `NetworkSetupFailed` - If the proxy listeners do not arrive
 /// * `SpawnFailed` - If the spawn or the recorder setup fails
 #[allow(clippy::too_many_lines)]
 pub(crate) fn spawn_linux(
@@ -1257,27 +1278,19 @@ pub(crate) fn spawn_linux(
         None
     };
 
-    // ProxyOnly: use the network that `prepare_proxy_network` created for the
-    // proxy address, or create one now.
-    let mut proxy_netns: Option<super::linux_netns::NetnsHandle> = if let NetworkMode::ProxyOnly {
-        proxy_addr,
-        dns_port,
-    } = &config.network
-    {
-        let mut handle = match super::linux_netns::take_prepared(proxy_addr.ip()) {
-            Some(h) => h,
-            None => super::linux_netns::create_netns()?,
-        };
-        handle.install_firewall(proxy_addr.port(), *dns_port)?;
-        Some(handle)
+    // ProxyOnly: the child makes the proxy listeners in its network namespace
+    // and sends them over a socket pair. It resolves names through the proxy
+    // DNS on 127.0.0.1:53.
+    let is_proxy = matches!(config.network, NetworkMode::ProxyOnly { .. });
+    let proxy_sockets = if is_proxy {
+        Some(super::linux_proxynet::ProxySocketsSetup::new()?)
     } else {
         None
     };
-    let resolv_src: Option<PathBuf> = match (&mut proxy_netns, &config.network) {
-        (Some(h), NetworkMode::ProxyOnly { dns_port, .. }) if *dns_port != 0 => {
-            Some(h.write_resolv_conf()?)
-        }
-        _ => None,
+    let resolv_src: Option<PathBuf> = if is_proxy {
+        Some(super::linux_proxynet::resolv_conf()?)
+    } else {
+        None
     };
 
     // Namespaces.
@@ -1288,11 +1301,7 @@ pub(crate) fn spawn_linux(
     let unshare_flags = if enforce || watch {
         libc::CLONE_NEWUSER | libc::CLONE_NEWNS | net_flag
     } else if net_flag != 0 {
-        let ns = if proxy_netns.is_some() {
-            libc::CLONE_NEWNS
-        } else {
-            0
-        };
+        let ns = if is_proxy { libc::CLONE_NEWNS } else { 0 };
         libc::CLONE_NEWUSER | net_flag | ns
     } else {
         0
@@ -1345,17 +1354,6 @@ pub(crate) fn spawn_linux(
             .extend(mask_files.iter().filter_map(|p| to_cstring(p)));
     }
 
-    // Sync pipes for ProxyOnly.
-    // ready: child writes its PID → helper thread reads it.
-    // go:    helper thread writes one byte → child reads it.
-    let pipes = if proxy_netns.is_some() {
-        let (ready_r, ready_w) = cloexec_pipe()?;
-        let (go_r, go_w) = cloexec_pipe()?;
-        Some((ready_r, ready_w, go_r, go_w))
-    } else {
-        None
-    };
-
     // The recorder. The supervisor thread starts before `spawn`: the child
     // sends the listener file descriptor during `spawn`, and its `execve`
     // waits for an answer from the supervisor.
@@ -1383,9 +1381,7 @@ pub(crate) fn spawn_linux(
         unshare_flags,
         uid_map: format!("{uid} {uid} 1\n").into_bytes(),
         gid_map: format!("{gid} {gid} 1\n").into_bytes(),
-        proxy_sync: pipes
-            .as_ref()
-            .map(|(_, ready_w, go_r, _)| (ready_w.as_raw_fd(), go_r.as_raw_fd())),
+        proxy_sockets: proxy_sockets.as_ref().map(|p| p.child),
         overlays: overlay_mounts.clone(),
         accessible,
         mounts,
@@ -1394,17 +1390,16 @@ pub(crate) fn spawn_linux(
         } else {
             None
         },
-        bring_up_lo: config.network == NetworkMode::LocalhostOnly,
+        bring_up_lo: config.network == NetworkMode::LocalhostOnly || is_proxy,
         no_new_privs: ruleset.is_some() || recorder.is_some(),
         ruleset,
         recorder: recorder.as_ref().map(|r| r.child.clone()),
     };
 
-    let effective_env = match (&config.network, &proxy_netns) {
-        (NetworkMode::ProxyOnly { proxy_addr, .. }, Some(handle)) => {
-            proxy_env(env, handle.outer_ip, proxy_addr.port())
-        }
-        _ => env.clone(),
+    let effective_env = if is_proxy {
+        proxy_env(env, super::linux_proxynet::child_proxy_addr())
+    } else {
+        env.clone()
     };
 
     let mut command = Command::new(cmd);
@@ -1423,62 +1418,25 @@ pub(crate) fn spawn_linux(
         command.pre_exec(move || plan.run());
     }
 
-    // The helper thread configures the child network. It must start before
-    // `spawn`, because the child blocks on the go pipe inside `spawn`.
-    let (parent_ends, helper) = match pipes {
-        Some((ready_r, ready_w, go_r, go_w)) => {
-            let net = proxy_netns
-                .as_ref()
-                .map(super::linux_netns::NetnsHandle::child_config);
-            let helper = std::thread::spawn(move || -> Result<bool, SandboxError> {
-                let mut pid_bytes = [0u8; 4];
-                match read_exact_fd(ready_r.as_raw_fd(), &mut pid_bytes) {
-                    Ok(true) => {}
-                    // EOF: the child failed before the handshake.
-                    Ok(false) => return Ok(false),
-                    Err(e) => {
-                        return Err(SandboxError::NetworkSetupFailed(format!(
-                            "cannot read the child PID: {e}"
-                        )))
-                    }
-                }
-                let child_pid = libc::pid_t::from_ne_bytes(pid_bytes);
-                if let Some(net) = &net {
-                    net.configure(child_pid)?;
-                }
-                write_all_fd(go_w.as_raw_fd(), b"1").map_err(|e| {
-                    SandboxError::NetworkSetupFailed(format!("cannot signal the child: {e}"))
-                })?;
-                Ok(true)
-            });
-            (Some((ready_w, go_r)), Some(helper))
-        }
-        None => (None, None),
-    };
-
     let spawn_result = command.spawn();
-    // Drop the closure (and with it the ruleset fd) and the parent copies of
-    // the child-side pipe ends. The helper then sees EOF if the child died
-    // before the handshake.
+    // Drop the closure (and with it the ruleset fd).
     drop(command);
-    drop(parent_ends);
     // Drop the parent copy of the socket end of the child. The supervisor
     // then sees EOF if the child died before it sent the listener.
     let events = recorder.map(crate::linux_watch::RecorderSetup::into_events);
 
-    let helper_result = match helper {
-        Some(h) => h.join().map_err(|_| {
-            SandboxError::NetworkSetupFailed("the network helper thread panicked".to_string())
-        })?,
-        None => Ok(true),
-    };
-
-    // On error, `proxy_netns` drops here and removes the network.
-    let child = match (spawn_result, helper_result) {
-        (Ok(child), Ok(_)) => child,
-        // The helper failure is the root cause of the spawn failure.
-        (_, Err(e)) => return Err(e),
-        (Err(e), Ok(_)) => return Err(SandboxError::SpawnFailed(e)),
+    let mut child = spawn_result.map_err(SandboxError::SpawnFailed)?;
+    // `spawn` returns after the `exec` of the child, so the child has sent
+    // its proxy listeners.
+    let proxy_listeners = match proxy_sockets.map(|p| p.receive()).transpose() {
+        Ok(listeners) => listeners,
+        Err(e) => {
+            // The child runs without its proxy; stop it. A failure means that
+            // it has already exited.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e);
+        }
     };
 
     // Start the inotify watcher now that the child is running.
@@ -1496,7 +1454,7 @@ pub(crate) fn spawn_linux(
     Ok(Spawned {
         child,
         overlay: overlay_handle,
-        netns: proxy_netns,
+        proxy_listeners,
         events,
     })
 }
@@ -1648,7 +1606,7 @@ mod tests {
 
         if check_available().is_ok() {
             match result {
-                Ok((mut child, _overlay, _netns)) => {
+                Ok((mut child, _overlay, _proxy)) => {
                     let status = child
                         .wait()
                         .map_err(|e| format!("Failed to wait on child: {e}"))?;
@@ -1694,7 +1652,7 @@ mod tests {
 
         if check_available().is_ok() {
             match result {
-                Ok((mut child, _overlay, _netns)) => {
+                Ok((mut child, _overlay, _proxy)) => {
                     let status = child
                         .wait()
                         .map_err(|e| format!("Failed to wait on child: {e}"))?;
@@ -1909,7 +1867,7 @@ mod tests {
             &test_env,
             &path_dirs,
         ) {
-            Ok((child, handle, _netns)) => Some((child, handle)),
+            Ok((child, handle, _proxy)) => Some((child, handle)),
             Err(SandboxError::SpawnFailed(e))
                 if e.kind() == std::io::ErrorKind::PermissionDenied =>
             {
@@ -1994,7 +1952,7 @@ mod tests {
             &path_dirs,
         );
 
-        let (mut child, overlay_handle, _netns) = match result {
+        let (mut child, overlay_handle, _proxy) = match result {
             Ok(r) => r,
             Err(SandboxError::SpawnFailed(e))
                 if e.kind() == std::io::ErrorKind::PermissionDenied =>
@@ -2409,7 +2367,7 @@ mod tests {
             &test_env,
             &path_dirs,
         );
-        let (mut child, overlay_handle, _netns) = match result {
+        let (mut child, overlay_handle, _proxy) = match result {
             Ok(r) => r,
             Err(SandboxError::SpawnFailed(e))
                 if e.kind() == std::io::ErrorKind::PermissionDenied =>
@@ -2502,7 +2460,7 @@ mod tests {
             &path_dirs,
         );
 
-        let (mut child, overlay_handle, _netns) = match result {
+        let (mut child, overlay_handle, _proxy) = match result {
             Err(SandboxError::SpawnFailed(e))
                 if e.kind() == std::io::ErrorKind::PermissionDenied =>
             {
@@ -2630,7 +2588,7 @@ mod tests {
             &test_env,
             &path_dirs,
         ) {
-            Ok((child, handle, _netns)) => Some((child, handle)),
+            Ok((child, handle, _proxy)) => Some((child, handle)),
             Err(SandboxError::SpawnFailed(e))
                 if e.kind() == std::io::ErrorKind::PermissionDenied =>
             {
@@ -3253,16 +3211,45 @@ mod tests {
         assert!(!dirs.contains(&PathBuf::from("/run/user/4242")));
     }
 
+    /// The child hides the host resolver sockets unless the network is
+    /// unrestricted. The test checks only the sockets that exist here.
     #[test]
-    fn test_read_write_helpers_handle_pipes() -> TestResult {
-        let (r, w) = cloexec_pipe().map_err(|e| format!("pipe: {e}"))?;
+    fn test_mask_targets_hide_resolver_sockets() {
+        let present: Vec<PathBuf> = RESOLVER_SOCKETS
+            .iter()
+            .filter_map(|s| std::fs::canonicalize(s).ok())
+            .collect();
+        let base = || {
+            SandboxConfig::new(
+                PathBuf::from("/tmp"),
+                SandboxPaths::default(),
+                PathBuf::from("/tmp"),
+            )
+        };
+        let (_, restricted) = mask_targets(
+            &base().with_network(NetworkMode::ProxyOnly {
+                proxy_addr: crate::linux_proxynet::child_proxy_addr(),
+                dns_port: crate::linux_proxynet::CHILD_DNS_PORT,
+            }),
+            4242,
+        );
+        let (_, open) = mask_targets(&base().with_network(NetworkMode::Unrestricted), 4242);
+        for socket in &present {
+            assert!(restricted.contains(socket), "{}", socket.display());
+            assert!(!open.contains(socket), "{}", socket.display());
+        }
+    }
+
+    #[test]
+    fn test_write_helper_writes_all() -> TestResult {
+        use std::io::Read as _;
+        use std::os::fd::AsRawFd as _;
+        let (mut r, w) = std::os::unix::net::UnixStream::pair()?;
         write_all_fd(w.as_raw_fd(), b"abcd")?;
         drop(w);
-        let mut buf = [0u8; 4];
-        assert!(read_exact_fd(r.as_raw_fd(), &mut buf)?);
-        assert_eq!(&buf, b"abcd");
-        // EOF before any byte.
-        assert!(!read_exact_fd(r.as_raw_fd(), &mut buf)?);
+        let mut buf = Vec::new();
+        r.read_to_end(&mut buf)?;
+        assert_eq!(buf, b"abcd");
         Ok(())
     }
 
@@ -3291,7 +3278,7 @@ mod tests {
         // SAFETY: getuid has no preconditions.
         let uid = unsafe { libc::getuid() };
         let script = format!("[ \"$({} -u)\" = {uid} ]", id_bin.display());
-        let (mut child, _overlay, _netns) = spawn_with_landlock(
+        let (mut child, _overlay, _proxy) = spawn_with_landlock(
             &config,
             &sh.to_string_lossy(),
             &["-c".to_string(), script],
@@ -3303,6 +3290,61 @@ mod tests {
             child.wait()?.success(),
             "the child must run with the real UID, not 65534"
         );
+        Ok(())
+    }
+
+    /// `ProxyOnly` without privileges: the child makes the proxy listeners
+    /// in its network namespace, and the parent receives them. The child
+    /// reaches the proxy on 127.0.0.1:3128 and its DNS on 127.0.0.1:53, and
+    /// it has no route to another address.
+    #[test]
+    #[serial]
+    fn test_proxy_only_passes_the_listeners() -> TestResult {
+        use std::io::Read as _;
+        if check_available().is_err() || check_user_namespaces().is_err() {
+            return Ok(());
+        }
+        let Some(bash) = which("bash") else {
+            return Ok(()); // skip: the test uses /dev/tcp of bash
+        };
+        let dirs = make_test_dirs();
+        let config = SandboxConfig::new(
+            dirs.workspace.clone(),
+            SandboxPaths::default(),
+            dirs.workspace.clone(),
+        )
+        .with_data_dir(dirs.data_dir)
+        .with_network(NetworkMode::ProxyOnly {
+            proxy_addr: crate::linux_proxynet::child_proxy_addr(),
+            dns_port: crate::linux_proxynet::CHILD_DNS_PORT,
+        });
+        // The first connection succeeds. A connection to a public address
+        // fails at once (no route), so the script then writes "isolated".
+        let script = "exec 3<>/dev/tcp/127.0.0.1/3128 && printf ok >&3; \
+                      if (exec 4<>/dev/tcp/192.0.2.1/80) 2>/dev/null; then printf leak >&3; \
+                      else printf ' isolated' >&3; fi; \
+                      read -r ns < /etc/resolv.conf; \
+                      [ \"$ns\" = 'nameserver 127.0.0.1' ] && printf ' resolv' >&3; \
+                      [ \"$HTTPS_PROXY\" = http://127.0.0.1:3128 ] && printf ' env' >&3";
+        let (mut child, _overlay, listeners) = spawn_with_landlock(
+            &config,
+            &bash.to_string_lossy(),
+            &["-c".to_string(), script.to_string()],
+            &std::collections::HashMap::new(),
+            &test_path_dirs(&bash),
+        )
+        .map_err(|e| format!("spawn failed: {e:?}"))?;
+        let listeners = listeners.ok_or("no proxy listeners")?;
+        assert_eq!(listeners.dns_udp.local_addr()?.to_string(), "127.0.0.1:53");
+        assert_eq!(listeners.dns_tcp.local_addr()?.to_string(), "127.0.0.1:53");
+        let tcp = listeners.tcp.first().ok_or("no TCP listener")?;
+        assert_eq!(tcp.local_addr()?.to_string(), "127.0.0.1:3128");
+        let (mut conn, _) = tcp.accept()?;
+        conn.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+        let mut got = String::new();
+        conn.read_to_string(&mut got)?;
+        assert!(child.wait()?.success());
+        assert_eq!(got, "ok isolated resolv env");
         Ok(())
     }
 
