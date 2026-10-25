@@ -9,6 +9,7 @@ result.
 | [linux-sandbox.md](linux-sandbox.md) | The Linux filesystem and process sandbox of `pent run` |
 | [network.md](network.md) | The proxy, the DNS server and the network namespace |
 | [watch-and-profiles.md](watch-and-profiles.md) | The recorder, the guard, the summary, the review and the profile store |
+| [macos.md](macos.md) | The macOS Seatbelt backend: the first test suite, and the findings that it states |
 
 ## The threat model
 
@@ -37,6 +38,10 @@ cargo test --workspace                      # the defenses that work
 cargo test --workspace -- --include-ignored # also the open findings
 ```
 
+A test that skips proves nothing either. Set `PENT_REQUIRE_ALL_TESTS=1` to
+make each skip a failure. The continuous integration sets it, so a job
+cannot stay green while the sandbox never ran.
+
 ## The state of the findings
 
 The reports hold the full list. The high items that are open need a change in
@@ -54,4 +59,4 @@ the kernel backend, and the notes in each report give the fix.
   but not the bytes inside it.
 - **macOS.** The Seatbelt profile starts from `(allow default)`, so it limits
   only file reads, file writes and the network. See the platform notes in the
-  README.
+  README and [macos.md](macos.md).
