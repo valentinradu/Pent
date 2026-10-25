@@ -25,7 +25,7 @@ test that fails holds the secure assertion and has the mark
 
 | ID | Severity | One line | State | Test |
 |----|----------|----------|-------|------|
-| FUZZ-1 | Medium | A crafted executable name forges a Seatbelt report, so a false access reaches the watch log and the draft profile. | **Open** | `a_crafted_executable_name_forges_no_report` |
+| FUZZ-1 | Medium | A crafted executable name forged a Seatbelt report, so a false access reached the watch log and the draft profile. | **Fixed** (`COMMIT-FUZZ-1`) | `a_crafted_executable_name_forges_no_report` |
 | FUZZ-2 | Low | The DNS server clears the truncation bit of an upstream answer, so the client never retries over TCP and loses records. | **Open** | `the_server_clears_the_truncation_bit_today` |
 | FUZZ-3 | Informational | The documentation of the domain filter states a pattern form (`*.*.example.com`) that the code rejects. | **Open** | `a_pattern_with_two_wildcards_is_rejected` |
 
@@ -34,7 +34,7 @@ buffer, loop forever, or overflow an integer.
 
 ### FUZZ-1 — a crafted executable name forges a Seatbelt report (Medium)
 
-**State: open.** The platform is macOS only.
+**State: fixed** in `COMMIT-FUZZ-1`. The platform is macOS only.
 
 **Where.** `parse_line` in `crates/pent-sandbox/src/macos_log.rs`.
 
@@ -77,24 +77,59 @@ the parser reads. Guard 3 (the PID filter) does not hold, because the
 attacker chooses the PID.
 
 **The limit of the finding.** The author of this document has no Mac. The
-test uses the line format that the module documents. If the kernel cuts the
-process name to 16 bytes, as `p_comm` does, the payload does not fit and
-the attack fails. The module comment already says that nobody checked the
-format of an allow report on a Mac. Check the length of the name in a real
-report first.
+test uses the line format that the module documents. Two facts of a real
+Mac make the attack smaller than the line suggests:
 
-**The fix.** Read the fields from the last `) deny` or `) allow` marker, and
-refuse a line whose remainder holds another marker. The target can hold a
-marker too (`target_with_marker_text_stays_whole`), so one marker alone is
-not enough: the parser also needs the rule that the process name holds no
-`(` followed by digits and `)`. The safest form is to drop a report whose
-message holds more than one marker, and to log that drop.
+- If the kernel cuts the process name to 16 bytes, as `p_comm` does, the
+  payload does not fit and the attack fails.
+- A file name holds no `/`. The payload of the example therefore needs a
+  path of several components, and the name of the report must then be the
+  whole path, not the file name. With a file name of one component the
+  forged target holds no `/`, and `map_operation` drops a filesystem
+  target that does not start with `/`.
+
+**The fix.** The text of a line cannot tell the two cases apart: a path
+that the program opens can hold the text of a marker, and the tests
+`target_with_marker_text_stays_whole` and
+`a_header_inside_a_path_gives_no_second_event` prove that such a line must
+still parse. So the fix does not change the parser. It uses a source that
+the program does not choose.
+
+The reader already follows the tree of processes. The poll now reads
+`comm` for each PID (`ps -A -o pid=,ppid=,stat=,comm=`), so the reader
+knows the file that each PID runs. `filter_lines` keeps a report only when
+the name of the record fits that file (`names_agree` and
+`ProcessTree::name_fits`). A forged name is a prefix of the real file
+name, so the two differ and the record goes.
+
+What the check holds:
+
+- A forgery goes, in both shapes: the short prefix (`a`) and a prefix of
+  exactly 16 bytes whose rest holds a marker.
+- A real report stays, also when the kernel cuts a long name to the 16
+  bytes of `p_comm`: the check accepts the cut form.
+
+What the check does not hold:
+
+- A report of a PID whose program pent never read goes too. A process that
+  exits and that its parent reaps between two polls is such a case. macOS
+  watch mode is a lower bound already, because the log limits the rate of
+  the reports; `--append` merges more runs.
+- An honest file name whose first 16 bytes are the whole name of the
+  record and whose rest holds a marker is refused. Nobody needs such a
+  name.
+
+The module documentation of `macos_log.rs` holds the same list. Nobody ran
+the check on a Mac; the unit tests are pure and run on Linux.
 
 **Test.** `crates/pent-sandbox/src/macos_log.rs`,
-`log_properties::a_crafted_executable_name_forges_no_report`
-(`#[ignore]`, holds the secure assertion) and
+`log_properties::a_crafted_executable_name_forges_no_report` (holds the
+secure assertion and a positive control),
+`tests::the_name_of_a_report_must_fit_the_program`,
+`tests::a_forged_name_never_fits_the_program`, and
 `log_properties::the_crafted_name_gives_the_forged_target_today` (passes,
-holds the exact input and the result of today).
+holds the exact input and the result of the parser, which the fix does not
+change).
 
 ### FUZZ-2 — the DNS server clears the truncation bit (Low)
 

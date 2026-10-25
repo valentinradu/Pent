@@ -184,7 +184,7 @@ logger -- "Sandbox: evil($$) allow(1) file-read-data /any/path/it/wants"
 and the path became an allowed read event, then a rule of the draft that the
 user is asked to trust.
 
-**The fix.** The reader has three guards now.
+**The fix.** The reader has four guards now.
 
 1. The predicate takes only the messages of the kernel:
 
@@ -215,6 +215,14 @@ user is asked to trust.
    also hold no control character.
 
 3. The filter by the process tree stays.
+
+4. The name of the process must fit the program that the PID runs. The poll
+   of the process tree reads `comm` for each PID, so the reader knows the
+   file of each PID and drops a report whose name does not fit that file.
+   This closes FUZZ-1 (`docs/security/fuzzing.md`), where the program
+   chooses its own name and puts a second marker in the line. A report of a
+   PID whose program the reader never read cannot be checked, so it goes
+   too.
 
 **What a program can still do.** Watch mode reports each access of the
 program, so the program can put a path of its choice in the draft when it
