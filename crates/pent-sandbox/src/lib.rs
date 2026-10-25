@@ -34,6 +34,9 @@ mod macos;
 mod linux;
 
 #[cfg(target_os = "linux")]
+mod linux_landlock;
+
+#[cfg(target_os = "linux")]
 mod linux_netns;
 
 #[cfg(target_os = "linux")]
@@ -43,6 +46,8 @@ pub use config::{system_default_paths, SandboxConfig};
 pub use env::{build_env, resolve_path_directories, resolve_path_dirs_from};
 #[cfg(target_os = "linux")]
 pub use linux::compute_accessible_set;
+#[cfg(target_os = "linux")]
+pub use linux_netns::{cleanup_stale_netns, prepare_proxy_network};
 #[cfg(target_os = "linux")]
 pub use linux_overlayfs::{cleanup_stale_overlays, OverlayHandle};
 pub use pent_settings::{Mount, NetworkMode, SandboxPaths, SandboxSettings};
@@ -97,6 +102,12 @@ pub enum SandboxError {
 /// On Linux, the returned [`SandboxChild::overlay`] may contain an
 /// [`OverlayHandle`] for write-listed file paths. Pass it to [`teardown_overlay`]
 /// after `child.wait()` returns to flush writes and clean up.
+///
+/// On Linux, the child gets `PR_SET_PDEATHSIG(SIGKILL)`: it dies when pent
+/// dies. The kernel sends this signal when the *thread* that called `fork`
+/// exits. Thus call this function on a thread that lives as long as the
+/// child (for example the main thread), not on a short-lived worker thread.
+/// File descriptors from 3 up do not pass to the child.
 ///
 /// # Errors
 /// Returns a [`SandboxError`] if the sandbox cannot be set up or the process cannot be spawned.

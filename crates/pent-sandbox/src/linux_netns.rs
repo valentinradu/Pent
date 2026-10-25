@@ -1,213 +1,590 @@
-//! Linux network namespace management for network isolation.
+//! Linux network namespace plumbing for `ProxyOnly` mode.
 //!
-//! Creates isolated network namespaces for sandboxed processes.
-//! Requires root or `CAP_NET_ADMIN` capability.
+//! The host side needs `CAP_NET_ADMIN` (root, or file capabilities on the
+//! `pent` binary).
 #![allow(unreachable_pub)]
 //!
-//! # Network Namespace Architecture
+//! # Architecture
 //!
 //! ```text
 //! Host
 //!   |
-//!   +-- veth1 (10.200.x.1/24)
+//!   +-- pentXXXXXXXXo (10.200.a.b+1/30)  <- proxy and DNS server bind here
 //!         |
-//!         +-- [routing through pent-proxy]
+//! --------+-------- namespace boundary (child user + net namespace)
 //!         |
-//! --------+-------- namespace boundary
+//!   +-- pentXXXXXXXXi (10.200.a.b+2/30)
 //!         |
-//!   +-- veth0 (10.200.x.2/24)
+//!         +-- default route via 10.200.a.b+1
 //!         |
-//!         +-- default route via 10.200.x.1
-//!         |
-//!   Sandboxed Process
+//!   Sandboxed process
 //! ```
 //!
-//! # Network Modes
+//! # Instance state and cleanup
 //!
-//! - `LocalhostOnly`: Namespace with loopback only
-//! - `ProxyOnly`: Namespace with veth pair routing through proxy
-//! - Blocked: Namespace with no interfaces
+//! Each instance has a random 32-bit ID. The ID gives the interface names
+//! (`pent<id>i`, `pent<id>o`, 13 bytes, less than `IFNAMSIZ`) and the nft
+//! table names. Each instance writes a state file in
+//! `$XDG_RUNTIME_DIR/pent/netns/`. The state file records the owner PID, the
+//! start time of the owner, the subnet and the firewall rules. A lock file in
+//! the same directory serializes the subnet allocation between concurrent
+//! pent processes. [`cleanup_stale_netns`] removes the rules of instances
+//! whose owner is dead (for example after `SIGKILL`).
+//!
+//! # Host firewall
+//!
+//! The host accepts only these packets from the veth: TCP to the proxy port,
+//! and UDP and TCP to the DNS port, on the outer address. The host drops all
+//! other packets from the veth (IPv4 and IPv6) and never forwards packets
+//! from or to the veth. The host also drops packets to the outer address that
+//! arrive on an interface other than the veth or the loopback, so other
+//! hosts on the LAN cannot reach the proxy.
 
 use crate::SandboxError;
-use std::net::Ipv4Addr;
+use std::fs::File;
+use std::io::Write as _;
+use std::net::{IpAddr, Ipv4Addr};
+use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
-/// Network namespace configuration.
-#[derive(Debug, Clone)]
-pub struct NetnsConfig {
-    /// Namespace name (e.g., "pent-12345").
-    pub name: String,
+/// First address of the pool for veth subnets (10.200.0.0/16).
+const POOL_BASE: u32 = u32::from_be_bytes([10, 200, 0, 0]);
+/// Prefix length of the pool.
+const POOL_PREFIX: u8 = 16;
+/// Prefix length of one instance subnet.
+const SUBNET_PREFIX: u8 = 30;
+/// Number of /30 subnets in the pool.
+const POOL_SLOTS: u32 = 1 << (SUBNET_PREFIX - POOL_PREFIX);
+/// Priority of the policy routing rule. The selector (`to <subnet>`) is
+/// unique per instance, so a delete never removes the rule of another
+/// instance.
+const RULE_PRIORITY: &str = "100";
 
-    /// IP address inside namespace (veth0).
-    pub inner_ip: Ipv4Addr,
-
-    /// IP address on host side (veth1).
-    pub outer_ip: Ipv4Addr,
-
-    /// Subnet prefix length (e.g., 24 for /24).
-    pub prefix_len: u8,
+/// The firewall backend that holds the mandatory drop rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FirewallKind {
+    /// No firewall rules are installed yet.
+    None,
+    /// A per-instance `inet` nft table.
+    Nft,
+    /// `iptables` and `ip6tables` rules with a comment tag.
+    Iptables,
 }
 
-impl NetnsConfig {
-    /// Create a network namespace config using the current process PID.
-    ///
-    /// PIDs are unique among running processes, so each pent invocation gets
-    /// its own namespace name and IP range.
-    pub fn from_pid() -> Self {
-        let pid = std::process::id();
-        #[allow(clippy::cast_possible_truncation)] // pid % 256 is always < 256
-        let octet = (pid % 256) as u8;
+impl FirewallKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Nft => "nft",
+            Self::Iptables => "iptables",
+        }
+    }
 
-        Self {
-            name: format!("pent-{pid}"),
-            inner_ip: Ipv4Addr::new(10, 200, octet, 2),
-            outer_ip: Ipv4Addr::new(10, 200, octet, 1),
-            prefix_len: 24,
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "none" => Some(Self::None),
+            "nft" => Some(Self::Nft),
+            "iptables" => Some(Self::Iptables),
+            _ => None,
         }
     }
 }
 
-/// Handle to a `ProxyOnly` sandbox network namespace.
+/// The persistent state of one instance. Pent derives every cleanup command
+/// from these fields. The state file holds no free-form commands, so a
+/// changed state file cannot make pent run arbitrary commands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InstanceState {
+    pub(crate) pid: u32,
+    pub(crate) start_time: u64,
+    pub(crate) id: u32,
+    pub(crate) network: Ipv4Addr,
+    pub(crate) veth_created: bool,
+    pub(crate) rule_added: bool,
+    pub(crate) firewall: FirewallKind,
+    pub(crate) proxy_port: u16,
+    pub(crate) dns_port: u16,
+    pub(crate) dns_table: bool,
+    pub(crate) distro_nft_accept: bool,
+    pub(crate) distro_ipt_accept: bool,
+}
+
+impl InstanceState {
+    fn new(pid: u32, start_time: u64, id: u32, network: Ipv4Addr) -> Self {
+        Self {
+            pid,
+            start_time,
+            id,
+            network,
+            veth_created: false,
+            rule_added: false,
+            firewall: FirewallKind::None,
+            proxy_port: 0,
+            dns_port: 0,
+            dns_table: false,
+            distro_nft_accept: false,
+            distro_ipt_accept: false,
+        }
+    }
+
+    pub(crate) fn veth_inner(&self) -> String {
+        veth_names(self.id).0
+    }
+
+    pub(crate) fn veth_outer(&self) -> String {
+        veth_names(self.id).1
+    }
+
+    pub(crate) fn tag(&self) -> String {
+        format!("pent_{:08x}", self.id)
+    }
+
+    fn dns_table_name(&self) -> String {
+        format!("pent_dns_{:08x}", self.id)
+    }
+
+    pub(crate) fn outer_ip(&self) -> Ipv4Addr {
+        Ipv4Addr::from(u32::from(self.network).wrapping_add(1))
+    }
+
+    pub(crate) fn inner_ip(&self) -> Ipv4Addr {
+        Ipv4Addr::from(u32::from(self.network).wrapping_add(2))
+    }
+
+    fn subnet_cidr(&self) -> String {
+        format!("{}/{SUBNET_PREFIX}", self.network)
+    }
+
+    fn serialize(&self) -> String {
+        format!(
+            "pid={}\nstart={}\nid={:08x}\nnetwork={}\nveth={}\nrule={}\nfirewall={}\n\
+             proxy_port={}\ndns_port={}\ndns_table={}\ndistro_nft={}\ndistro_ipt={}\n",
+            self.pid,
+            self.start_time,
+            self.id,
+            self.network,
+            u8::from(self.veth_created),
+            u8::from(self.rule_added),
+            self.firewall.as_str(),
+            self.proxy_port,
+            self.dns_port,
+            u8::from(self.dns_table),
+            u8::from(self.distro_nft_accept),
+            u8::from(self.distro_ipt_accept),
+        )
+    }
+
+    /// Parse a state file. Returns `None` for any unknown or invalid value.
+    fn parse(text: &str) -> Option<Self> {
+        let mut map = std::collections::HashMap::new();
+        for line in text.lines() {
+            let (k, v) = line.split_once('=')?;
+            map.insert(k, v);
+        }
+        let flag = |k: &str| -> Option<bool> {
+            match *map.get(k)? {
+                "0" => Some(false),
+                "1" => Some(true),
+                _ => None,
+            }
+        };
+        let network: Ipv4Addr = map.get("network")?.parse().ok()?;
+        if !subnet_in_pool(network) {
+            return None;
+        }
+        Some(Self {
+            pid: map.get("pid")?.parse().ok()?,
+            start_time: map.get("start")?.parse().ok()?,
+            id: u32::from_str_radix(map.get("id")?, 16).ok()?,
+            network,
+            veth_created: flag("veth")?,
+            rule_added: flag("rule")?,
+            firewall: FirewallKind::parse(map.get("firewall")?)?,
+            proxy_port: map.get("proxy_port")?.parse().ok()?,
+            dns_port: map.get("dns_port")?.parse().ok()?,
+            dns_table: flag("dns_table")?,
+            distro_nft_accept: flag("distro_nft")?,
+            distro_ipt_accept: flag("distro_ipt")?,
+        })
+    }
+
+    /// Remove all host resources that this state records.
+    ///
+    /// Each step is independent. A failed step is logged and the next step
+    /// runs.
+    fn undo(&self) {
+        let veth_outer = self.veth_outer();
+        let tag = self.tag();
+        if self.veth_created {
+            // Delete of one end deletes the pair.
+            log_cleanup("ip link del", run_tool("ip", &["link", "del", &veth_outer]));
+        }
+        if self.rule_added {
+            let cidr = self.subnet_cidr();
+            log_cleanup(
+                "ip rule del",
+                run_tool(
+                    "ip",
+                    &[
+                        "rule",
+                        "del",
+                        "to",
+                        &cidr,
+                        "table",
+                        "main",
+                        "priority",
+                        RULE_PRIORITY,
+                    ],
+                ),
+            );
+        }
+        if self.firewall == FirewallKind::Nft {
+            log_cleanup(
+                "nft delete table",
+                run_tool("nft", &["delete", "table", "inet", &tag]),
+            );
+        }
+        let rules = FirewallRules::new(self);
+        if self.firewall == FirewallKind::Iptables || self.distro_ipt_accept {
+            for rule in rules.iptables_accept() {
+                log_cleanup("iptables -D", rule.delete());
+            }
+        }
+        if self.firewall == FirewallKind::Iptables {
+            for rule in rules.iptables_drop() {
+                log_cleanup("iptables -D", rule.delete());
+            }
+        }
+        if self.dns_table {
+            let table = self.dns_table_name();
+            log_cleanup(
+                "nft delete dns table",
+                run_tool("nft", &["delete", "table", "ip", &table]),
+            );
+        }
+        if self.distro_nft_accept {
+            for chain in ["input", "output"] {
+                for handle in nft_find_tagged_rule_handles(chain, &tag) {
+                    let h = handle.to_string();
+                    log_cleanup(
+                        "nft delete rule",
+                        run_tool(
+                            "nft",
+                            &["delete", "rule", "inet", "filter", chain, "handle", &h],
+                        ),
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Return the inner and outer veth names for an instance ID.
 ///
-/// The child process creates its own network namespace via
-/// `unshare(CLONE_NEWUSER | CLONE_NEWNET)` in its `pre_exec` hook.
-/// `create_netns` sets up the outer (host-side) veth and firewall rules;
-/// the background thread in `spawn_with_landlock` moves the inner veth into
-/// the child's namespace once it's ready (signalled via pipe).
+/// The names have 13 bytes. `IFNAMSIZ` is 16 (15 bytes and a NUL).
+#[must_use]
+pub(crate) fn veth_names(id: u32) -> (String, String) {
+    (format!("pent{id:08x}i"), format!("pent{id:08x}o"))
+}
+
+/// Return true if `network` is the base address of a /30 inside the pool.
+fn subnet_in_pool(network: Ipv4Addr) -> bool {
+    let n = u32::from(network);
+    let pool_mask = u32::MAX << (32 - POOL_PREFIX);
+    n & pool_mask == POOL_BASE && n & 0b11 == 0
+}
+
+/// Return the base address of slot `slot` in the pool.
+fn slot_network(slot: u32) -> Ipv4Addr {
+    Ipv4Addr::from(POOL_BASE | ((slot % POOL_SLOTS) << 2))
+}
+
+/// Return true if the two networks overlap.
+#[must_use]
+pub(crate) fn nets_overlap(a: Ipv4Addr, a_prefix: u8, b: Ipv4Addr, b_prefix: u8) -> bool {
+    let prefix = a_prefix.min(b_prefix).min(32);
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - u32::from(prefix))
+    };
+    u32::from(a) & mask == u32::from(b) & mask
+}
+
+/// Choose a free /30 in the pool.
 ///
-/// Dropping the handle removes firewall/routing rules and deletes the veth pair.
+/// The search starts at slot `start` and wraps. A slot is free if it does
+/// not overlap any network in `taken`. A network with a prefix shorter than
+/// the pool (for example a default route `0.0.0.0/0`) is ignored, because it
+/// does not occupy the pool.
+#[must_use]
+pub(crate) fn choose_subnet(start: u32, taken: &[(Ipv4Addr, u8)]) -> Option<Ipv4Addr> {
+    (0..POOL_SLOTS)
+        .map(|i| slot_network(start.wrapping_add(i)))
+        .find(|candidate| {
+            !taken.iter().any(|(net, prefix)| {
+                *prefix >= POOL_PREFIX && nets_overlap(*candidate, SUBNET_PREFIX, *net, *prefix)
+            })
+        })
+}
+
+/// Parse every `a.b.c.d/n` token in the output of `ip addr` or `ip route`.
+#[must_use]
+pub(crate) fn parse_ipv4_nets(text: &str) -> Vec<(Ipv4Addr, u8)> {
+    text.split_whitespace()
+        .filter_map(|tok| {
+            let (addr, prefix) = tok.split_once('/')?;
+            let addr: Ipv4Addr = addr.parse().ok()?;
+            let prefix: u8 = prefix.parse().ok()?;
+            (prefix <= 32).then_some((addr, prefix))
+        })
+        .collect()
+}
+
+/// One `iptables` or `ip6tables` rule with its chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IptRule {
+    pub(crate) tool: &'static str,
+    pub(crate) chain: &'static str,
+    pub(crate) spec: Vec<String>,
+}
+
+impl IptRule {
+    fn insert(&self) -> std::io::Result<std::process::Output> {
+        let mut args = vec!["-I", self.chain, "1"];
+        args.extend(self.spec.iter().map(String::as_str));
+        run_tool(self.tool, &args)
+    }
+
+    fn delete(&self) -> std::io::Result<std::process::Output> {
+        let mut args = vec!["-D", self.chain];
+        args.extend(self.spec.iter().map(String::as_str));
+        run_tool(self.tool, &args)
+    }
+}
+
+/// The firewall rules of one instance.
+pub(crate) struct FirewallRules {
+    tag: String,
+    veth: String,
+    outer: Ipv4Addr,
+    proxy_port: u16,
+    dns_port: u16,
+}
+
+impl FirewallRules {
+    pub(crate) fn new(state: &InstanceState) -> Self {
+        Self {
+            tag: state.tag(),
+            veth: state.veth_outer(),
+            outer: state.outer_ip(),
+            proxy_port: state.proxy_port,
+            dns_port: state.dns_port,
+        }
+    }
+
+    /// The allowed (protocol, port) pairs from the veth to the outer address.
+    fn allowed(&self) -> Vec<(&'static str, u16)> {
+        let mut v = vec![("tcp", self.proxy_port)];
+        if self.dns_port != 0 {
+            v.push(("udp", self.dns_port));
+            v.push(("tcp", self.dns_port));
+        }
+        v
+    }
+
+    /// The nft script for the per-instance filter table.
+    pub(crate) fn nft_script(&self) -> String {
+        let Self {
+            tag, veth, outer, ..
+        } = self;
+        let mut accepts = String::new();
+        for (proto, port) in self.allowed() {
+            accepts.push_str(&format!(
+                "    iifname \"{veth}\" ip daddr {outer} {proto} dport {port} accept\n"
+            ));
+        }
+        format!(
+            "table inet {tag} {{\n\
+             \x20 chain input {{\n\
+             \x20   type filter hook input priority -10; policy accept;\n\
+             {accepts}\
+             \x20   iifname \"{veth}\" drop\n\
+             \x20   ip daddr {outer} iifname != \"lo\" drop\n\
+             \x20 }}\n\
+             \x20 chain forward {{\n\
+             \x20   type filter hook forward priority -10; policy accept;\n\
+             \x20   iifname \"{veth}\" drop\n\
+             \x20   oifname \"{veth}\" drop\n\
+             \x20 }}\n\
+             }}\n"
+        )
+    }
+
+    fn comment(&self) -> [String; 4] {
+        [
+            "-m".to_string(),
+            "comment".to_string(),
+            "--comment".to_string(),
+            self.tag.clone(),
+        ]
+    }
+
+    /// The `iptables` ACCEPT rules for the proxy and DNS ports.
+    pub(crate) fn iptables_accept(&self) -> Vec<IptRule> {
+        self.allowed()
+            .into_iter()
+            .map(|(proto, port)| {
+                let mut spec: Vec<String> = [
+                    "-i",
+                    &self.veth,
+                    "-d",
+                    &self.outer.to_string(),
+                    "-p",
+                    proto,
+                    "--dport",
+                    &port.to_string(),
+                ]
+                .iter()
+                .map(ToString::to_string)
+                .collect();
+                spec.extend(self.comment());
+                spec.extend(["-j".to_string(), "ACCEPT".to_string()]);
+                IptRule {
+                    tool: "iptables",
+                    chain: "INPUT",
+                    spec,
+                }
+            })
+            .collect()
+    }
+
+    /// The `iptables` and `ip6tables` DROP rules (the fallback when nft is
+    /// not available).
+    pub(crate) fn iptables_drop(&self) -> Vec<IptRule> {
+        let rule = |tool: &'static str, chain: &'static str, parts: &[&str]| {
+            let mut spec: Vec<String> = parts.iter().map(ToString::to_string).collect();
+            spec.extend(self.comment());
+            spec.extend(["-j".to_string(), "DROP".to_string()]);
+            IptRule { tool, chain, spec }
+        };
+        let outer = self.outer.to_string();
+        vec![
+            rule("iptables", "INPUT", &["-i", &self.veth]),
+            rule("iptables", "INPUT", &["-d", &outer, "!", "-i", "lo"]),
+            rule("iptables", "FORWARD", &["-i", &self.veth]),
+            rule("iptables", "FORWARD", &["-o", &self.veth]),
+            rule("ip6tables", "INPUT", &["-i", &self.veth]),
+            rule("ip6tables", "FORWARD", &["-i", &self.veth]),
+            rule("ip6tables", "FORWARD", &["-o", &self.veth]),
+        ]
+    }
+}
+
+/// Handle to the host side of a `ProxyOnly` network.
+///
+/// Dropping the handle removes the veth pair, the routing rule and the
+/// firewall rules, and deletes the state file.
+#[derive(Debug)]
 pub struct NetnsHandle {
-    /// Host-side veth IP — injected into the child's env as `HTTP_PROXY` etc.
-    pub outer_ip: std::net::Ipv4Addr,
-    /// Inner veth name (e.g. `veth-PID-in`). Captured in the `pre_exec` closure
-    /// so the child can configure it after the parent moves it in.
+    /// Host-side veth IP. The proxy and the DNS server bind to this address.
+    pub outer_ip: Ipv4Addr,
+    /// Inner veth name. The parent moves it into the child namespace.
     pub inner_veth: String,
-    /// CIDR for the inner veth (e.g. `10.200.1.2/24`).
+    /// CIDR for the inner veth (for example `10.200.1.2/30`).
     pub inner_cidr: String,
-    veth_outer: String,
-    outer_cidr: String,
-    /// Name of the per-instance nft table used for DNS PREROUTING redirect
-    /// (e.g. `pent_dns_12345`). Empty if DNS redirect was not set up.
-    nft_dns_table: String,
+    state: InstanceState,
+    state_path: PathBuf,
+    resolv_path: Option<PathBuf>,
 }
 
 impl Drop for NetnsHandle {
     fn drop(&mut self) {
-        use std::process::Command;
-
-        let log_cleanup = |label: &str, result: std::io::Result<std::process::Output>| match result
-        {
-            Ok(out) if !out.status.success() => {
-                tracing::debug!(
-                    cmd = label,
-                    stderr = %String::from_utf8_lossy(&out.stderr).trim(),
-                    "cleanup command failed (may be expected if resource already removed)"
-                );
-            }
-            Err(e) => tracing::warn!(cmd = label, err = %e, "failed to run cleanup command"),
-            _ => {}
-        };
-
-        // Delete the outer veth. If the child's namespace is already gone the
-        // inner veth (and thus the outer peer) may already be deleted — that's
-        // fine, ip link del is idempotent from our perspective.
-        let mut del = Command::new("ip");
-        del.args(["link", "del", &self.veth_outer]);
-        // SAFETY: raise_net_admin_ambient uses only async-signal-safe syscalls.
-        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-        unsafe { del.pre_exec(raise_net_admin_ambient) };
-        log_cleanup("ip link del", del.output());
-
-        if let Some(h) = nft_find_iface_rule_handle("input", "iifname", &self.veth_outer) {
-            let mut cmd = Command::new("nft");
-            cmd.args([
-                "delete",
-                "rule",
-                "inet",
-                "filter",
-                "input",
-                "handle",
-                &h.to_string(),
-            ]);
-            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-            unsafe { cmd.pre_exec(raise_net_admin_ambient) };
-            log_cleanup("nft delete rule input", cmd.output());
+        self.state.undo();
+        remove_file_logged(&self.state_path);
+        if let Some(p) = &self.resolv_path {
+            remove_file_logged(p);
         }
-        if let Some(h) = nft_find_iface_rule_handle("output", "oifname", &self.veth_outer) {
-            let mut cmd = Command::new("nft");
-            cmd.args([
-                "delete",
-                "rule",
-                "inet",
-                "filter",
-                "output",
-                "handle",
-                &h.to_string(),
-            ]);
-            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-            unsafe { cmd.pre_exec(raise_net_admin_ambient) };
-            log_cleanup("nft delete rule output", cmd.output());
-        }
+    }
+}
 
-        // Remove INPUT ACCEPT rule for the veth.
-        {
-            let mut cmd = Command::new("iptables");
-            cmd.args(["-D", "INPUT", "-i", &self.veth_outer, "-j", "ACCEPT"]);
-            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-            unsafe { cmd.pre_exec(raise_net_admin_ambient) };
-            log_cleanup("iptables -D INPUT", cmd.output());
+fn remove_file_logged(path: &Path) {
+    if let Err(e) = std::fs::remove_file(path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::debug!(path = %path.display(), err = %e, "cannot remove pent state file");
         }
+    }
+}
 
-        // Remove policy routing rule that bypasses VPN/tunnel policy routes for
-        // the veth subnet.
-        {
-            let mut cmd = Command::new("ip");
-            cmd.args([
-                "rule",
-                "del",
-                "to",
-                &self.outer_cidr,
-                "table",
-                "main",
-                "priority",
-                "100",
-            ]);
-            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-            unsafe { cmd.pre_exec(raise_net_admin_ambient) };
-            log_cleanup("ip rule del", cmd.output());
-        }
+fn log_cleanup(label: &str, result: std::io::Result<std::process::Output>) {
+    match result {
+        Ok(out) if !out.status.success() => tracing::debug!(
+            cmd = label,
+            stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+            "cleanup command failed (the resource can be gone already)"
+        ),
+        Err(e) => tracing::warn!(cmd = label, err = %e, "cannot run cleanup command"),
+        Ok(_) => {}
+    }
+}
 
-        // Delete the per-instance nft DNS redirect table.
-        if !self.nft_dns_table.is_empty() {
-            let mut cmd = Command::new("nft");
-            cmd.args(["delete", "table", "ip", &self.nft_dns_table]);
-            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-            unsafe { cmd.pre_exec(raise_net_admin_ambient) };
-            log_cleanup("nft delete table dns", cmd.output());
-        }
+/// Run `tool args…` with `CAP_NET_ADMIN` raised as an ambient capability.
+fn run_tool(tool: &str, args: &[&str]) -> std::io::Result<std::process::Output> {
+    let mut cmd = Command::new(tool);
+    cmd.args(args);
+    // SAFETY: `raise_net_admin_ambient` uses only async-signal-safe system
+    // calls on stack data, so it is safe between fork and exec in a
+    // multithreaded parent.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    unsafe { cmd.pre_exec(raise_net_admin_ambient) };
+    cmd.output()
+}
+
+/// Run `tool args…` and convert a failure into `NetworkSetupFailed`.
+fn run_tool_checked(tool: &str, args: &[&str]) -> Result<(), SandboxError> {
+    let output = run_tool(tool, args)
+        .map_err(|e| SandboxError::NetworkSetupFailed(format!("cannot run {tool}: {e}")))?;
+    if !output.status.success() {
+        return Err(SandboxError::NetworkSetupFailed(format!(
+            "{tool} {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
+/// Write a static message to the error output. Async-signal-safe.
+pub(crate) fn write_stderr_static(msg: &'static [u8]) {
+    // SAFETY: write(2) on fd 2 with a static buffer is async-signal-safe.
+    // The result is ignored because no other channel for the error exists.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    unsafe {
+        libc::write(libc::STDERR_FILENO, msg.as_ptr().cast(), msg.len());
     }
 }
 
 /// Raise `CAP_NET_ADMIN` as an ambient capability in the calling process.
 ///
-/// Called in a fork child (before exec) so that the exec'd binary
-/// inherits `CAP_NET_ADMIN` even if it has no file capabilities of its own.
+/// Call this between fork and exec so that the new program keeps
+/// `CAP_NET_ADMIN`. As root (effective UID 0), the function does nothing.
+/// Otherwise `CAP_NET_ADMIN` must be in the permitted set (for example
+/// through `setcap cap_net_admin=eip pent`, or through `setns` into a user
+/// namespace that this user owns).
 ///
-/// If running as root (UID 0), this is a no-op since root has all capabilities.
-/// Otherwise, requires `CAP_NET_ADMIN` in the permitted, effective, AND inheritable sets.
-/// Set on the `pent` binary via `setcap cap_net_admin=eip pent` (note: must include 'i' flag).
+/// The function is async-signal-safe: it uses only raw system calls and
+/// static messages.
 ///
-/// Typical usage: `pent run --allow domain --` automatically uses `sudo` when needed,
-/// which runs the entire process as root, so this function becomes a no-op.
+/// # Errors
+/// Returns the OS error of the failed `capget`, `capset` or `prctl` call.
 pub fn raise_net_admin_ambient() -> std::io::Result<()> {
     const CAP_NET_ADMIN: u32 = 12;
-    // _LINUX_CAPABILITY_VERSION_3 — two 32-bit data words, supports caps 0–63.
     const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
-    // PR_CAP_AMBIENT = 47, PR_CAP_AMBIENT_RAISE = 2 (not in libc crate).
     const PR_CAP_AMBIENT: libc::c_int = 47;
     const PR_CAP_AMBIENT_RAISE: libc::c_ulong = 2;
 
-    // Raw kernel structs for capget/capset (not exposed by the libc crate).
     #[repr(C)]
     struct CapHeader {
         version: u32,
@@ -221,125 +598,79 @@ pub fn raise_net_admin_ambient() -> std::io::Result<()> {
         inheritable: u32,
     }
 
-    // If running as root, we already have all capabilities; no need to do anything.
-    // SAFETY: geteuid is always safe to call.
+    // SAFETY: geteuid has no preconditions.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     if unsafe { libc::geteuid() } == 0 {
         return Ok(());
     }
 
-    // SAFETY: capget/capset/prctl syscalls are safe with valid pointers;
-    // this runs in a single-threaded fork child before exec.
+    let mut hdr = CapHeader {
+        version: LINUX_CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let mut data = [CapData {
+        effective: 0,
+        permitted: 0,
+        inheritable: 0,
+    }; 2];
+    // SAFETY: `hdr` and `data` are valid, writable, and have the layout that
+    // capget(2) expects for version 3 (two data words).
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-    unsafe {
-        let mut hdr = CapHeader {
-            version: LINUX_CAPABILITY_VERSION_3,
-            pid: 0,
-        };
-        let mut data = [CapData {
-            effective: 0,
-            permitted: 0,
-            inheritable: 0,
-        }; 2];
-
-        if libc::syscall(libc::SYS_capget, &raw mut hdr, data.as_mut_ptr()) != 0 {
-            let errno = std::io::Error::last_os_error();
-            // Write to stderr since logging from pre_exec doesn't work
-            let msg = format!("capget failed: {errno}\n");
-            libc::write(
-                libc::STDERR_FILENO,
-                msg.as_ptr().cast::<libc::c_void>(),
-                msg.len(),
-            );
-            return Err(errno);
-        }
-
-        // Check if CAP_NET_ADMIN is already in the effective set
-        let cap_bit = 1u32 << CAP_NET_ADMIN;
-        if (data[0].effective & cap_bit) == 0 {
-            let effective = data[0].effective;
-            let permitted = data[0].permitted;
-            let msg = format!(
-                "CAP_NET_ADMIN not in effective set (effective=0x{effective:x}, permitted=0x{permitted:x})\n"
-            );
-            libc::write(
-                libc::STDERR_FILENO,
-                msg.as_ptr().cast::<libc::c_void>(),
-                msg.len(),
-            );
-        }
-
-        // Add CAP_NET_ADMIN to the inheritable set — required before raising as ambient.
-        data[0].inheritable |= cap_bit;
-        hdr.version = LINUX_CAPABILITY_VERSION_3;
-        hdr.pid = 0;
-
-        if libc::syscall(libc::SYS_capset, &raw mut hdr, data.as_ptr()) != 0 {
-            let errno = std::io::Error::last_os_error();
-            let msg = format!("capset failed: {errno}\n");
-            libc::write(
-                libc::STDERR_FILENO,
-                msg.as_ptr().cast::<libc::c_void>(),
-                msg.len(),
-            );
-            return Err(errno);
-        }
-
-        // Raise CAP_NET_ADMIN as ambient so the exec'd binary inherits it.
-        if libc::prctl(
+    if unsafe { libc::syscall(libc::SYS_capget, &raw mut hdr, data.as_mut_ptr()) } != 0 {
+        write_stderr_static(b"pent: capget failed\n");
+        return Err(std::io::Error::last_os_error());
+    }
+    let cap_bit = 1u32 << CAP_NET_ADMIN;
+    data[0].inheritable |= cap_bit;
+    hdr.version = LINUX_CAPABILITY_VERSION_3;
+    hdr.pid = 0;
+    // SAFETY: the same valid buffers as above, now read by capset(2).
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    if unsafe { libc::syscall(libc::SYS_capset, &raw mut hdr, data.as_ptr()) } != 0 {
+        write_stderr_static(b"pent: capset failed (is CAP_NET_ADMIN permitted?)\n");
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: prctl with integer arguments only.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let ret = unsafe {
+        libc::prctl(
             PR_CAP_AMBIENT,
             PR_CAP_AMBIENT_RAISE,
             libc::c_ulong::from(CAP_NET_ADMIN),
             0,
             0,
-        ) != 0
-        {
-            let errno = std::io::Error::last_os_error();
-            let msg = format!("prctl(CAP_AMBIENT_RAISE) failed: {errno}\n");
-            libc::write(
-                libc::STDERR_FILENO,
-                msg.as_ptr().cast::<libc::c_void>(),
-                msg.len(),
-            );
-            return Err(errno);
-        }
+        )
+    };
+    if ret != 0 {
+        write_stderr_static(b"pent: prctl(PR_CAP_AMBIENT_RAISE) failed\n");
+        return Err(std::io::Error::last_os_error());
     }
     Ok(())
 }
 
-/// Check if running with sufficient privileges for network namespaces.
+/// Check if the process has the privileges for the host side of a veth.
 ///
 /// # Errors
-/// Returns `PrivilegeRequired` with sudo/setcap hint if insufficient privileges.
+/// Returns `PrivilegeRequired` with a hint if `CAP_NET_ADMIN` is absent.
 pub fn check_netns_privileges() -> Result<(), SandboxError> {
-    use std::fs;
-
-    // Check if running as root
-    // SAFETY: geteuid is always safe to call
+    // SAFETY: geteuid has no preconditions.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-    let euid = unsafe { libc::geteuid() };
-    if euid == 0 {
+    if unsafe { libc::geteuid() } == 0 {
         return Ok(());
     }
-
-    // Check for CAP_NET_ADMIN in /proc/self/status
-    if let Ok(status) = fs::read_to_string("/proc/self/status") {
-        for line in status.lines() {
-            if line.starts_with("CapEff:") {
-                // Parse the effective capabilities
-                if let Some(hex) = line.split_whitespace().nth(1) {
-                    if let Ok(caps) = u64::from_str_radix(hex, 16) {
-                        // CAP_NET_ADMIN is bit 12
-                        const CAP_NET_ADMIN: u64 = 1 << 12;
-                        if caps & CAP_NET_ADMIN != 0 {
-                            return Ok(());
-                        }
-                    }
-                }
-            }
-        }
+    const CAP_NET_ADMIN: u64 = 1 << 12;
+    let has_cap = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status
+                .lines()
+                .find_map(|l| l.strip_prefix("CapEff:"))
+                .and_then(|hex| u64::from_str_radix(hex.trim(), 16).ok())
+        })
+        .is_some_and(|caps| caps & CAP_NET_ADMIN != 0);
+    if has_cap {
+        return Ok(());
     }
-
     Err(SandboxError::PrivilegeRequired(
         "ProxyOnly mode on Linux requires CAP_NET_ADMIN to create the veth pair \
          between the sandbox and the proxy. \
@@ -349,673 +680,843 @@ pub fn check_netns_privileges() -> Result<(), SandboxError> {
     ))
 }
 
-/// Create the host-side network plumbing for a `ProxyOnly` sandbox.
-///
-/// Creates a veth pair and configures the outer (host-side) end. The inner
-/// veth is left in the host namespace until the child calls
-/// `unshare(CLONE_NEWUSER | CLONE_NEWNET)` in its `pre_exec` hook; the
-/// background thread in `spawn_with_landlock` then moves it with
-/// `move_inner_veth_to_pid`. The child configures its end via `run_ip_local`
-/// while still inside `pre_exec` (before Landlock is applied).
-///
-/// `dns_port` is the port of the proxy's DNS server (bound on 0.0.0.0). If
-/// non-zero, a per-instance nft PREROUTING REDIRECT table is created so that
-/// DNS queries (UDP/TCP port 53) arriving from the child on the outer veth are
-/// redirected to the proxy DNS server. This runs in the initial user namespace
-/// with ambient `CAP_NET_ADMIN`, so nft NAT works correctly.
-///
-/// Dropping the handle removes firewall/routing rules and the outer veth.
-///
-/// # Errors
-/// * `PrivilegeRequired` — if `CAP_NET_ADMIN` is absent
-/// * `NetworkSetupFailed` — if any setup step fails
-#[allow(clippy::too_many_lines)]
-pub fn create_netns(config: &NetnsConfig, dns_port: u16) -> Result<NetnsHandle, SandboxError> {
-    use std::process::Command;
+// ── State directory, lock and liveness ─────────────────────────────────────
 
-    check_netns_privileges()?;
-
-    let pid_str = config.name.strip_prefix("pent-").unwrap_or(&config.name);
-    let veth_inner = format!("veth-{pid_str}-in");
-    let veth_outer = format!("veth-{pid_str}-out");
-    let inner_cidr = format!("{}/{}", config.inner_ip, config.prefix_len);
-    let outer_cidr = format!("{}/{}", config.outer_ip, config.prefix_len);
-
-    let run_ip = |args: &[&str]| -> Result<(), SandboxError> {
-        let mut cmd = Command::new("ip");
-        cmd.args(args);
-        // SAFETY: pre_exec runs in a single-threaded fork child before exec;
-        // raise_net_admin_ambient uses only async-signal-safe syscalls.
-        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-        unsafe { cmd.pre_exec(raise_net_admin_ambient) };
-        let output = cmd
-            .output()
-            .map_err(|e| SandboxError::NetworkSetupFailed(format!("failed to run ip: {e}")))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(SandboxError::NetworkSetupFailed(format!(
-                "ip {} failed: {}",
-                args.join(" "),
-                stderr.trim()
-            )));
-        }
-        Ok(())
-    };
-
-    let run_nft = |args: &[&str]| -> Result<(), SandboxError> {
-        let mut cmd = Command::new("nft");
-        cmd.args(args);
-        // SAFETY: pre_exec runs in a single-threaded fork child before exec;
-        // raise_net_admin_ambient uses only async-signal-safe syscalls.
-        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-        unsafe { cmd.pre_exec(raise_net_admin_ambient) };
-        let output = cmd
-            .output()
-            .map_err(|e| SandboxError::NetworkSetupFailed(format!("failed to run nft: {e}")))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(SandboxError::NetworkSetupFailed(format!(
-                "nft {} failed: {}",
-                args.join(" "),
-                stderr.trim()
-            )));
-        }
-        Ok(())
-    };
-
-    // Create veth pair. Both ends start in the host namespace; the background
-    // thread moves veth_inner to the child after it unshares.
-    run_ip(&[
-        "link",
-        "add",
-        &veth_inner,
-        "type",
-        "veth",
-        "peer",
-        "name",
-        &veth_outer,
-    ])?;
-
-    // Configure outer veth; on error clean up the pair.
-    if let Err(e) = (|| -> Result<(), SandboxError> {
-        run_ip(&["addr", "add", &outer_cidr, "dev", &veth_outer])?;
-        run_ip(&["link", "set", &veth_outer, "up"])
-    })() {
-        let _ = run_ip(&["link", "del", &veth_outer]);
-        return Err(e);
-    }
-
-    // Add a policy routing rule so that packets destined for the veth subnet
-    // are always routed via the main table. Without this, policy routing rules
-    // from VPNs, tunnels, or other tools (e.g. a default-route override with
-    // high priority) might route return traffic for the child through the wrong
-    // interface, causing the proxy ↔ child TCP connections to fail.
-    {
-        let mut cmd = Command::new("ip");
-        cmd.args([
-            "rule",
-            "add",
-            "to",
-            &outer_cidr,
-            "table",
-            "main",
-            "priority",
-            "100",
-        ]);
-        // SAFETY: raise_net_admin_ambient uses only async-signal-safe syscalls.
-        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-        unsafe { cmd.pre_exec(raise_net_admin_ambient) };
-        match cmd.output() {
-            Ok(out) if !out.status.success() => tracing::debug!(
-                stderr = %String::from_utf8_lossy(&out.stderr).trim(),
-                "ip rule add for veth subnet failed; proxy connections may fail if \
-                 high-priority policy routing overrides the main table for this subnet"
-            ),
-            Err(e) => tracing::debug!(err = %e, "failed to run ip rule add"),
-            _ => {}
+/// Return the directory for instance state files.
+fn state_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from) {
+        if dir.is_absolute() && dir.is_dir() {
+            return dir.join("pent").join("netns");
         }
     }
+    // SAFETY: getuid/geteuid have no preconditions.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let (uid, euid) = unsafe { (libc::getuid(), libc::geteuid()) };
+    if euid == 0 {
+        return PathBuf::from("/run/pent/netns");
+    }
+    std::env::temp_dir()
+        .join(format!("pent-{uid}"))
+        .join("netns")
+}
 
-    // Allow traffic through the veth interface in the host firewall.
-    // nftables and iptables rules are added as a best-effort; failure is logged
-    // at debug level since these tools may not be installed or the default
-    // filter table may not exist on this system.
-    // NOTE: All firewall commands need CAP_NET_ADMIN; we raise it as ambient.
-    {
-        let mut cmd = Command::new("nft");
-        cmd.args([
-            "insert",
-            "rule",
-            "inet",
-            "filter",
-            "input",
-            &format!("iifname \"{veth_outer}\" accept"),
-        ]);
-        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-        unsafe { cmd.pre_exec(raise_net_admin_ambient) };
-        match cmd.output() {
-            Ok(out) if !out.status.success() => tracing::debug!(
-                stderr = %String::from_utf8_lossy(&out.stderr).trim(),
-                "nft insert rule input failed (no inet filter table?)"
-            ),
-            Err(e) => tracing::debug!(err = %e, "failed to run nft insert rule input"),
-            _ => {}
-        }
-    }
-    {
-        let mut cmd = Command::new("nft");
-        cmd.args([
-            "insert",
-            "rule",
-            "inet",
-            "filter",
-            "output",
-            &format!("oifname \"{veth_outer}\" accept"),
-        ]);
-        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-        unsafe { cmd.pre_exec(raise_net_admin_ambient) };
-        match cmd.output() {
-            Ok(out) if !out.status.success() => tracing::debug!(
-                stderr = %String::from_utf8_lossy(&out.stderr).trim(),
-                "nft insert rule output failed (no inet filter table?)"
-            ),
-            Err(e) => tracing::debug!(err = %e, "failed to run nft insert rule output"),
-            _ => {}
-        }
-    }
-    {
-        let mut cmd = Command::new("iptables");
-        cmd.args(["-I", "INPUT", "1", "-i", &veth_outer, "-j", "ACCEPT"]);
-        // SAFETY: raise_net_admin_ambient uses only async-signal-safe syscalls.
-        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-        unsafe { cmd.pre_exec(raise_net_admin_ambient) };
-        match cmd.output() {
-            Ok(out) if !out.status.success() => tracing::debug!(
-                stderr = %String::from_utf8_lossy(&out.stderr).trim(),
-                "iptables -I INPUT failed"
-            ),
-            Err(e) => tracing::debug!(err = %e, "failed to run iptables -I INPUT"),
-            _ => {}
-        }
-    }
+/// Create the state directory with mode 0700 and return it.
+fn ensure_state_dir() -> Result<PathBuf, SandboxError> {
+    use std::os::unix::fs::DirBuilderExt;
+    let dir = state_dir();
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)
+        .map_err(|e| {
+            SandboxError::NetworkSetupFailed(format!("cannot create {}: {e}", dir.display()))
+        })?;
+    Ok(dir)
+}
 
-    // Set up a per-instance nft PREROUTING DNAT table to redirect DNS queries
-    // (port 53) arriving from the child on the outer veth to the proxy's DNS
-    // server at outer_ip:dns_port.
-    //
-    // This runs in the initial user namespace with ambient CAP_NET_ADMIN so
-    // nft NAT operations succeed (unlike child-side NAT which requires
-    // initial-namespace privileges and always fails in a user namespace).
-    //
-    // When the child sends a DNS query to outer_ip:53, the PREROUTING hook
-    // fires before the routing decision and rewrites the destination port to
-    // dns_port. The kernel then routes the packet locally to the proxy's DNS
-    // socket. No ip_forward changes are needed.
-    let nft_dns_table = if dns_port != 0 {
-        let table = format!("pent_dns_{pid_str}");
-        let result = (|| -> Result<(), SandboxError> {
-            run_nft(&["add", "table", "ip", &table])?;
-            run_nft(&[
-                "add",
-                "chain",
-                "ip",
-                &table,
-                "prerouting",
-                "{ type nat hook prerouting priority -100 ; }",
-            ])?;
-            for proto in &["udp", "tcp"] {
-                let rule = format!(
-                    "iifname \"{}\" {} dport 53 dnat to {}:{}",
-                    veth_outer, proto, config.outer_ip, dns_port
-                );
-                run_nft(&["add", "rule", "ip", &table, "prerouting", &rule])?;
+/// An exclusive `flock` on the lock file. The lock is released on drop.
+struct StateLock {
+    _file: File,
+}
+
+impl StateLock {
+    fn acquire(dir: &Path) -> Result<Self, SandboxError> {
+        let path = dir.join("lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .map_err(|e| {
+                SandboxError::NetworkSetupFailed(format!("cannot open {}: {e}", path.display()))
+            })?;
+        loop {
+            // SAFETY: flock on a file descriptor that `file` owns.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                return Ok(Self { _file: file });
             }
-            Ok(())
-        })();
-        match result {
-            Ok(()) => table,
-            Err(e) => {
-                tracing::warn!(
-                    "DNS redirect via nft failed; non-proxy-aware DNS may not work: {}",
-                    e
-                );
-                // Best-effort cleanup of the partially-created table.
-                let mut cmd = Command::new("nft");
-                cmd.args(["delete", "table", "ip", &table]);
-                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-                unsafe { cmd.pre_exec(raise_net_admin_ambient) };
-                let _ = cmd.output();
-                String::new()
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::Interrupted {
+                return Err(SandboxError::NetworkSetupFailed(format!(
+                    "cannot lock {}: {err}",
+                    path.display()
+                )));
             }
         }
-    } else {
-        String::new()
-    };
+    }
+}
 
-    Ok(NetnsHandle {
-        outer_ip: config.outer_ip,
-        inner_veth: veth_inner,
-        inner_cidr,
-        veth_outer,
-        outer_cidr,
-        nft_dns_table,
+/// Return the start time of process `pid` (field 22 of `/proc/<pid>/stat`).
+fn process_start_time(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    parse_start_time(&stat)
+}
+
+/// Parse field 22 (`starttime`) of a `/proc/<pid>/stat` line.
+fn parse_start_time(stat: &str) -> Option<u64> {
+    // The command name (field 2) can contain spaces and parentheses, so
+    // split after the last ')'. Field 3 is the first field after it.
+    let (_, rest) = stat.rsplit_once(')')?;
+    rest.split_whitespace().nth(22 - 3)?.parse().ok()
+}
+
+fn process_alive(pid: u32, start_time: u64) -> bool {
+    process_start_time(pid) == Some(start_time)
+}
+
+fn random_u32() -> u32 {
+    let mut buf = [0u8; 4];
+    // SAFETY: getrandom writes at most `buf.len()` bytes into `buf`.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let n = unsafe { libc::getrandom(buf.as_mut_ptr().cast(), buf.len(), 0) };
+    if n == 4 {
+        return u32::from_ne_bytes(buf);
+    }
+    // Fallback: the ID only needs to be unique among live instances, and the
+    // allocation below checks that.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    nanos ^ std::process::id().rotate_left(16)
+}
+
+/// Read every valid state file in `dir`, with its path.
+fn read_states(dir: &Path) -> Vec<(PathBuf, InstanceState)> {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: geteuid has no preconditions.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let euid = unsafe { libc::geteuid() };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "state"))
+        .filter_map(|p| {
+            // Accept only files that this user owns.
+            let meta = std::fs::symlink_metadata(&p).ok()?;
+            if !meta.is_file() || meta.uid() != euid {
+                return None;
+            }
+            let state = InstanceState::parse(&std::fs::read_to_string(&p).ok()?)?;
+            Some((p, state))
+        })
+        .collect()
+}
+
+fn write_state(path: &Path, state: &InstanceState) -> Result<(), SandboxError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let tmp = path.with_extension("tmp");
+    let write = || -> std::io::Result<()> {
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(state.serialize().as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    };
+    write().map_err(|e| {
+        SandboxError::NetworkSetupFailed(format!("cannot write {}: {e}", path.display()))
     })
 }
 
-/// Find the handle number of an nftables ACCEPT rule for a specific interface.
-///
-/// Runs `nft -a list chain inet filter {chain}` and returns the handle of the
-/// first rule that references `{iface_name}` with `{iface_keyword}` (either
-/// `iifname` for input or `oifname` for output). Returns `None` if the rule is
-/// not found or if nftables is unavailable.
-fn nft_find_iface_rule_handle(chain: &str, iface_keyword: &str, iface_name: &str) -> Option<u64> {
-    use std::process::Command;
-
-    let mut cmd = Command::new("nft");
-    cmd.args(["-a", "list", "chain", "inet", "filter", chain]);
-    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-    unsafe { cmd.pre_exec(raise_net_admin_ambient) };
-    let output = cmd.output().ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let quoted = format!("\"{iface_name}\"");
-
-    for line in stdout.lines() {
-        if line.contains(iface_keyword) && line.contains(quoted.as_str()) {
-            // Rule output looks like: `iifname "veth-X-out" accept # handle 42`
-            if let Some(pos) = line.rfind("# handle ") {
-                let handle_str = line[pos + 9..].trim();
-                return handle_str.parse().ok();
+/// Collect the IPv4 networks that the host uses now.
+fn host_networks() -> Vec<(Ipv4Addr, u8)> {
+    let mut nets = Vec::new();
+    for args in [
+        &["-o", "-4", "addr", "show"][..],
+        &["-4", "route", "show", "table", "all"][..],
+    ] {
+        match Command::new("ip").args(args).output() {
+            Ok(out) if out.status.success() => {
+                nets.extend(parse_ipv4_nets(&String::from_utf8_lossy(&out.stdout)));
             }
+            Ok(out) => tracing::debug!(
+                stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+                "ip {} failed", args.join(" ")
+            ),
+            Err(e) => tracing::debug!(err = %e, "cannot run ip"),
         }
     }
-
-    None
+    nets
 }
 
-/// Run `ip <args>` in the calling process's current network namespace.
+/// Remove the host resources of `ProxyOnly` instances whose owner is dead.
 ///
-/// Forks a helper, raises `CAP_NET_ADMIN` as ambient, then `execvp("ip",
-/// args)`. Used inside the sandboxed child's `pre_exec` hook (after
-/// `unshare(CLONE_NEWNET)`) to configure the inner veth once the parent
-/// background thread has moved it in.
+/// Call this at startup (next to `cleanup_stale_overlays`). The function
+/// does nothing without `CAP_NET_ADMIN`, because the cleanup commands would
+/// fail; the state files stay for a later run with privileges.
+pub fn cleanup_stale_netns() {
+    let dir = state_dir();
+    if !dir.is_dir() || check_netns_privileges().is_err() {
+        return;
+    }
+    let Ok(_lock) = StateLock::acquire(&dir) else {
+        return;
+    };
+    for (path, state) in read_states(&dir) {
+        if process_alive(state.pid, state.start_time) {
+            continue;
+        }
+        tracing::debug!(id = %state.tag(), pid = state.pid, "removing stale pent network");
+        state.undo();
+        remove_file_logged(&path);
+        remove_file_logged(&path.with_extension("resolv.conf"));
+    }
+}
+
+// ── Creation ───────────────────────────────────────────────────────────────
+
+/// Allocate a subnet and create the host side of a `ProxyOnly` network.
+///
+/// The function creates a veth pair with a unique name, gives the outer end
+/// its address, brings it up and adds a per-instance policy routing rule.
+/// Call [`NetnsHandle::install_firewall`] when the proxy ports are known.
 ///
 /// # Errors
-/// Returns `NetworkSetupFailed` if fork/exec/waitpid fails or ip exits
-/// non-zero (exit 4 = raise ambient failed, exit 127 = execvp failed).
-pub fn run_ip_local(args: &[&str]) -> Result<(), SandboxError> {
-    use std::ffi::CString;
+/// * `PrivilegeRequired` if `CAP_NET_ADMIN` is absent.
+/// * `NetworkSetupFailed` if any step fails. The partial setup is removed.
+pub fn create_netns() -> Result<NetnsHandle, SandboxError> {
+    check_netns_privileges()?;
+    let dir = ensure_state_dir()?;
+    let pid = std::process::id();
+    let start_time = process_start_time(pid).ok_or_else(|| {
+        SandboxError::NetworkSetupFailed("cannot read the start time of pent".to_string())
+    })?;
 
-    // SAFETY: fork() is always safe.
-    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-    let pid = unsafe { libc::fork() };
-    match pid {
-        -1 => Err(SandboxError::NetworkSetupFailed(format!(
-            "fork failed: {}",
-            std::io::Error::last_os_error()
-        ))),
-        0 => {
-            // SAFETY: single-threaded child; async-signal-safe ops only.
-            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-            if raise_net_admin_ambient().is_err() {
-                unsafe { libc::_exit(4) };
-            }
-
-            // SAFETY: "ip" contains no null bytes; _exit is async-signal-safe.
-            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-            let ip_cstr = match CString::new("ip") {
-                Ok(s) => s,
-                Err(_) => unsafe { libc::_exit(127) },
-            };
-            let mut c_args: Vec<CString> = vec![ip_cstr.clone()];
-            for a in args {
-                let cs = match CString::new(*a) {
-                    Ok(s) => s,
-                    Err(_) => unsafe { libc::_exit(127) },
-                };
-                c_args.push(cs);
-            }
-            let mut ptrs: Vec<*const libc::c_char> = c_args.iter().map(|a| a.as_ptr()).collect();
-            ptrs.push(std::ptr::null());
-
-            // SAFETY: execvp with valid null-terminated argv array.
-            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-            unsafe { libc::execvp(ip_cstr.as_ptr(), ptrs.as_ptr()) };
-            // SAFETY: _exit is always safe.
-            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-            unsafe { libc::_exit(127) };
+    // Allocate the ID and the subnet under the lock, and record them in the
+    // state file before the lock is released.
+    let (state, state_path) = {
+        let _lock = StateLock::acquire(&dir)?;
+        let live: Vec<InstanceState> = read_states(&dir)
+            .into_iter()
+            .map(|(_, s)| s)
+            .filter(|s| process_alive(s.pid, s.start_time))
+            .collect();
+        let mut taken = host_networks();
+        taken.extend(live.iter().map(|s| (s.network, SUBNET_PREFIX)));
+        let mut id = random_u32();
+        while live.iter().any(|s| s.id == id) || dir.join(format!("{id:08x}.state")).exists() {
+            id = random_u32();
         }
-        child_pid => {
-            let mut status = 0;
-            // SAFETY: waitpid on a known child pid.
-            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-            let (exited, code) = unsafe {
-                let ret = libc::waitpid(child_pid, &raw mut status, 0);
-                if ret == -1 {
-                    return Err(SandboxError::NetworkSetupFailed(format!(
-                        "waitpid failed: {}",
-                        std::io::Error::last_os_error()
-                    )));
+        let network = choose_subnet(id, &taken).ok_or_else(|| {
+            SandboxError::NetworkSetupFailed("no free subnet in 10.200.0.0/16".to_string())
+        })?;
+        let state = InstanceState::new(pid, start_time, id, network);
+        let state_path = dir.join(format!("{id:08x}.state"));
+        write_state(&state_path, &state)?;
+        (state, state_path)
+    };
+
+    let mut handle = NetnsHandle {
+        outer_ip: state.outer_ip(),
+        inner_veth: state.veth_inner(),
+        inner_cidr: format!("{}/{SUBNET_PREFIX}", state.inner_ip()),
+        state,
+        state_path,
+        resolv_path: None,
+    };
+    // On error, `handle` drops and removes what exists.
+    handle.create_veth()?;
+    Ok(handle)
+}
+
+impl NetnsHandle {
+    fn save(&self) -> Result<(), SandboxError> {
+        write_state(&self.state_path, &self.state)
+    }
+
+    fn create_veth(&mut self) -> Result<(), SandboxError> {
+        let inner = self.state.veth_inner();
+        let outer = self.state.veth_outer();
+        let outer_cidr = format!("{}/{SUBNET_PREFIX}", self.outer_ip);
+        run_tool_checked(
+            "ip",
+            &[
+                "link", "add", &inner, "type", "veth", "peer", "name", &outer,
+            ],
+        )?;
+        self.state.veth_created = true;
+        self.save()?;
+        run_tool_checked("ip", &["addr", "add", &outer_cidr, "dev", &outer])?;
+        run_tool_checked("ip", &["link", "set", &outer, "up"])?;
+
+        // Packets to the veth subnet always use the main table. Without this
+        // rule, policy routes of a VPN can send the replies to the child out
+        // of the wrong interface.
+        let cidr = self.state.subnet_cidr();
+        match run_tool(
+            "ip",
+            &[
+                "rule",
+                "add",
+                "to",
+                &cidr,
+                "table",
+                "main",
+                "priority",
+                RULE_PRIORITY,
+            ],
+        ) {
+            Ok(out) if out.status.success() => {
+                self.state.rule_added = true;
+                self.save()?;
+            }
+            Ok(out) => tracing::debug!(
+                stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+                "ip rule add for the veth subnet failed; a VPN policy route can break the proxy"
+            ),
+            Err(e) => tracing::debug!(err = %e, "cannot run ip rule add"),
+        }
+        Ok(())
+    }
+
+    /// Install the host firewall rules for the proxy and DNS ports.
+    ///
+    /// The drop rules are mandatory: without them the child can reach every
+    /// service that listens on the host. The function tries a per-instance
+    /// nft table first and `iptables`/`ip6tables` next. The DNS redirect and
+    /// the ACCEPT rules in the distribution firewall are best effort.
+    ///
+    /// # Errors
+    /// Returns `NetworkSetupFailed` if neither nft nor iptables can install
+    /// the drop rules.
+    pub fn install_firewall(&mut self, proxy_port: u16, dns_port: u16) -> Result<(), SandboxError> {
+        self.state.proxy_port = proxy_port;
+        self.state.dns_port = dns_port;
+        self.save()?;
+        let rules = FirewallRules::new(&self.state);
+
+        // 1. Mandatory drop rules.
+        match nft_load(&rules.nft_script()) {
+            Ok(()) => {
+                self.state.firewall = FirewallKind::Nft;
+                self.save()?;
+            }
+            Err(nft_err) => {
+                tracing::debug!(err = %nft_err, "nft table failed; trying iptables");
+                // Record the kind first, so that a partial install is undone.
+                self.state.firewall = FirewallKind::Iptables;
+                self.save()?;
+                // `-I CHAIN 1` puts each rule on top, so insert in reverse.
+                for rule in rules.iptables_drop().iter().rev() {
+                    check_output(rule.tool, rule.insert()).map_err(|e| {
+                        SandboxError::NetworkSetupFailed(format!(
+                            "cannot install the host firewall (nft: {nft_err}; iptables: {e})"
+                        ))
+                    })?;
                 }
-                (libc::WIFEXITED(status), libc::WEXITSTATUS(status))
-            };
-
-            if !exited || code != 0 {
-                return Err(SandboxError::NetworkSetupFailed(format!(
-                    "ip {} failed (exit {})",
-                    args.join(" "),
-                    if exited { code } else { -1 }
-                )));
+                for rule in rules.iptables_accept().iter().rev() {
+                    check_output(rule.tool, rule.insert())?;
+                }
             }
-            Ok(())
+        }
+
+        // 2. DNS redirect: queries to port 53 from the child go to the DNS
+        //    server of the proxy.
+        if dns_port != 0 {
+            let table = self.state.dns_table_name();
+            self.state.dns_table = true;
+            self.save()?;
+            let veth = self.state.veth_outer();
+            let outer = self.outer_ip;
+            let script = format!(
+                "table ip {table} {{\n\
+                 \x20 chain prerouting {{\n\
+                 \x20   type nat hook prerouting priority -100;\n\
+                 \x20   iifname \"{veth}\" udp dport 53 dnat to {outer}:{dns_port}\n\
+                 \x20   iifname \"{veth}\" tcp dport 53 dnat to {outer}:{dns_port}\n\
+                 \x20 }}\n\
+                 }}\n"
+            );
+            if let Err(e) = nft_load(&script) {
+                tracing::warn!(
+                    "DNS redirect via nft failed; DNS for apps that ignore the proxy can fail: {e}"
+                );
+                self.state.dns_table = false;
+                self.save()?;
+            }
+        }
+
+        // 3. Best effort: ACCEPT rules in the distribution firewall, so that
+        //    its own input policy does not drop the proxy traffic.
+        if self.state.firewall == FirewallKind::Nft {
+            let tag = self.state.tag();
+            let veth = self.state.veth_outer();
+            let outer = self.outer_ip;
+            self.state.distro_nft_accept = true;
+            self.save()?;
+            let mut rules_ok = 0usize;
+            for (proto, port) in rules.allowed() {
+                let rule = format!(
+                    "iifname \"{veth}\" ip daddr {outer} {proto} dport {port} accept comment \"{tag}\""
+                );
+                if check_output(
+                    "nft",
+                    run_tool("nft", &["insert", "rule", "inet", "filter", "input", &rule]),
+                )
+                .is_ok()
+                {
+                    rules_ok += 1;
+                }
+            }
+            let rule = format!("oifname \"{veth}\" accept comment \"{tag}\"");
+            if check_output(
+                "nft",
+                run_tool(
+                    "nft",
+                    &["insert", "rule", "inet", "filter", "output", &rule],
+                ),
+            )
+            .is_ok()
+            {
+                rules_ok += 1;
+            }
+            if rules_ok == 0 {
+                tracing::debug!("no inet filter table; no nft ACCEPT rules added");
+                self.state.distro_nft_accept = false;
+                self.save()?;
+            }
+
+            self.state.distro_ipt_accept = true;
+            self.save()?;
+            let mut any = false;
+            for rule in rules.iptables_accept().iter().rev() {
+                any |= check_output(rule.tool, rule.insert()).is_ok();
+            }
+            if !any {
+                self.state.distro_ipt_accept = false;
+                self.save()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Write the `resolv.conf` file for the child and return its path.
+    ///
+    /// The file points the resolver at the outer veth address. The child
+    /// bind-mounts it over `/etc/resolv.conf` in its own mount namespace.
+    ///
+    /// # Errors
+    /// Returns `NetworkSetupFailed` if the file cannot be written.
+    pub fn write_resolv_conf(&mut self) -> Result<PathBuf, SandboxError> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let path = self.state_path.with_extension("resolv.conf");
+        let content = format!("nameserver {}\n", self.outer_ip);
+        std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o644)
+            .open(&path)
+            .and_then(|mut f| f.write_all(content.as_bytes()))
+            .map_err(|e| {
+                SandboxError::NetworkSetupFailed(format!("cannot write {}: {e}", path.display()))
+            })?;
+        self.resolv_path = Some(path.clone());
+        Ok(path)
+    }
+
+    /// Return the data that the parent needs to configure the child side.
+    #[must_use]
+    pub(crate) fn child_config(&self) -> ChildNetConfig {
+        ChildNetConfig {
+            inner_veth: self.inner_veth.clone(),
+            inner_cidr: self.inner_cidr.clone(),
+            outer_ip: self.outer_ip,
         }
     }
 }
 
-/// Set up resolv.conf inside the child's own network namespace.
-///
-/// Must be called from the child's `pre_exec` hook, after the child has called
-/// `unshare(CLONE_NEWUSER | CLONE_NEWNET | CLONE_NEWNS)` and configured its
-/// veth/loopback/routes, but before Landlock is applied.
-///
-/// # What this does
-///
-/// 1. Makes the mount tree private (`MS_REC|MS_PRIVATE`) so subsequent mounts
-///    don't propagate back to the host.  Must be called AFTER overlayfs mounts
-///    (making the tree private before overlayfs causes EACCES on some kernels).
-/// 2. Mounts a fresh tmpfs on `/run` to give us a writable scratch space
-///    invisible to the host.
-/// 3. Writes `nameserver <outer_ip>` to `/etc/resolv.conf` so that the child's
-///    libc resolver sends DNS queries to the proxy's outer veth IP (port 53).
-///    DNS PREROUTING rules set up on the host side (in `create_netns`) redirect
-///    those port-53 packets to the proxy's DNS server port.
-///
-/// Failures are silently ignored — proxy-aware apps use `SOCKS5h` (hostname
-/// resolved server-side) and are unaffected. Non-proxy-aware apps benefit from
-/// the resolv.conf + host-side PREROUTING redirect.
-pub fn setup_child_dns(outer_ip: &str, _dns_port: u16) {
-    // ── 0. Make mount tree private ───────────────────────────────────────────
-    // After unshare(CLONE_NEWNS), inherited mounts are "slaves".  We must
-    // make the tree private before mounting tmpfs on /run or bind-mounting
-    // resolv.conf, otherwise the kernel refuses with EPERM.
-    //
-    // IMPORTANT: this must happen AFTER mount_overlays (if any).  Making the
-    // tree private before overlayfs causes EACCES on the overlay mount itself
-    // (confirmed on kernel 6.18.9 with btrfs lower + tmpfs upper).
-    // SAFETY: mount(2) is always safe with valid pointers.
-    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-    let ret = unsafe {
-        libc::mount(
-            c"none".as_ptr(),
-            c"/".as_ptr(),
-            std::ptr::null(),
-            libc::MS_REC | libc::MS_PRIVATE,
-            std::ptr::null(),
-        )
-    };
-    if ret != 0 {
-        // SAFETY: write(2) is async-signal-safe.
-        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-        unsafe {
-            let msg = b"pent: mount --make-rprivate / failed; tmpfs/resolv.conf may not work\n";
-            libc::write(libc::STDERR_FILENO, msg.as_ptr().cast(), msg.len());
-        }
-    }
-
-    // ── 1. Mount tmpfs on /run ───────────────────────────────────────────────
-    // The host's /run is root-owned so an unprivileged user can't write to it.
-    // Mounting a fresh tmpfs here (inside CLONE_NEWNS) gives us a writable
-    // /run that is invisible to the host.
-    // SAFETY: mount(2) is always safe with valid pointers.
-    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-    let ret = unsafe {
-        libc::mount(
-            c"tmpfs".as_ptr(),
-            c"/run".as_ptr(),
-            c"tmpfs".as_ptr(),
-            libc::MS_NOSUID | libc::MS_NODEV,
-            std::ptr::null(),
-        )
-    };
-    if ret != 0 {
-        // SAFETY: write(2) is async-signal-safe.
-        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-        unsafe {
-            let msg = b"pent: mount tmpfs /run failed; resolv.conf setup may not work\n";
-            libc::write(libc::STDERR_FILENO, msg.as_ptr().cast(), msg.len());
-        }
-    }
-
-    // ── 2. Resolv.conf ───────────────────────────────────────────────────────
-    // Point the resolver at outer_ip (the host-side veth IP). DNS queries to
-    // port 53 on that IP are intercepted by the host-side nft PREROUTING rule
-    // (set up in create_netns) and redirected to the proxy's DNS server port.
-    let resolv_content = format!("nameserver {outer_ip}\n");
-    setup_child_resolv_conf(&resolv_content);
+/// The child side of a `ProxyOnly` network. The helper thread of the parent
+/// uses it while the main thread waits in `spawn`.
+#[derive(Debug, Clone)]
+pub(crate) struct ChildNetConfig {
+    inner_veth: String,
+    inner_cidr: String,
+    outer_ip: Ipv4Addr,
 }
 
-/// Write a custom resolv.conf pointing at the proxy and make it visible.
-///
-/// Handles three cases:
-/// - `/etc/resolv.conf` is a regular file → bind-mount our file over it.
-/// - `/etc/resolv.conf` is a symlink into `/run/` → create the target path
-///   inside the (now-tmpfs) `/run` and write our file there directly.
-/// - Anything else → best-effort bind-mount; errors silently ignored.
-fn setup_child_resolv_conf(content: &str) {
-    let src = "/run/pent-resolv.conf";
-    if let Err(e) = std::fs::write(src, content) {
-        eprintln!("pent: write {src}: {e}");
-    }
+impl ChildNetConfig {
+    /// Move the inner veth into the namespace of `pid` and configure it.
+    ///
+    /// The child must have created its user and network namespaces and
+    /// written its UID and GID maps. The parent runs `ip` in the network
+    /// namespace of the child: a helper process calls `setns` into the user
+    /// namespace of the child (this user owns it, so the helper gets all
+    /// capabilities there) and then into its network namespace.
+    ///
+    /// # Errors
+    /// Returns `NetworkSetupFailed` if a step fails.
+    pub(crate) fn configure(&self, pid: libc::pid_t) -> Result<(), SandboxError> {
+        let inner = self.inner_veth.as_str();
+        let pid_str = pid.to_string();
+        run_tool_checked("ip", &["link", "set", inner, "netns", &pid_str])?;
 
-    // Check whether /etc/resolv.conf is a symlink.
-    if let Ok(target) = std::fs::read_link("/etc/resolv.conf") {
-        let abs_target = if target.is_absolute() {
-            target
-        } else {
-            std::path::PathBuf::from("/etc").join(target)
+        let open_ns = |kind: &str| -> Result<File, SandboxError> {
+            File::open(format!("/proc/{pid}/ns/{kind}")).map_err(|e| {
+                SandboxError::NetworkSetupFailed(format!("cannot open the {kind} namespace: {e}"))
+            })
         };
-        // If the symlink target is under /run (e.g. systemd-resolved), create
-        // the path inside our tmpfs and write our resolv.conf there.
-        if abs_target.starts_with("/run") {
-            if let Some(parent) = abs_target.parent() {
-                if let Err(e) = std::fs::create_dir_all(parent) {
-                    eprintln!("pent: mkdir {}: {e}", parent.display());
-                }
-            }
-            if let Err(e) = std::fs::write(&abs_target, content) {
-                eprintln!("pent: write {}: {e}", abs_target.display());
-            }
-            return;
+        let user_ns = open_ns("user")?;
+        let net_ns = open_ns("net")?;
+        let gateway = self.outer_ip.to_string();
+        let steps: [&[&str]; 4] = [
+            &["addr", "add", &self.inner_cidr, "dev", inner],
+            &["link", "set", inner, "up"],
+            &["link", "set", "lo", "up"],
+            &["route", "add", "default", "via", &gateway],
+        ];
+        for args in steps {
+            run_ip_in_ns(user_ns.as_raw_fd(), net_ns.as_raw_fd(), args)?;
         }
-        // Symlink points elsewhere — fall through to bind-mount attempt.
-    }
-
-    // Regular file (or symlink pointing outside /run): bind-mount our temp
-    // file over /etc/resolv.conf.  MS_BIND follows symlinks for the target,
-    // so this also works for symlinks to non-/run paths when the target exists.
-    // SAFETY: mount(2) with valid pointers.
-    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-    let ret = unsafe {
-        libc::mount(
-            c"/run/pent-resolv.conf".as_ptr(),
-            c"/etc/resolv.conf".as_ptr(),
-            std::ptr::null(),
-            libc::MS_BIND,
-            std::ptr::null(),
-        )
-    };
-    if ret != 0 {
-        // SAFETY: write(2) is async-signal-safe.
-        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-        unsafe {
-            let msg = b"pent: bind-mount /etc/resolv.conf failed; DNS may not work\n";
-            libc::write(libc::STDERR_FILENO, msg.as_ptr().cast(), msg.len());
-        }
+        Ok(())
     }
 }
 
-/// Move `inner_veth` into the network namespace of process `pid`.
-///
-/// Called from the background thread in `spawn_with_landlock` after the child
-/// has signalled readiness (it has already called `unshare(CLONE_NEWNET)`).
-/// Uses `ip link set <inner_veth> netns <pid>`, which only requires
-/// `CAP_NET_ADMIN` in the source (host) network namespace.
-///
-/// # Errors
-/// Returns `NetworkSetupFailed` if the `ip link set netns` call fails.
-pub fn move_inner_veth_to_pid(inner_veth: &str, pid: libc::pid_t) -> Result<(), SandboxError> {
-    use std::process::Command;
-
-    let pid_str = pid.to_string();
+/// Run `ip args…` inside the user and network namespaces `user_fd` and
+/// `net_fd`.
+fn run_ip_in_ns(
+    user_fd: libc::c_int,
+    net_fd: libc::c_int,
+    args: &[&str],
+) -> Result<(), SandboxError> {
     let mut cmd = Command::new("ip");
-    cmd.args(["link", "set", inner_veth, "netns", &pid_str]);
-    // SAFETY: pre_exec runs in a single-threaded fork child before exec.
+    cmd.args(args);
+    // SAFETY: the hook runs between fork and exec. It uses only setns(2) on
+    // file descriptors that the caller keeps open during `output()`, and the
+    // async-signal-safe `raise_net_admin_ambient`.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-    unsafe { cmd.pre_exec(raise_net_admin_ambient) };
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::setns(user_fd, libc::CLONE_NEWUSER) != 0 {
+                write_stderr_static(b"pent: setns(user) failed\n");
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::setns(net_fd, libc::CLONE_NEWNET) != 0 {
+                write_stderr_static(b"pent: setns(net) failed\n");
+                return Err(std::io::Error::last_os_error());
+            }
+            raise_net_admin_ambient()
+        })
+    };
     let output = cmd
         .output()
-        .map_err(|e| SandboxError::NetworkSetupFailed(format!("failed to run ip: {e}")))?;
+        .map_err(|e| SandboxError::NetworkSetupFailed(format!("cannot run ip: {e}")))?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(SandboxError::NetworkSetupFailed(format!(
-            "ip link set {} netns {} failed: {}",
-            inner_veth,
-            pid,
-            stderr.trim()
+            "ip {} (in the child namespace) failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
     Ok(())
 }
 
+fn check_output(
+    tool: &str,
+    result: std::io::Result<std::process::Output>,
+) -> Result<(), SandboxError> {
+    match result {
+        Ok(out) if out.status.success() => Ok(()),
+        Ok(out) => Err(SandboxError::NetworkSetupFailed(format!(
+            "{tool} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))),
+        Err(e) => Err(SandboxError::NetworkSetupFailed(format!(
+            "cannot run {tool}: {e}"
+        ))),
+    }
+}
+
+/// Load an nft script with `nft -f -`.
+fn nft_load(script: &str) -> Result<(), SandboxError> {
+    use std::process::Stdio;
+    let mut cmd = Command::new("nft");
+    cmd.args(["-f", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    // SAFETY: see `run_tool`.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    unsafe { cmd.pre_exec(raise_net_admin_ambient) };
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| SandboxError::NetworkSetupFailed(format!("cannot run nft: {e}")))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(script.as_bytes())
+            .map_err(|e| SandboxError::NetworkSetupFailed(format!("cannot write to nft: {e}")))?;
+    }
+    check_output("nft", child.wait_with_output())
+}
+
+/// Find the handles of the rules in `inet filter <chain>` that carry the
+/// comment `tag`.
+fn nft_find_tagged_rule_handles(chain: &str, tag: &str) -> Vec<u64> {
+    let Ok(output) = run_tool("nft", &["-a", "list", "chain", "inet", "filter", chain]) else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    parse_tagged_handles(&String::from_utf8_lossy(&output.stdout), tag)
+}
+
+/// Parse `nft -a list chain` output and return the handles of the rules
+/// with `comment "<tag>"`.
+fn parse_tagged_handles(text: &str, tag: &str) -> Vec<u64> {
+    const MARKER: &str = "# handle ";
+    let comment = format!("comment \"{tag}\"");
+    text.lines()
+        .filter(|line| line.contains(&comment))
+        .filter_map(|line| {
+            let pos = line.rfind(MARKER)?;
+            line.get(pos + MARKER.len()..)?.trim().parse().ok()
+        })
+        .collect()
+}
+
+// ── Prepared networks ──────────────────────────────────────────────────────
+
+/// Networks that `prepare_proxy_network` created and no spawn took yet.
+static PREPARED: std::sync::Mutex<Vec<NetnsHandle>> = std::sync::Mutex::new(Vec::new());
+
+/// Create the host side of a `ProxyOnly` network before the proxy starts.
+///
+/// Returns the outer veth address. Bind the proxy and the DNS server to this
+/// address, so that only the sandbox (and local processes) can reach them.
+/// Then pass `NetworkMode::ProxyOnly { proxy_addr, .. }` with a `proxy_addr`
+/// on this address: `spawn_sandboxed` uses the prepared network.
+///
+/// If no spawn takes the network, the next pent run removes it with
+/// [`cleanup_stale_netns`].
+///
+/// # Errors
+/// * `PrivilegeRequired` if `CAP_NET_ADMIN` is absent.
+/// * `NetworkSetupFailed` if a step fails.
+pub fn prepare_proxy_network() -> Result<Ipv4Addr, SandboxError> {
+    let handle = create_netns()?;
+    let ip = handle.outer_ip;
+    PREPARED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(handle);
+    Ok(ip)
+}
+
+/// Take the prepared network whose outer address is `ip`.
+pub(crate) fn take_prepared(ip: IpAddr) -> Option<NetnsHandle> {
+    let mut list = PREPARED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let pos = list.iter().position(|h| IpAddr::V4(h.outer_ip) == ip)?;
+    Some(list.swap_remove(pos))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serial_test::serial;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-    // ========================================================================
-    // NetnsConfig::new tests
-    // ========================================================================
-
     #[test]
-    fn test_netns_config_name_format() {
-        let config = NetnsConfig::from_pid();
-        assert!(config.name.starts_with("pent-"));
-        let pid = std::process::id().to_string();
-        assert!(config.name.contains(&pid));
-    }
-
-    #[test]
-    fn test_netns_config_ip_range() {
-        let config = NetnsConfig::from_pid();
-        // Inner IP should be 10.200.x.2
-        assert_eq!(config.inner_ip.octets()[0], 10);
-        assert_eq!(config.inner_ip.octets()[1], 200);
-        assert_eq!(config.inner_ip.octets()[3], 2);
-
-        // Outer IP should be 10.200.x.1
-        assert_eq!(config.outer_ip.octets()[0], 10);
-        assert_eq!(config.outer_ip.octets()[1], 200);
-        assert_eq!(config.outer_ip.octets()[3], 1);
-    }
-
-    #[test]
-    fn test_netns_config_prefix_len() {
-        let config = NetnsConfig::from_pid();
-        assert_eq!(config.prefix_len, 24);
-    }
-
-    // ========================================================================
-    // check_netns_privileges tests
-    // ========================================================================
-
-    #[test]
-    fn test_check_netns_privileges_returns_result() -> TestResult {
-        // This will likely fail unless running as root
-        let result = check_netns_privileges();
-        // Just verify it returns something sensible
-        match result {
-            Ok(()) | Err(SandboxError::PrivilegeRequired(_)) => {}
-            Err(e) => return Err(format!("Unexpected error: {e:?}").into()),
+    fn test_veth_names_fit_ifnamsiz() {
+        for id in [0, 1, 0xdead_beef, u32::MAX] {
+            let (inner, outer) = veth_names(id);
+            assert!(inner.len() <= 15, "{inner} is too long");
+            assert!(outer.len() <= 15, "{outer} is too long");
+            assert_ne!(inner, outer);
+            assert!(inner.starts_with("pent"));
         }
+        assert_eq!(veth_names(0xdead_beef).1, "pentdeadbeefo");
+    }
+
+    #[test]
+    fn test_nets_overlap() {
+        let a = Ipv4Addr::new(10, 200, 0, 4);
+        assert!(nets_overlap(a, 30, Ipv4Addr::new(10, 200, 0, 5), 32));
+        assert!(!nets_overlap(a, 30, Ipv4Addr::new(10, 200, 0, 8), 30));
+        assert!(nets_overlap(a, 30, Ipv4Addr::new(10, 200, 0, 0), 16));
+        assert!(nets_overlap(a, 30, Ipv4Addr::new(0, 0, 0, 0), 0));
+    }
+
+    #[test]
+    fn test_choose_subnet_skips_taken() {
+        let taken = vec![
+            (Ipv4Addr::new(10, 200, 0, 1), 30),
+            (Ipv4Addr::new(10, 200, 0, 4), 30),
+            (Ipv4Addr::new(0, 0, 0, 0), 0), // default route: ignored
+        ];
+        assert_eq!(choose_subnet(0, &taken), Some(Ipv4Addr::new(10, 200, 0, 8)));
+        // The start slot wraps inside the pool.
+        assert_eq!(
+            choose_subnet(POOL_SLOTS + 3, &[]),
+            Some(Ipv4Addr::new(10, 200, 0, 12))
+        );
+    }
+
+    #[test]
+    fn test_choose_subnet_full_pool() {
+        let taken = vec![(Ipv4Addr::new(10, 200, 0, 0), 16)];
+        assert_eq!(choose_subnet(7, &taken), None);
+    }
+
+    #[test]
+    fn test_parse_ipv4_nets() {
+        let text = "2: eth0    inet 192.168.1.5/24 brd 192.168.1.255 scope global eth0\n\
+                    default via 192.168.1.1 dev eth0\n10.200.3.0/30 dev pentx scope link\n";
+        let nets = parse_ipv4_nets(text);
+        assert!(nets.contains(&(Ipv4Addr::new(192, 168, 1, 5), 24)));
+        assert!(nets.contains(&(Ipv4Addr::new(10, 200, 3, 0), 30)));
+        assert_eq!(nets.len(), 2);
+    }
+
+    #[test]
+    fn test_state_roundtrip() -> TestResult {
+        let mut s = InstanceState::new(42, 12345, 0x0102_0304, Ipv4Addr::new(10, 200, 1, 4));
+        s.veth_created = true;
+        s.firewall = FirewallKind::Nft;
+        s.proxy_port = 8080;
+        s.dns_port = 5353;
+        let parsed = InstanceState::parse(&s.serialize()).ok_or("parse failed")?;
+        assert_eq!(parsed, s);
+        assert_eq!(parsed.outer_ip(), Ipv4Addr::new(10, 200, 1, 5));
+        assert_eq!(parsed.inner_ip(), Ipv4Addr::new(10, 200, 1, 6));
         Ok(())
     }
 
-    // ========================================================================
-    // create_netns tests
-    // ========================================================================
+    #[test]
+    fn test_state_parse_rejects_bad_values() {
+        let good = InstanceState::new(1, 2, 3, Ipv4Addr::new(10, 200, 0, 0)).serialize();
+        assert!(InstanceState::parse(&good).is_some());
+        // A network outside the pool or not aligned to /30.
+        assert!(InstanceState::parse(&good.replace("10.200.0.0", "192.168.0.0")).is_none());
+        assert!(InstanceState::parse(&good.replace("10.200.0.0", "10.200.0.1")).is_none());
+        // An unknown firewall kind.
+        assert!(InstanceState::parse(&good.replace("firewall=none", "firewall=x")).is_none());
+        // A free-form line.
+        assert!(InstanceState::parse(&format!("{good}rm -rf /\n")).is_none());
+    }
 
-    // Note: create_netns requires root/CAP_NET_ADMIN
-    // These tests would need to run in a privileged environment
+    #[test]
+    fn test_parse_start_time() {
+        let stat = "1234 (my (odd) cmd) S 1 1234 1234 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 987654 1000 10";
+        assert_eq!(parse_start_time(stat), Some(987_654));
+        assert_eq!(parse_start_time("garbage"), None);
+    }
+
+    #[test]
+    fn test_own_process_is_alive() -> TestResult {
+        let pid = std::process::id();
+        let start = process_start_time(pid).ok_or("no start time")?;
+        assert!(process_alive(pid, start));
+        assert!(!process_alive(pid, start.wrapping_add(1)));
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_tagged_handles() {
+        let text = "table inet filter {\n\
+                    chain input {\n\
+                    iifname \"pentaao\" tcp dport 1 accept comment \"pent_000000aa\" # handle 42\n\
+                    iifname \"other\" accept # handle 7\n\
+                    iifname \"x\" accept comment \"pent_000000aa\" # handle\n\
+                    }\n}";
+        assert_eq!(parse_tagged_handles(text, "pent_000000aa"), vec![42]);
+    }
+
+    #[test]
+    fn test_firewall_rules_cover_ports_and_drop() {
+        let mut s = InstanceState::new(1, 2, 0xab, Ipv4Addr::new(10, 200, 0, 8));
+        s.proxy_port = 3128;
+        s.dns_port = 5353;
+        let rules = FirewallRules::new(&s);
+        let script = rules.nft_script();
+        assert!(script.contains("table inet pent_000000ab"));
+        assert!(script.contains("ip daddr 10.200.0.9 tcp dport 3128 accept"));
+        assert!(script.contains("udp dport 5353 accept"));
+        assert!(script.contains("iifname \"pent000000abo\" drop"));
+        assert!(script.contains("hook forward"));
+        assert!(script.contains("iifname != \"lo\" drop"));
+
+        let accept = rules.iptables_accept();
+        assert_eq!(accept.len(), 3);
+        let drop = rules.iptables_drop();
+        assert!(drop
+            .iter()
+            .any(|r| r.tool == "ip6tables" && r.chain == "INPUT"));
+        assert!(drop.iter().any(|r| r.chain == "FORWARD"));
+        assert!(drop
+            .iter()
+            .chain(&accept)
+            .all(|r| r.spec.contains(&"pent_000000ab".to_string())));
+
+        s.dns_port = 0;
+        assert_eq!(FirewallRules::new(&s).iptables_accept().len(), 1);
+    }
+
+    #[test]
+    fn test_check_netns_privileges_returns_result() -> TestResult {
+        match check_netns_privileges() {
+            Ok(()) | Err(SandboxError::PrivilegeRequired(_)) => Ok(()),
+            Err(e) => Err(format!("Unexpected error: {e:?}").into()),
+        }
+    }
 
     #[test]
     fn test_create_netns_requires_privileges() {
         if check_netns_privileges().is_err() {
-            let config = NetnsConfig::from_pid();
-            let result = create_netns(&config, 0);
-            // Should fail without privileges
-            assert!(result.is_err());
+            assert!(create_netns().is_err());
         }
     }
 
-    // ========================================================================
-    // NetnsHandle tests
-    // ========================================================================
-
+    /// The parent can run `ip` in a user and network namespace that a child
+    /// owns. This needs no host privileges, only unprivileged user
+    /// namespaces.
     #[test]
-    fn test_netns_handle_drop_is_idempotent() {
-        // A handle with sentinel values should not panic when dropped.
-        // ip link del on a non-existent interface is a no-op from Drop's perspective.
-        let handle = NetnsHandle {
-            outer_ip: std::net::Ipv4Addr::new(10, 200, 1, 1),
-            inner_veth: "veth-test-in".to_string(),
-            inner_cidr: "10.200.1.2/24".to_string(),
-            veth_outer: "veth-test-out-nonexistent".to_string(),
-            outer_cidr: "10.200.1.1/24".to_string(),
-            nft_dns_table: String::new(),
+    fn test_run_ip_in_child_namespace() -> TestResult {
+        if Command::new("ip").arg("-V").output().is_err() {
+            return Ok(()); // skip: no ip binary
+        }
+        let mut child = match Command::new("unshare")
+            .args(["--user", "--map-current-user", "--net", "sleep", "5"])
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(_) => return Ok(()), // skip: no unshare binary
         };
-        drop(handle); // must not panic or crash
-    }
-
-    #[test]
-    #[serial]
-    fn test_create_netns_returns_valid_handle() -> TestResult {
-        if check_netns_privileges().is_err() {
-            return Ok(()); // skip — requires CAP_NET_ADMIN
+        // Wait until the child is in its new network namespace.
+        let pid = child.id();
+        let own = std::fs::read_link("/proc/self/ns/net")?;
+        let mut ready = false;
+        for _ in 0..50 {
+            if std::fs::read_link(format!("/proc/{pid}/ns/net")).is_ok_and(|ns| ns != own) {
+                ready = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        let config = NetnsConfig::from_pid();
-        let handle = create_netns(&config, 0).map_err(|e| format!("create_netns failed: {e:?}"))?;
-
-        // outer_ip must match config
-        assert_eq!(handle.outer_ip, config.outer_ip);
-        // inner_veth should be set
-        assert!(!handle.inner_veth.is_empty());
-        // inner_cidr should contain the inner IP
-        assert!(handle.inner_cidr.contains(&config.inner_ip.to_string()));
-
-        // Capture veth name before drop
-        let veth_outer = format!(
-            "veth-{}-out",
-            config.name.strip_prefix("pent-").unwrap_or(&config.name)
+        if !ready {
+            child.kill().ok();
+            child.wait().ok();
+            return Ok(()); // skip: user namespaces not available
+        }
+        let user_ns = File::open(format!("/proc/{pid}/ns/user"))?;
+        let net_ns = File::open(format!("/proc/{pid}/ns/net"))?;
+        let result = run_ip_in_ns(
+            user_ns.as_raw_fd(),
+            net_ns.as_raw_fd(),
+            &["link", "set", "lo", "up"],
         );
-
-        // drop cleans up — should not panic
-        drop(handle);
-
-        // veth-out should be gone after drop
-        let output = std::process::Command::new("ip")
-            .args(["link", "show", &veth_outer])
-            .output()
-            .map_err(|e| format!("ip link show failed: {e}"))?;
-        assert!(
-            !output.status.success(),
-            "veth-out should be deleted after NetnsHandle drop"
-        );
+        child.kill().ok();
+        child.wait().ok();
+        assert!(result.is_ok(), "ip in child namespace failed: {result:?}");
         Ok(())
     }
 }

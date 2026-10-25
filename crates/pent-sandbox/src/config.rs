@@ -32,14 +32,31 @@ pub fn system_default_paths() -> SandboxPaths {
             // Homebrew: ARM Macs → /opt/homebrew, Intel → /usr/local (covered by /usr/*)
             "/opt/homebrew".to_string(),
         ],
-        read_write: vec![
-            "/tmp".to_string(),
-            // Device files — processes need /dev/null, /dev/urandom, etc.
-            "/dev".to_string(),
-            // macOS per-user volatile cache dirs (Keychain/MDS/Security framework)
-            "/private/var/folders".to_string(),
-        ],
+        read_write: default_read_write_paths(),
     }
+}
+
+/// Default read-write paths.
+///
+/// On Linux, the Landlock backend always grants the minimal device set
+/// (`/dev/null`, `/dev/zero`, `/dev/tty`, `/dev/pts`, ... read-write and
+/// `/dev/urandom`, ... read-only). Thus `/dev` is not in this list: a
+/// read-write grant on all of `/dev` includes `/dev/shm` and `/dev/mqueue`.
+#[cfg(target_os = "linux")]
+fn default_read_write_paths() -> Vec<String> {
+    vec!["/tmp".to_string()]
+}
+
+/// Default read-write paths.
+#[cfg(not(target_os = "linux"))]
+fn default_read_write_paths() -> Vec<String> {
+    vec![
+        "/tmp".to_string(),
+        // Device files — processes need /dev/null, /dev/urandom, etc.
+        "/dev".to_string(),
+        // macOS per-user volatile cache dirs (Keychain/MDS/Security framework)
+        "/private/var/folders".to_string(),
+    ]
 }
 
 /// Configuration for sandboxed process execution.
