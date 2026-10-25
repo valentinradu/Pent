@@ -9,6 +9,7 @@ use std::ffi::OsStr;
 use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
 
+use crate::guard::{classify, guard_rules, GuardAccess, GuardRule, GuardTarget};
 use crate::psl;
 use crate::{FsOp, GuardClass, Outcome, ProfileDoc, WatchEvent};
 
@@ -273,8 +274,16 @@ where
                 let Some(path) = normalize(path) else {
                     continue;
                 };
-                if let Outcome::Blocked(class) = outcome {
-                    add_blocked(&mut blocked, *op, path, *class, &process.name, &env);
+                // An access that matches a guard rule goes to the blocked
+                // section, also when the guard did not block it (a denial of
+                // `pent run`, or a path without a mount). The review does not
+                // select these items by default.
+                let class = match outcome {
+                    Outcome::Blocked(class) => Some(*class),
+                    Outcome::Allowed | Outcome::Denied => env.guard_class(*op, &path),
+                };
+                if let Some(class) = class {
+                    add_blocked(&mut blocked, *op, path, class, &process.name, &env);
                 } else if !env.is_omitted(&path) {
                     fs.record(*op, path, &process.name);
                 }
@@ -431,10 +440,31 @@ fn repo_root(path: &Path) -> Option<PathBuf> {
 }
 
 /// The paths of the context, checked once.
+/// Return the paths that the guard rules for `access` name.
+fn guard_paths(home: &Path, access: GuardAccess) -> Vec<PathBuf> {
+    guard_rules(home)
+        .into_iter()
+        .filter(|r| r.access == access)
+        .filter_map(|r| match r.target {
+            GuardTarget::Exact(p) | GuardTarget::Subtree(p) => Some(p),
+            GuardTarget::FilesInDir { dir, .. } => Some(dir),
+            GuardTarget::BinaryName(_) => None,
+        })
+        .collect()
+}
+
 struct Env {
     home: Option<PathBuf>,
     workspace: Option<PathBuf>,
     covered: Vec<PathBuf>,
+    /// The guard rules for the home directory.
+    guard: Vec<GuardRule>,
+    /// The paths of the read guard rules. No directory rule can contain one
+    /// of them.
+    guarded_read: Vec<PathBuf>,
+    /// The paths of the write guard rules. No read-write directory rule can
+    /// contain one of them.
+    guarded_write: Vec<PathBuf>,
 }
 
 impl Env {
@@ -445,7 +475,20 @@ impl Env {
             home: normalize(&ctx.home),
             workspace: normalize(&ctx.workspace),
             covered: ctx.covered.iter().filter_map(|p| normalize(p)).collect(),
+            guard: guard_rules(&ctx.home),
+            guarded_read: guard_paths(&ctx.home, GuardAccess::Read),
+            guarded_write: guard_paths(&ctx.home, GuardAccess::Write),
         }
+    }
+
+    /// Return the guard class of an access, if a guard rule matches it.
+    fn guard_class(&self, op: FsOp, path: &Path) -> Option<GuardClass> {
+        let access = match op {
+            FsOp::Read => GuardAccess::Read,
+            FsOp::Exec => GuardAccess::ExecName,
+            FsOp::Write | FsOp::Create | FsOp::Delete => GuardAccess::Write,
+        };
+        classify(&self.guard, path, access)
     }
 
     fn is_omitted(&self, path: &Path) -> bool {
@@ -457,6 +500,7 @@ impl Env {
     /// Return true if a directory is too broad for a rule.
     fn is_broad(&self, dir: &Path) -> bool {
         dir.components().count() <= 2
+            || self.guarded_read.iter().any(|g| g.starts_with(dir))
             || self.home.as_ref().is_some_and(|home| {
                 home.starts_with(dir) || BROAD_HOME_DIRS.iter().any(|r| dir == home.join(r))
             })
@@ -465,6 +509,17 @@ impl Env {
     /// Return true if grouping can make a rule on `dir`.
     fn can_group(&self, dir: &Path) -> bool {
         !self.is_broad(dir) && !self.workspace.as_ref().is_some_and(|w| w.starts_with(dir))
+    }
+
+    /// Return true if a directory is too broad for a read-write rule: it is
+    /// broad, or it contains a path that the guard protects from writes.
+    fn is_broad_for_write(&self, dir: &Path) -> bool {
+        self.is_broad(dir) || self.guarded_write.iter().any(|g| g.starts_with(dir))
+    }
+
+    /// Return true if grouping can make a read-write rule on `dir`.
+    fn can_group_for_write(&self, dir: &Path) -> bool {
+        self.can_group(dir) && !self.is_broad_for_write(dir)
     }
 
     fn is_cache(&self, path: &Path) -> bool {
@@ -599,7 +654,7 @@ fn includes(wide: FsAccess, narrow: FsAccess) -> bool {
 fn group(
     candidates: &BTreeSet<PathBuf>,
     counts: impl Fn(&Path) -> bool,
-    env: &Env,
+    allowed: impl Fn(&Path) -> bool,
 ) -> BTreeSet<PathBuf> {
     let mut entries: BTreeMap<&Path, BTreeSet<&Path>> = BTreeMap::new();
     for candidate in candidates.iter().filter(|c| counts(c)) {
@@ -611,7 +666,7 @@ fn group(
     }
     let groups: BTreeSet<&Path> = entries
         .iter()
-        .filter(|(dir, kids)| kids.len() >= DIR_THRESHOLD && env.can_group(dir))
+        .filter(|(dir, kids)| kids.len() >= DIR_THRESHOLD && allowed(dir))
         .map(|(dir, _)| *dir)
         .collect();
     candidates
@@ -641,7 +696,7 @@ fn fs_items(fs: &FsLog, env: &Env, order: &[String]) -> Vec<Item> {
         let Some(dir) = path.parent() else {
             continue;
         };
-        if env.is_broad(dir) {
+        if env.is_broad_for_write(dir) {
             // A temporary file in a broad directory gets no rule: its next
             // name is not known.
             if !fs.is_transient(path) {
@@ -668,12 +723,12 @@ fn fs_items(fs: &FsLog, env: &Env, order: &[String]) -> Vec<Item> {
         }
     }
     for (dir, n) in writes_in_dir {
-        if n >= WRITE_DIR_THRESHOLD && env.can_group(dir) {
+        if n >= WRITE_DIR_THRESHOLD && env.can_group_for_write(dir) {
             rw_dirs.insert(dir.to_path_buf());
             rw.insert(dir.to_path_buf());
         }
     }
-    let rw = group(&rw, |p| rw_dirs.contains(p), env);
+    let rw = group(&rw, |p| rw_dirs.contains(p), |d| env.can_group_for_write(d));
 
     let exec: BTreeSet<PathBuf> = fs.execs.keys().map(|b| env.exec_dir(b)).collect();
 
@@ -684,7 +739,7 @@ fn fs_items(fs: &FsLog, env: &Env, order: &[String]) -> Vec<Item> {
         .map(|p| env.cache_root(p).unwrap_or_else(|| p.clone()))
         .filter(|p| !wider_exists(p))
         .collect();
-    let read = group(&read, |_| true, env);
+    let read = group(&read, |_| true, |d| env.can_group(d));
 
     let mut rules: BTreeSet<(FsAccess, PathBuf)> = BTreeSet::new();
     rules.extend(rw.into_iter().map(|p| (FsAccess::ReadWrite, p)));
@@ -1213,6 +1268,33 @@ mod tests {
     }
 
     #[test]
+    fn denied_credential_reads_are_blocked_items() {
+        let events = [
+            fs_outcome(Read, "/home/u/.ssh/id_ed25519", "ssh", Outcome::Denied),
+            fs_outcome(Read, "/home/u/.ssh/id_rsa", "ssh", Outcome::Denied),
+            fs_outcome(Read, "/home/u/.ssh/known_hosts", "ssh", Outcome::Denied),
+            fs_outcome(Read, "/home/u/.ssh/config", "ssh", Outcome::Denied),
+            fs_outcome(Read, "/home/u/.ssh/other", "ssh", Outcome::Denied),
+        ];
+        let lines = run(&events);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("blocked Read ~/.ssh/id_ed25519")),
+            "{lines:?}"
+        );
+        // ~/.ssh holds guarded keys, so it never gets a directory rule.
+        assert!(
+            !lines.iter().any(|l| l.starts_with("r ~/.ssh |")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.starts_with("r ~/.ssh/known_hosts")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
     fn cache_accesses_give_the_cache_directory() {
         let events = [
             fs(Write, "/home/u/.cache/app/a/f1", "app"),
@@ -1386,11 +1468,13 @@ mod tests {
             fs_outcome(Read, "/home/u/.tool/a", "tool", Outcome::Denied),
             fs_outcome(Read, "/home/u/.ssh/id_rsa", "ssh", Outcome::Denied),
         ];
+        // A denied read of a credential is a blocked item, so the review
+        // does not select it by default.
         assert_eq!(
             run(&events),
             vec![
-                "r ~/.ssh/id_rsa | read by ssh",
-                "r ~/.tool/a | read by tool"
+                "r ~/.tool/a | read by tool",
+                "blocked Read ~/.ssh/id_rsa | ssh (Credential)"
             ]
         );
     }
