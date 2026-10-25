@@ -18,7 +18,12 @@ async fn main() {
     // This allows pent to create veth pairs for network proxying without sudo.
 
     #[cfg(target_os = "linux")]
-    pent_sandbox::cleanup_stale_overlays();
+    {
+        pent_sandbox::cleanup_stale_overlays();
+        // Remove the veth pairs and firewall rules of pent processes that died
+        // without cleanup (for example after SIGKILL).
+        pent_sandbox::cleanup_stale_netns();
+    }
 
     let result = dispatch(cli).await;
     if let Err(e) = result {
