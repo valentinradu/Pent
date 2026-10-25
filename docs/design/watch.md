@@ -65,7 +65,7 @@ Pent shows a warning when the name is a generic shell or interpreter
 | `~/.config/pent/profiles/<name>.toml` | A trusted profile (`pent_profile::ProfileDoc`). |
 | `~/.config/pent/trusted.toml` | The trust store: the path and the SHA-256 of each trusted profile. |
 | `~/.local/state/pent/drafts/<name>.toml` | The draft that `pent watch` writes. |
-| `~/.local/state/pent/watch/<name>/<run>.jsonl` | The raw events of one watch run (one `WatchEvent` per line). |
+| `~/.local/state/pent/watch/<name>/<run>.jsonl` | The raw events of one watch run (one `WatchEvent` per line). A path that is not valid UTF-8 has the form `{"bytes":[...]}`. |
 | `~/.local/state/pent/denied/<name>.jsonl` | The accesses that `pent run` denied. `pent trust NAME --review` reads them. |
 
 Pent uses `$XDG_CONFIG_HOME` and `$XDG_STATE_HOME` when they are set.
@@ -102,7 +102,8 @@ Continue? [y/N]
 
 The guard blocks a small set of dangerous accesses. The kernel enforces it, so
 the program cannot race it. The list is `pent_profile::guard_rules`, the same on
-all platforms:
+all platforms. `pent watch` calls `guard_rules_with`, which adds the real pent
+directories, because `$XDG_CONFIG_HOME` and `$XDG_STATE_HOME` can move them:
 
 | Class | Access | Linux | macOS |
 |---|---|---|---|
@@ -161,8 +162,11 @@ Filesystem rules:
 3. When the program reads at least 4 files in one directory, the rule is one
    read rule on that directory.
 4. Never make a rule for `/`, `~`, `~/.config`, `~/.local`, `~/.local/share`,
-   `~/.local/state` or `~/.cache`. Use the child directory instead
-   (`~/.cache/claude`).
+   `~/.local/state`, `~/.cache`, a directory that a guard rule protects
+   (`~/.ssh`), the workspace or a parent of the workspace. Use the child
+   directory instead (`~/.cache/claude`). The limit holds for each rule,
+   also for a rule that comes from one access: `open("~")` gives no rule. A
+   file directly in such a directory (`~/.apprc`) keeps its own rule.
 5. Exec rules use the directory of the binary. A binary that the program
    created in the session gets the note `CreatedThenExecuted`.
 6. A read-write rule includes read. An exec rule includes read. Do not show a

@@ -262,7 +262,6 @@ fn p1_terminal_summary_has_no_control_characters() -> TestResult {
 }
 
 #[test]
-#[ignore = "OPEN H-1: the terminal summary prints bidi override characters from events"]
 fn p1_terminal_summary_has_no_bidi_characters() -> TestResult {
     assert_clean(
         "render_terminal",
@@ -279,7 +278,6 @@ fn p1_review_prompts_have_no_control_characters() -> TestResult {
 }
 
 #[test]
-#[ignore = "OPEN H-1: the review prompts print bidi override characters from events"]
 fn p1_review_prompts_have_no_bidi_characters() -> TestResult {
     assert_clean("review", &review_text(&crafted_summary())?, Danger::Bidi);
     Ok(())
@@ -292,7 +290,6 @@ fn p1_draft_has_no_control_characters() -> TestResult {
 }
 
 #[test]
-#[ignore = "OPEN H-1: the draft keeps bidi override characters in rules and comments"]
 fn p1_draft_has_no_bidi_characters() -> TestResult {
     assert_clean("draft", &draft_text(&crafted_summary())?, Danger::Bidi);
     Ok(())
@@ -308,7 +305,6 @@ fn p1_render_profile_has_no_control_characters() {
 }
 
 #[test]
-#[ignore = "OPEN H-1: render_profile prints bidi override characters from rules"]
 fn p1_render_profile_has_no_bidi_characters() {
     assert_clean(
         "render_profile",
@@ -462,7 +458,6 @@ fn p2_render_draft_with_arbitrary_rules_round_trips() -> TestResult {
 /// Reasons that come back from an earlier draft keep their text. A bare CR
 /// in a comment of the earlier draft must not break the new draft.
 #[test]
-#[ignore = "OPEN H-6: a bare CR or ESC in a comment of the earlier draft makes the next draft invalid"]
 fn p2_reasons_from_an_earlier_draft_keep_the_draft_valid() -> TestResult {
     let mut doc = ProfileDoc::default();
     doc.filesystem.read.push("~/a".to_string());
@@ -613,7 +608,6 @@ fn p3_mixed_generated_sessions_do_not_widen() {
 /// ~/.config/x` (which also tries `mkdir ~/.config`), a delete, and a path
 /// with `..` that normalizes to a broad directory.
 #[test]
-#[ignore = "OPEN H-2: one read or create on ~, ~/.config, ~/.cache, ... gives a rule on that directory"]
 fn p3_one_access_on_a_broad_dir_gives_no_rule() {
     let mut failures = Vec::new();
     for dir in BROAD_DIRS.iter().chain(["/", "/home"].iter()) {
@@ -634,7 +628,6 @@ fn p3_one_access_on_a_broad_dir_gives_no_rule() {
 /// them in one directory start the grouping, and a read rule on `~/.ssh`
 /// includes the private keys.
 #[test]
-#[ignore = "OPEN H-3: four reads in ~/.ssh give a read rule on ~/.ssh, which includes the private keys"]
 fn p3_reads_in_ssh_dir_do_not_widen_to_the_dir() {
     let events: Vec<WatchEvent> = [
         "config",
@@ -660,7 +653,6 @@ fn p3_reads_in_ssh_dir_do_not_widen_to_the_dir() {
 
 /// Hundreds of entries in `~/.ssh`, with each operation.
 #[test]
-#[ignore = "OPEN H-3: many entries in ~/.ssh give a rule on ~/.ssh"]
 fn p3_many_entries_in_ssh_dir_do_not_widen() {
     let mut failures = Vec::new();
     for op in ALL_OPS {
@@ -685,7 +677,6 @@ fn p3_many_entries_in_ssh_dir_do_not_widen() {
 /// the parent of the workspace: that rule includes the workspace and each
 /// sibling repository.
 #[test]
-#[ignore = "OPEN H-4: one create or delete in the workspace parent gives read-write on the parent"]
 fn p3_create_in_workspace_parent_gives_no_parent_rule() {
     let mut failures = Vec::new();
     for op in [FsOp::Create, FsOp::Delete] {
@@ -852,7 +843,6 @@ const MISSING_PUBLIC_SUFFIXES: &[&str] = &[
 ];
 
 #[test]
-#[ignore = "OPEN H-5: the PSL subset misses common tunnel and hosting suffixes; the summary makes wildcards on them"]
 fn p3_no_wildcard_on_common_public_suffix_services() {
     let widened: Vec<(&str, Vec<String>)> = MISSING_PUBLIC_SUFFIXES
         .iter()
@@ -1010,13 +1000,11 @@ fn p4_guard_covers_the_named_locations() {
 }
 
 #[test]
-#[ignore = "GAP G-1: ~/.config/git/credentials (XDG git credential store) is not guarded"]
 fn p4_gap_xdg_git_credentials() {
     assert_guard(&[(".config/git/credentials", R, Some(Cred))]);
 }
 
 #[test]
-#[ignore = "GAP G-2: Terraform and Vault tokens are not guarded"]
 fn p4_gap_terraform_and_vault_tokens() {
     assert_guard(&[
         (".terraform.d/credentials.tfrc.json", R, Some(Cred)),
@@ -1025,7 +1013,6 @@ fn p4_gap_terraform_and_vault_tokens() {
 }
 
 #[test]
-#[ignore = "GAP G-3: SSH private keys with a name that does not start with id_, or in a subdirectory, are not guarded"]
 fn p4_gap_ssh_keys_with_other_names() {
     assert_guard(&[
         (".ssh/github_rsa", R, Some(Cred)),
@@ -1036,7 +1023,6 @@ fn p4_gap_ssh_keys_with_other_names() {
 }
 
 #[test]
-#[ignore = "GAP G-4: password manager and cloud CLI stores are not guarded (1Password, podman, rclone, pgpass, s3cmd, OCI, age)"]
 fn p4_gap_other_credential_stores() {
     assert_guard(&[
         (".config/op/config", R, Some(Cred)),
@@ -1053,7 +1039,6 @@ fn p4_gap_other_credential_stores() {
 }
 
 #[test]
-#[ignore = "GAP G-5: shell history files (which often hold secrets) are not guarded for read"]
 fn p4_gap_shell_history() {
     assert_guard(&[
         (".bash_history", R, Some(Cred)),
@@ -1065,7 +1050,6 @@ fn p4_gap_shell_history() {
 }
 
 #[test]
-#[ignore = "GAP G-6: rc files of other shells, and ~/.bash_aliases, are not guarded for write"]
 fn p4_gap_other_shell_rc_files() {
     assert_guard(&[
         (".bash_aliases", W, Some(Pers)),
@@ -1081,7 +1065,6 @@ fn p4_gap_other_shell_rc_files() {
 }
 
 #[test]
-#[ignore = "GAP G-7: X session and PAM environment files are not guarded for write"]
 fn p4_gap_session_startup_files() {
     assert_guard(&[
         (".pam_environment", W, Some(Pers)),
@@ -1094,7 +1077,6 @@ fn p4_gap_session_startup_files() {
 }
 
 #[test]
-#[ignore = "GAP G-8: PATH directories other than ~/.local/bin are not guarded (binary planting)"]
 fn p4_gap_other_path_directories() {
     assert_guard(&[
         ("bin/git", W, Some(Pers)),
@@ -1105,7 +1087,6 @@ fn p4_gap_other_path_directories() {
 }
 
 #[test]
-#[ignore = "GAP G-9: config files that run code at the next start of a tool are not guarded (Python user site, editors, cargo, git templates, direnv)"]
 fn p4_gap_tool_configs_that_run_code() {
     assert_guard(&[
         (
@@ -1130,7 +1111,6 @@ fn p4_gap_tool_configs_that_run_code() {
 }
 
 #[test]
-#[ignore = "GAP G-10: schedulers without a file in the home directory (crontab, at, systemd-run) are not guarded"]
 fn p4_gap_schedulers() {
     assert_guard(&[
         ("/usr/bin/crontab", ExecName, Some(Pers)),

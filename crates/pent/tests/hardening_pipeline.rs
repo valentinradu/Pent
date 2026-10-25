@@ -234,7 +234,6 @@ fn p1_cli_review_summary_has_no_control_characters() -> TestResult {
 }
 
 #[test]
-#[ignore = "OPEN H-1: pent trust --review prints bidi override characters from events"]
 fn p1_cli_review_summary_has_no_bidi_characters() -> TestResult {
     let env = Env::new()?;
     let out = review_output(&env)?;
@@ -267,7 +266,6 @@ fn p1_cli_trust_and_show_have_no_control_characters() -> TestResult {
 }
 
 #[test]
-#[ignore = "OPEN H-1: pent trust and pent profile show print bidi override characters from the draft"]
 fn p1_cli_trust_and_show_have_no_bidi_characters() -> TestResult {
     let env = Env::new()?;
     Env::write(&env.draft_path("tool"), &env.crafted_draft()?)?;

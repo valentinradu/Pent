@@ -247,11 +247,33 @@ fn canonical_key(config_path: &Path) -> PathBuf {
     std::fs::canonicalize(config_path).unwrap_or_else(|_| config_path.to_path_buf())
 }
 
+/// The number of tries for a new temporary file name.
+const TMP_TRIES: u32 = 32;
+
+/// Create `dir` and its missing parents with the mode `0700`.
+///
+/// # Errors
+/// Returns the I/O error of `mkdir(2)`.
+pub(crate) fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    builder.create(dir)
+}
+
 /// Write `contents` to `path` through a temporary file and a rename.
 ///
-/// The temporary file is in the same directory, thus the rename is atomic. On
-/// Unix the file gets the mode `0600`. Pent creates the missing parent
-/// directories.
+/// The temporary file is in the same directory, thus the rename is atomic.
+/// On Unix the file gets the mode `0600`, and a missing parent directory
+/// gets the mode `0700`.
+///
+/// The temporary file has a name that no other process can guess, and pent
+/// opens it with `O_EXCL` and `O_NOFOLLOW`. Thus pent never writes through
+/// a symbolic link that another process put at that name.
 ///
 /// # Errors
 /// Returns the I/O error of the first step that fails.
@@ -262,29 +284,13 @@ pub(crate) fn write_atomic_private(path: &Path, contents: &[u8]) -> std::io::Res
             "the path has no parent directory",
         )
     })?;
-    std::fs::create_dir_all(dir)?;
+    create_private_dir(dir)?;
 
     let file_name = path
         .file_name()
         .map_or_else(|| TRUST_FILE_NAME.into(), |n| n.to_string_lossy());
-    let tmp = dir.join(format!(".{file_name}.{}.tmp", std::process::id()));
-
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
+    let (tmp, mut file) = create_new_private(dir, &file_name)?;
     let result = (|| {
-        let mut file = options.open(&tmp)?;
-        // The mode in `open` applies only to a new file. Set it again in case
-        // an old temporary file with a wider mode exists.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        }
         file.write_all(contents)?;
         file.sync_all()?;
         std::fs::rename(&tmp, path)
@@ -295,6 +301,59 @@ pub(crate) fn write_atomic_private(path: &Path, contents: &[u8]) -> std::io::Res
         let _ = std::fs::remove_file(&tmp);
     }
     result
+}
+
+/// Create a new file in `dir` with the mode `0600` and a name that no other
+/// process can guess, and return its path and the open file.
+///
+/// `create_new` gives `O_EXCL`, so the call fails when the name exists.
+/// With `O_NOFOLLOW` it also fails when the name is a symbolic link. Pent
+/// tries [`TMP_TRIES`] names.
+///
+/// # Errors
+/// Returns the I/O error of `open(2)`.
+fn create_new_private(dir: &Path, file_name: &str) -> std::io::Result<(PathBuf, std::fs::File)> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let pid = std::process::id();
+    let mut last = None;
+    for attempt in 0..TMP_TRIES {
+        let tmp = dir.join(format!(".{file_name}.{pid}.{:016x}.tmp", nonce(attempt)));
+        match options.open(&tmp) {
+            Ok(file) => return Ok((tmp, file)),
+            // The name exists, or it is a symbolic link. Try the next name.
+            Err(e)
+                if e.kind() == std::io::ErrorKind::AlreadyExists
+                    || e.raw_os_error() == Some(libc::ELOOP) =>
+            {
+                last = Some(e);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "no free name for the temporary file",
+        )
+    }))
+}
+
+/// A number for the name of a temporary file. The clock and the number of
+/// the try make it different for each call.
+fn nonce(attempt: u32) -> u64 {
+    let since_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let seed = u64::from(since_epoch.subsec_nanos()) ^ since_epoch.as_secs().rotate_left(32);
+    // A multiplication with an odd constant spreads the bits of the clock.
+    seed.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(u64::from(attempt))
 }
 
 #[cfg(test)]
