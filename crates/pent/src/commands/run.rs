@@ -60,6 +60,15 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
         event_rx,
     } = setup_proxy(&config, decision.choice, args.trace).await?;
 
+    // The workspace is always read-write. If it is `/` or the home directory,
+    // the sandbox gives write access to almost all user files.
+    if !args.no_sandbox && is_broad_workspace(&cwd) {
+        ui::warn(format!(
+            "the workspace is {}; the sandboxed process can change all files below it",
+            cwd.display()
+        ));
+    }
+
     // Build SandboxConfig.
     // from_sandbox_settings merges user paths on top of system defaults and
     // handles mounts, replacing the previous manual path-extension loop.
@@ -233,6 +242,17 @@ fn build_run_env(args_env: &[String]) -> HashMap<String, String> {
         env_map.insert(k, v);
     }
     env_map
+}
+
+/// Return true if `workspace` is `/` or the home directory of the user.
+fn is_broad_workspace(workspace: &Path) -> bool {
+    if workspace.parent().is_none() {
+        return true;
+    }
+    std::env::var_os("HOME").is_some_and(|home| {
+        let home = PathBuf::from(home);
+        workspace == home || std::fs::canonicalize(&home).is_ok_and(|h| workspace == h)
+    })
 }
 
 /// Tell the user about edits that pent could not save, and (in trace mode)
@@ -1457,12 +1477,23 @@ mod tests {
     // ── trace log ────────────────────────────────────────────────────────────
 
     #[test]
+    fn root_is_a_broad_workspace() {
+        assert!(is_broad_workspace(Path::new("/")));
+        assert!(!is_broad_workspace(Path::new(
+            "/definitely/not/home/pent-test"
+        )));
+    }
+
+    #[test]
     fn proxy_fix_names_the_domain_for_connect() {
         let fix = proxy_violation_fix(
             "network: SOCKS5 connection to \"evil.example\" port 443 blocked: \
              the domain is not in the allowlist",
         );
-        assert!(fix.contains("add \"evil.example\" to domain_allowlist"), "{fix}");
+        assert!(
+            fix.contains("add \"evil.example\" to domain_allowlist"),
+            "{fix}"
+        );
     }
 
     #[test]

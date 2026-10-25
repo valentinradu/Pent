@@ -2889,7 +2889,8 @@ mod tests {
         socks5_connect(&mut client, dest).await;
         let messages = drain(&mut rx);
         assert!(
-            messages.iter().any(|m| m == &format!(
+            messages.iter().any(|m| m
+                == &format!(
                 "access network: SOCKS5 connection to 127.0.0.1 port {} (\"test.local\") allowed",
                 dest.port()
             )),

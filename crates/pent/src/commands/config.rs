@@ -5,8 +5,8 @@ use std::str::FromStr;
 
 use pent_settings::{
     build_profiles_config, is_profile_likely_active, profile_deps_transitive, ConfigLoader,
-    LoadedConfig, NetworkMode, PentConfig, PrivateDestinations, Profile, ProjectConfigStatus, TrustError, TrustStatus,
-    TrustStore,
+    LoadedConfig, NetworkMode, PentConfig, PrivateDestinations, Profile, ProjectConfigStatus,
+    TrustError, TrustStatus, TrustStore,
 };
 
 use crate::cli::{ConfigSubcommand, OutputFormat};

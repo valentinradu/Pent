@@ -891,6 +891,12 @@ fn test_execute_flag_allows_binary() -> TestResult {
     //
     // execute_access is now ReadDir | Execute (no ReadFile), so the binary and
     // its shared libraries must also be listed under --read for execve to succeed.
+    //
+    // The test uses the FHS layout. Some systems (NixOS) do not have it.
+    if !std::path::Path::new("/usr/bin/true").exists() {
+        println!("SKIP: /usr/bin/true does not exist on this system");
+        return Ok(());
+    }
     let out = run_pent(
         std::path::Path::new("/tmp"),
         &[
