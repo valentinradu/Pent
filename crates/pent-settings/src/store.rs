@@ -1033,6 +1033,74 @@ mod tests {
         assert_eq!(f.store.load(&n).unwrap().status, ProfileStatus::NotTrusted);
     }
 
+    /// Only a missing watch directory is not an error. When the directory
+    /// exists and pent cannot delete it, `remove` reports the error. A
+    /// silent return would tell the user that the raw logs of the watch
+    /// runs are gone while they stay on the disk.
+    #[cfg(unix)]
+    #[test]
+    fn remove_reports_the_error_when_it_cannot_delete_the_watch_directory() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let f = fixture();
+        let n = name("claude");
+        f.store.write_draft(&n, DRAFT).unwrap();
+        let mut log = f.store.start_watch_run(&n, WatchRunMode::Append).unwrap();
+        log.append(&fs_event("/a", Outcome::Allowed)).unwrap();
+        drop(log);
+
+        let watch = f.store.watch_dir(&n);
+        let parent = watch.parent().unwrap().to_path_buf();
+        let read_only = std::fs::Permissions::from_mode(0o500);
+        let writable = std::fs::Permissions::from_mode(0o700);
+        std::fs::set_permissions(&parent, read_only).unwrap();
+        if ignores_the_mode(&parent) {
+            // The user of the test has `CAP_DAC_OVERRIDE` (for example
+            // root). The mode then stops nothing.
+            std::fs::set_permissions(&parent, writable).unwrap();
+            println!("SKIP: the user of this test can write a directory with the mode 0500");
+            return;
+        }
+
+        let result = f.store.remove(&n);
+        // Give the write permission back, so that the temporary directory
+        // goes away at the end of the test.
+        std::fs::set_permissions(&parent, writable).unwrap();
+
+        // The comparison is on the text, because the test must not panic
+        // on an unexpected value.
+        let reported = match &result {
+            Err(StoreError::Io { path, source }) => {
+                format!("{} {:?}", path.display(), source.kind())
+            }
+            other => format!("not an I/O error: {other:?}"),
+        };
+        assert_eq!(
+            reported,
+            format!(
+                "{} {:?}",
+                watch.display(),
+                std::io::ErrorKind::PermissionDenied
+            )
+        );
+        // The logs are still there, as the error says.
+        assert!(watch.exists());
+    }
+
+    /// True when the process can create a file in `dir`, although the mode
+    /// of `dir` gives no write permission.
+    #[cfg(unix)]
+    fn ignores_the_mode(dir: &Path) -> bool {
+        let probe = dir.join("probe");
+        match std::fs::write(&probe, b"x") {
+            Ok(()) => {
+                std::fs::remove_file(&probe).unwrap();
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
     /// A draft comes back with its text and with its rules.
     #[test]
     fn a_draft_comes_back_with_its_text_and_its_rules() {

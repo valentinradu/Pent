@@ -313,6 +313,31 @@ pub(crate) fn write_atomic_private(path: &Path, contents: &[u8]) -> std::io::Res
 /// # Errors
 /// Returns the I/O error of `open(2)`.
 fn create_new_private(dir: &Path, file_name: &str) -> std::io::Result<(PathBuf, std::fs::File)> {
+    create_new_private_from(dir, temp_names(file_name))
+}
+
+/// The names that [`create_new_private`] tries, in order.
+///
+/// The name holds the identifier of the process and a nonce, thus another
+/// process cannot guess it.
+fn temp_names(file_name: &str) -> impl Iterator<Item = String> + '_ {
+    let pid = std::process::id();
+    (0..TMP_TRIES).map(move |attempt| format!(".{file_name}.{pid}.{:016x}.tmp", nonce(attempt)))
+}
+
+/// Create a new file in `dir` with the mode `0600` and the first free name
+/// of `names`, and return its path and the open file.
+///
+/// The caller gives the source of the names, thus a test can give names that
+/// it knows. [`create_new_private`] gives the names of [`temp_names`].
+///
+/// # Errors
+/// Returns the I/O error of `open(2)`. When every name exists, or when
+/// `names` is empty, it returns the error `AlreadyExists`.
+fn create_new_private_from<I>(dir: &Path, names: I) -> std::io::Result<(PathBuf, std::fs::File)>
+where
+    I: IntoIterator<Item = String>,
+{
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -320,10 +345,9 @@ fn create_new_private(dir: &Path, file_name: &str) -> std::io::Result<(PathBuf, 
         use std::os::unix::fs::OpenOptionsExt as _;
         options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
-    let pid = std::process::id();
     let mut last = None;
-    for attempt in 0..TMP_TRIES {
-        let tmp = dir.join(format!(".{file_name}.{pid}.{:016x}.tmp", nonce(attempt)));
+    for name in names {
+        let tmp = dir.join(name);
         match options.open(&tmp) {
             Ok(file) => return Ok((tmp, file)),
             // The name exists, or it is a symbolic link. Try the next name.
@@ -347,9 +371,19 @@ fn create_new_private(dir: &Path, file_name: &str) -> std::io::Result<(PathBuf, 
 /// A number for the name of a temporary file. The clock and the number of
 /// the try make it different for each call.
 fn nonce(attempt: u32) -> u64 {
-    let since_epoch = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
+    nonce_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default(),
+        attempt,
+    )
+}
+
+/// The nonce for the clock value `since_epoch` and the try `attempt`.
+///
+/// The caller gives the clock value, thus a test can give a series of values
+/// and look at the result.
+fn nonce_from(since_epoch: std::time::Duration, attempt: u32) -> u64 {
     let seed = u64::from(since_epoch.subsec_nanos()) ^ since_epoch.as_secs().rotate_left(32);
     // A multiplication with an odd constant spreads the bits of the clock.
     seed.wrapping_mul(0x9E37_79B9_7F4A_7C15)
@@ -505,6 +539,185 @@ mod tests {
             "the nonce of the temporary file is always the same: {seen:?}"
         );
         assert_ne!(nonce(0), nonce(1), "each try must give another name");
+    }
+
+    /// The nonce must not repeat, and its low bits must vary. A test cannot
+    /// count entropy, but it can check these two properties on a long series
+    /// of clock values.
+    #[test]
+    fn ten_thousand_nonces_hold_no_duplicate_and_the_low_bits_vary() {
+        use std::collections::HashSet;
+        use std::time::Duration;
+
+        const COUNT: u32 = 10_000;
+        const SECS: u64 = 1_700_000_000;
+        let values: Vec<u64> = (0..COUNT)
+            .map(|nanos| nonce_from(Duration::new(SECS, nanos), 0))
+            .collect();
+
+        let unique: HashSet<u64> = values.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            values.len(),
+            "two clock values give the same nonce"
+        );
+
+        let low_bytes: HashSet<u8> = values
+            .iter()
+            .map(|value| u8::try_from(value & 0xff).unwrap())
+            .collect();
+        assert_eq!(
+            low_bytes.len(),
+            256,
+            "the low bits of the nonce do not vary: {} values",
+            low_bytes.len()
+        );
+
+        // The number of the try also changes the nonce.
+        let clock = Duration::new(SECS, 7);
+        assert_ne!(nonce_from(clock, 0), nonce_from(clock, 1));
+    }
+
+    /// The names of the temporary files hold the identifier of the process
+    /// and a nonce, and no name repeats.
+    #[test]
+    fn the_temporary_names_hold_the_process_and_a_nonce() {
+        use std::collections::HashSet;
+
+        let names: Vec<String> = temp_names("trusted.toml").collect();
+        assert_eq!(names.len(), TMP_TRIES as usize);
+        let prefix = format!(".trusted.toml.{}.", std::process::id());
+        assert!(
+            names
+                .iter()
+                .all(|n| n.starts_with(&prefix) && n.ends_with(".tmp")),
+            "{names:?}"
+        );
+        let unique: HashSet<&String> = names.iter().collect();
+        assert_eq!(unique.len(), names.len(), "{names:?}");
+    }
+
+    /// Another process can put a file at the name that pent tries. Pent then
+    /// takes the next name, and it does not touch the file of the other
+    /// process.
+    #[test]
+    fn the_next_name_wins_when_the_first_name_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let taken = dir.path().join("first.tmp");
+        std::fs::write(&taken, "other process").unwrap();
+
+        let names = vec!["first.tmp".to_string(), "second.tmp".to_string()];
+        let result = create_new_private_from(dir.path(), names);
+        let taken_name = result.as_ref().ok().map(|(path, _)| path.clone());
+        assert_eq!(
+            taken_name,
+            Some(dir.path().join("second.tmp")),
+            "{result:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&taken).unwrap(), "other process");
+    }
+
+    /// A symbolic link at the name gives `ELOOP`, because pent opens the
+    /// file with `O_NOFOLLOW`. Pent takes the next name, and it never writes
+    /// through the link. This is the race that the retry stops.
+    #[cfg(unix)]
+    #[test]
+    fn the_next_name_wins_when_the_first_name_is_a_symbolic_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "keep").unwrap();
+        std::os::unix::fs::symlink(&victim, dir.path().join("first.tmp")).unwrap();
+
+        let names = vec!["first.tmp".to_string(), "second.tmp".to_string()];
+        let result = create_new_private_from(dir.path(), names);
+        let taken_name = result.as_ref().ok().map(|(path, _)| path.clone());
+        assert_eq!(
+            taken_name,
+            Some(dir.path().join("second.tmp")),
+            "{result:?}"
+        );
+        if let Ok((_, mut file)) = result {
+            assert!(file.write_all(b"new").is_ok());
+        }
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
+    }
+
+    /// With no free name pent reports an error and writes nothing.
+    #[test]
+    fn no_free_name_gives_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["first.tmp", "second.tmp"] {
+            std::fs::write(dir.path().join(name), "taken").unwrap();
+        }
+        let names = vec!["first.tmp".to_string(), "second.tmp".to_string()];
+        let result = create_new_private_from(dir.path(), names);
+        assert_eq!(
+            error_kind(&result),
+            Some(std::io::ErrorKind::AlreadyExists),
+            "{result:?}"
+        );
+        // An empty source of names gives the same error.
+        let result = create_new_private_from(dir.path(), Vec::new());
+        assert_eq!(
+            error_kind(&result),
+            Some(std::io::ErrorKind::AlreadyExists),
+            "{result:?}"
+        );
+    }
+
+    /// An error that is not a name conflict stops the retry: pent reports
+    /// the error of the first try and takes no other name.
+    ///
+    /// The test counts the names, because the kind of the error is the
+    /// same after one try and after 32 tries.
+    #[test]
+    fn an_error_that_is_not_a_name_conflict_stops_the_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+
+        let mut tried = 0_u32;
+        let names = ["first.tmp", "second.tmp", "third.tmp"]
+            .into_iter()
+            .map(|name| {
+                tried += 1;
+                name.to_string()
+            });
+        let result = create_new_private_from(&missing, names);
+        assert_eq!(
+            error_kind(&result),
+            Some(std::io::ErrorKind::NotFound),
+            "{result:?}"
+        );
+        assert_eq!(tried, 1, "pent must stop after the first name");
+    }
+
+    /// A name conflict makes pent take the next name, and only the next
+    /// name. The test counts the names that pent takes from the source.
+    #[test]
+    fn a_name_conflict_takes_one_more_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("first.tmp"), "taken").unwrap();
+
+        let mut tried = 0_u32;
+        let names = ["first.tmp", "second.tmp", "third.tmp"]
+            .into_iter()
+            .map(|name| {
+                tried += 1;
+                name.to_string()
+            });
+        let result = create_new_private_from(dir.path(), names);
+        let taken_name = result.as_ref().ok().map(|(path, _)| path.clone());
+        assert_eq!(
+            taken_name,
+            Some(dir.path().join("second.tmp")),
+            "{result:?}"
+        );
+        assert_eq!(tried, 2, "pent must stop at the first free name");
+    }
+
+    /// The kind of the error of a result, or `None` when it is `Ok`.
+    fn error_kind<T>(result: &std::io::Result<T>) -> Option<std::io::ErrorKind> {
+        result.as_ref().err().map(std::io::Error::kind)
     }
 
     #[test]
