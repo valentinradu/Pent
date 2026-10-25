@@ -358,7 +358,25 @@ where
     stats.ip_hosts = ips.0;
 
     let mut items = fs_items(&fs, &env, &stats.processes);
-    items.extend(blocked_items(blocked, &env));
+    let blocked_items = blocked_items(blocked, &env);
+    // A path that the guard protects must appear one time only, in the
+    // blocked section. The same run can both make a file and read it: the
+    // create is a write, which no read guard matches, so the file also got
+    // a normal read-write rule. The review selects a normal rule by
+    // default, so a user who pressed Enter gave the program a rule for a
+    // credential that the same summary called blocked.
+    let guarded: Vec<&str> = blocked_items
+        .iter()
+        .filter_map(|item| match &item.grant {
+            Grant::Fs { path, .. } => Some(path.as_str()),
+            Grant::Domain(_) | Grant::UnixSocket(_) => None,
+        })
+        .collect();
+    items.retain(|item| match &item.grant {
+        Grant::Fs { path, .. } => !guarded.iter().any(|g| covers_path(path, g)),
+        Grant::Domain(_) | Grant::UnixSocket(_) => true,
+    });
+    items.extend(blocked_items);
     items.extend(net.items());
     items.extend(unix.items());
     if let Some(existing) = &ctx.existing {
@@ -755,6 +773,15 @@ fn group(
                 .to_path_buf()
         })
         .collect()
+}
+
+/// True if the rule `rule` gives access to the path `guarded`: the two are
+/// equal, or `guarded` is below the directory `rule`.
+fn covers_path(rule: &str, guarded: &str) -> bool {
+    rule == guarded
+        || guarded
+            .strip_prefix(rule)
+            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// Make the filesystem items.

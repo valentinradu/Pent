@@ -289,7 +289,6 @@ mod draft_against_the_guard {
     };
 
     #[test]
-    #[ignore = "OPEN DIFF-7: the draft grants a path that the same summary shows as a blocked credential"]
     fn diff_7_the_draft_grants_a_blocked_credential() -> TestResult {
         let test = "guard_diff_7_draft_grants_a_credential";
         if !have_tools(test, &["sh", "cat"]) || !sandbox_ready(test) {

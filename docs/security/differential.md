@@ -77,7 +77,7 @@ proof of the finding.
 | DIFF-4 | Medium | The kernel | A `read` rule also gives execute. |
 | DIFF-5 | High | The kernel | The guard misses a private key behind a symbolic link, and the summary says "blocked". |
 | DIFF-6 | High | The kernel | The guard misses a private key that the program makes during the run, and the summary says "blocked". |
-| DIFF-7 | High | The summary | The draft grants a path that the same summary shows as a blocked credential. |
+| DIFF-7 | High | The summary | **Fixed.** The draft granted a path that the same summary showed as a blocked credential. |
 | DIFF-8 | Medium | The summary | The proxy refuses a destination that is not public, and records nothing. |
 | DIFF-9 | Medium | The kernel | On macOS a guard pattern with a leading `*` has no effect. |
 
