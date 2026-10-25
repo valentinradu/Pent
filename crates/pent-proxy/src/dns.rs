@@ -2563,6 +2563,58 @@ mod wire_properties {
         );
     }
 
+    /// Build a query and the answer of an upstream server for it. The
+    /// answer holds the flags `flags` in the second byte of the header.
+    fn query_and_answer(flags: u8) -> (Vec<u8>, Vec<u8>) {
+        let query = build_dns_query(0x1234, "example.com", rtype::A);
+        let mut answer = query.clone();
+        if let Some(byte) = answer.get_mut(2) {
+            *byte = flags;
+        }
+        (query, answer)
+    }
+
+    /// OPEN FUZZ-2. The server must keep the truncation bit of the
+    /// upstream answer. Without the bit the client takes a short answer as
+    /// the whole answer and never asks again over TCP. The server does
+    /// serve DNS over TCP (`DnsServer::run_tcp_on`), so the retry works.
+    #[test]
+    #[ignore = "OPEN FUZZ-2: the server clears the truncation bit of the upstream answer"]
+    fn the_server_keeps_the_truncation_bit() {
+        let (query, answer) = query_and_answer(FLAG_QR | FLAG_TC);
+        let Ok(question) = read_question(&query, Pointers::Forbidden) else {
+            panic!("the query of the test must parse");
+        };
+        let response = DnsServer::finish_response(&query, &question, answer);
+        let Some(flags) = response.get(2) else {
+            panic!("the response has no header");
+        };
+        assert!(
+            flags & FLAG_TC != 0,
+            "the server removed the truncation bit of the upstream answer"
+        );
+    }
+
+    /// The result of today for the input of FUZZ-2. This test passes; it
+    /// fails when somebody fixes the flag.
+    #[test]
+    fn the_server_clears_the_truncation_bit_today() {
+        let (query, answer) = query_and_answer(FLAG_QR | FLAG_TC);
+        let Ok(question) = read_question(&query, Pointers::Forbidden) else {
+            panic!("the query of the test must parse");
+        };
+        let response = DnsServer::finish_response(&query, &question, answer);
+        assert_eq!(
+            response.get(2).map(|f| f & FLAG_TC),
+            Some(0),
+            "the server now keeps the truncation bit; update FUZZ-2"
+        );
+        // The rest of the header is correct: the answer is a response, and
+        // the server offers recursion.
+        assert_eq!(response.get(2).map(|f| f & FLAG_QR), Some(FLAG_QR));
+        assert_eq!(response.get(3).map(|f| f & FLAG_RA), Some(FLAG_RA));
+    }
+
     /// A clamped TTL is always inside the bounds, for every pair of bounds.
     #[test]
     fn clamp_ttl_stays_in_the_bounds() {

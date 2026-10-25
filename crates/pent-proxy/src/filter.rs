@@ -1047,4 +1047,31 @@ mod filter_properties {
             "a name that is not valid stays blocked"
         );
     }
+
+    /// FUZZ-3. The documentation of this module names the form
+    /// `*.*.example.com`, and says that it matches `a.b.example.com`. The
+    /// code accepts a wildcard only in the first label, so it rejects the
+    /// form. `DomainFilter::new` then drops the pattern and logs a
+    /// warning, and the name stays blocked. The behaviour is fail-closed;
+    /// the documentation is wrong.
+    #[test]
+    fn a_pattern_with_two_wildcards_is_rejected() {
+        assert!(
+            matches!(
+                DomainPattern::parse("*.*.example.com"),
+                Err(DomainNameError::InvalidWildcard(_))
+            ),
+            "the parser now accepts two wildcards; update FUZZ-3"
+        );
+        let filter = DomainFilter::new(&["*.*.example.com".to_string()]);
+        assert_eq!(
+            filter.pattern_count(),
+            0,
+            "the filter kept a pattern that it cannot parse"
+        );
+        assert!(
+            !filter.is_allowed("a.b.example.com"),
+            "the dropped pattern must allow no name"
+        );
+    }
 }
