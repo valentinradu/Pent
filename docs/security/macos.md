@@ -164,7 +164,7 @@ clippy targets.
 | MAC-3 | High | The watch guard covers only the direct children of a guarded directory. | Fixed | `watch_guard_blocks_a_key_in_a_subdirectory` |
 | MAC-4 | Critical | The profile starts from `(allow default)`, so `launchd` runs a program for the child, outside the sandbox. | Open | `the_child_cannot_start_a_program_through_launchd` |
 | MAC-5 | Low | The log reader trusts the lines that it reads. | Fixed with MAC-1 | The unit tests of `parse_line` |
-| MAC-6 | Medium | `pent run --trace` has a second log reader with the old predicate and the old parser. | Open | No test yet |
+| MAC-6 | Medium | `pent run --trace` had a second log reader with the old predicate and the old parser. | Fixed | The tests of `macos_log.rs` |
 
 ### MAC-1 — the program forges its own events
 
@@ -358,18 +358,24 @@ fields at fixed positions and takes the rest of the line as the target
 (`target_with_marker_text_stays_whole`,
 `a_header_inside_a_path_gives_no_second_event`).
 
-### MAC-6 — `pent run --trace` has a second log reader
+### MAC-6 — `pent run --trace` had a second log reader
 
-**Severity: medium. Open.**
+**Severity: medium. Fixed by `fix(cli): read the macOS trace through the
+hardened reader`.**
 
-`crates/pent/src/commands/run.rs` holds its own reader (`mod macos_trace`)
-for the trace of `pent run --trace`. It has the predicate
+`crates/pent/src/commands/run.rs` held its own reader (`mod macos_trace`)
+for the trace of `pent run --trace`. It had the predicate
 `eventMessage CONTAINS "deny("` and its own parser, which both predate the
-fix of MAC-1. A program in the sandbox can thus write its own denials into
-the trace log and into the log of denied accesses, which
-`pent trust NAME --review` reads. The fix is to give that reader the
-predicate and the parser of `macos_log.rs`, or better, to make it use
-`macos_log.rs`.
+fix of MAC-1. Each program can write a message that holds the text
+`deny(`, so a program in the sandbox could write its own denials into the
+trace log and into the log of denied accesses, which
+`pent trust NAME --review` reads. A forged line could thus become a rule
+of the profile.
+
+The second reader is gone. Both platforms now take the denials from
+`SandboxChild::events`, which `macos_log.rs` fills on macOS, and
+`fs_trace_line` makes the line of the trace log for each one. That removes
+605 lines, and it leaves one reader to harden and to test.
 
 ## What the first run must tell us
 
