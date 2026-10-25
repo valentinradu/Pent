@@ -209,18 +209,14 @@ pub struct EventLog {
 impl EventLog {
     /// Open `path` for append. Create the file (mode `0600`) and its parent
     /// directories (mode `0700`) when they do not exist.
+    ///
+    /// The open uses `O_NOFOLLOW`, so a symbolic link at the path of the log
+    /// makes the call fail. Pent never appends to the target of such a link.
     fn open_append(path: PathBuf) -> Result<Self, StoreError> {
         if let Some(dir) = path.parent() {
             create_private_dir(dir)?;
         }
-        let mut options = std::fs::OpenOptions::new();
-        options.append(true).create(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
-        }
-        match options.open(&path) {
+        match open_log_nofollow(&path, LogOpen::Append) {
             Ok(file) => Ok(Self { path, file }),
             Err(source) => Err(StoreError::Io { path, source }),
         }
@@ -461,6 +457,37 @@ impl ProfileStore {
         parse_doc(&profile, &bytes)?;
         trust.trust(&profile, &bytes);
         trust.save()?;
+        Ok(profile)
+    }
+
+    /// Trust exactly the bytes `shown` for the profile `name`, and return
+    /// the path of the profile file.
+    ///
+    /// Use this function after the user saw `shown` and said yes.
+    /// [`ProfileStore::trust`] reads the file again, so a change between
+    /// the question and the answer goes into the profile without the user
+    /// seeing it. This function writes `shown`, records the hash of
+    /// `shown`, and deletes the draft. Thus the profile holds the bytes
+    /// that the user saw, also when another process changed the draft in
+    /// the meantime.
+    ///
+    /// # Errors
+    /// Returns `StoreError::Doc` when `shown` is not a valid profile, and
+    /// I/O or trust store errors.
+    pub fn trust_exact(&self, name: &ProfileName, shown: &[u8]) -> Result<PathBuf, StoreError> {
+        let profile = self.profile_path(name);
+        parse_doc(&profile, shown)?;
+        let mut trust = self.open_trust()?;
+        if let Some(dir) = profile.parent() {
+            create_private_dir(dir)?;
+        }
+        write_atomic_private(&profile, shown).map_err(|source| StoreError::Io {
+            path: profile.clone(),
+            source,
+        })?;
+        trust.trust(&profile, shown);
+        trust.save()?;
+        remove_optional(&self.draft_path(name))?;
         Ok(profile)
     }
 
@@ -757,14 +784,7 @@ pub fn open_log_nofollow(path: &Path, how: LogOpen) -> std::io::Result<std::fs::
 
 /// Create `dir` and its missing parents with the mode `0700`.
 fn create_private_dir(dir: &Path) -> Result<(), StoreError> {
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt as _;
-        builder.mode(0o700);
-    }
-    builder.create(dir).map_err(|source| StoreError::Io {
+    crate::trust::create_private_dir(dir).map_err(|source| StoreError::Io {
         path: dir.to_path_buf(),
         source,
     })

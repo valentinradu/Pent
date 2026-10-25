@@ -78,7 +78,9 @@ fn trust_draft(
             return Ok(());
         }
     }
-    let profile = store.trust(name)?;
+    // Trust the bytes that pent printed, not the bytes of a new read: the
+    // file can change between the question and the answer.
+    let profile = store.trust_exact(name, text.as_bytes())?;
     ui::ok(format!("trusted \"{name}\" ({})", profile.display()));
     Ok(())
 }
