@@ -219,7 +219,16 @@ impl DnsServerConfig {
 
     /// Read system DNS resolvers from /etc/resolv.conf.
     fn read_system_resolvers() -> Option<Vec<SocketAddr>> {
-        parse_resolv_conf(&std::fs::read_to_string(RESOLV_CONF).ok()?)
+        Self::read_resolvers(std::path::Path::new(RESOLV_CONF))
+    }
+
+    /// Read the resolvers from the file at `path`.
+    ///
+    /// The caller gives the path, thus a test can give another file.
+    /// Returns `None` when pent cannot read the file, and when the file
+    /// holds no usable `nameserver` line.
+    fn read_resolvers(path: &std::path::Path) -> Option<Vec<SocketAddr>> {
+        parse_resolv_conf(&std::fs::read_to_string(path).ok()?)
     }
 
     /// The TTL bounds in seconds: `(min, max)`.
@@ -712,10 +721,12 @@ impl DnsServer {
             let mut len_buf = [0u8; 2];
             match tokio::time::timeout(TCP_IDLE_TIMEOUT, stream.read_exact(&mut len_buf)).await {
                 Ok(Ok(_)) => {}
-                // EOF or a read error: the client is gone.
-                Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
-                Ok(Err(e)) => return Err(e),
-                Err(_) => return Ok(()),
+                // The client is gone: it closed the connection, the read
+                // failed, or the connection was idle for too long. The
+                // server holds no state between two queries of one
+                // connection, thus it ends the connection in each case.
+                // The server itself continues with the next client.
+                Ok(Err(_)) | Err(_) => return Ok(()),
             }
             let len = usize::from(u16::from_be_bytes(len_buf));
             let mut query = vec![0u8; len];
@@ -2141,6 +2152,52 @@ mod tests {
         assert_eq!(parse_resolv_conf("nameservers 192.0.2.1\n"), None);
     }
 
+    /// The read of the resolver file gives the resolvers of the file, and
+    /// `None` for each file that holds no usable address. The caller then
+    /// takes the fallback resolvers.
+    #[test]
+    fn the_resolver_file_gives_the_resolvers_or_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let read = |name: &str| DnsServerConfig::read_resolvers(&dir.path().join(name));
+
+        // A file that is not there.
+        assert_eq!(read("missing"), None);
+        // A directory at the path: the read fails with another error.
+        std::fs::create_dir(dir.path().join("a-directory")).unwrap();
+        assert_eq!(read("a-directory"), None);
+        // An empty file.
+        std::fs::write(dir.path().join("empty"), "").unwrap();
+        assert_eq!(read("empty"), None);
+        // A file with no nameserver line.
+        std::fs::write(dir.path().join("no-nameserver"), "search example.com\n").unwrap();
+        assert_eq!(read("no-nameserver"), None);
+        // A file with an address that the parser does not accept.
+        std::fs::write(dir.path().join("bad-address"), "nameserver 300.1.2.3\n").unwrap();
+        assert_eq!(read("bad-address"), None);
+        // A file with one good address and one bad address.
+        std::fs::write(
+            dir.path().join("good"),
+            "nameserver 300.1.2.3\nnameserver 192.0.2.1\n",
+        )
+        .unwrap();
+        assert_eq!(read("good"), Some(vec!["192.0.2.1:53".parse().unwrap()]));
+    }
+
+    /// The resolvers of the system come from the file of the system. The
+    /// test reads the same file and compares, thus it does not depend on
+    /// the content. It ends when the machine has no usable file.
+    #[test]
+    fn the_system_resolvers_come_from_the_file_of_the_system() {
+        let expected = std::fs::read_to_string(RESOLV_CONF)
+            .ok()
+            .and_then(|text| parse_resolv_conf(&text));
+        let Some(expected) = expected else {
+            crate::test_support::skip("this machine has no usable /etc/resolv.conf");
+            return;
+        };
+        assert_eq!(DnsServerConfig::read_system_resolvers(), Some(expected));
+    }
+
     /// The transaction ID of an upstream query must not be the same each
     /// time. A fixed ID lets a remote host answer before the real server.
     #[test]
@@ -2331,6 +2388,101 @@ mod tests {
         assert_eq!(clamp_ttl(100_000, (30, 300)), 300);
         // The maximum has priority if it is smaller than the minimum.
         assert_eq!(clamp_ttl(5, (30, 1)), 1);
+    }
+
+    /// The longest name in wire format is 255 bytes. The parser must
+    /// accept a name of exactly 255 bytes, and reject one byte more. A
+    /// wrong limit rejects a name that the allowlist permits.
+    #[test]
+    fn a_name_of_255_wire_bytes_is_accepted_and_256_is_not() {
+        let wire_name = |lengths: &[usize]| -> Vec<u8> {
+            let mut message = Vec::new();
+            for &len in lengths {
+                message.push(u8::try_from(len).unwrap());
+                message.extend(std::iter::repeat_n(b'a', len));
+            }
+            message.push(0);
+            message
+        };
+
+        // Each label takes its length byte too, and the name ends with
+        // the byte of the root label. Three labels of 63 bytes and one
+        // label of 61 bytes give 64 + 64 + 64 + 62 + 1 = 255.
+        let longest = wire_name(&[63, 63, 63, 61]);
+        let read = read_name(&longest, 0, Pointers::Forbidden, LabelBytes::Any);
+        assert!(
+            read.is_ok(),
+            "a name of 255 bytes must be accepted: {read:?}"
+        );
+
+        let too_long = wire_name(&[63, 63, 63, 62]);
+        assert_eq!(
+            read_name(&too_long, 0, Pointers::Forbidden, LabelBytes::Any),
+            Err(WireError::NameTooLong)
+        );
+    }
+
+    /// The parser of an upstream reply takes the response code from the low
+    /// four bits of the second flag byte, and it takes the addresses from
+    /// the answer section only. A record of the authority section or of the
+    /// additional section must not reach the cache of the proxy.
+    #[test]
+    fn the_upstream_reply_gives_the_code_and_only_the_answer_addresses() {
+        let query = build_dns_query(0x1234, "example.com", rtype::A);
+        let question = read_question(&query, Pointers::Forbidden).unwrap();
+        let record = |rr_type: u16, ttl: u32, rdata: &[u8]| {
+            let mut r = vec![0xC0, 0x0C];
+            r.extend_from_slice(&rr_type.to_be_bytes());
+            r.extend_from_slice(&CLASS_IN.to_be_bytes());
+            r.extend_from_slice(&ttl.to_be_bytes());
+            r.extend_from_slice(&u16::try_from(rdata.len()).unwrap().to_be_bytes());
+            r.extend_from_slice(rdata);
+            r
+        };
+
+        let mut reply = query[..2].to_vec();
+        reply.extend_from_slice(&[0x81, 0x80 | rcode::NOERROR]);
+        reply.extend_from_slice(&[0, 1]); // one question
+        reply.extend_from_slice(&[0, 1]); // one answer
+        reply.extend_from_slice(&[0, 1]); // one record in the authority section
+        reply.extend_from_slice(&[0, 0]); // no record in the additional section
+        reply.extend_from_slice(&query[HEADER_LEN..question.end]);
+        reply.extend_from_slice(&record(rtype::A, 60, &[93, 184, 216, 34]));
+        reply.extend_from_slice(&record(rtype::A, 60, &[203, 0, 113, 9]));
+
+        let result =
+            process_upstream_response(reply.clone(), 0x1234, "example.com", rtype::A, (30, 300));
+        let code = result.as_ref().ok().map(|reply| reply.rcode);
+        assert_eq!(code, Some(rcode::NOERROR), "{result:?}");
+        let addresses = result.as_ref().ok().map(|reply| reply.addresses.clone());
+        assert_eq!(
+            addresses,
+            Some(vec!["93.184.216.34".parse::<IpAddr>().unwrap()]),
+            "only the answer section gives addresses"
+        );
+
+        // A message with no QR bit is a query, not a response. The server
+        // must not take it as an answer: an answer to a response can make
+        // a loop, and a query of another host must not reach the cache.
+        let mut not_a_response = reply;
+        not_a_response[2] = 0x01;
+        assert_eq!(
+            process_upstream_response(not_a_response, 0x1234, "example.com", rtype::A, (30, 300)),
+            Err(WireError::Mismatch)
+        );
+
+        // A reply that holds only a header has no question. The length
+        // guard accepts it, and the rule for one question rejects it.
+        let header_only = vec![0x12, 0x34, 0x81, 0x80, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(
+            process_upstream_response(header_only, 0x1234, "example.com", rtype::A, (30, 300)),
+            Err(WireError::Mismatch)
+        );
+        // A reply that is shorter than the header is truncated.
+        assert_eq!(
+            process_upstream_response(vec![0x12, 0x34], 0x1234, "example.com", rtype::A, (30, 300)),
+            Err(WireError::Truncated)
+        );
     }
 
     #[test]
@@ -2884,6 +3036,90 @@ mod tests {
             "the server must close the connection: {read:?}"
         );
         run.abort();
+    }
+    /// A client that closes the connection in the middle of the length
+    /// prefix must not stop the server, and it must not hold its place.
+    /// The next client gets its answer on a new connection.
+    ///
+    /// The server of the test serves one connection at a time
+    /// (`max_concurrent_queries` is 1). Thus the test sees the end of the
+    /// broken connection: the next connection gets an answer only when the
+    /// server gave the place of the broken connection back.
+    #[tokio::test]
+    async fn a_broken_length_prefix_does_not_stop_the_tcp_server() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let Ok(listener) = tokio::net::TcpListener::bind("127.0.0.1:0").await else {
+            crate::test_support::skip("this machine cannot bind a TCP socket on the loopback");
+            return;
+        };
+        let Ok(addr) = listener.local_addr() else {
+            crate::test_support::skip("this machine gives no address for a TCP listener");
+            return;
+        };
+        let state = Arc::new(SharedState::new(vec!["allowed.com".to_string()]));
+        let config = DnsServerConfig {
+            max_concurrent_queries: 1,
+            ..Default::default()
+        };
+        let server = DnsServer::new(config, state).unwrap();
+        let task = tokio::spawn(async move {
+            let _ = server.run_tcp_on(listener).await;
+        });
+
+        // One byte of the two-byte length prefix, then the close.
+        let mut broken = tokio::net::TcpStream::connect(addr).await.unwrap();
+        broken.write_all(&[0x00]).await.unwrap();
+        drop(broken);
+
+        // A new connection with a complete query. The name is not on the
+        // allowlist, thus the server answers NXDOMAIN and asks no upstream.
+        let query = build_test_dns_query("blocked.example", rtype::A);
+        let mut request = u16::try_from(query.len()).unwrap().to_be_bytes().to_vec();
+        request.extend_from_slice(&query);
+
+        let mut answer = None;
+        // The server ends the broken connection in its own task. The test
+        // gives it up to two seconds for that.
+        for _ in 0..20u32 {
+            let Ok(mut client) = tokio::net::TcpStream::connect(addr).await else {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            };
+            if client.write_all(&request).await.is_err() {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+            let mut len_buf = [0u8; 2];
+            let read = client.read_exact(&mut len_buf);
+            let complete = matches!(
+                tokio::time::timeout(Duration::from_millis(100), read).await,
+                Ok(Ok(_))
+            );
+            if !complete {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+            let mut response = vec![0u8; usize::from(u16::from_be_bytes(len_buf))];
+            let read = client.read_exact(&mut response);
+            assert!(
+                tokio::time::timeout(Duration::from_secs(5), read)
+                    .await
+                    .is_ok(),
+                "the answer is shorter than its length"
+            );
+            answer = Some(response);
+            break;
+        }
+
+        let Some(response) = answer else {
+            task.abort();
+            panic!("the server gave no answer after the broken connection");
+        };
+        assert_eq!(rcode_of(&response), rcode::NXDOMAIN);
+        assert_eq!(response.get(..2), query.get(..2), "another transaction");
+
+        task.abort();
     }
 }
 

@@ -147,6 +147,53 @@ cannot change any behaviour, 10 are not worth a test, and 1 is an open
 gap. The lists below give each one.
 
 ## The first run: the five survivors that matter most
+## The second change: the survivors that the first run dismissed
+
+The first run dismissed ten survivors with the words "not worth a test".
+That phrase meant "awkward to reach". A place that is awkward to reach
+needs a seam, not a dismissal. A later change gave each place a seam and
+wrote the test. The second change wrote 21 tests. The sections below hold
+the result.
+
+The second change ran the tool again on the five files that it changed.
+The column **before** gives the number of the table above, and the column
+**now** gives the measured number after the second change.
+
+| File | Mutants | Unviable | Survivors before | Survivors now |
+|---|---:|---:|---:|---:|
+| `pent-settings/src/trust.rs` | 49 | 11 | 6 | 1 |
+| `pent-settings/src/store.rs` | 87 | 16 | 1 | 0 |
+| `pent-proxy/src/inspect.rs` | 73 | 2 | 3 | 3 |
+| `pent-proxy/src/dns.rs` | 153 | 8 | 10 | 6 |
+| `pent-profile/src/summary.rs` | 232 | 11 | 4 | 2 |
+| **Total** | **594** | **48** | **24** | **12** |
+
+Each of the twelve survivors is in the list "Equivalent" below. Thus no
+mutant of these five files stays that can change a behaviour.
+
+The second run also found seven survivors that the list of the first run
+did not hold: five in `dns.rs` (the limit of the length of a name, the
+guard of the length of a reply, the response code, the QR bit, and the
+count of the answer section) and two in `summary.rs` (`covers_path`). The
+columns **before** of `dns.rs` and of `summary.rs` are thus too low. New
+tests kill six of the seven. The seventh joins two bit fields that do not
+overlap in `read_name`, and it cannot change a behaviour.
+
+The run of `summary.rs` came before the test of `covers_path`. It reported
+four survivors: the two of `covers_path`, which that test now kills, and
+the two of the list "Equivalent". The column **now** gives two.
+
+The seams of the second change:
+
+| File | Seam |
+|---|---|
+| `trust.rs` | `create_new_private_from` takes the source of the names. `create_new_private` keeps the behaviour of today and gives it the names of `temp_names`. |
+| `trust.rs` | `nonce_from` takes the value of the clock. `nonce` reads the clock and calls it. |
+| `dns.rs` | `DnsServerConfig::read_resolvers` takes the path of the resolver file. `read_system_resolvers` gives it `/etc/resolv.conf`. |
+| `inspect.rs` | `InspectPorts` holds the two ports of the inspection, with 443 and 80 as the default. `Inspect::for_port_in` takes the value, and `Inspect::for_port` reads the value of the process. |
+| `pent-settings` | The helper program `pent-dirs-probe` prints the pent directories. A test runs it in a child process with the environment that the test wants. |
+
+## The five survivors that matter most
 
 1. **`Inspect::for_port` could return `None` for every port, and no test
    failed** (`inspect.rs:58:9`, with the two mutants that delete the arm
@@ -197,28 +244,61 @@ query to the client.
 | `psl.rs:262:26` `||` to `&&` in `wildcard_allowed` | The guard reads `domain.is_empty() \|\| !domain.contains('.') \|\| is_public_suffix(domain)`. A name with no dot is always its own public suffix, so the second test implies the third. The mutant gives `(a && b) \|\| c`, which has the same value for every input. |
 | `summary.rs:934:31` `>` to `<` in `rw_reason` | The line `written > 0 \|\| deleted > 0` is reached only when the line above (`deleted > 0 && written == 0`) was false. With `written == 0` the first line already returned, so `deleted` is zero here and the second test is always false. |
 | `summary.rs:1008:57` `&&` to `\|\|` in `blocked_items` | The test is `access == Execute && !binaries.is_empty()`. Only an `Exec` event makes an `Execute` key, and it always adds the name of the binary. Thus the two tests have the same value. |
-| `dns.rs:326:66`, `dns.rs:499:27`, `dns.rs:499:36`, `dns.rs:500:27`, `dns.rs:861:31`, `dns.rs:864:30`, `inspect.rs:163:17`, `inspect.rs:164:17` (`\|` to `^`) | Each one joins bit fields that do not overlap (`0x80` with `0x0F`, a high byte with a low byte). For disjoint bits, `\|` and `^` give the same result. |
+| `dns.rs:326:66`, `dns.rs:499:27`, `dns.rs:499:36`, `dns.rs:500:27`, `dns.rs:861:31`, `dns.rs:864:30`, `inspect.rs:163:17`, `inspect.rs:164:17` (`\|` to `^`) | Each one joins bit fields that do not overlap (`0x80` with `0x0F`, a high byte with a low byte). For disjoint bits, `\|` and `^` give the same result. The second run finds the same mutants at `dns.rs:346:66`, `dns.rs:519:27`, `dns.rs:519:36`, `dns.rs:520:27`, `dns.rs:883:31`, `dns.rs:886:30`, `inspect.rs:227:17` and `inspect.rs:228:17`. |
 | `inspect.rs:162:39` `<<` to `>>` in `Cursor::u24` | The high byte of the 24-bit handshake length is always zero: a TLS record body is at most 16,384 bytes plus the permitted expansion, so the length never reaches 65,536. |
+| `trust.rs:353` `^` to `\|` in `nonce` | The seed is `nanos ^ secs.rotate_left(32)`. The rotation puts the seconds in the bits 32 to 63, and the nanoseconds are below 2^30. The two parts have no common bit, thus `^` and `\|` give the same value. This holds while the clock is below 2^32 seconds, that is before the year 2106. The test of the nonce passes with this mutant, as it must. |
 
-### The two filters that hide each other
+### The two filters that do not hide each other
 
-`summary.rs:720:57` (`includes`) and `summary.rs:822:78` (`wider_exists`)
-are two filters that remove the same rules. `wider_exists` drops a read
-below a read-write or an execute rule before the grouping, and `hidden`
-(which calls `includes`) drops it after. A mutant in one of them alone
-changes nothing, because the other still removes the rule. Mutation testing
-makes one change at a time, so it cannot show this pair. The code is
-correct but it has one filter too many; a later change can remove one of
-them.
+The first run called `summary.rs:720:57` (`includes`) and
+`summary.rs:822:78` (`wider_exists`) a pair of filters that remove the same
+rules. They are not a pair. The second change took each one away and looked
+at the result.
 
-### Not worth a test
+- `wider_exists` stays. It drops a read below a read-write rule or below an
+  execute rule **before** the grouping. A read that stays counts for the
+  grouping of the directory above it. The test
+  `a_read_below_a_read_write_rule_does_not_widen_a_read_rule` shows the
+  difference: with the filter the profile gets `r ~/.tool/x`, `r ~/.tool/y`
+  and `r ~/.tool/z`; without it the profile gets `r ~/.tool`, which is the
+  whole directory.
+- The read part of `includes` is gone. After `wider_exists` no read rule
+  has a read-write rule or an execute rule above it, thus the condition
+  `narrow == Read && wide != Read` was always false. `hidden` now looks
+  only for the same access above a rule, and it still removes a read-write
+  rule below a read-write rule. The suite of `pent-profile` passes, and a
+  `hidden` that always answers false makes five tests fail.
 
-| Mutant | Why |
+### The survivors that the second run added to the list
+
+| Mutant | The test that kills it |
 |---|---|
-| `dns.rs:705:31` (two mutants), `dns.rs:705:40` (the `UnexpectedEof` guard in `serve_tcp`) | The two branches differ only in the log line: both end the connection. A test would need a client that closes the connection in the middle of a length prefix, and it could not see the difference. |
-| `store.rs:561:23` (the `NotFound` guard of `remove_dir_all`) | To reach the other branch the watch directory must exist and fail to be deleted, which needs a read-only parent directory or a mount point. The cost of the test is higher than the value. |
-| `trust.rs:331:20` (two mutants), `trust.rs:331:29`, `trust.rs:332:21`, `trust.rs:332:41` (the retry guard of `create_new_private`) | The guard decides whether pent tries the next temporary name. The name holds a nonce that no test can predict, so a test cannot make the first name exist. With the guard always true, pent tries 32 names and then returns the same error, so the result does not change either. |
-| `trust.rs:353:54` `^` to `\|` in `nonce` | The seed keeps the nanoseconds of the clock, so the name still changes with each call. The mutant removes bits of entropy that a test cannot count. The other mutant of the same line, `^` to `&`, makes the seed always zero, and a new test kills it. |
+| `dns.rs:322:29` `>` to `>=` in `read_name` | `dns.rs`: `a_name_of_255_wire_bytes_is_accepted_and_256_is_not`. The longest name in wire format is 255 bytes, and the byte of the root label counts. |
+| `dns.rs:409:22` (two mutants) the guard of the length of a reply, `dns.rs:415:35` the QR bit, `dns.rs:447:18` the count of the answer section | `dns.rs`: `the_upstream_reply_gives_the_code_and_only_the_answer_addresses`. The test gives the parser a reply with one answer and one record in the authority section, a message with no QR bit, a message with only a header, and a message that is shorter than a header. |
+| `summary.rs:776:5` `covers_path` with `false`, and `summary.rs:777:9` `\|\|` to `&&` | `summary.rs`: `a_normal_rule_that_covers_a_blocked_path_goes_away`. The mutant `\|\|` to `&&` has the same value as `false`: with `rule == guarded` the rest of the path is empty, and an empty rest does not start with `/`. |
+
+### The survivors that a test now kills
+
+| Mutant | The test that kills it |
+|---|---|
+| `store.rs:561:23` (the `NotFound` guard of `remove_dir_all`) | `store.rs`: `remove_reports_the_error_when_it_cannot_delete_the_watch_directory`. The test gives the parent of the watch directory the mode `0500`. The deletion then fails with a permission error, not with "not found". The test ends with a line when the user can write such a directory (root). |
+| `trust.rs:331:20` (two mutants), `trust.rs:331:29`, `trust.rs:332:21`, `trust.rs:332:41` (the retry guard of `create_new_private`) | `trust.rs`: `the_next_name_wins_when_the_first_name_exists` and `the_next_name_wins_when_the_first_name_is_a_symbolic_link`. Each test gives the names to `create_new_private_from`, makes the first name exist, and looks at the name that pent takes. `no_free_name_gives_an_error` and `an_error_that_is_not_a_name_conflict_stops_the_retry` hold the two ends of the guard. |
+| `trust.rs:353` `^` to `&` in `nonce` | `trust.rs`: `ten_thousand_nonces_hold_no_duplicate_and_the_low_bits_vary`. The test gives ten thousand values of the clock to `nonce_from`. With the mutant the seed is always zero, and the ten thousand nonces are one value. |
+| `dns.rs`: `read_system_resolvers` and `read_resolvers` with `None` | `dns.rs`: `the_resolver_file_gives_the_resolvers_or_nothing` (a file that is absent, a directory, an empty file, a file with no nameserver line, a file with an address that does not parse, and a good file) and `the_system_resolvers_come_from_the_file_of_the_system`. |
+| `store.rs:100:9`: `PentDirs::from_env`, and `trust.rs:145:9`: `TrustStore::default_path` | `pent-settings/tests/dirs_without_home.rs`: `the_locations_follow_the_home_directory` and `an_absolute_xdg_variable_wins_over_the_home_directory`. Each test runs the helper program in a child process, thus no test changes the environment of the test process. |
+| `inspect.rs:58:9`: `Inspect::for_port` with `None`, for the whole path | `inspect.rs`: `the_proxy_does_not_relay_a_fronted_host`. The test puts the port of the inspection on the port of its own server, thus it needs no port below 1024. |
+
+### The mutants that the second change removed
+
+`dns.rs:705:31` (two mutants) and `dns.rs:705:40` were the guard
+`e.kind() == UnexpectedEof` in `serve_tcp`. The two branches ended the
+connection in the same way and differed only in a log line. The guard is
+gone: a read error on the length prefix and an idle connection now take one
+branch. The test `a_broken_length_prefix_does_not_stop_the_tcp_server`
+holds the behaviour that matters. The server of the test serves one
+connection at a time, thus the test sees that the server gives the place of
+the broken connection back. A branch that waits in place of returning makes
+the test fail.
 
 ### One more note
 
@@ -230,14 +310,28 @@ the arm.
 
 ## The first run: the gaps
 
-One mutant stays open. Two more are killed, but only on a machine that
-has a home directory.
+The three gaps of the first run are closed. Two points stay open. Neither
+point is a mutant that survives.
 
-| Gap | Why it stays |
+| Point | What is missing |
 |---|---|
-| `dns.rs`: `read_system_resolvers` with `None` | The function reads `/etc/resolv.conf` with a path that is fixed in the code. A test cannot give it another file, and a test that reads the real file depends on the host. This change moved the parser into `parse_resolv_conf`, which takes the text and has a test, so only the file read stays without a test. |
-| `store.rs:100:9`: `PentDirs::from_env`, and `trust.rs:145:9`: `TrustStore::default_path` | The new tests compare these functions with `from_vars` on the variables of the process. They kill the mutants on each normal machine. On a machine with no `HOME` and no XDG variable both sides are `None`, and the tests then prove nothing. A test that sets an environment variable would change the whole process and race the other tests. |
-| The end-to-end proof that the proxy blocks a fronted host on port 443 | The proxy inspects the SNI only after it connects to the destination. A test would need a server on port 443 of the loopback, and an unprivileged test cannot bind a port below 1024. The new unit test of `Inspect::for_port`, together with the tests of `check_requested_host`, covers the two halves of the path, but not the path itself. |
+| The ports of the inspection are not yet a setting of the session | `InspectPorts` is a value with the usual ports as the default, and only a test gives other ports. `ProxyConfig` does not carry the ports yet, because `server.rs` and `proxy.rs` belong to another change. The step that stays: put the field in `ProxyConfig`, give the value to `TcpProxy`, and take the value of the process away. |
+| The test with no home directory runs on Linux only | `PentDirs::from_env` answers `None` only when the environment gives no location **and** the user database has no entry for the user. The tests `no_home_and_no_xdg_variable_give_none` and `pent_reports_a_clear_error_and_does_not_panic` make that state with a user namespace, thus they run on Linux only. macOS has no equivalent, and there the two functions keep the answer of the user database. |
+
+### How a test reaches a machine with no home directory
+
+The C library answers with the home directory of the user database when
+`HOME` is not set. A test thus needs two things: an environment with no
+`HOME` and no XDG variable, and a user that the database does not know.
+The tests make the second one with a user namespace:
+
+```bash
+unshare --user --map-user=61234 -- <program>
+```
+
+A test must not change the environment of the test process, because that
+races the other tests. Each test runs a child process instead: the helper
+program `pent-dirs-probe` of `pent-settings`, or the `pent` binary.
 
 ## The second run: the rest of `pent-proxy`, of `pent-profile` and of `pent-settings`
 
