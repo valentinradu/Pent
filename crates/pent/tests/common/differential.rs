@@ -729,25 +729,24 @@ pub const GUARD_CASES: &[GuardCase] = &[
         path: ".ssh/old/more/id_rsa",
         ..GUARD
     },
-    // Through a symbolic link.
+    // Through a symbolic link. The Linux supervisor refuses the read,
+    // because no mask covers the name that the program uses; the macOS
+    // profile holds a deny rule for the real directory of the link,
+    // because Seatbelt matches the path that the kernel resolves.
     GuardCase {
         id: "key-through-a-symbolic-link",
         path: ".ssh/linked/id_rsa",
         link_dir: Some((".ssh/linked", "keystore")),
-        open_linux: Some("DIFF-5"),
-        // Seatbelt matches the real path too, so the deny rule on
-        // `~/.ssh` does not cover `~/keystore/id_rsa` either.
-        open_macos: Some("DIFF-5"),
         ..GUARD
     },
     // A key that the program makes during the run. The Linux backend
-    // masks only the children that exist when the child starts; Seatbelt
-    // decides at the time of the access.
+    // masks only the children that exist when the child starts, so the
+    // supervisor refuses the read; Seatbelt decides at the time of the
+    // access.
     GuardCase {
         id: "key-made-during-the-run",
         path: ".ssh/id_new",
         make_in_run: true,
-        open_linux: Some("DIFF-6"),
         ..GUARD
     },
     // The other credential shapes.
@@ -991,6 +990,25 @@ pub fn guard_open(id: &str) -> Vec<&'static GuardCase> {
         .iter()
         .filter(|c| c.open_here() == Some(id))
         .collect()
+}
+
+/// The rows of [`GUARD_CASES`] with these names.
+///
+/// A test of a closed finding names its rows, so the test keeps its rows
+/// after the fix moves them out of [`guard_open`].
+///
+/// # Panics
+/// Panics when a name is not in the table.
+#[must_use]
+pub fn guard_rows(ids: &[&str]) -> Vec<&'static GuardCase> {
+    let rows: Vec<&'static GuardCase> =
+        GUARD_CASES.iter().filter(|c| ids.contains(&c.id)).collect();
+    assert_eq!(
+        rows.len(),
+        ids.len(),
+        "GUARD_CASES does not hold each row of {ids:?}"
+    );
+    rows
 }
 
 /// Every disagreement that [`GUARD_CASES`] states on this platform, sorted

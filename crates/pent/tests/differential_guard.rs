@@ -39,7 +39,7 @@ mod guard_table {
         have_tools, sandbox_ready, stderr, stdout, BoxError, TestEnv, TestResult,
     };
     use super::differential::{
-        guard_closed, guard_open, guard_open_ids, GuardCase, GuardKind, Verdict, MARKER, RAN, WROTE,
+        guard_closed, guard_open_ids, guard_rows, GuardCase, GuardKind, Verdict, MARKER, RAN, WROTE,
     };
 
     /// The probe that reads the path in `$1`.
@@ -214,33 +214,32 @@ printf 'rc=%s\n' "$?"
         run_rows(test, &guard_closed())
     }
 
-    /// The guard must hide a private key that a symbolic link below
-    /// `~/.ssh` points to. The summary says "blocked"; the program reads
-    /// the key.
+    /// DIFF-5. The guard must hide a private key that a symbolic link
+    /// below `~/.ssh` points to. The summary says "blocked", so the
+    /// program must not read the key.
     #[test]
-    #[ignore = "OPEN DIFF-5: the guard misses a key behind a symbolic link, but the summary says blocked"]
     fn diff_5_a_key_behind_a_symbolic_link() -> TestResult {
         let test = "guard_diff_5_symlink";
         if !ready(test) {
             return Ok(());
         }
-        run_rows(test, &guard_open("DIFF-5"))
+        run_rows(test, &guard_rows(&["key-through-a-symbolic-link"]))
     }
 
-    /// The guard must hide a private key that the program makes during
-    /// the run. The summary says "blocked"; the program reads the key.
+    /// DIFF-6. The guard must hide a private key that the program makes
+    /// during the run. The summary says "blocked", so the program must
+    /// not read the key.
     ///
-    /// Seatbelt decides at the time of the access, so the row has no
+    /// Seatbelt decides at the time of the access, so the row never had a
     /// disagreement on macOS and the test runs on Linux only.
     #[test]
     #[cfg(target_os = "linux")]
-    #[ignore = "OPEN DIFF-6: the guard misses a key made during the run, but the summary says blocked"]
     fn diff_6_a_key_made_during_the_run() -> TestResult {
         let test = "guard_diff_6_new_key";
         if !ready(test) {
             return Ok(());
         }
-        run_rows(test, &guard_open("DIFF-6"))
+        run_rows(test, &guard_rows(&["key-made-during-the-run"]))
     }
 
     /// On macOS the guard must also hide a key whose name matches a
@@ -254,16 +253,16 @@ printf 'rc=%s\n' "$?"
         if !ready(test) {
             return Ok(());
         }
-        run_rows(test, &guard_open("DIFF-9"))
+        run_rows(test, &super::differential::guard_open("DIFF-9"))
     }
 
     /// Each disagreement of the table has an ignored test in this file.
     #[test]
     fn every_open_row_has_a_test() {
         let expected: Vec<&str> = if cfg!(target_os = "macos") {
-            vec!["DIFF-5", "DIFF-9"]
+            vec!["DIFF-9"]
         } else {
-            vec!["DIFF-5", "DIFF-6"]
+            Vec::new()
         };
         assert_eq!(
             guard_open_ids(),

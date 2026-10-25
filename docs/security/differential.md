@@ -75,8 +75,8 @@ proof of the finding.
 | DIFF-2 | Medium | The kernel | A profile entry that names a symbolic link gives access to nothing. |
 | DIFF-3 | Low | The kernel | A write to a read-only rule succeeds inside the run. |
 | DIFF-4 | Medium | The kernel | A `read` rule also gives execute. |
-| DIFF-5 | High | The kernel | The guard misses a private key behind a symbolic link, and the summary says "blocked". |
-| DIFF-6 | High | The kernel | The guard misses a private key that the program makes during the run, and the summary says "blocked". |
+| DIFF-5 | High | The kernel | **Fixed.** The guard missed a private key behind a symbolic link, and the summary said "blocked". |
+| DIFF-6 | High | The kernel | **Fixed.** The guard missed a private key that the program makes during the run, and the summary said "blocked". |
 | DIFF-7 | High | The summary | **Fixed.** The draft granted a path that the same summary showed as a blocked credential. |
 | DIFF-8 | Medium | The summary | The proxy refuses a destination that is not public, and records nothing. |
 | DIFF-9 | Medium | The kernel | On macOS a guard pattern with a leading `*` has no effect. |
@@ -170,10 +170,11 @@ entry only. A `read` entry gets `READ_FILE` and `READ_DIR`.
 
 ### DIFF-5 — the guard misses a private key behind a symbolic link
 
-**Severity:** High. **Wrong description:** the kernel.
+**Severity:** High. **Wrong description:** the kernel. **Fixed** in `COMMIT-DIFF-5-6`.
 
 **Test:** `differential_guard.rs`, `diff_5_a_key_behind_a_symbolic_link`.
-Row `key-through-a-symbolic-link`.
+Row `key-through-a-symbolic-link`. The test runs now, and
+`classify_and_the_kernel_agree` holds the row too.
 
 `~/.ssh/linked` is a symbolic link to `~/keystore`. The program reads
 `~/.ssh/linked/id_rsa`. `pent_profile::classify` answers `Credential`, and
@@ -192,16 +193,33 @@ This is the same class of defect as the macOS case that started this
 review. The user reads "blocked" and believes in a protection that is not
 there.
 
-**The fix.** Resolve the guard directory before the mask. Mask the real
-directory, not the name. Also mask each symbolic link below a guard
-directory, or refuse to follow one.
+**The fix.** A mount covers one inode, so a mask can never cover each
+name that reaches a key. The two backends close the hole in the way that
+fits them.
+
+On Linux, `plan_guard` puts each `FilesInDir` rule in the list
+`unenforced` of the plan. The supervisor of the recorder sees the
+`openat` before the kernel answers, it classifies the path as the summary
+does, and it refuses the read with `EACCES` (`Judge::denies` in
+`linux_watch.rs`). The masks stay the first layer and have no race; the
+supervisor is the second layer and stops the names that no mask covers.
+
+On macOS, `guard_dir_variants` in `macos.rs` walks each guarded directory
+one time before the child starts and adds a deny rule for the real
+directory of every symbolic link that leaves the tree. Seatbelt matches
+the path that the kernel resolves, so the rule on `~/keystore` covers
+`~/.ssh/linked/id_rsa`. The macOS half is a prediction until the pipeline
+runs the row on a Mac; the unit test
+`the_watch_profile_covers_a_key_behind_a_symbolic_link` holds the shape
+of the profile.
 
 ### DIFF-6 — the guard misses a private key that the program makes
 
-**Severity:** High. **Wrong description:** the kernel.
+**Severity:** High. **Wrong description:** the kernel. **Fixed** in `COMMIT-DIFF-5-6`.
 
 **Test:** `differential_guard.rs`, `diff_6_a_key_made_during_the_run`. Row
-`key-made-during-the-run`.
+`key-made-during-the-run`. The test runs now, and
+`classify_and_the_kernel_agree` holds the row too.
 
 The program writes `~/.ssh/id_new` and reads it back. `classify` answers
 `Credential`, and the summary shows the read in the blocked section. The
@@ -211,9 +229,17 @@ program read the content. The Linux guard masks only the children of
 A program that makes a key and reads it back is not a normal program, but a
 program that moves a key into `~/.ssh` and reads it is the same case.
 
-**The fix.** Mask the directory, not each child. An empty tmpfs over the
-directory, with a bind mount of each file that no rule protects, holds for
-a new name too. `docs/security/watch-and-profiles.md` names this as H-13.
+**The fix.** There is nothing to mount over, so the mounts cannot help.
+`plan_guard` puts a rule with no mount in the list `unenforced`, and the
+supervisor refuses the read itself with `EACCES`, as it already refuses a
+write to a guarded path that has no mount. The read side and the write
+side now work the same way.
+
+Another thread of the program can change the path after the supervisor
+reads it, so this layer stops accidents, not a hostile program. The
+masks, which have no race, stay the first layer for each path that exists
+when the child starts. `docs/security/watch-and-profiles.md` names the
+limit of the masks as H-13.
 
 ### DIFF-7 — the draft grants a path that the summary calls a credential
 
@@ -328,7 +354,7 @@ directory, a write with an atomic rename, a delete, four reads that become
 one directory rule, an execution, the four odd name shapes, a read through
 a symbolic link, and a program that touches nothing.
 
-**`classify` against the kernel (21 of 23 rows on Linux).**
+**`classify` against the kernel (23 of 23 rows on Linux).**
 
 The guard blocks each name shape of a private key, at one and at two levels
 below `~/.ssh`, and also a name with a dot, a plus, brackets or a star in
