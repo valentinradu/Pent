@@ -2952,6 +2952,48 @@ mod tests {
         handle.abort();
     }
 
+    /// An HTTP CONNECT to a port that refuses the connection gets 502.
+    /// The client must see that the destination refused, not that the
+    /// policy blocked the name.
+    #[tokio::test]
+    async fn an_http_connect_to_a_closed_port_gets_502() {
+        // A port that nothing listens on: bind it, read the number, close.
+        let Some(closed) = get_free_port().await else {
+            return;
+        };
+        let (state, mut rx) = traced_state(&["localhost"]);
+        let config = TcpProxyConfig {
+            private_destinations: PrivateDestinations::Allow,
+            ..Default::default()
+        };
+        let Some((proxy, handle)) = start_proxy(state, config).await else {
+            return;
+        };
+        let mut client = TcpStream::connect(proxy).await.unwrap();
+        let request = format!(
+            "CONNECT localhost:{port} HTTP/1.1\r\n\r\n",
+            port = closed.port()
+        );
+        client.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), client.read_to_end(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            response.starts_with(b"HTTP/1.1 502"),
+            "the client must see 502: {}",
+            String::from_utf8_lossy(&response)
+        );
+        // The policy allowed the name; only the destination refused.
+        let messages = drain(&mut rx);
+        assert!(
+            messages.iter().any(|m| m.starts_with("access ")),
+            "the policy must allow the name: {messages:?}"
+        );
+        handle.abort();
+    }
+
     #[test]
     fn test_parse_http_connect_target_ip_literal() {
         let target = parse_http_connect_target("CONNECT [2001:db8::1]:443 HTTP/1.1").unwrap();

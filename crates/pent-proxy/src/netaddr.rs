@@ -136,6 +136,31 @@ mod tests {
         classify(text.parse().unwrap())
     }
 
+    /// Each reason has its own text. The proxy puts the text in the
+    /// violation message that the user reads, so an empty text or the same
+    /// text twice makes the message useless.
+    #[test]
+    fn each_reason_has_its_own_text() {
+        const ALL: [NonPublic; 8] = [
+            NonPublic::Unspecified,
+            NonPublic::Loopback,
+            NonPublic::Private,
+            NonPublic::SharedCgnat,
+            NonPublic::LinkLocal,
+            NonPublic::UniqueLocal,
+            NonPublic::Multicast,
+            NonPublic::Reserved,
+        ];
+        let texts: Vec<String> = ALL.iter().map(ToString::to_string).collect();
+        for text in &texts {
+            assert!(!text.is_empty(), "a reason has no text");
+        }
+        let mut sorted = texts.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), texts.len(), "two reasons share one text");
+    }
+
     #[test]
     fn test_classify_rejects_non_public_ipv4() {
         assert_eq!(class("0.0.0.0"), Some(NonPublic::Unspecified));

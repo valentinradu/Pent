@@ -1084,6 +1084,104 @@ Network
         assert!(text.contains("# one two [31m\n"), "{text}");
         Ok(())
     }
+
+    // ========================================================================
+    // The lines that the coverage run found open.
+    // See docs/testing/fuzzing-and-coverage.md.
+    // ========================================================================
+
+    /// Each note has its own text, and no text is empty. The user reads
+    /// the note beside the rule, so two notes with the same text hide the
+    /// difference.
+    #[test]
+    fn each_note_has_its_own_text() {
+        const ALL: [ItemNote; 3] = [
+            ItemNote::CreatedThenExecuted,
+            ItemNote::OutsideHome,
+            ItemNote::OtherRepository,
+        ];
+        let texts: Vec<&str> = ALL.iter().map(note_label).collect();
+        for text in &texts {
+            assert!(!text.is_empty(), "a note has no text");
+        }
+        let mut sorted = texts.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), texts.len(), "two notes share one text");
+    }
+
+    /// A blocked item starts with the access. A domain and a Unix socket
+    /// both use the verb `connect`.
+    #[test]
+    fn a_blocked_item_names_its_access() {
+        let item = |grant: Grant| Item {
+            grant,
+            reason: String::new(),
+            blocked: Some(GuardClass::Credential),
+            notes: Vec::new(),
+        };
+        assert_eq!(
+            item_label(&item(Grant::Domain("evil.example".to_string()))),
+            "connect evil.example"
+        );
+        assert_eq!(
+            item_label(&item(Grant::UnixSocket("~/.ssh/agent".to_string()))),
+            "connect ~/.ssh/agent"
+        );
+        assert_eq!(
+            item_label(&item(Grant::Fs {
+                access: FsAccess::Read,
+                path: "~/.ssh/id_ed25519".to_string(),
+            })),
+            "read ~/.ssh/id_ed25519"
+        );
+        // With no reason the comment is only the class of the guard.
+        assert_eq!(
+            item_comment(&item(Grant::Domain("evil.example".to_string()))),
+            "credential"
+        );
+        // With a reason the class comes after it, in parentheses.
+        let mut with_reason = item(Grant::Domain("evil.example".to_string()));
+        with_reason.reason = "read by ssh".to_string();
+        assert_eq!(item_comment(&with_reason), "read by ssh (credential)");
+    }
+
+    /// `Warnings::is_empty` and `Reasons::is_empty` answer for the empty
+    /// value and for a value that holds one entry. `pent watch` uses them
+    /// to decide whether to print the warning block.
+    #[test]
+    fn the_empty_checks_answer_for_both_cases() {
+        assert!(Warnings::default().is_empty());
+        let one_of_each = [
+            Warnings {
+                outside_home: 1,
+                ..Warnings::default()
+            },
+            Warnings {
+                other_repository: 1,
+                ..Warnings::default()
+            },
+            Warnings {
+                refused_unix_sockets: 1,
+                ..Warnings::default()
+            },
+        ];
+        for warnings in one_of_each {
+            assert!(
+                !warnings.is_empty(),
+                "the warnings {warnings:?} are not empty"
+            );
+            assert_eq!(warnings.lines().len(), 1, "one count gives one line");
+        }
+
+        assert!(Reasons::default().is_empty());
+        let reasons = Reasons::from_draft("domains = [\n\"a.example\", # why\n]\n");
+        assert!(!reasons.is_empty(), "the draft holds one reason");
+        assert_eq!(
+            reasons.get(&Grant::Domain("a.example".to_string())),
+            Some("why")
+        );
+    }
 }
 
 /// Property tests of the draft writer and of the profile reader.

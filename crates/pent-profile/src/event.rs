@@ -250,6 +250,7 @@ pub mod path_json {
 }
 
 #[cfg(test)]
+#[allow(clippy::panic)] // a test that reaches a branch it must not reach fails
 mod tests {
     use super::*;
     use std::path::Path;
@@ -321,6 +322,91 @@ mod tests {
             "{event:?}"
         );
         Ok(())
+    }
+
+    // ========================================================================
+    // The lines that the coverage run found open.
+    // See docs/testing/fuzzing-and-coverage.md.
+    // ========================================================================
+
+    /// `outcome` answers for an event of each kind. The summary reads the
+    /// outcome of every event, so one arm that gives the wrong value would
+    /// put a blocked access in the rules.
+    #[test]
+    fn the_outcome_of_each_kind_of_event() {
+        let process = ProcessInfo {
+            pid: 1,
+            name: "p".to_string(),
+        };
+        let events = [
+            WatchEvent::Fs {
+                op: FsOp::Read,
+                path: PathBuf::from("/a"),
+                process: process.clone(),
+                outcome: Outcome::Allowed,
+            },
+            WatchEvent::UnixConnect {
+                target: "/run/x".to_string(),
+                process: process.clone(),
+                outcome: Outcome::Blocked(GuardClass::Credential),
+            },
+            WatchEvent::Dns {
+                name: "a.example".to_string(),
+                qtype: "A".to_string(),
+                outcome: Outcome::Denied,
+            },
+            WatchEvent::Connect {
+                host: "a.example".to_string(),
+                port: 443,
+                protocol: NetProtocol::Socks5,
+                outcome: Outcome::Allowed,
+            },
+        ];
+        let outcomes: Vec<Outcome> = events.iter().map(WatchEvent::outcome).collect();
+        assert_eq!(
+            outcomes,
+            vec![
+                Outcome::Allowed,
+                Outcome::Blocked(GuardClass::Credential),
+                Outcome::Denied,
+                Outcome::Allowed,
+            ]
+        );
+    }
+
+    /// A path that is neither a string nor an object gives an error that
+    /// names both forms. The user sees this message when a log line is
+    /// broken.
+    #[test]
+    fn a_path_of_another_type_names_both_forms() {
+        let line = "{\"type\":\"fs\",\"op\":\"read\",\"path\":5,\
+                    \"process\":{\"pid\":1,\"name\":\"p\"},\"outcome\":{\"kind\":\"allowed\"}}";
+        let Err(error) = WatchEvent::from_json_line(line) else {
+            panic!("a number is not a path");
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("a path as a string"),
+            "the message must name the string form: {message}"
+        );
+        assert!(
+            message.contains("bytes"),
+            "the message must name the raw form: {message}"
+        );
+    }
+
+    /// An object with no `bytes` field is not a path either.
+    #[test]
+    fn a_path_object_without_bytes_is_an_error() {
+        let line = "{\"type\":\"fs\",\"op\":\"read\",\"path\":{\"other\":1},\
+                    \"process\":{\"pid\":1,\"name\":\"p\"},\"outcome\":{\"kind\":\"allowed\"}}";
+        let Err(error) = WatchEvent::from_json_line(line) else {
+            panic!("an object with no bytes field is not a path");
+        };
+        assert!(
+            error.to_string().contains("bytes"),
+            "the message must name the field: {error}"
+        );
     }
 }
 

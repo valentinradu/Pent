@@ -419,6 +419,63 @@ pub(crate) mod tests {
         assert_eq!(buf, vec![0x16, 0x03]);
         drop(a);
     }
+
+    // ========================================================================
+    // The decisions and the error paths that the coverage run found open.
+    // See docs/testing/fuzzing-and-coverage.md.
+    // ========================================================================
+
+    /// The proxy inspects port 443 and port 80, and no other port. On
+    /// another port the server can speak first, so the proxy must not wait
+    /// for data of the client.
+    #[test]
+    fn only_the_two_ports_of_a_first_client_message_get_an_inspection() {
+        assert_eq!(Inspect::for_port(443), Some(Inspect::Tls));
+        assert_eq!(Inspect::for_port(80), Some(Inspect::Http));
+        for port in [0u16, 22, 25, 8080, 8443, 65535] {
+            assert_eq!(
+                Inspect::for_port(port),
+                None,
+                "port {port} must get no inspection"
+            );
+        }
+    }
+
+    /// A client on port 80 that does not start with an HTTP method sends
+    /// no HTTP request. The reader must not wait for the end of a head
+    /// that never comes.
+    #[test]
+    fn a_first_byte_that_is_not_a_method_ends_the_http_read() {
+        // A real request is not complete before the empty line.
+        assert!(!Inspect::Http.is_complete(b"GET / HTTP/1.1\r\n"));
+        assert!(Inspect::Http.is_complete(b"GET / HTTP/1.1\r\n\r\n"));
+        // The first byte of a TLS record, of a lowercase word and of a
+        // digit: none of them starts an HTTP method.
+        for first in [&b"\x16\x03\x01"[..], &b"get /"[..], &b"1234"[..]] {
+            assert!(
+                Inspect::Http.is_complete(first),
+                "the reader must not wait for {first:?}"
+            );
+        }
+        // An empty buffer is never complete: the client sent nothing yet.
+        assert!(!Inspect::Http.is_complete(b""));
+    }
+
+    /// The reader stops when the client closes its side, and it keeps the
+    /// bytes that it read. The caller forwards them to the destination.
+    #[tokio::test]
+    async fn the_reader_stops_at_the_end_of_the_client_data() {
+        use tokio::io::AsyncWriteExt;
+        let (mut a, mut b) = tokio::io::duplex(64);
+        // Two bytes of a TLS record, then the end of the stream.
+        a.write_all(&[0x16, 0x03]).await.unwrap();
+        a.shutdown().await.unwrap();
+        drop(a);
+        let buf = read_initial(&mut b, vec![], Inspect::Tls, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(buf, vec![0x16, 0x03]);
+    }
 }
 
 /// Property tests of the readers of the first client bytes.

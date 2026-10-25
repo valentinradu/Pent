@@ -649,6 +649,7 @@ impl TryFrom<&pent_settings::ProxySettings> for ProxyConfig {
 
 #[cfg(test)]
 #[allow(clippy::items_after_statements)] // use statements inside test fns after skip_if_no_bind!()
+#[allow(clippy::panic)] // a test that reaches a branch it must not reach fails
 mod tests {
     use super::*;
 
@@ -1216,20 +1217,23 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpStream;
 
+        // Port 0 and the address of the handle: a fixed port makes the
+        // test fail when another test or another program holds the port.
         let config = ProxyConfig {
-            dns_bind_addr: "127.0.0.1:25366".parse()?,
-            proxy_bind_addr: "127.0.0.1:29313".parse()?,
+            dns_bind_addr: "127.0.0.1:0".parse()?,
+            proxy_bind_addr: "127.0.0.1:0".parse()?,
             domain_allowlist: vec!["example.com".to_string()],
             ..Default::default()
         };
         let server = ProxyServer::new(config)?;
         let handle = server.start().await?;
-
-        // Give the spawned server task time to actually bind
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let Some(proxy) = handle.proxy_addr() else {
+            crate::test_support::skip("the proxy has no TCP address");
+            return Ok(());
+        };
 
         // Connect to proxy and try direct IP (not resolved through DNS)
-        let mut stream = TcpStream::connect("127.0.0.1:29313").await?;
+        let mut stream = TcpStream::connect(proxy).await?;
 
         // SOCKS5 handshake
         stream.write_all(&[0x05, 0x01, 0x00]).await?;
@@ -1240,8 +1244,15 @@ mod tests {
         let request = [0x05, 0x01, 0x00, 0x01, 1, 2, 3, 4, 0x00, 0x50];
         stream.write_all(&request).await?;
 
+        // The reply must arrive. Without `read_exact` an empty read leaves
+        // the buffer at zero, and the test then fails for the wrong
+        // reason.
         let mut reply = [0u8; 10];
-        let _ = stream.read(&mut reply).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream.read_exact(&mut reply),
+        )
+        .await??;
 
         // Should be rejected (reply[1] != 0x00)
         assert_ne!(reply[1], 0x00, "Direct IP should be rejected");
@@ -1750,6 +1761,90 @@ mod tests {
             matches!(read, Ok(Ok(0) | Err(_))),
             "the relay is still open after shutdown: {read:?}"
         );
+        Ok(())
+    }
+
+    // ========================================================================
+    // The decisions and the error paths that the coverage run found open.
+    // See docs/testing/fuzzing-and-coverage.md.
+    // ========================================================================
+
+    /// Each field of the settings reaches the configuration of the proxy.
+    ///
+    /// `test_try_from_settings_defaults` covers the empty settings. This
+    /// test covers the branch of each field that the user sets. The policy
+    /// for destinations that are not public is a security decision: a user
+    /// who writes `deny` must get `Deny`.
+    #[test]
+    fn each_setting_reaches_the_configuration() -> TestResult {
+        use pent_settings::ProxySettings;
+
+        let settings = ProxySettings {
+            upstream_dns: Some(vec!["9.9.9.9:53".to_string()]),
+            dns_ttl_seconds: Some(120),
+            tcp_connect_timeout_secs: Some(7),
+            tcp_idle_timeout_secs: Some(11),
+            private_destinations: Some(pent_settings::PrivateDestinations::Allow),
+        };
+        let config = ProxyConfig::try_from(&settings)?;
+        assert_eq!(config.dns_ttl, std::time::Duration::from_secs(120));
+        assert_eq!(
+            config.tcp_connect_timeout,
+            std::time::Duration::from_secs(7)
+        );
+        assert_eq!(config.tcp_idle_timeout, std::time::Duration::from_secs(11));
+        assert_eq!(config.private_destinations, PrivateDestinations::Allow);
+        assert_eq!(
+            config.upstream_dns,
+            Some(vec!["9.9.9.9:53".parse::<SocketAddr>()?])
+        );
+
+        // "deny" stays "deny".
+        let settings = ProxySettings {
+            private_destinations: Some(pent_settings::PrivateDestinations::Deny),
+            ..ProxySettings::default()
+        };
+        let config = ProxyConfig::try_from(&settings)?;
+        assert_eq!(config.private_destinations, PrivateDestinations::Deny);
+        Ok(())
+    }
+
+    /// A domain that the caller adds at run time reaches the filter, and a
+    /// pattern that is not valid changes nothing.
+    #[tokio::test]
+    async fn a_domain_added_at_run_time_reaches_the_filter() -> TestResult {
+        skip_if_no_bind!();
+        let config = ProxyConfig {
+            domain_allowlist: vec!["example.com".to_string()],
+            ..Default::default()
+        };
+        let handle = ProxyServer::new(config)?.start().await?;
+        assert_eq!(handle.allowlist(), vec!["example.com".to_string()]);
+        assert_eq!(handle.connections_accepted(), 0);
+        assert_eq!(
+            handle
+                .connections_accepted_ref()
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        assert_eq!(handle.dropped_trace_events(), 0);
+
+        handle.add_domain("*.added.example".to_string())?;
+        let allowlist = handle.allowlist();
+        assert!(
+            allowlist.contains(&"*.added.example".to_string()),
+            "{allowlist:?}"
+        );
+
+        // A pattern that is not valid gives an error and adds nothing.
+        let before = handle.allowlist();
+        match handle.add_domain("hüh.example".to_string()) {
+            Err(ProxyError::InvalidDomain(_)) => {}
+            other => panic!("a name that is not ASCII must be an error: {other:?}"),
+        }
+        assert_eq!(handle.allowlist(), before);
+
+        handle.shutdown().await?;
         Ok(())
     }
 }
