@@ -78,23 +78,29 @@ jobs:
       - name: Build
         run: cargo build --workspace --tests
 
-      # TEMPORARY. The test of MAC-10 shows an empty raw log, and the
-      # same command by hand records 27 accesses. The report of the test
-      # now holds the summary of the run and the listing of the directory
-      # of the runs, which tells the two causes apart. The step never
-      # fails. Remove it when MAC-10 has a verdict.
+      # TEMPORARY. The test of MAC-10 records 0 accesses when it runs
+      # first, and the same command by hand after it records 27. The step
+      # holds that apart: it warms the unified log with one watch run and
+      # then runs the test. Remove it when MAC-10 has a verdict.
       - name: Probe the open macOS findings
         if: runner.os == 'macOS'
         run: |
           set +e
-          probe() {
-            echo "=== PROBE $2 ==="
-            cargo test -p pent --test "$1" -- --include-ignored --exact "$2" \
-              --test-threads=1 --nocapture
-            echo "=== PROBE RESULT $2: exit=$? ==="
-          }
-          probe e2e_macos macos::watch_records_a_read_of_a_short_lived_child
-          probe e2e_macos macos::watch_records_a_read_of_a_known_file
+          PENTBIN=$(cargo build -p pent --message-format=json 2>/dev/null \
+            | /usr/bin/sed -n 's/.*"executable":"\([^"]*\/pent\)".*/\1/p' | tail -1)
+          echo "=== W warm the unified log with one watch run ==="
+          H=$(cd "$(mktemp -d)" && pwd -P)
+          mkdir -p "$H/home" "$H/ws"
+          printf 'foo\n' > "$H/home/.foorc"
+          ( cd "$H/ws" && HOME="$H/home" XDG_CONFIG_HOME="$H/cfg" \
+            XDG_STATE_HOME="$H/state" "$PENTBIN" watch --yes --profile w \
+            -- /bin/sh -c 'cat ~/.foorc; echo END' 2>&1 | grep -a accesses )
+          echo "=== PROBE the test of MAC-10 after the warm-up ==="
+          cargo test -p pent --test e2e_macos -- --include-ignored --exact \
+            macos::watch_records_a_read_of_a_short_lived_child \
+            --test-threads=1 --nocapture 2>&1 | grep -av '^   [0-9]*:' \
+            | grep -av '^             at '
+          echo "=== PROBE RESULT MAC-10 after the warm-up: exit=$? ==="
           exit 0
 
       # The whole workspace, in debug. The macOS suites (e2e_macos,
