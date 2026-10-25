@@ -24,19 +24,14 @@ pub(crate) fn home_dir() -> Result<PathBuf, CliError> {
         .ok_or_else(|| CliError::Other("the home directory is not available".to_string()))
 }
 
-/// The directories that the sandbox defaults already allow. The summary
-/// omits paths below them.
+/// The directories that the sandbox already allows without a rule. The
+/// summary omits paths below them.
 ///
 /// The traversal list is not in the result: a traversal grant on `/` gives
 /// no read access.
 pub(crate) fn covered_paths() -> Vec<PathBuf> {
-    let (_traversal, read, execute, read_write) =
-        pent_sandbox::system_default_paths().expand_paths();
-    read.into_iter()
-        .chain(execute)
-        .chain(read_write)
-        .map(|(path, _glob)| path)
-        .collect()
+    let path_env = std::env::var("PATH").unwrap_or_default();
+    pent_sandbox::implicit_allowed_paths(&path_env)
 }
 
 /// What to do when the review needs the user and pent has no terminal.

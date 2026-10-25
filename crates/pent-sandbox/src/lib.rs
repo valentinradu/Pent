@@ -71,6 +71,35 @@ pub use pent_settings::{Mount, NetworkMode, SandboxPaths, SandboxSettings};
 use std::process::Child;
 use thiserror::Error;
 
+/// Return the paths that the sandbox allows without a profile rule.
+///
+/// The list has the default paths of [`system_default_paths`], the paths that
+/// the platform backend always allows (on Linux: `/nix/store`, `/proc`, the
+/// device nodes, ...), the directories in `path_env` (a `PATH` value) and
+/// their canonical targets. The summary of watch mode omits accesses below
+/// these paths, because a profile does not need a rule for them.
+#[must_use]
+pub fn implicit_allowed_paths(path_env: &str) -> Vec<std::path::PathBuf> {
+    let (_traversal, read, execute, read_write) = system_default_paths().expand_paths();
+    let mut paths: Vec<std::path::PathBuf> = read
+        .into_iter()
+        .chain(execute)
+        .chain(read_write)
+        .map(|(path, _glob)| path)
+        .collect();
+    #[cfg(target_os = "linux")]
+    paths.extend(linux::implicit_paths());
+    for dir in resolve_path_dirs_from(path_env) {
+        if let Ok(real) = std::fs::canonicalize(&dir) {
+            paths.push(real);
+        }
+        paths.push(dir);
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
 /// The options of watch mode.
 ///
 /// Watch mode does not apply the sandbox policy. It records each access of

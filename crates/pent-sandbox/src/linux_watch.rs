@@ -11,11 +11,12 @@
 //! - An exec guard (`sudo`, ...): `PR_SET_NO_NEW_PRIVS` makes setuid
 //!   binaries fail. Pent only marks the attempt.
 //!
-//! A bind mount needs a target that exists. Pent cannot enforce a guard on a
-//! path that does not exist when the child starts (for example a write guard
-//! on `~/.zshrc` when the file does not exist, or an SSH key that the program
-//! creates). The recorder reports such an access as `Outcome::Allowed`,
-//! because the access goes through.
+//! A bind mount needs a target that exists. For a write guard on a path that
+//! does not exist when the child starts (for example `~/.zshrc`), the
+//! supervisor denies the create or the write itself with EACCES and reports
+//! `Outcome::Blocked`. Another thread of the process can race that check, so
+//! it stops accidents, not a hostile program. A read guard on a path that
+//! does not exist needs no protection: there is nothing to read.
 //!
 //! # The recorder
 //!
@@ -100,6 +101,10 @@ pub(crate) struct GuardPlan {
     /// with these rules. A rule on a path that did not exist at the start is
     /// not in this list.
     pub(crate) effective: Vec<GuardRule>,
+    /// The write rules on paths that did not exist at the start. A bind mount
+    /// cannot enforce them, so the supervisor denies a write or a create on
+    /// these paths itself (see [`Judge::denies`]).
+    pub(crate) unenforced: Vec<GuardRule>,
 }
 
 impl GuardPlan {
@@ -172,7 +177,13 @@ pub(crate) fn plan_guard(rules: &[GuardRule]) -> GuardPlan {
             (
                 GuardAccess::Read | GuardAccess::Write,
                 GuardTarget::Exact(p) | GuardTarget::Subtree(p),
-            ) => plan.add_existing(rule, p),
+            ) => {
+                if rule.access == GuardAccess::Write && std::fs::symlink_metadata(p).is_err() {
+                    plan.unenforced.push(rule.clone());
+                } else {
+                    plan.add_existing(rule, p);
+                }
+            }
             (GuardAccess::Read | GuardAccess::Write, GuardTarget::FilesInDir { dir, .. }) => {
                 let Ok(entries) = std::fs::read_dir(dir) else {
                     continue;
@@ -764,8 +775,14 @@ fn seqpacket_pair() -> Result<(OwnedFd, OwnedFd), SandboxError> {
 
 /// How the recorder decides the outcome of an event.
 pub(crate) enum Judge {
-    /// Watch mode: the rules that the guard enforces.
-    Guard(Vec<GuardRule>),
+    /// Watch mode: the rules that the guard mounts enforce, and the write
+    /// rules on paths that did not exist at the start.
+    Guard {
+        /// The rules that the mounts enforce.
+        enforced: Vec<GuardRule>,
+        /// The write rules that the supervisor enforces.
+        unenforced: Vec<GuardRule>,
+    },
     /// `pent run --trace`: the prediction of the Landlock policy.
     Policy(AccessPolicy),
 }
@@ -773,23 +790,51 @@ pub(crate) enum Judge {
 impl Judge {
     fn fs(&self, op: FsOp, path: &Path, is_dir: bool) -> Outcome {
         match self {
-            Self::Guard(rules) => {
-                let access = match op {
-                    FsOp::Read => GuardAccess::Read,
-                    FsOp::Exec => GuardAccess::ExecName,
-                    FsOp::Write | FsOp::Create | FsOp::Delete => GuardAccess::Write,
-                };
-                classify(rules, path, access).map_or(Outcome::Allowed, Outcome::Blocked)
+            Self::Guard {
+                enforced,
+                unenforced,
+            } => {
+                let access = guard_access(op);
+                classify(enforced, path, access)
+                    .or_else(|| {
+                        (access == GuardAccess::Write)
+                            .then(|| classify(unenforced, path, access))
+                            .flatten()
+                    })
+                    .map_or(Outcome::Allowed, Outcome::Blocked)
             }
             Self::Policy(policy) => policy.predict(op, path, is_dir),
         }
     }
 
+    /// Return true if the supervisor must deny the call. This is a write to
+    /// a guarded path that has no mount, because it did not exist at the
+    /// start (for example `~/.zshrc`). Another thread of the process can
+    /// race this check, so it stops accidents, not a hostile program.
+    fn denies(&self, op: FsOp, path: &Path) -> bool {
+        match self {
+            Self::Guard { unenforced, .. } => {
+                let access = guard_access(op);
+                access == GuardAccess::Write && classify(unenforced, path, access).is_some()
+            }
+            Self::Policy(_) => false,
+        }
+    }
+
     fn unix(&self, target: &str) -> Outcome {
         match self {
-            Self::Guard(_) => Outcome::Allowed,
+            Self::Guard { .. } => Outcome::Allowed,
             Self::Policy(policy) => policy.predict_unix(target),
         }
+    }
+}
+
+/// The guard access that matches a filesystem operation.
+const fn guard_access(op: FsOp) -> GuardAccess {
+    match op {
+        FsOp::Read => GuardAccess::Read,
+        FsOp::Exec => GuardAccess::ExecName,
+        FsOp::Write | FsOp::Create | FsOp::Delete => GuardAccess::Write,
     }
 }
 
@@ -922,6 +967,8 @@ impl ProcCache {
 struct Supervisor {
     listener: OwnedFd,
     judge: Judge,
+    /// Deny the current call with EACCES instead of `CONTINUE`.
+    deny: bool,
     procs: ProcCache,
     page: usize,
     /// The buffer for `SECCOMP_IOCTL_NOTIF_RECV` (the kernel size or more).
@@ -972,6 +1019,7 @@ impl Supervisor {
         Self {
             listener,
             judge,
+            deny: false,
             procs: ProcCache::default(),
             page,
             req: aligned_buffer(req_len.max(std::mem::size_of::<libc::seccomp_notif>())),
@@ -1061,6 +1109,7 @@ impl Supervisor {
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let notif = unsafe { std::ptr::read(self.req.as_ptr().cast::<libc::seccomp_notif>()) };
         self.out.clear();
+        self.deny = false;
         self.record(&notif);
         if !self.out.is_empty() && !self.id_valid(notif.id) {
             // The task died; its PID can belong to another process now.
@@ -1077,13 +1126,22 @@ impl Supervisor {
 
     fn respond(&mut self, id: u64) {
         self.resp.fill(0);
-        let resp = libc::seccomp_notif_resp {
-            id,
-            val: 0,
-            error: 0,
-            // The flag value is 1.
-            #[allow(clippy::cast_possible_truncation)]
-            flags: libc::SECCOMP_USER_NOTIF_FLAG_CONTINUE as u32,
+        let resp = if self.deny {
+            libc::seccomp_notif_resp {
+                id,
+                val: 0,
+                error: -libc::EACCES,
+                flags: 0,
+            }
+        } else {
+            libc::seccomp_notif_resp {
+                id,
+                val: 0,
+                error: 0,
+                // The flag value is 1.
+                #[allow(clippy::cast_possible_truncation)]
+                flags: libc::SECCOMP_USER_NOTIF_FLAG_CONTINUE as u32,
+            }
         };
         // SAFETY: `resp` buffer is aligned for u64 and at least as large as
         // `struct seccomp_notif_resp`.
@@ -1212,6 +1270,7 @@ impl Supervisor {
             .flatten()
             .filter(|t| *t != path);
         let outcome = self.judge.fs(op, &path, st.is_dir);
+        self.deny |= self.judge.denies(op, &path);
         self.out.push(WatchEvent::Fs {
             op,
             path,
@@ -1220,6 +1279,7 @@ impl Supervisor {
         });
         if let Some(target) = target {
             let outcome = self.judge.fs(op, &target, st.is_dir);
+            self.deny |= self.judge.denies(op, &target);
             self.out.push(WatchEvent::Fs {
                 op,
                 path: target,
@@ -1736,7 +1796,10 @@ mod tests {
         assert_eq!(plan.mask_files, vec![ssh.join("id_ed25519")]);
         assert_eq!(plan.mask_dirs, vec![gnupg.clone()]);
         assert_eq!(plan.ro_binds, vec![root.join(".bashrc")]);
-        let judge = Judge::Guard(plan.effective);
+        let judge = Judge::Guard {
+            enforced: plan.effective,
+            unenforced: plan.unenforced,
+        };
         let cred = Outcome::Blocked(GuardClass::Credential);
         let pers = Outcome::Blocked(GuardClass::Persistence);
         assert_eq!(judge.fs(FsOp::Read, &ssh.join("id_ed25519"), false), cred);
@@ -1750,10 +1813,11 @@ mod tests {
             judge.fs(FsOp::Read, &root.join(".bashrc"), false),
             Outcome::Allowed
         );
-        assert_eq!(
-            judge.fs(FsOp::Create, &root.join(".zshrc"), false),
-            Outcome::Allowed
-        );
+        // `.zshrc` does not exist, so no mount enforces the rule: the
+        // supervisor denies the create.
+        assert_eq!(judge.fs(FsOp::Create, &root.join(".zshrc"), false), pers);
+        assert!(judge.denies(FsOp::Create, &root.join(".zshrc")));
+        assert!(!judge.denies(FsOp::Write, &root.join(".bashrc")));
         assert_eq!(
             judge.fs(FsOp::Exec, Path::new("/usr/bin/sudo"), false),
             Outcome::Blocked(GuardClass::PrivilegeEscalation)

@@ -16,6 +16,10 @@ use crate::{FsOp, GuardClass, Outcome, ProfileDoc, WatchEvent};
 /// directory.
 const DIR_THRESHOLD: usize = 4;
 
+/// The number of written files in one directory that give one read-write
+/// rule on the directory.
+const WRITE_DIR_THRESHOLD: usize = 2;
+
 /// The number of names below one registrable domain that makes one wildcard.
 const WILDCARD_THRESHOLD: usize = 3;
 
@@ -469,6 +473,19 @@ impl Env {
             .is_some_and(|home| CACHE_DIRS.iter().any(|r| path.starts_with(home.join(r))))
     }
 
+    /// Return the program directory in a cache (`~/.cache/<name>`) for a
+    /// path below it. A program owns its cache directory, and the file
+    /// names in it change, so the summary always makes one rule for it.
+    fn cache_root(&self, path: &Path) -> Option<PathBuf> {
+        let home = self.home.as_ref()?;
+        CACHE_DIRS.iter().find_map(|r| {
+            let cache = home.join(r);
+            let rel = path.strip_prefix(&cache).ok()?;
+            let first = rel.components().next()?;
+            Some(cache.join(first))
+        })
+    }
+
     fn is_outside_home(&self, path: &Path) -> bool {
         !self
             .home
@@ -616,6 +633,11 @@ fn fs_items(fs: &FsLog, env: &Env, order: &[String]) -> Vec<Item> {
     let mut rw_dirs = BTreeSet::new();
     let mut rw = BTreeSet::new();
     for path in fs.created.iter().chain(fs.deleted.iter()) {
+        if let Some(cache) = env.cache_root(path) {
+            rw_dirs.insert(cache.clone());
+            rw.insert(cache);
+            continue;
+        }
         let Some(dir) = path.parent() else {
             continue;
         };
@@ -630,9 +652,25 @@ fn fs_items(fs: &FsLog, env: &Env, order: &[String]) -> Vec<Item> {
             rw.insert(dir.to_path_buf());
         }
     }
-    for path in fs.writes.keys() {
-        if !fs.created.contains(path) {
-            rw.insert(path.clone());
+    // Writes to existing files: two or more files in one directory give the
+    // directory, because the program probably writes other files there too.
+    let mut writes_in_dir: BTreeMap<&Path, usize> = BTreeMap::new();
+    for path in fs.writes.keys().filter(|p| !fs.created.contains(*p)) {
+        if let Some(cache) = env.cache_root(path) {
+            rw_dirs.insert(cache.clone());
+            rw.insert(cache);
+            continue;
+        }
+        rw.insert(path.clone());
+        if let Some(dir) = path.parent() {
+            let n = writes_in_dir.entry(dir).or_default();
+            *n = n.saturating_add(1);
+        }
+    }
+    for (dir, n) in writes_in_dir {
+        if n >= WRITE_DIR_THRESHOLD && env.can_group(dir) {
+            rw_dirs.insert(dir.to_path_buf());
+            rw.insert(dir.to_path_buf());
         }
     }
     let rw = group(&rw, |p| rw_dirs.contains(p), env);
@@ -643,8 +681,8 @@ fn fs_items(fs: &FsLog, env: &Env, order: &[String]) -> Vec<Item> {
     let read: BTreeSet<PathBuf> = fs
         .reads
         .keys()
+        .map(|p| env.cache_root(p).unwrap_or_else(|| p.clone()))
         .filter(|p| !wider_exists(p))
-        .cloned()
         .collect();
     let read = group(&read, |_| true, env);
 
@@ -1172,6 +1210,42 @@ mod tests {
             .map(|i| fs(Read, &format!("/home/u/work/other{i}/README.md"), "tool"))
             .collect();
         assert_eq!(run(&events).len(), 4);
+    }
+
+    #[test]
+    fn cache_accesses_give_the_cache_directory() {
+        let events = [
+            fs(Write, "/home/u/.cache/app/a/f1", "app"),
+            fs(Read, "/home/u/.cache/app/b/f2", "app"),
+            fs(Read, "/home/u/.cache/other/x", "app"),
+        ];
+        let lines = run(&events);
+        assert!(
+            lines.iter().any(|l| l.starts_with("rw ~/.cache/app")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.starts_with("r ~/.cache/other")),
+            "{lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("f1") || l.contains("f2")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn two_written_files_give_the_directory() {
+        let events = [
+            fs(Write, "/home/u/.config/app/a.json", "app"),
+            fs(Write, "/home/u/.config/app/b.json", "app"),
+        ];
+        let lines = run(&events);
+        assert!(
+            lines.iter().any(|l| l.starts_with("rw ~/.config/app")),
+            "{lines:?}"
+        );
+        assert!(!lines.iter().any(|l| l.contains("a.json")), "{lines:?}");
     }
 
     #[test]

@@ -335,6 +335,21 @@ fn add_ruleset_rules(
     }
 }
 
+/// Return the paths that the Landlock backend always allows, in addition to
+/// the configuration: the system paths, the temporary paths, the device
+/// nodes and `/proc`.
+#[must_use]
+pub(crate) fn implicit_paths() -> Vec<PathBuf> {
+    SYSTEM_PATHS
+        .iter()
+        .chain(TEMP_PATHS)
+        .chain(DEV_RW_PATHS)
+        .chain(DEV_READ_PATHS)
+        .chain(PROC_PATHS)
+        .map(PathBuf::from)
+        .collect()
+}
+
 /// Build the Landlock ruleset for `config` (test helper).
 ///
 /// # Errors
@@ -1361,7 +1376,10 @@ pub(crate) fn spawn_linux(
     // waits for an answer from the supervisor.
     let recorder = if record {
         let judge = match guard {
-            Some(plan) => crate::linux_watch::Judge::Guard(plan.effective.clone()),
+            Some(plan) => crate::linux_watch::Judge::Guard {
+                enforced: plan.effective.clone(),
+                unenforced: plan.unenforced.clone(),
+            },
             None => {
                 let mut policy = AccessPolicy::default();
                 add_ruleset_rules(&mut policy, config, path_dirs, &write_set, &overlay_dirs);
