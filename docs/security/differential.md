@@ -26,9 +26,9 @@ code.
 
 | File | Table | Compares |
 |---|---|---|
-| `crates/pent/tests/differential_profile_kernel.rs` | `FS_CASES` (38 rows) | the profile against the kernel |
+| `crates/pent/tests/differential_profile_kernel.rs` | `FS_CASES` (39 rows) | the profile against the kernel |
 | `crates/pent/tests/differential_watch_round_trip.rs` | `WATCH_CASES` (9 rows) | the summary against the kernel |
-| `crates/pent/tests/differential_guard.rs` | `GUARD_CASES` (23 rows) | `classify` against the kernel |
+| `crates/pent/tests/differential_guard.rs` | `GUARD_CASES` (25 rows) | `classify` against the kernel |
 | `crates/pent/tests/differential_network.rs` | `NET_CASES` (7 rows) | the DNS answer, the proxy and the profile |
 
 The tables are in `crates/pent/tests/common/differential.rs`. A row is one
@@ -380,7 +380,7 @@ each character that a regular expression gives a meaning to.
 These results are solid. Each one comes from a real run of the `pent`
 binary, three times, alone, on Linux.
 
-**The profile against the kernel (38 of 38 rows).**
+**The profile against the kernel (39 of 39 rows).**
 
 - A rule on one file gives the file and no sibling.
 - A rule on one directory gives each child, at any depth, and no other
@@ -413,7 +413,7 @@ directory, a write with an atomic rename, a delete, four reads that become
 one directory rule, an execution, the four odd name shapes, a read through
 a symbolic link, and a program that touches nothing.
 
-**`classify` against the kernel (23 of 23 rows on Linux).**
+**`classify` against the kernel (25 of 25 rows on Linux).**
 
 The guard blocks each name shape of a private key, at one and at two levels
 below `~/.ssh`, and also a name with a dot, a plus, brackets or a star in
@@ -444,12 +444,14 @@ are stable:
 
 | Test | Times |
 |---|---|
-| `the_profile_and_the_kernel_agree` (38 rows) | 2.7 s, 2.8 s, 3.0 s |
+| `the_profile_and_the_kernel_agree` (39 rows) | 3.1 s, 3.2 s, 3.1 s |
 | `the_draft_has_each_rule_that_the_program_needs` | 0.8 s, 0.4 s, 0.4 s |
 | `the_draft_has_no_rule_that_the_program_never_needed` | 0.4 s, 0.4 s, 0.4 s |
 | `a_run_with_the_draft_makes_no_denial` | 1.4 s, 1.2 s, 1.1 s |
-| `classify_and_the_kernel_agree` (23 rows) | 0.7 s, 0.7 s, 0.7 s |
+| `classify_and_the_kernel_agree` (25 rows) | 0.8 s, 0.8 s, 0.8 s |
 | `the_three_layers_of_the_network_agree` (7 rows) | 1.0 s, 1.0 s, 1.0 s |
 
-Each of the eight tests of a disagreement failed in all three runs, with
-the same message. No finding of this document comes from one run.
+Each of the eight tests of a disagreement failed in all three runs of
+the review, with the same message. No finding of this document comes from
+one run. After the fixes, the test of each closed finding passes and the
+two tests of DIFF-3 and DIFF-9 still hold the open assertion.
