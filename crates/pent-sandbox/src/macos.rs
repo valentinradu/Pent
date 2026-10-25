@@ -1036,7 +1036,7 @@ pub(crate) fn child_env(config: &SandboxConfig) -> std::collections::HashMap<Str
 /// each report against the program that the PID runs, and the process table
 /// misses a process that lives less than one poll interval. These two names
 /// come from pent itself, so the reports of a short-lived root process also
-/// reach the recorder. See MAC-6 in `docs/security/macos.md`.
+/// reach the recorder. See MAC-8 in `docs/security/macos.md`.
 fn root_process_names(cmd: &str) -> Vec<String> {
     let command = Path::new(cmd)
         .file_name()
@@ -2042,7 +2042,7 @@ mod tests {
 
     /// The root process of a run has two names: the front end and the
     /// command. The reader needs both, because `sandbox-exec` runs the
-    /// command in the same process (MAC-6).
+    /// command in the same process (MAC-8).
     #[test]
     fn the_root_process_has_the_name_of_the_front_end_and_of_the_command() {
         assert_eq!(

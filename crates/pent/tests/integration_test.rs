@@ -75,7 +75,7 @@ fn expect_failure(out: &Output) {
 // /bin/true`, which answered a different question and gave the wrong
 // answer: it asked whether `sandbox-exec` can run `/bin/true`. The probe
 // read each failure of that program as "no sandbox", so thirteen tests
-// skipped on a machine that runs the sandbox well. See MAC-5 in
+// skipped on a machine that runs the sandbox well. See MAC-7 in
 // `docs/security/macos.md`.
 
 /// Extra --read flags that must be added to give the sandboxed shell

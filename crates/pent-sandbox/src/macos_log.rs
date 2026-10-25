@@ -73,7 +73,7 @@
 //!   never reaches the process table, and pent knows no name of it, so its
 //!   reports go. The root process is safe, because pent knows its names.
 //!   macOS watch mode is a lower bound for this reason; `--append` merges
-//!   more runs. See MAC-6 in `docs/security/macos.md`.
+//!   more runs. See MAC-8 in `docs/security/macos.md`.
 //! - A file name whose first 16 bytes are the whole name of the record and
 //!   whose rest holds a marker is refused, also when it is honest. Such a
 //!   name is a forgery or a name that nobody needs.
@@ -427,18 +427,13 @@ pub(crate) struct ProcessTree {
 }
 
 impl ProcessTree {
-    /// Create a tree with only `root` and no name for it.
-    pub(crate) fn new(root: u32) -> Self {
-        Self::with_names(root, &[])
-    }
-
     /// Create a tree with only `root`, and with the names of the programs
     /// that `root` runs.
     ///
     /// The process table is one source of the name of a process, and it
     /// misses a process that lives less than one poll interval. Pent
     /// itself is the second source: it starts the root process, so it
-    /// knows the program of the root before the first poll. See MAC-6 in
+    /// knows the program of the root before the first poll. See MAC-8 in
     /// `docs/security/macos.md`.
     pub(crate) fn with_names(root: u32, names: &[String]) -> Self {
         let root_names: HashSet<String> = names.iter().filter(|n| !n.is_empty()).cloned().collect();
@@ -725,7 +720,7 @@ mod runtime {
         /// `root_names` holds the names of the programs that the root
         /// process runs: the front end `sandbox-exec` and the command of
         /// the user. A short-lived root never reaches the process table, so
-        /// without these names the reader drops each report of it (MAC-6 in
+        /// without these names the reader drops each report of it (MAC-8 in
         /// `docs/security/macos.md`).
         pub(crate) fn attach(
             mut self,
@@ -789,7 +784,7 @@ mod runtime {
             // is a source that the program does not choose. Without it,
             // each report after the first exec of a process has a name
             // that no snapshot of the process table holds yet, and the
-            // reader drops it (MAC-6).
+            // reader drops it (MAC-8).
             if record.operation.starts_with("process-exec") && record.target.starts_with('/') {
                 lock(tree)
                     .tree
@@ -1006,7 +1001,7 @@ mod tests {
     fn a_pid_outside_the_tree_is_not_in_the_record() {
         let r = record("Sandbox: other(1234) deny(1) file-read-data /etc/passwd");
         assert_eq!(r.pid, 1234);
-        let mut tree = ProcessTree::new(10);
+        let mut tree = ProcessTree::with_names(10, &[]);
         assert!(tree.update(&parse_ps_output("10 1 S\n")));
         assert!(tree.contains(10));
         assert!(!tree.contains(r.pid));
@@ -1132,7 +1127,7 @@ mod tests {
     /// does not fit is a forgery.
     #[test]
     fn the_name_of_a_report_must_fit_the_program() {
-        let mut tree = ProcessTree::new(10);
+        let mut tree = ProcessTree::with_names(10, &[]);
         let _live = tree.update(&parse_ps_output(
             "10 1 S /bin/sh\n\
              11 10 S /usr/bin/cat\n\
@@ -1162,7 +1157,7 @@ mod tests {
         assert!(!names_agree("cat", ""));
     }
 
-    /// MAC-6. A root process that lives less than one poll interval never
+    /// MAC-8. A root process that lives less than one poll interval never
     /// reaches the process table. Pent starts that process, so it gives
     /// the two names of it to the tree, and the reports of the process
     /// reach the recorder.
@@ -1176,11 +1171,11 @@ mod tests {
         // Another PID gets nothing from the names of the root.
         assert!(!tree.name_fits(11, "cat"));
         // A tree without names keeps the old behaviour.
-        let empty = ProcessTree::new(10);
+        let empty = ProcessTree::with_names(10, &[]);
         assert!(!empty.name_fits(10, "cat"));
     }
 
-    /// MAC-6. A process that runs a new file keeps its PID, and the name
+    /// MAC-8. A process that runs a new file keeps its PID, and the name
     /// of each later report is the name of the new file. The exec report
     /// gives that name, and the earlier name stays valid for a report that
     /// arrives late.
@@ -1203,7 +1198,7 @@ mod tests {
 
     #[test]
     fn tree_follows_descendants_and_ends() {
-        let mut tree = ProcessTree::new(10);
+        let mut tree = ProcessTree::with_names(10, &[]);
         // 10 -> 11 -> 12; 20 is not ours.
         let rows = parse_ps_output("10 1 S\n11 10 S\n12 11 S\n20 1 S\n");
         assert!(tree.update(&rows));
@@ -1222,7 +1217,7 @@ mod tests {
 
     #[test]
     fn tree_ignores_reused_pid() {
-        let mut tree = ProcessTree::new(10);
+        let mut tree = ProcessTree::with_names(10, &[]);
         assert!(tree.update(&parse_ps_output("10 1 S\n")));
         assert!(!tree.update(&parse_ps_output("")));
         // An unrelated process gets PID 10 again.
@@ -1231,14 +1226,14 @@ mod tests {
 
     #[test]
     fn tree_records_zombie_children() {
-        let mut tree = ProcessTree::new(10);
+        let mut tree = ProcessTree::with_names(10, &[]);
         assert!(tree.update(&parse_ps_output("10 1 S\n11 10 Z\n")));
         assert!(tree.contains(11));
     }
 
     #[test]
     fn tree_without_root_is_empty() {
-        let mut tree = ProcessTree::new(10);
+        let mut tree = ProcessTree::with_names(10, &[]);
         assert!(!tree.update(&parse_ps_output("20 1 S\n")));
     }
 }
@@ -1511,7 +1506,7 @@ mod log_properties {
                 rows.len() <= text.lines().count(),
                 "the parser made rows out of nothing"
             );
-            let mut tree = ProcessTree::new(rng.below(8).try_into().unwrap_or(0));
+            let mut tree = ProcessTree::with_names(rng.below(8).try_into().unwrap_or(0), &[]);
             // Three updates: the second and the third see the state that the
             // first left behind.
             for _ in 0..3 {
@@ -1563,7 +1558,7 @@ mod log_properties {
         // The same through the process table. A file name holds no `/`, so
         // a crafted name of one component looks like this one; the check
         // works on the file name that `ps` gives either way.
-        let mut tree = ProcessTree::new(1234);
+        let mut tree = ProcessTree::with_names(1234, &[]);
         let _live = tree.update(&parse_ps_output(
             "1234 1 S /tmp/a(1234) deny(1) file-read-data x\n\
              1235 1234 S /bin/cat\n",

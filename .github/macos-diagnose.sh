@@ -5,12 +5,12 @@
 # of the machine to the four open questions:
 #
 # A. Why does `sandbox-exec -p '(version 1) (allow default)' /bin/true`
-#    fail? (MAC-5)
+#    fail? (MAC-7)
 # B. Does a `(with report)` allow rule put a line in the unified log, and
-#    what is the exact text of that line? (MAC-6)
+#    what is the exact text of that line? (MAC-8)
 # C. Does `(deny process-exec)` after `(allow default)` stop a program?
 #    (MAC-4)
-# D. How long can a path in a profile be? (MAC-7)
+# D. How long can a path in a profile be? (MAC-9)
 #
 # Remove this script and its step in ci.yml when the findings are closed.
 
