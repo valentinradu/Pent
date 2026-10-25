@@ -3,6 +3,9 @@
 //! Each test binary uses only some of the helpers.
 #![allow(dead_code)] // each test binary uses a different subset of the helpers
 
+#[cfg(unix)]
+pub mod e2e;
+
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 

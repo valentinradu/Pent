@@ -201,7 +201,16 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
     let mut denied = DeniedRecorder::new(&store, &name);
     let mut sink = |event: RunEvent| match event {
         RunEvent::Trace(line) => write_trace_line(trace_log_path.as_deref(), &line),
-        RunEvent::Access(event) => denied.record(&event),
+        RunEvent::Access(event) => {
+            // Linux: the recorder sends the filesystem denials only with
+            // --trace. Write them to the trace log too. On macOS, the trace
+            // log gets them from `log stream`.
+            #[cfg(target_os = "linux")]
+            if let Some(line) = fs_trace_line(&event, &name) {
+                write_trace_line(trace_log_path.as_deref(), &line);
+            }
+            denied.record(&event);
+        }
     };
     let (exit_status, rest) = wait_child(child, &mut signals, Some(event_rx), &mut sink).await;
 
@@ -538,6 +547,41 @@ fn proxy_trace_line(event: TraceEvent, profile: &ProfileName) -> TraceLine {
             message: msg,
         },
     }
+}
+
+/// Convert a denied filesystem access into a trace line with a fix hint.
+///
+/// Returns `None` for other events and for accesses that the sandbox did not
+/// deny.
+#[cfg(any(target_os = "linux", test))]
+fn fs_trace_line(event: &WatchEvent, profile: &ProfileName) -> Option<TraceLine> {
+    let WatchEvent::Fs {
+        op,
+        path,
+        process,
+        outcome: Outcome::Denied,
+    } = event
+    else {
+        return None;
+    };
+    let (verb, flag) = match op {
+        pent_profile::FsOp::Read => ("read", "--read"),
+        pent_profile::FsOp::Write => ("write", "--write"),
+        pent_profile::FsOp::Create => ("create", "--write"),
+        pent_profile::FsOp::Delete => ("delete", "--write"),
+        pent_profile::FsOp::Exec => ("exec", "--execute"),
+    };
+    let path = path.display();
+    Some(TraceLine::Denied {
+        message: format!(
+            "filesystem: \"{}\" (pid {}) was denied {verb} on \"{path}\"",
+            process.name, process.pid
+        ),
+        fix: Some(format!(
+            "allow it for one run with {flag} \"{path}\", or add it to the profile: \
+             pent trust {profile} --review"
+        )),
+    })
 }
 
 /// Compute a fix hint for a proxy violation message.
@@ -1196,7 +1240,32 @@ mod tests {
         );
     }
 
-    // ── macOS log parsing ────────────────────────────────────────────────────
+    #[test]
+    fn fs_denial_gives_a_trace_line() {
+        let event = |outcome| WatchEvent::Fs {
+            op: pent_profile::FsOp::Create,
+            path: PathBuf::from("/srv/out.txt"),
+            process: pent_profile::ProcessInfo {
+                pid: 7,
+                name: "sh".to_string(),
+            },
+            outcome,
+        };
+        let line = fs_trace_line(&event(Outcome::Denied), &profile_name());
+        assert_eq!(
+            line.map(|l| format_trace_line(&l)),
+            Some(format!(
+                "pent: [denied] filesystem: \"sh\" (pid 7) was denied create on \"/srv/out.txt\"\n\
+                 pent: fix: allow it for one run with --write \"/srv/out.txt\", or add it to the \
+                 profile: pent trust {} --review\n\n",
+                profile_name()
+            ))
+        );
+        assert_eq!(
+            fs_trace_line(&event(Outcome::Allowed), &profile_name()),
+            None
+        );
+    }
 
     // ── macOS log parsing ────────────────────────────────────────────────────
 

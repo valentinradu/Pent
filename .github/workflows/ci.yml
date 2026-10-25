@@ -81,21 +81,31 @@ jobs:
         run: cargo fmt --all -- --check
 
   test-linux-agents:
-    name: Agent configs (Linux / Docker)
+    name: E2E (Linux / Docker)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
+      # Ubuntu 24.04 limits unprivileged user namespaces with AppArmor.
+      # Pent needs them, also in the container.
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
       - name: Build Docker image
         run: docker build --file e2e/Dockerfile --tag pent-test .
 
-      - name: Run agent-config smoke tests
+      # The default command of the image runs the e2e, integration and
+      # profile tests in parallel, also the tests that need the internet.
+      # Pent needs no privilege; the default seccomp and AppArmor profiles
+      # of Docker block unshare(2). The overlay upper layers of pent are in
+      # /tmp, which must not be on overlayfs: thus /tmp is a tmpfs.
+      - name: Run e2e tests
         run: |
           docker run --rm \
-            --privileged \
+            --security-opt seccomp=unconfined \
+            --security-opt apparmor=unconfined \
             --tmpfs /tmp:exec,mode=1777 \
-            pent-test \
-            cargo test --test e2e_linux -- --nocapture --include-ignored
+            pent-test
 
   test-macos-agents:
     name: Agent configs (macOS)

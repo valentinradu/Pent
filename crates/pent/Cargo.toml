@@ -34,7 +34,6 @@ clap        = { workspace = true, features = ["string"] }
 [dev-dependencies]
 tempfile    = { workspace = true }
 toml        = "0.8"
-serial_test = "3"
 
 [package.metadata.deb]
 name = "pent"
