@@ -71,22 +71,25 @@ proof of the finding.
 
 | ID | Severity | Which description is wrong | Finding |
 |---|---|---|---|
-| DIFF-1 | Medium | The summary | A read that the overlay hides is not a recorded denial. |
+| DIFF-1 | Medium | The summary | **Fixed.** A read that the overlay hid was not a recorded denial. |
 | DIFF-2 | Medium | The kernel | **Fixed.** A profile entry that named a symbolic link gave access to nothing. |
 | DIFF-3 | Low | The kernel | A write to a read-only rule succeeds inside the run. |
 | DIFF-4 | Medium | The kernel | **Fixed.** A `read` rule also gave execute. |
 | DIFF-5 | High | The kernel | **Fixed.** The guard missed a private key behind a symbolic link, and the summary said "blocked". |
 | DIFF-6 | High | The kernel | **Fixed.** The guard missed a private key that the program makes during the run, and the summary said "blocked". |
 | DIFF-7 | High | The summary | **Fixed.** The draft granted a path that the same summary showed as a blocked credential. |
-| DIFF-8 | Medium | The summary | The proxy refuses a destination that is not public, and records nothing. |
+| DIFF-8 | Medium | The summary | **Fixed.** The proxy refused a destination that is not public, and recorded nothing. |
 | DIFF-9 | Medium | The kernel | On macOS a guard pattern with a leading `*` has no effect. |
 
 ### DIFF-1 — a read that the overlay hides is not a recorded denial
 
-**Severity:** Medium. **Wrong description:** the summary.
+**Severity:** Medium. **Wrong description:** the summary. **Fixed** in
+`COMMIT-DIFF-1`.
 
 **Test:** `differential_profile_kernel.rs`,
-`diff_1_a_hidden_path_is_not_a_recorded_denial`.
+`diff_1_a_hidden_path_is_not_a_recorded_denial`. The test runs now, and
+the unit test `access_policy_reports_a_path_that_the_overlay_hides` in
+`linux.rs` holds the prediction.
 
 The README says that `pent run` records each access that the sandbox
 denies, and that `pent trust NAME --review` groups them into rules. This
@@ -100,11 +103,18 @@ The test has a positive control: a read outside the home directory gives a
 Landlock denial, and pent records it. The log then holds `outside.txt` and
 not `secret.txt`.
 
-**The fix.** The overlay knows which paths it hides. Emit a
-`WatchEvent::Fs` with `Outcome::Denied` when the child opens a path below
-an overlay mount point that the upper layer hides. The observe recorder of
-`pent run --trace` already has the path of each `open`; compare it with the
-hidden set and record a denial.
+**The fix.** `AccessPolicy`, the prediction that the recorder of
+`pent run --trace` uses, now holds the overlay mount points and the paths
+that the overlay shows (`AccessPolicy::set_overlay`). A read or an
+execution of a path below a mount point that neither lies in a shown
+subtree nor leads to one gets `Outcome::Denied`, so the event reaches the
+trace log and `~/.local/state/pent/denied/<name>.jsonl`, and
+`pent trust NAME --review` proposes the rule.
+
+A write or a create keeps the Landlock answer: it goes to the upper layer
+and works inside the run, so it is not a denial. The recorder also drops
+a read of a path that does not exist on the host, so a hidden name that
+the child made itself makes no event.
 
 ### DIFF-2 — a profile entry that names a symbolic link gives access to nothing
 
@@ -301,25 +311,43 @@ guard rule to the blocked section, and never show it in a normal section.
 **Severity:** Medium. **Wrong description:** the summary.
 
 **Test:** `differential_network.rs`,
-`diff_8_a_refused_destination_is_not_recorded`.
+`diff_8_a_refused_destination_is_not_recorded`. The test runs now.
 
-The proxy refuses a destination that is not public, also for a domain of
-the allowlist. It answers HTTP 400 and records nothing. The trace log of
-`pent run --trace` has no line, and
-`~/.local/state/pent/denied/<name>.jsonl` has no item. An address written
-as a number gets the same treatment.
+The proxy refused a destination that is not public, also for a domain of
+the allowlist. It answered HTTP 400 and recorded nothing. The trace log
+of `pent run --trace` had no line, and
+`~/.local/state/pent/denied/<name>.jsonl` had no item. An address written
+as a number got the same treatment.
 
 A domain outside the allowlist does reach both files. The test uses that as
 its positive control.
 
 The README says that the proxy "rejects destinations that are not public"
 and that the user can set `private_destinations = "allow"`. A user who does
-not know that setting sees a 400 with no reason.
+not know that setting saw a 400 with no reason.
 
-**The fix.** Emit a `WatchEvent::Connect` with `Outcome::Denied` and a
-reason in the two places where the proxy refuses an address: the check of
-the private destination, and the check of the address that has no name.
-Give the trace line the fix hint of the setting.
+**The cause.** The refusal was not the silent step. Pent sets
+`HTTP_PROXY=http://127.0.0.1:3128`, and a client sends an `http://` URL
+to such a proxy as a plain request in the absolute form
+(`GET http://host/path HTTP/1.1`), not as `CONNECT`. The proxy read only
+`CONNECT`, so it answered 400 at the handshake and never looked at the
+destination. Each row of `NET_CASES` that uses an `http://` URL therefore
+refused the connection for the wrong reason.
+
+**The fix.** `proxy.rs` reads the absolute form too
+(`parse_http_forward_target`) and forwards the request. The destination
+then reaches the same checks as a tunnel: the allowlist, the private
+address and the `Host` header. Each refusal reports a violation and ends
+with `record.finish(Outcome::Denied)`, as it already did for `CONNECT`,
+so the trace log and the list of the denied accesses both hold the
+destination. The two messages of a destination that is not public now
+carry the fix hint of the setting.
+
+The new head of a forwarded request asks the server to close the
+connection after its answer (`forward_head`), because the proxy checks
+the destination one time: a connection must carry one request only. A
+plain `http://` URL to a domain of the allowlist now works; before the
+fix it answered 400.
 
 ### DIFF-9 — on macOS a guard pattern with a leading `*` has no effect
 
