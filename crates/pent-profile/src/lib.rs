@@ -9,7 +9,8 @@
 //! - [`doc`]: the profile file (`~/.config/pent/profiles/<name>.toml`).
 //! - [`guard`]: the dangerous paths that watch mode blocks on all platforms.
 //! - [`summary`]: the step that groups raw events into a short list of rules.
-//! - [`review`]: the interactive review at the end of watch mode.
+//! - [`review`](mod@review): the interactive review at the end of watch mode.
+//! - [`psl`]: a compact subset of the public suffix list.
 //!
 //! See `docs/design/watch.md` for the full design.
 
@@ -17,6 +18,7 @@ pub mod doc;
 pub mod event;
 pub mod guard;
 pub mod name;
+pub mod psl;
 pub mod review;
 pub mod summary;
 
@@ -24,3 +26,9 @@ pub use doc::{DocError, FilesystemRules, NetworkRules, ProfileDoc};
 pub use event::{FsOp, GuardClass, NetProtocol, Outcome, ProcessInfo, WatchEvent};
 pub use guard::{classify, guard_rules, GuardAccess, GuardRule, GuardTarget};
 pub use name::{ProfileName, ProfileNameError};
+pub use summary::{
+    summarize, FsAccess, Grant, Item, ItemNote, Section, Stats, Summary, SummaryContext,
+};
+
+#[cfg(test)]
+mod fixture;
