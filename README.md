@@ -53,9 +53,9 @@ The profile starts from `(allow default)`. It denies file reads (file content) a
 
 macOS has no network namespaces. In proxy mode, the profile denies outbound connections and allows only the proxy port on loopback, the system name resolver socket and the Unix sockets in the writable paths. See [Platform limitations](#platform-limitations) below.
 
-### Linux: Landlock + overlayfs + network namespaces
+### Linux: Landlock + overlayfs + namespaces
 
-On Linux, Pent combines three kernel mechanisms. **Landlock LSM** restricts filesystem access at the kernel level. **Overlayfs shadowing** protects parent directories by mounting a temporary layer in a private namespace; writes to non-allowlisted paths disappear when the process exits. **Network namespaces** (`unshare(CLONE_NEWNET)`) isolate the network stack. In proxy mode, the child can reach only its own loopback. Pent's proxy listens there on sockets that the child makes and gives to Pent. Pent needs no root and no capability.
+On Linux, Pent combines four kernel mechanisms. **Landlock LSM** restricts filesystem access at the kernel level. **Overlayfs shadowing** protects parent directories by mounting a temporary layer in a private namespace; writes to non-allowlisted paths disappear when the process exits. **Mount namespaces** give the child its own empty `/tmp`, `/var/tmp` and `/run`, so the temporary files and the control sockets of the host stay out of reach. **Network namespaces** (`unshare(CLONE_NEWNET)`) isolate the network stack. In proxy mode, the child can reach only its own loopback. Pent's proxy listens there on sockets that the child makes and gives to Pent. A **PID namespace** with its own `proc` hides the processes of the host and ends the background processes of the sandbox. Pent needs no root and no capability.
 
 ### Built-in proxy
 
@@ -94,13 +94,29 @@ The macOS backend also ignores `[[sandbox.mounts]]`. Use a profile rule (or `--r
 
 Pent requires Landlock ABI v3 or later (Linux 6.2), and Landlock must be enabled at boot. Pent uses the highest ABI up to v6. On ABI v6, the sandboxed process cannot connect to abstract Unix sockets outside the sandbox and cannot send signals to processes outside the sandbox.
 
-Landlock does not control `connect(2)` on Unix sockets that have a path. A sandboxed process can connect to any socket file that it can find. To decrease this risk, Pent hides the well-known sockets in the private mount namespace of the child: an empty tmpfs covers `/run/user/<uid>` (session D-Bus, systemd user manager, rootless Docker), and `/dev/null` covers `/run/docker.sock` and `/run/podman/podman.sock`. When the network is not `unrestricted`, `/dev/null` also covers the sockets of the host resolvers (`/run/nscd/socket` and `/run/systemd/resolve/io.systemd.Resolve`), because a query through them goes past the proxy. If your configuration names one of these paths, Pent does not hide it. Other socket files (for example the system D-Bus socket or sockets in your home directory) stay reachable.
+#### Private `/tmp`, `/var/tmp` and `/run`
+
+The sandboxed process gets its own empty `/tmp`, `/var/tmp` and `/run` in its mount namespace. It does not see the temporary files of your other programs, and it does not see the control sockets that the daemons of the host keep under `/run`. Pent binds back only what the session needs: the workspace, the data directory, the working directory, every path that your profile names, every directory of `PATH`, and the system paths (on NixOS `/run/current-system`, `/run/wrappers/bin` and the graphics drivers). A workspace under `/tmp` keeps working. `XDG_RUNTIME_DIR` and a `TMPDIR` under these directories become an empty directory; a `TMPDIR` outside them stays as it is.
+
+Each private directory is a tmpfs with `nosuid` and `nodev`, and with no size limit, so it takes the kernel default of half of the memory. A build writes large temporary files, and a smaller limit breaks it. There is no setting to share `/tmp` or `/run` with the host.
+
+#### Unix sockets
+
+Landlock does not control `connect(2)` on Unix sockets that have a path. The kernel also needs no file right to walk through a directory. A sandboxed process can connect to any socket file that it can find, even when the file is outside the profile. The private directories above remove the main targets: every socket under `/tmp`, `/var/tmp` and `/run` is gone, among them the socket of a terminal multiplexer (which would run a command for the process outside the sandbox), the system D-Bus socket, the `tailscaled` LocalAPI socket (which opens a TCP stream to any host, past the proxy), the Docker and Podman sockets, and the sockets of the host resolvers.
+
+A fixed list of sockets can never be complete, so Pent hides a directory, not a name. For the sockets that no private directory covers, Pent keeps a list and covers each one with `/dev/null`: the system D-Bus socket, the agent sockets of your home directory (`~/.gnupg/S.gpg-agent*`, `~/.gnupg/S.dirmngr*`, `~/.ssh/agent.*`), the container sockets, and, when the network is not `unrestricted`, the sockets of the host resolvers and of `tailscaled`. If your configuration names one of these paths, Pent does not hide it.
+
+A socket in another directory still works. The full fix is a `connect(2)` filter in the supervisor; see [`docs/security/linux-sandbox.md`](docs/security/linux-sandbox.md).
+
+#### Processes
+
+The sandboxed process runs in a new PID namespace with its own `proc` mount. It sees only the processes of the sandbox, so it cannot read the command line of your other programs (a command line often holds a token). When the command exits, the kernel ends every other process of the sandbox, so no background process outlives `pent run`. The exit code and the signal of the command reach you unchanged. Watch mode (`pent watch`) does not take a PID namespace: it must not change how the program runs.
 
 The sandboxed process keeps the controlling terminal, because interactive tools need it. A seccomp filter blocks `ioctl(TIOCSTI)` and `ioctl(TIOCLINUX)`, so the process cannot push keystrokes into your shell. Pent makes `<workspace>/.pent` read-only inside the sandbox.
 
 ### Linux: proxy mode without privileges
 
-Pent needs no root and no capability on Linux. It needs unprivileged user namespaces. `pent check` tells you if they are available. Some distributions turn them off (the sysctl `user.max_user_namespaces`, or `kernel.apparmor_restrict_unprivileged_userns` on Ubuntu 24.04 and later).
+Pent needs no root and no capability on Linux. It needs unprivileged user namespaces (and the PID and network namespaces inside them). `pent check` tells you if they are available. Some distributions turn them off (the sysctl `user.max_user_namespaces`, or `kernel.apparmor_restrict_unprivileged_userns` on Ubuntu 24.04 and later).
 
 In proxy mode, the child gets a new network namespace with only the loopback interface. Before the program starts, the child makes three sockets in this namespace: the proxy port `127.0.0.1:3128` (SOCKS5 and HTTP CONNECT) and the DNS port `127.0.0.1:53` (UDP and TCP). It gives them to Pent. Pent serves the proxy on these sockets and connects to the allowed hosts from the host network. The child has no route out of its namespace, so it cannot reach a host past the proxy. When IPv6 is available in the namespace, the proxy port also listens on `[::1]:3128`. The DNS port is IPv4 only.
 

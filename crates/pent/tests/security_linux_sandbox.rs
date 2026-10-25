@@ -3,9 +3,10 @@
 //!
 //! Each test runs the real `pent` binary with a trusted profile in an
 //! isolated `HOME`, `XDG_CONFIG_HOME` and `XDG_STATE_HOME` under
-//! `CARGO_TARGET_TMPDIR` (not `/tmp`, because the sandbox always allows
-//! `/tmp`). A test creates its own victim resources, so it needs no X11,
-//! D-Bus or SSH agent on the host.
+//! `CARGO_TARGET_TMPDIR` (not `/tmp`, because the child gets its own empty
+//! `/tmp`; a test of `/tmp` makes its victim there on purpose). A test
+//! creates its own victim resources, so it needs no X11, D-Bus or SSH agent
+//! on the host.
 //!
 //! A test that asserts the secure behaviour has two uses:
 //! - It passes: the defense works, and the test is a regression guard.
