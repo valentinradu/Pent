@@ -535,7 +535,8 @@ struct MountPlan {
     resolv: Option<CString>,
     /// Paths to bind-mount read-only onto themselves (`<workspace>/.pent`).
     readonly: Vec<CString>,
-    /// Directories to hide with an empty tmpfs (`/run/user/<uid>`).
+    /// Directories to hide with an empty tmpfs (`/run/user/<uid>` and the
+    /// overlay staging root).
     mask_dirs: Vec<CString>,
     /// Socket files to hide with a bind mount of `/dev/null`.
     mask_files: Vec<CString>,
@@ -713,7 +714,7 @@ impl MountPlan {
                 )
             };
             if ret != 0 {
-                return Err(last_err(b"pent: cannot hide the user runtime directory\n"));
+                return Err(last_err(b"pent: cannot hide a directory with a tmpfs\n"));
             }
         }
 
@@ -1094,7 +1095,18 @@ pub fn spawn_with_landlock(
         if dot_pent.exists() {
             mounts.readonly.extend(to_cstring(&dot_pent));
         }
-        let (mask_dirs, mask_files) = mask_targets(config, uid);
+        let (mut mask_dirs, mask_files) = mask_targets(config, uid);
+        // Hide the overlay staging root. The child can write to /tmp, and the
+        // staging root holds the stub layers that hide the files which are
+        // not on the allowlist. If the child deletes a whiteout there, the
+        // hidden file appears. The overlay mounts keep their references to
+        // the layers, so the tmpfs over the staging root does not change
+        // them. The tmpfs mounts after the overlay mounts.
+        for staging_root in overlay_mounts.iter().filter_map(|m| m.base_dir.parent()) {
+            if !mask_dirs.iter().any(|d| staging_root.starts_with(d)) {
+                mask_dirs.push(staging_root.to_path_buf());
+            }
+        }
         mounts
             .mask_dirs
             .extend(mask_dirs.iter().filter_map(|p| to_cstring(p)));

@@ -877,7 +877,7 @@ pub fn prepare_overlay_dirs(
             Ok(mount) => mounts.push(mount),
             Err(e) => {
                 for mount in &mounts {
-                    if let Err(rm) = std::fs::remove_dir_all(&mount.base_dir) {
+                    if let Err(rm) = remove_staging_dir(&mount.base_dir) {
                         tracing::warn!("cannot remove '{}': {rm}", mount.base_dir.display());
                     }
                 }
@@ -2339,7 +2339,7 @@ pub fn teardown(handle: OverlayHandle) -> OverlayTeardownReport {
         if report.failures.is_empty() {
             // Overlayfs mounts are already gone — they existed only inside
             // the mount namespace of the session.
-            if let Err(e) = std::fs::remove_dir_all(&overlay.base_dir) {
+            if let Err(e) = remove_staging_dir(&overlay.base_dir) {
                 tracing::warn!("cannot remove '{}': {e}", overlay.base_dir.display());
             }
         } else {
@@ -2409,11 +2409,44 @@ fn cleanup_stale_in(root: &Path) {
             continue;
         }
         if session_is_dead(pid, Some(start)) {
-            if let Err(e) = std::fs::remove_dir_all(proc_fd_path(root_fd.as_fd(), Some(&name))) {
+            if let Err(e) = remove_staging_dir(&proc_fd_path(root_fd.as_fd(), Some(&name))) {
                 tracing::warn!("cannot remove '{}': {e}", root.join(&name).display());
             }
         }
     }
+}
+
+/// Remove a staging directory and all its content.
+///
+/// The kernel creates the overlayfs `work/work` directory with the mode 0000.
+/// Thus a plain `remove_dir_all` cannot read it and fails with EACCES. On
+/// EACCES, this function gives the owner access to each directory in the
+/// tree and tries again. It never follows a symbolic link.
+fn remove_staging_dir(path: &Path) -> io::Result<()> {
+    match std::fs::remove_dir_all(path) {
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+            make_dirs_accessible(path)?;
+            std::fs::remove_dir_all(path)
+        }
+        other => other,
+    }
+}
+
+/// Set the mode 0700 on `dir` and on each directory below it.
+fn make_dirs_accessible(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = std::fs::symlink_metadata(dir)?;
+    if !meta.is_dir() {
+        return Ok(());
+    }
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            make_dirs_accessible(&entry.path())?;
+        }
+    }
+    Ok(())
 }
 
 /// Removes `/tmp/pent-ovl-<pid>-<n>` directories of older pent versions.
@@ -2440,7 +2473,7 @@ fn cleanup_legacy_tmp() {
             continue;
         }
         if session_is_dead(pid, None) {
-            if let Err(e) = std::fs::remove_dir_all(&path) {
+            if let Err(e) = remove_staging_dir(&path) {
                 tracing::warn!("cannot remove '{}': {e}", path.display());
             }
         }
@@ -2506,6 +2539,19 @@ mod tests {
     }
 
     /// Creates `real/ws` and `upper/ws` in a new temp dir.
+    #[test]
+    fn remove_staging_dir_handles_mode_zero_work_dir() -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir()?;
+        let base = tmp.path().join("ovl-1-2-0");
+        let inner = base.join("work").join("work");
+        std::fs::create_dir_all(inner.join("sub"))?;
+        std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o000))?;
+        super::remove_staging_dir(&base)?;
+        assert!(!base.exists());
+        Ok(())
+    }
+
     fn layout() -> Result<(tempfile::TempDir, PathBuf, PathBuf), Box<dyn std::error::Error>> {
         let tmp = tempfile::tempdir()?;
         let real = tmp.path().join("real");
