@@ -28,13 +28,20 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 const PENT: &str = env!("CARGO_BIN_EXE_pent");
 
 /// Invoke `pent` with the given arguments in `cwd` and return the full Output.
+///
+/// A `config` subcommand reads the global config and writes the trust store.
+/// For these commands, `HOME` and `XDG_CONFIG_HOME` point into `cwd/.test-home`,
+/// thus the test does not read or change the real user config.
 #[allow(clippy::panic)] // infrastructure helper: spawn failure is a hard test setup error
 fn run_pent(cwd: &Path, args: &[&str]) -> Output {
-    Command::new(PENT)
-        .args(args)
-        .current_dir(cwd)
-        .env_remove("PENT_LOG") // keep test output clean
-        .output()
+    let mut cmd = Command::new(PENT);
+    cmd.args(args).current_dir(cwd).env_remove("PENT_LOG"); // keep test output clean
+    if args.first() == Some(&"config") {
+        let home = cwd.join(".test-home");
+        cmd.env("HOME", &home)
+            .env("XDG_CONFIG_HOME", home.join(".config"));
+    }
+    cmd.output()
         .unwrap_or_else(|e| panic!("Failed to spawn pent binary: {e}"))
 }
 
@@ -225,6 +232,8 @@ fn test_config_project_overrides_domain_allowlist() -> TestResult {
         dot_pent.join("pent.toml"),
         "[proxy]\ndomain_allowlist = [\"project-domain.example\"]\n",
     )?;
+    // Pent applies a project config only after the user trusts it.
+    expect_success(&run_pent(dir.path(), &["config", "trust", "--yes"]));
 
     let out = run_pent(dir.path(), &["config", "show", "--format", "json"]);
     let stdout = expect_success(&out);
@@ -846,6 +855,8 @@ fn test_run_extra_config_merges_domain_allowlist() -> TestResult {
         dot_pent.join("pent.toml"),
         "[proxy]\ndomain_allowlist = [\"base-domain.example\"]\n",
     )?;
+    // Pent applies a project config only after the user trusts it.
+    expect_success(&run_pent(dir.path(), &["config", "trust", "--yes"]));
 
     // `pent run --config extra.toml --no-config echo` would skip project config
     // but load the extra one. Instead we test via a `run` that exits immediately.
@@ -1247,6 +1258,10 @@ mod no_hang {
             "[proxy]\ndomain_allowlist = [\"api.anthropic.com\"]\n",
         )
         .unwrap();
+        // Pent applies a project config only after the user trusts it.
+        let (trusted, trust_stderr) =
+            pent_timeout(dir.path(), home.path(), &["config", "trust", "--yes"], 5);
+        assert!(trusted, "pent config trust --yes failed:\n{trust_stderr}");
 
         let (ok, stderr) = pent_timeout(
             dir.path(),

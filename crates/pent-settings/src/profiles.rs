@@ -7,7 +7,27 @@
 use std::fmt;
 use std::str::FromStr;
 
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use thiserror::Error;
+
 use crate::{PentConfig, ProxySettings, SandboxPaths, SandboxSettings};
+
+/// A profile name does not match a known profile.
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+#[error("unknown profile '{name}'; valid profiles: {}", valid_profile_names())]
+pub struct ProfileParseError {
+    /// The name that does not match a profile.
+    pub name: String,
+}
+
+/// All profile names, separated by spaces.
+fn valid_profile_names() -> String {
+    PROFILES
+        .iter()
+        .map(|(_, n)| *n)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
 /// A named configuration profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -68,21 +88,29 @@ impl fmt::Display for Profile {
 }
 
 impl FromStr for Profile {
-    type Err = String;
+    type Err = ProfileParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         PROFILES
             .iter()
             .find(|(_, name)| *name == s)
             .map(|(p, _)| *p)
-            .ok_or_else(|| {
-                let valid: Vec<&str> = PROFILES.iter().map(|(_, n)| *n).collect();
-                format!(
-                    "unknown profile '{}'; valid profiles: {}",
-                    s,
-                    valid.join(" ")
-                )
+            .ok_or_else(|| ProfileParseError {
+                name: s.to_string(),
             })
+    }
+}
+
+impl Serialize for Profile {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for Profile {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        Self::from_str(&name).map_err(serde::de::Error::custom)
     }
 }
 
@@ -189,6 +217,7 @@ fn profile_config(p: Profile) -> PentConfig {
 
         // ── @npm ──────────────────────────────────────────────────────────────
         Profile::Npm => PentConfig {
+            profiles: Vec::new(),
             proxy: ProxySettings {
                 domain_allowlist: vec!["registry.npmjs.org".to_string(), "*.npmjs.org".to_string()],
                 ..Default::default()
@@ -206,6 +235,7 @@ fn profile_config(p: Profile) -> PentConfig {
 
         // ── @cargo ────────────────────────────────────────────────────────────
         Profile::Cargo => PentConfig {
+            profiles: Vec::new(),
             proxy: ProxySettings {
                 domain_allowlist: vec![
                     "crates.io".to_string(),
@@ -229,6 +259,7 @@ fn profile_config(p: Profile) -> PentConfig {
 
         // ── @pip ──────────────────────────────────────────────────────────────
         Profile::Pip => PentConfig {
+            profiles: Vec::new(),
             proxy: ProxySettings {
                 domain_allowlist: vec![
                     "pypi.org".to_string(),
@@ -260,6 +291,7 @@ fn profile_config(p: Profile) -> PentConfig {
 
         // ── @gem ──────────────────────────────────────────────────────────────
         Profile::Gem => PentConfig {
+            profiles: Vec::new(),
             proxy: ProxySettings {
                 domain_allowlist: vec!["rubygems.org".to_string(), "*.rubygems.org".to_string()],
                 ..Default::default()
@@ -281,6 +313,7 @@ fn profile_config(p: Profile) -> PentConfig {
 
         // ── @go ───────────────────────────────────────────────────────────────
         Profile::Go => PentConfig {
+            profiles: Vec::new(),
             proxy: ProxySettings {
                 domain_allowlist: vec![
                     "proxy.golang.org".to_string(),
@@ -302,6 +335,7 @@ fn profile_config(p: Profile) -> PentConfig {
 
         // ── @brew ─────────────────────────────────────────────────────────────
         Profile::Brew => PentConfig {
+            profiles: Vec::new(),
             proxy: ProxySettings {
                 domain_allowlist: vec![
                     "formulae.brew.sh".to_string(),
@@ -346,6 +380,7 @@ fn profile_config(p: Profile) -> PentConfig {
 
         // ── @gh ───────────────────────────────────────────────────────────────
         Profile::Gh => PentConfig {
+            profiles: Vec::new(),
             proxy: ProxySettings {
                 domain_allowlist: vec![
                     "github.com".to_string(),
@@ -434,6 +469,7 @@ fn profile_config(p: Profile) -> PentConfig {
         },
 
         Profile::Claude => PentConfig {
+            profiles: Vec::new(),
             proxy: ProxySettings {
                 domain_allowlist: vec![
                     "api.anthropic.com".to_string(),
@@ -482,6 +518,7 @@ fn profile_config(p: Profile) -> PentConfig {
         },
 
         Profile::Codex => PentConfig {
+            profiles: Vec::new(),
             proxy: ProxySettings {
                 domain_allowlist: vec!["api.openai.com".to_string(), "*.openai.com".to_string()],
                 ..Default::default()
@@ -500,6 +537,7 @@ fn profile_config(p: Profile) -> PentConfig {
         },
 
         Profile::Gemini => PentConfig {
+            profiles: Vec::new(),
             proxy: ProxySettings {
                 domain_allowlist: vec![
                     "generativelanguage.googleapis.com".to_string(),
@@ -599,8 +637,11 @@ mod tests {
     #[test]
     fn test_profile_from_str_invalid() {
         let err = "@unknown-profile".parse::<Profile>().unwrap_err();
-        assert!(err.contains("unknown profile"));
-        assert!(err.contains("@unknown-profile"));
+        assert_eq!(err.name, "@unknown-profile");
+        let msg = err.to_string();
+        assert!(msg.contains("unknown profile"));
+        assert!(msg.contains("@unknown-profile"));
+        assert!(msg.contains("@npm"));
     }
 
     #[test]
@@ -640,6 +681,24 @@ mod tests {
             !all.iter().any(|p| p.starts_with("~/.ssh/id_")),
             "@claude must not grant SSH private keys: {all:?}"
         );
+    }
+
+    #[test]
+    fn test_profile_serde_roundtrip() {
+        let config = PentConfig {
+            profiles: vec![Profile::Npm, Profile::Claude],
+            ..Default::default()
+        };
+        let toml = config.to_toml().unwrap();
+        assert!(toml.contains("\"@npm\""), "{toml}");
+        let parsed = PentConfig::parse(&toml).unwrap();
+        assert_eq!(parsed.profiles, vec![Profile::Npm, Profile::Claude]);
+    }
+
+    #[test]
+    fn test_profile_deserialize_unknown_fails() {
+        let err = PentConfig::parse("profiles = [\"@nope\"]\n").unwrap_err();
+        assert!(err.to_string().contains("@nope"), "{err}");
     }
 
     #[test]

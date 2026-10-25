@@ -108,7 +108,8 @@ pub(crate) enum ConfigSubcommand {
         #[arg(long)]
         global: bool,
     },
-    /// Print the effective merged configuration
+    /// Print the effective merged configuration.
+    /// The status lines on stderr tell if the project config applies
     Show {
         #[arg(long, value_enum, default_value = "toml")]
         format: OutputFormat,
@@ -133,6 +134,15 @@ pub(crate) enum ConfigSubcommand {
         #[arg(long)]
         global: bool,
     },
+    /// Show what the project config adds, then trust it.
+    /// Pent applies a project config only after you trust it
+    Trust {
+        /// Trust the project config without a prompt
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// Remove the trust of the project config. Pent then does not apply it
+    Untrust,
 }
 
 #[derive(ValueEnum, Clone, Copy)]

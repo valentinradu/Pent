@@ -5,7 +5,9 @@
 //! - Global config: `~/.config/pent/pent.toml`
 //! - Project config: `<workspace>/.pent/pent.toml`
 //!
-//! Project values take precedence for scalar fields; list fields are merged.
+//! The global config always applies. The project config applies only when
+//! the user trusts it (see [`TrustStore`]). Project values take precedence for
+//! scalar fields; list fields are merged.
 //!
 //! # Example
 //!
@@ -18,12 +20,14 @@
 
 mod loader;
 mod profiles;
+mod trust;
 
-pub use loader::ConfigLoader;
+pub use loader::{ConfigLoader, LoadedConfig, ProjectConfigStatus};
 pub use profiles::{
     build_profiles_config, is_profile_likely_active, profile_deps_transitive, profile_requires,
-    Profile,
+    Profile, ProfileParseError,
 };
+pub use trust::{TrustError, TrustStatus, TrustStore};
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -36,6 +40,22 @@ pub enum SettingsError {
     #[error("Failed to parse config: {0}")]
     ParseError(#[from] toml::de::Error),
 
+    /// TOML deserialization of a specific config file failed.
+    #[error("Failed to parse config file {}: {source}", path.display())]
+    ParseFile {
+        /// The config file that failed to parse.
+        path: PathBuf,
+        /// The parse error.
+        source: Box<toml::de::Error>,
+    },
+
+    /// A config file does not contain valid UTF-8.
+    #[error("Config file {} is not valid UTF-8", path.display())]
+    NotUtf8 {
+        /// The config file with the invalid content.
+        path: PathBuf,
+    },
+
     /// TOML serialization failed.
     #[error("Failed to serialize config: {0}")]
     SerializeError(#[from] toml::ser::Error),
@@ -43,11 +63,30 @@ pub enum SettingsError {
     /// I/O error reading or writing a config file.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// A trust store operation failed.
+    #[error(transparent)]
+    Trust(#[from] TrustError),
+}
+
+/// A `read_write` entry uses a glob, which the Linux backend does not support.
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+#[error(
+    "read_write path {entry:?} uses a glob ('*') which is not supported \
+     on Linux (overlayfs requires exact paths); \
+     remove the trailing '*' or use the exact filename"
+)]
+pub struct RwGlobError {
+    /// The `read_write` entry that ends with `*`.
+    pub entry: String,
 }
 
 /// Network isolation mode for sandboxed processes.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "mode", rename_all = "snake_case")]
+// Deserialization goes through `NetworkModeRepr`: serde ignores unknown keys
+// of a unit variant in an internally tagged enum, also with
+// `deny_unknown_fields`.
+#[serde(tag = "mode", rename_all = "snake_case", from = "NetworkModeRepr")]
 pub enum NetworkMode {
     /// Unrestricted network access.
     Unrestricted,
@@ -75,6 +114,37 @@ fn default_proxy_addr() -> std::net::SocketAddr {
     std::net::SocketAddr::from(([127, 0, 0, 1], 0))
 }
 
+/// The TOML form of [`NetworkMode`]: a table with only the `mode` key.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NetworkModeRepr {
+    mode: NetworkModeKind,
+}
+
+/// The values of the `mode` key.
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum NetworkModeKind {
+    Unrestricted,
+    LocalhostOnly,
+    ProxyOnly,
+    Blocked,
+}
+
+impl From<NetworkModeRepr> for NetworkMode {
+    fn from(repr: NetworkModeRepr) -> Self {
+        match repr.mode {
+            NetworkModeKind::Unrestricted => Self::Unrestricted,
+            NetworkModeKind::LocalhostOnly => Self::LocalhostOnly,
+            NetworkModeKind::ProxyOnly => Self::ProxyOnly {
+                proxy_addr: default_proxy_addr(),
+                dns_port: 0,
+            },
+            NetworkModeKind::Blocked => Self::Blocked,
+        }
+    }
+}
+
 type ExpandedPath = (PathBuf, bool);
 type ExpandedPathLists = (
     Vec<ExpandedPath>,
@@ -84,7 +154,13 @@ type ExpandedPathLists = (
 );
 
 /// Filesystem paths made available to the sandboxed process.
+///
+/// Each entry is a string. Pent expands a leading `~` or `~/` to the home
+/// directory. Pent does not expand environment variables such as `$HOME`.
+/// The loader resolves a relative entry against the workspace (see
+/// [`PentConfig::resolve_relative_paths`]).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SandboxPaths {
     /// Paths that may be traversed (stat / readdir) but not read or written.
     #[serde(default)]
@@ -124,18 +200,35 @@ impl SandboxPaths {
     ///
     /// # Errors
     ///
-    /// Returns an error string describing the first offending entry.
-    pub fn validate_no_rw_globs(&self) -> Result<(), String> {
-        for entry in &self.read_write {
-            if entry.ends_with('*') {
-                return Err(format!(
-                    "read_write path {entry:?} uses a glob ('*') which is not supported \
-                     on Linux (overlayfs requires exact paths); \
-                     remove the trailing '*' or use the exact filename"
-                ));
+    /// Returns [`RwGlobError`] for the first `read_write` entry that ends
+    /// with `*`.
+    pub fn validate_no_rw_globs(&self) -> Result<(), RwGlobError> {
+        match self.read_write.iter().find(|entry| entry.ends_with('*')) {
+            Some(entry) => Err(RwGlobError {
+                entry: entry.clone(),
+            }),
+            None => Ok(()),
+        }
+    }
+
+    /// Resolve each relative entry against `base`.
+    ///
+    /// An entry that starts with `/` or `~` does not change. Pent does not
+    /// normalize `..`, thus an entry such as `../other` names a directory
+    /// outside `base`.
+    pub fn resolve_relative(&mut self, base: &Path) {
+        for list in [
+            &mut self.traversal,
+            &mut self.read,
+            &mut self.execute,
+            &mut self.read_write,
+        ] {
+            for entry in list.iter_mut() {
+                if let Some(resolved) = resolve_entry(entry, base) {
+                    *entry = resolved;
+                }
             }
         }
-        Ok(())
     }
 
     /// Expand each list into `PathBuf` values.
@@ -154,20 +247,7 @@ impl SandboxPaths {
             let (s, is_glob) = s
                 .strip_suffix('*')
                 .map_or((s, false), |stripped| (stripped, true));
-            let path = s.strip_prefix("~/").map_or_else(
-                || {
-                    if s == "~" {
-                        home.as_ref().map_or_else(|| PathBuf::from(s), Clone::clone)
-                    } else {
-                        PathBuf::from(s)
-                    }
-                },
-                |rest| {
-                    home.as_ref()
-                        .map_or_else(|| PathBuf::from(s), |h| h.join(rest))
-                },
-            );
-            (path, is_glob)
+            (expand_tilde(Path::new(s), home.as_deref()), is_glob)
         };
         let to_paths = |v: &Vec<String>| v.iter().map(|s| expand(s)).collect::<Vec<_>>();
         (
@@ -179,18 +259,57 @@ impl SandboxPaths {
     }
 }
 
+/// Expand a leading `~` component in `path` to `home`.
+///
+/// The path does not change when `home` is `None` or when the first component
+/// is not `~`.
+fn expand_tilde(path: &Path, home: Option<&Path>) -> PathBuf {
+    let Some(home) = home else {
+        return path.to_path_buf();
+    };
+    match path.strip_prefix("~") {
+        Ok(rest) if rest.as_os_str().is_empty() => home.to_path_buf(),
+        Ok(rest) => home.join(rest),
+        Err(_) => path.to_path_buf(),
+    }
+}
+
+/// Resolve one relative config entry against `base`.
+///
+/// Returns `None` when the entry is empty, absolute, or starts with `~`, or
+/// when the result is not valid UTF-8. In these cases the entry stays as it is.
+fn resolve_entry(entry: &str, base: &Path) -> Option<String> {
+    if entry.is_empty() || entry.starts_with('~') || Path::new(entry).is_absolute() {
+        return None;
+    }
+    base.join(entry).into_os_string().into_string().ok()
+}
+
 /// An additional mount point exposed inside the sandbox.
+///
+/// Only the Linux backend uses mounts. The macOS backend ignores them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Mount {
-    /// Path to expose.
+    /// Path to expose. Pent expands a leading `~`. The loader resolves a
+    /// relative path against the workspace.
     pub path: PathBuf,
     /// Whether the path is read-only inside the sandbox.
-    #[serde(default)]
+    ///
+    /// The default is `true`. Set `readonly = false` to give write access.
+    #[serde(default = "default_mount_readonly")]
     pub readonly: bool,
+}
+
+/// Default value of [`Mount::readonly`]: a mount is read-only unless the
+/// config says otherwise.
+const fn default_mount_readonly() -> bool {
+    true
 }
 
 /// TOML `[sandbox]` section.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SandboxSettings {
     /// Network isolation mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -207,6 +326,7 @@ pub struct SandboxSettings {
 
 /// TOML `[proxy]` section.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProxySettings {
     /// Domains allowed through the proxy.
     /// Supports exact matches (`example.com`) and wildcards (`*.github.com`).
@@ -233,7 +353,16 @@ pub struct ProxySettings {
 
 /// Top-level pent configuration, corresponding to `pent.toml`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PentConfig {
+    /// Profiles that `pent config add` wrote into this file.
+    ///
+    /// `pent config rm` uses this list to find the entries that other
+    /// profiles still need. `pent config rm` never removes an entry that no
+    /// listed profile gives, because the user added that entry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub profiles: Vec<Profile>,
+
     /// Sandbox configuration.
     #[serde(default)]
     pub sandbox: SandboxSettings,
@@ -253,14 +382,54 @@ impl PentConfig {
         toml::from_str(toml).map_err(SettingsError::ParseError)
     }
 
+    /// Parse a `PentConfig` from the bytes of the file at `path`.
+    ///
+    /// This function does not read `path`. It uses `path` only in the error
+    /// message.
+    ///
+    /// # Errors
+    /// Returns `SettingsError::NotUtf8` if the bytes are not UTF-8, or
+    /// `SettingsError::ParseFile` if the TOML is malformed or contains
+    /// unrecognised keys.
+    pub fn parse_file_contents(path: &Path, contents: &[u8]) -> Result<Self, SettingsError> {
+        let text = std::str::from_utf8(contents).map_err(|_| SettingsError::NotUtf8 {
+            path: path.to_path_buf(),
+        })?;
+        toml::from_str(text).map_err(|source| SettingsError::ParseFile {
+            path: path.to_path_buf(),
+            source: Box::new(source),
+        })
+    }
+
     /// Load a `PentConfig` from a file on disk.
     ///
     /// # Errors
-    /// Returns `SettingsError::Io` on read failure, or
-    /// `SettingsError::ParseError` if the file content is not valid TOML.
+    /// Returns `SettingsError::Io` on read failure, `SettingsError::NotUtf8`
+    /// if the file is not UTF-8, or `SettingsError::ParseFile` if the file
+    /// content is not valid TOML or contains unrecognised keys.
     pub fn load(path: &Path) -> Result<Self, SettingsError> {
-        let contents = std::fs::read_to_string(path)?;
-        Self::parse(&contents)
+        let contents = std::fs::read(path)?;
+        Self::parse_file_contents(path, &contents)
+    }
+
+    /// Resolve relative paths against `base`, and expand `~` in mount paths.
+    ///
+    /// The loader calls this function with the workspace as `base`. Thus a
+    /// relative entry in a config file names a path in the workspace, not a
+    /// path in the current directory of the process. Pent does not normalize
+    /// `..`, thus an entry such as `../other` names a directory outside the
+    /// workspace.
+    pub fn resolve_relative_paths(&mut self, base: &Path) {
+        self.sandbox.paths.resolve_relative(base);
+        let home = dirs::home_dir();
+        for mount in &mut self.sandbox.mounts {
+            let expanded = expand_tilde(&mount.path, home.as_deref());
+            mount.path = if expanded.is_relative() {
+                base.join(expanded)
+            } else {
+                expanded
+            };
+        }
     }
 
     /// Serialize this config to a TOML string.
@@ -292,6 +461,12 @@ impl PentConfig {
     ///   `other`'s values so both global and project entries contribute.
     #[must_use]
     pub fn merge(mut self, other: Self) -> Self {
+        // recorded profiles: union, without duplicates
+        for p in other.profiles {
+            if !self.profiles.contains(&p) {
+                self.profiles.push(p);
+            }
+        }
         // sandbox scalars: project wins if set
         if other.sandbox.network.is_some() {
             self.sandbox.network = other.sandbox.network;
@@ -479,6 +654,100 @@ mod tests {
         assert_eq!(read, vec![(PathBuf::from("/usr/lib"), false)]);
         assert_eq!(execute, vec![(PathBuf::from("/usr/bin"), false)]);
         assert_eq!(read_write, vec![(PathBuf::from("/tmp"), false)]);
+    }
+
+    #[test]
+    fn test_unknown_keys_rejected() {
+        for (toml, key) in [
+            ("typo = 1\n", "typo"),
+            ("[sandbox]\nnetwrk = 1\n", "netwrk"),
+            ("[sandbox.paths]\nreadwrite = []\n", "readwrite"),
+            ("[proxy]\ndomain_alowlist = []\n", "domain_alowlist"),
+            (
+                "[[sandbox.mounts]]\npath = \"/x\"\nread_only = true\n",
+                "read_only",
+            ),
+            (
+                "[sandbox.network]\nmode = \"blocked\"\nproxy = 1\n",
+                "proxy",
+            ),
+            (
+                "[sandbox.network]\nmode = \"proxy_only\"\ndns_port = 53\n",
+                "dns_port",
+            ),
+        ] {
+            let result = PentConfig::parse(toml);
+            assert!(result.is_err(), "{toml:?} must be rejected");
+            if let Err(err) = result {
+                assert!(err.to_string().contains(key), "{toml:?}: {err}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_file_contents_names_the_file() {
+        let err = PentConfig::parse_file_contents(Path::new("/x/pent.toml"), b"[proxy]\nfoo = 1\n")
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("/x/pent.toml"), "{msg}");
+        assert!(msg.contains("foo"), "{msg}");
+    }
+
+    #[test]
+    fn test_mount_readonly_default_true() {
+        let config =
+            PentConfig::parse("[[sandbox.mounts]]\npath = \"/a\"\n[[sandbox.mounts]]\npath = \"/b\"\nreadonly = false\n")
+                .unwrap();
+        assert!(config.sandbox.mounts[0].readonly);
+        assert!(!config.sandbox.mounts[1].readonly);
+    }
+
+    #[test]
+    fn test_validate_no_rw_globs() {
+        let ok = SandboxPaths {
+            read_write: vec!["~/.claude.json".to_string()],
+            ..Default::default()
+        };
+        assert!(ok.validate_no_rw_globs().is_ok());
+        let bad = SandboxPaths {
+            read_write: vec!["~/.claude.json*".to_string()],
+            ..Default::default()
+        };
+        let err = bad.validate_no_rw_globs().unwrap_err();
+        assert_eq!(err.entry, "~/.claude.json*");
+        assert!(err.to_string().contains("glob"));
+    }
+
+    #[test]
+    fn test_expand_tilde() {
+        let home = Path::new("/home/u");
+        assert_eq!(expand_tilde(Path::new("~"), Some(home)), home);
+        assert_eq!(
+            expand_tilde(Path::new("~/a/b"), Some(home)),
+            PathBuf::from("/home/u/a/b")
+        );
+        assert_eq!(
+            expand_tilde(Path::new("~other/a"), Some(home)),
+            PathBuf::from("~other/a")
+        );
+        assert_eq!(
+            expand_tilde(Path::new("/a"), Some(home)),
+            PathBuf::from("/a")
+        );
+        assert_eq!(expand_tilde(Path::new("~/a"), None), PathBuf::from("~/a"));
+    }
+
+    #[test]
+    fn test_resolve_relative_paths() {
+        let mut config = PentConfig::parse(
+            "[sandbox.paths]\nread_write = [\"out\", \"../up\", \"/abs\", \"~/h\", \"g*\"]\n",
+        )
+        .unwrap();
+        config.resolve_relative_paths(Path::new("/ws"));
+        assert_eq!(
+            config.sandbox.paths.read_write,
+            vec!["/ws/out", "/ws/../up", "/abs", "~/h", "/ws/g*"]
+        );
     }
 
     #[test]

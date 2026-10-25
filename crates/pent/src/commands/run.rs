@@ -142,14 +142,21 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
 
 /// Load and merge config.
 /// `--no-config` skips global/project config files but `--config <extra>` still applies.
+///
+/// An untrusted or changed project config does not apply. Pent prints a
+/// warning and continues with the global config only.
 fn load_config(args: &RunArgs, cwd: &Path) -> Result<PentConfig, CliError> {
     let mut config = if args.no_config {
         PentConfig::default()
     } else {
-        ConfigLoader::load(cwd)?
+        let loaded = ConfigLoader::load_with_status(cwd)?;
+        crate::commands::config::warn_if_project_ignored(&loaded);
+        loaded.config
     };
     if let Some(ref extra) = args.extra_config {
-        let extra_cfg = PentConfig::load(extra)?;
+        let mut extra_cfg = PentConfig::load(extra)?;
+        // Relative paths in the extra file also resolve against the workspace.
+        extra_cfg.resolve_relative_paths(cwd);
         config = config.merge(extra_cfg);
     }
     Ok(config)
@@ -185,11 +192,7 @@ fn apply_cli_overrides(config: &mut PentConfig, args: &RunArgs) -> Result<(), Cl
     // On Linux, read_write paths must be exact filenames — glob ('*') patterns
     // are not supported because overlayfs requires specific paths to mount over.
     #[cfg(target_os = "linux")]
-    config
-        .sandbox
-        .paths
-        .validate_no_rw_globs()
-        .map_err(CliError::Other)?;
+    config.sandbox.paths.validate_no_rw_globs()?;
 
     Ok(())
 }

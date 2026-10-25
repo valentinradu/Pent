@@ -1,47 +1,148 @@
 //! Layered configuration loading.
 //!
 //! Loads and merges configuration from two locations:
-//! 1. Global: `~/.config/pent/pent.toml`
-//! 2. Project: `<workspace>/.pent/pent.toml`
+//! 1. Global: `~/.config/pent/pent.toml`. Pent always loads it, also when the
+//!    workspace has no project config.
+//! 2. Project: `<workspace>/.pent/pent.toml`. Pent loads it only when the user
+//!    trusts its exact content (see [`TrustStore`]).
 //!
 //! Project values take precedence for scalar fields; list fields are extended
-//! so that both global and project entries contribute.
+//! so that both global and project entries contribute. Relative paths in both
+//! files resolve against the workspace.
 
-use crate::{PentConfig, SettingsError};
+use crate::{PentConfig, SettingsError, TrustStatus, TrustStore};
 use std::path::{Path, PathBuf};
 
 /// Loads and merges `PentConfig` from global and project-level files.
 pub struct ConfigLoader;
 
+/// The state of the project config after a load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectConfigStatus {
+    /// The workspace has no project config.
+    Absent,
+    /// The user trusts the project config. Pent applies it.
+    Trusted,
+    /// The user did not trust the project config. Pent does not apply it.
+    Untrusted,
+    /// The project config changed after the user trusted it. Pent does not
+    /// apply it.
+    Changed,
+}
+
+impl ProjectConfigStatus {
+    /// Returns `true` when pent applies the project config.
+    #[must_use]
+    pub const fn is_applied(self) -> bool {
+        matches!(self, Self::Trusted)
+    }
+
+    /// Returns `true` when a project config exists but pent does not apply it.
+    #[must_use]
+    pub const fn is_ignored(self) -> bool {
+        matches!(self, Self::Untrusted | Self::Changed)
+    }
+}
+
+impl From<TrustStatus> for ProjectConfigStatus {
+    fn from(status: TrustStatus) -> Self {
+        match status {
+            TrustStatus::Trusted => Self::Trusted,
+            TrustStatus::Untrusted => Self::Untrusted,
+            TrustStatus::Changed => Self::Changed,
+        }
+    }
+}
+
+/// The result of [`ConfigLoader::load_with_status`].
+#[derive(Debug, Clone)]
+pub struct LoadedConfig {
+    /// The merged configuration that pent applies.
+    pub config: PentConfig,
+    /// The path of the project config file (it may not exist).
+    pub project_path: PathBuf,
+    /// The state of the project config.
+    pub project_status: ProjectConfigStatus,
+}
+
 impl ConfigLoader {
     /// Load the merged configuration for the given workspace.
     ///
-    /// Reads the global config (`~/.config/pent/pent.toml`), then the project
-    /// config (`<workspace>/.pent/pent.toml`), and merges them. Missing files
-    /// are silently skipped. Parse errors are returned as errors.
+    /// Reads the global config (`~/.config/pent/pent.toml`) and, when the user
+    /// trusts it, the project config (`<workspace>/.pent/pent.toml`), and
+    /// merges them. The global config applies also when the workspace has no
+    /// project config. Missing files are silently skipped. An untrusted or
+    /// changed project config is skipped; use [`ConfigLoader::load_with_status`]
+    /// to find out about it and warn the user.
     ///
     /// # Errors
-    /// Returns an error if a config file exists but cannot be parsed.
+    /// Returns an error if the global config or a trusted project config
+    /// exists but cannot be parsed.
     pub fn load(workspace: &Path) -> Result<PentConfig, SettingsError> {
-        let project_path = Self::project_config_path(workspace);
-        let project = Self::load_file(&project_path)?.unwrap_or_default();
+        Ok(Self::load_with_status(workspace)?.config)
+    }
 
-        // Global config is only loaded when a project config file exists.
-        // Without a project context the behaviour must match --no-config
-        // (defaults only), so that running `pent run -- <cmd>` in an
-        // unconfigured directory never silently activates ProxyOnly or other
-        // modes the user didn't ask for in that context.
-        let global = if project_path.exists() {
-            if let Some(path) = Self::global_config_path() {
-                Self::load_file(&path)?.unwrap_or_default()
-            } else {
-                PentConfig::default()
-            }
-        } else {
-            PentConfig::default()
+    /// Load the merged configuration and the state of the project config.
+    ///
+    /// The trust store is `<config dir>/pent/trusted.toml`. When pent cannot
+    /// read the trust store, no project config is trusted.
+    ///
+    /// # Errors
+    /// Returns an error if the global config or a trusted project config
+    /// exists but cannot be parsed.
+    pub fn load_with_status(workspace: &Path) -> Result<LoadedConfig, SettingsError> {
+        // A trust store that pent cannot read trusts nothing. Pent then
+        // ignores the project config and warns; it does not fail, so that
+        // embedders keep working.
+        let store = TrustStore::open_default().ok();
+        Self::load_from(
+            workspace,
+            Self::global_config_path().as_deref(),
+            store.as_ref(),
+        )
+    }
+
+    /// Load with an explicit global config path and trust store.
+    pub(crate) fn load_from(
+        workspace: &Path,
+        global_path: Option<&Path>,
+        store: Option<&TrustStore>,
+    ) -> Result<LoadedConfig, SettingsError> {
+        let global = match global_path {
+            Some(path) => match read_optional(path)? {
+                Some(bytes) => PentConfig::parse_file_contents(path, &bytes)?,
+                None => PentConfig::default(),
+            },
+            None => PentConfig::default(),
         };
 
-        Ok(global.merge(project))
+        let project_path = Self::project_config_path(workspace);
+        // Read the bytes once: pent checks the trust of these bytes and parses
+        // the same bytes, thus a change between the two steps has no effect.
+        let (project, project_status) = match read_optional(&project_path)? {
+            None => (PentConfig::default(), ProjectConfigStatus::Absent),
+            Some(bytes) => {
+                let status = store.map_or(ProjectConfigStatus::Untrusted, |s| {
+                    s.status(&project_path, &bytes).into()
+                });
+                if status.is_applied() {
+                    (
+                        PentConfig::parse_file_contents(&project_path, &bytes)?,
+                        status,
+                    )
+                } else {
+                    (PentConfig::default(), status)
+                }
+            }
+        };
+
+        let mut config = global.merge(project);
+        config.resolve_relative_paths(workspace);
+        Ok(LoadedConfig {
+            config,
+            project_path,
+            project_status,
+        })
     }
 
     /// Absolute path to the global config file.
@@ -60,6 +161,18 @@ impl ConfigLoader {
         Self::project_config_dir(workspace).join("pent.toml")
     }
 
+    /// Load one config file, returning `None` if it is absent or inaccessible.
+    ///
+    /// The relative paths in the file do not change.
+    ///
+    /// # Errors
+    /// Returns an error if the file is readable but not a valid config.
+    pub fn load_file(path: &Path) -> Result<Option<PentConfig>, SettingsError> {
+        read_optional(path)?
+            .map(|bytes| PentConfig::parse_file_contents(path, &bytes))
+            .transpose()
+    }
+
     fn global_config_dir() -> Option<PathBuf> {
         dirs::config_dir().map(|d| d.join("pent"))
     }
@@ -67,31 +180,31 @@ impl ConfigLoader {
     fn project_config_dir(workspace: &Path) -> PathBuf {
         workspace.join(".pent")
     }
+}
 
-    /// Load a config file, returning `None` if it is absent or inaccessible.
-    ///
-    /// IO errors (not-found, permission-denied, EPERM from a sandbox, etc.) are
-    /// treated as "no config" so that optional config files — in particular the
-    /// global one — never prevent the tool from running in restricted environments.
-    ///
-    /// # Errors
-    /// Returns an error only if the file is readable but contains invalid TOML.
-    fn load_file(path: &Path) -> Result<Option<PentConfig>, SettingsError> {
-        match std::fs::read_to_string(path) {
-            Ok(contents) => PentConfig::parse(&contents).map(Some),
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
-                ) =>
-            {
-                Ok(None)
-            }
-            // EPERM (raw os error 1) is not always mapped to PermissionDenied by
-            // std on macOS; handle it explicitly so sandboxed environments work.
-            Err(ref e) if e.raw_os_error() == Some(1) => Ok(None),
-            Err(e) => Err(SettingsError::Io(e)),
+/// Read a config file, returning `None` if it is absent or inaccessible.
+///
+/// IO errors (not-found, permission-denied, EPERM from a sandbox, etc.) are
+/// treated as "no config" so that optional config files — in particular the
+/// global one — never prevent the tool from running in restricted environments.
+///
+/// # Errors
+/// Returns an error for other I/O errors.
+fn read_optional(path: &Path) -> Result<Option<Vec<u8>>, SettingsError> {
+    match std::fs::read(path) {
+        Ok(contents) => Ok(Some(contents)),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            Ok(None)
         }
+        // EPERM (raw os error 1) is not always mapped to PermissionDenied by
+        // std on macOS; handle it explicitly so sandboxed environments work.
+        Err(ref e) if e.raw_os_error() == Some(1) => Ok(None),
+        Err(e) => Err(SettingsError::Io(e)),
     }
 }
 
@@ -102,35 +215,162 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
+    /// A workspace, a global config path and a trust store, all in temp dirs.
+    struct Fixture {
+        workspace: tempfile::TempDir,
+        config_dir: tempfile::TempDir,
+    }
+
+    impl Fixture {
+        fn new() -> Result<Self, std::io::Error> {
+            Ok(Self {
+                workspace: tempfile::tempdir()?,
+                config_dir: tempfile::tempdir()?,
+            })
+        }
+
+        fn global_path(&self) -> PathBuf {
+            self.config_dir.path().join("pent.toml")
+        }
+
+        fn store_path(&self) -> PathBuf {
+            self.config_dir.path().join("trusted.toml")
+        }
+
+        fn write_project(&self, contents: &str) -> Result<PathBuf, std::io::Error> {
+            let pent_dir = self.workspace.path().join(".pent");
+            fs::create_dir_all(&pent_dir)?;
+            let path = pent_dir.join("pent.toml");
+            fs::write(&path, contents)?;
+            Ok(path)
+        }
+
+        fn trust_project(&self) -> TestResult {
+            let path = ConfigLoader::project_config_path(self.workspace.path());
+            let bytes = fs::read(&path)?;
+            let mut store = TrustStore::open(self.store_path())?;
+            store.trust(&path, &bytes);
+            store.save()?;
+            Ok(())
+        }
+
+        fn load(&self) -> Result<LoadedConfig, Box<dyn std::error::Error>> {
+            let store = TrustStore::open(self.store_path())?;
+            Ok(ConfigLoader::load_from(
+                self.workspace.path(),
+                Some(&self.global_path()),
+                Some(&store),
+            )?)
+        }
+    }
+
     #[test]
-    fn test_load_no_project_config_returns_default() -> TestResult {
-        let dir = tempfile::tempdir()?;
-        // No .pent/pent.toml → load() must return defaults regardless of any
-        // global config the developer may have installed on this machine.
-        let config = ConfigLoader::load(dir.path())?;
-        assert!(config.sandbox.network.is_none());
-        assert!(config.proxy.domain_allowlist.is_empty());
+    fn test_load_nothing_returns_default() -> TestResult {
+        let f = Fixture::new()?;
+        let loaded = f.load()?;
+        assert!(loaded.config.sandbox.network.is_none());
+        assert!(loaded.config.proxy.domain_allowlist.is_empty());
+        assert_eq!(loaded.project_status, ProjectConfigStatus::Absent);
         Ok(())
     }
 
     #[test]
-    fn test_load_project_config_only() -> TestResult {
-        let dir = tempfile::tempdir()?;
-        let pent_dir = dir.path().join(".pent");
-        fs::create_dir_all(&pent_dir)?;
+    fn test_global_config_loaded_without_project_config() -> TestResult {
+        let f = Fixture::new()?;
         fs::write(
-            pent_dir.join("pent.toml"),
-            "[proxy]\ndomain_allowlist = [\"example.com\"]\n",
+            f.global_path(),
+            "[proxy]\ndomain_allowlist = [\"global.com\"]\n",
         )?;
+        let loaded = f.load()?;
+        assert_eq!(loaded.config.proxy.domain_allowlist, vec!["global.com"]);
+        assert_eq!(loaded.project_status, ProjectConfigStatus::Absent);
+        Ok(())
+    }
 
-        let config = ConfigLoader::load(dir.path())?;
-        assert!(
-            config
-                .proxy
-                .domain_allowlist
-                .contains(&"example.com".to_string()),
-            "project domain_allowlist should be present"
+    #[test]
+    fn test_untrusted_project_config_not_applied() -> TestResult {
+        let f = Fixture::new()?;
+        fs::write(
+            f.global_path(),
+            "[proxy]\ndomain_allowlist = [\"global.com\"]\n",
+        )?;
+        f.write_project("[proxy]\ndomain_allowlist = [\"project.com\"]\n")?;
+        let loaded = f.load()?;
+        assert_eq!(loaded.project_status, ProjectConfigStatus::Untrusted);
+        assert_eq!(loaded.config.proxy.domain_allowlist, vec!["global.com"]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_untrusted_malformed_project_config_is_not_parsed() -> TestResult {
+        let f = Fixture::new()?;
+        f.write_project("not valid toml :::")?;
+        let loaded = f.load()?;
+        assert_eq!(loaded.project_status, ProjectConfigStatus::Untrusted);
+        Ok(())
+    }
+
+    #[test]
+    fn test_trusted_project_config_applied_and_merged() -> TestResult {
+        let f = Fixture::new()?;
+        fs::write(
+            f.global_path(),
+            "[proxy]\ndomain_allowlist = [\"global.com\"]\n",
+        )?;
+        f.write_project("[proxy]\ndomain_allowlist = [\"project.com\"]\n")?;
+        f.trust_project()?;
+        let loaded = f.load()?;
+        assert_eq!(loaded.project_status, ProjectConfigStatus::Trusted);
+        assert_eq!(
+            loaded.config.proxy.domain_allowlist,
+            vec!["global.com", "project.com"]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_edit_invalidates_trust() -> TestResult {
+        let f = Fixture::new()?;
+        f.write_project("[proxy]\ndomain_allowlist = [\"project.com\"]\n")?;
+        f.trust_project()?;
+        f.write_project("[proxy]\ndomain_allowlist = [\"evil.com\"]\n")?;
+        let loaded = f.load()?;
+        assert_eq!(loaded.project_status, ProjectConfigStatus::Changed);
+        assert!(loaded.config.proxy.domain_allowlist.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_no_store_means_untrusted() -> TestResult {
+        let f = Fixture::new()?;
+        f.write_project("[proxy]\ndomain_allowlist = [\"project.com\"]\n")?;
+        let loaded = ConfigLoader::load_from(f.workspace.path(), None, None)?;
+        assert_eq!(loaded.project_status, ProjectConfigStatus::Untrusted);
+        assert!(loaded.config.proxy.domain_allowlist.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_relative_project_paths_resolve_against_workspace() -> TestResult {
+        let f = Fixture::new()?;
+        f.write_project(
+            "[sandbox.paths]\nread = [\"data\", \"/abs\", \"~/x\"]\n\
+             [[sandbox.mounts]]\npath = \"mnt\"\n",
+        )?;
+        f.trust_project()?;
+        let loaded = f.load()?;
+        let ws = f.workspace.path();
+        assert_eq!(
+            loaded.config.sandbox.paths.read,
+            vec![
+                ws.join("data").to_string_lossy().into_owned(),
+                "/abs".to_string(),
+                "~/x".to_string(),
+            ]
+        );
+        let mount = loaded.config.sandbox.mounts.first().ok_or("no mount")?;
+        assert_eq!(mount.path, ws.join("mnt"));
+        assert!(mount.readonly, "a mount without the key must be read-only");
         Ok(())
     }
 
@@ -150,47 +390,23 @@ mod tests {
     }
 
     #[test]
-    fn test_load_malformed_config_returns_error() -> TestResult {
-        let dir = tempfile::tempdir()?;
-        let pent_dir = dir.path().join(".pent");
-        fs::create_dir_all(&pent_dir)?;
-        fs::write(pent_dir.join("pent.toml"), "not valid toml :::")?;
-
-        let result = ConfigLoader::load(dir.path());
+    fn test_load_trusted_malformed_config_returns_error() -> TestResult {
+        let f = Fixture::new()?;
+        f.write_project("not valid toml :::")?;
+        f.trust_project()?;
+        let result = f.load();
         assert!(result.is_err(), "malformed config should return an error");
         Ok(())
     }
 
     #[test]
-    fn test_load_merges_global_and_project() -> TestResult {
-        let global_dir = tempfile::tempdir()?;
-        let global_config_path = global_dir.path().join("pent.toml");
-        std::fs::write(
-            &global_config_path,
-            "[proxy]\ndomain_allowlist = [\"global.com\"]\n",
-        )?;
-
-        let project_dir = tempfile::tempdir()?;
-        let pent_dir = project_dir.path().join(".pent");
-        fs::create_dir_all(&pent_dir)?;
-        fs::write(
-            pent_dir.join("pent.toml"),
-            "[proxy]\ndomain_allowlist = [\"project.com\"]\n",
-        )?;
-
-        // Load global manually then merge with project to test merge logic
-        let global = PentConfig::load(&global_config_path)?;
-        let project = PentConfig::load(&pent_dir.join("pent.toml"))?;
-        let merged = global.merge(project);
-
-        assert!(merged
-            .proxy
-            .domain_allowlist
-            .contains(&"global.com".to_string()));
-        assert!(merged
-            .proxy
-            .domain_allowlist
-            .contains(&"project.com".to_string()));
+    fn test_load_malformed_global_config_returns_error() -> TestResult {
+        let f = Fixture::new()?;
+        fs::write(f.global_path(), "[proxy]\ndomain_alowlist = []\n")?;
+        let err = f.load().err().ok_or("expected an error")?;
+        let msg = err.to_string();
+        assert!(msg.contains("domain_alowlist"), "{msg}");
+        assert!(msg.contains("pent.toml"), "{msg}");
         Ok(())
     }
 }
