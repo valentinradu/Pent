@@ -171,6 +171,16 @@ mod tests {
         assert_eq!(class("ff02::1"), Some(NonPublic::Multicast));
     }
 
+    /// `fec0::/10` is the deprecated site-local range. A router can still
+    /// carry it, so it is not a public destination.
+    #[test]
+    fn test_classify_rejects_deprecated_site_local() {
+        assert_eq!(class("fec0::1"), Some(NonPublic::UniqueLocal));
+        assert_eq!(class("feff:ffff::1"), Some(NonPublic::UniqueLocal));
+        // The range stops at `fec0::/10`: `fe00::` is below it.
+        assert_eq!(class("fe00::1"), None);
+    }
+
     #[test]
     fn test_classify_rejects_embedded_ipv4_forms() {
         assert_eq!(class("::ffff:127.0.0.1"), Some(NonPublic::Loopback));

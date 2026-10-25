@@ -467,6 +467,43 @@ mod tests {
         Ok(())
     }
 
+    /// An exact pattern matches its own name and no other name.
+    #[test]
+    fn an_exact_pattern_matches_only_its_own_name() -> Result<(), DomainNameError> {
+        let pattern = DomainPattern::parse("example.com")?;
+        assert!(pattern.matches("example.com"));
+        assert!(!pattern.matches("other.com"));
+        assert!(!pattern.matches("sub.example.com"));
+        Ok(())
+    }
+
+    /// The limit is 253 bytes: a name of 253 bytes is valid, and a name of
+    /// 254 bytes is not.
+    #[test]
+    fn the_name_length_limit_is_253_bytes() {
+        let name_253 = make_name(MAX_NAME_LEN);
+        assert_eq!(name_253.len(), MAX_NAME_LEN);
+        assert_eq!(normalize_hostname(&name_253), Ok(name_253.clone()));
+        let name_254 = make_name(MAX_NAME_LEN + 1);
+        assert_eq!(
+            normalize_hostname(&name_254),
+            Err(DomainNameError::TooLong(name_254))
+        );
+    }
+
+    /// A host name of exactly `len` bytes, with labels of 31 bytes.
+    fn make_name(len: usize) -> String {
+        let mut name = String::new();
+        while name.len() < len {
+            if !name.is_empty() {
+                name.push('.');
+            }
+            let room = len.saturating_sub(name.len()).min(31);
+            name.push_str(&"a".repeat(room));
+        }
+        name
+    }
+
     #[test]
     fn test_pattern_parse_single_wildcard() -> Result<(), DomainNameError> {
         let pattern = DomainPattern::parse("*.example.com")?;

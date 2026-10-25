@@ -1946,4 +1946,112 @@ mod tests {
             vec!["r /opt/tool/a | read by tool [OutsideHome]"]
         );
     }
+
+    /// Only a path below `/proc/<pid>`, `/proc/self` or `/proc/thread-self`
+    /// is short-lived. A path with the same name below another directory
+    /// keeps its rule, and a file directly in `/proc` keeps its rule too.
+    #[test]
+    fn only_the_per_process_part_of_proc_is_ephemeral() {
+        let mut c = ctx();
+        // The fixture context marks `/proc` as covered, which would hide
+        // every path below it. Remove that, so the test sees `is_ephemeral`.
+        c.covered = vec![PathBuf::from("/usr")];
+        let events = [
+            fs(Read, "/proc/self/maps", "tool"),
+            fs(Read, "/proc/thread-self/stat", "tool"),
+            fs(Read, "/proc/4242/cmdline", "tool"),
+            fs(Read, "/proc/mounts", "tool"),
+            fs(Read, "/opt/self/data", "tool"),
+            fs(Read, "/opt/4242/data", "tool"),
+        ];
+        assert_eq!(
+            lines(&summarize(&events, &c)),
+            vec![
+                "r /opt/4242/data | read by tool [OutsideHome]",
+                "r /opt/self/data | read by tool [OutsideHome]",
+                "r /proc/mounts | read by tool [OutsideHome]",
+            ]
+        );
+    }
+
+    /// The reason of a read-write rule says what the program did, and the
+    /// name of a single file gives the kind of the file.
+    #[test]
+    fn read_write_reasons_name_the_change_and_the_kind_of_file() {
+        let events = [
+            fs(Write, "/home/u/.tool/a.json", "tool"),
+            fs(Write, "/home/u/.tool/b.json", "tool"),
+            // A read below a read-write rule gives no second rule.
+            fs(Read, "/home/u/.tool/c.json", "tool"),
+            fs(Delete, "/home/u/.other/x", "tool"),
+            fs(Write, "/home/u/.other/y", "tool"),
+            fs(Write, "/home/u/.third/a.lock", "tool"),
+            fs(Write, "/home/u/.fourth/my_history", "tool"),
+            fs(Write, "/home/u/.fifth/run.log", "tool"),
+        ];
+        assert_eq!(
+            run(&events),
+            vec![
+                "rw ~/.fifth/run.log | log file",
+                "rw ~/.fourth/my_history | history file",
+                "rw ~/.other | edits files",
+                "rw ~/.third/a.lock | lock file",
+                "rw ~/.tool | edits files",
+            ]
+        );
+    }
+
+    /// The note of another repository goes only on the rules of that
+    /// repository, and a local name gives no domain rule.
+    #[test]
+    fn notes_and_local_names_stay_on_their_own_items() {
+        let events = [
+            fs(Read, "/home/u/src/lib/.git/HEAD", "git"),
+            fs(Write, "/home/u/.tool/config.json", "tool"),
+            WatchEvent::UnixConnect {
+                target: "/home/u/.run/bus".to_string(),
+                process: crate::ProcessInfo {
+                    pid: 7,
+                    name: "tool".to_string(),
+                },
+                outcome: Outcome::Allowed,
+            },
+            WatchEvent::UnixConnect {
+                target: "/home/u/.run/system_bus_socket".to_string(),
+                process: crate::ProcessInfo {
+                    pid: 7,
+                    name: "tool".to_string(),
+                },
+                outcome: Outcome::Allowed,
+            },
+            dns("api.localhost"),
+            dns("printer.local"),
+            dns("real.example.net"),
+        ];
+        assert_eq!(
+            run(&events),
+            vec![
+                "rw ~/.tool/config.json | config file",
+                "r ~/src/lib/.git/HEAD | read by git [OtherRepository]",
+                "unix ~/.run/bus | D-Bus",
+                "unix ~/.run/system_bus_socket | D-Bus",
+                "net real.example.net | DNS lookup only",
+            ]
+        );
+    }
+
+    /// A wildcard rule in the profile covers only its own domain. A new
+    /// wildcard for another domain stays in the summary.
+    #[test]
+    fn a_wildcard_rule_does_not_cover_another_wildcard() {
+        let mut c = ctx();
+        let mut doc = ProfileDoc::default();
+        doc.network.domains.push("*.example.com".to_string());
+        c.existing = Some(doc);
+        let events = [dns("a.foo.com"), dns("b.foo.com"), dns("c.foo.com")];
+        assert_eq!(
+            lines(&summarize(&events, &c)),
+            vec!["net *.foo.com | a, b, c"]
+        );
+    }
 }
