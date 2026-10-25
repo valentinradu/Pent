@@ -576,17 +576,17 @@ mod macos {
         Ok(())
     }
 
-    // ── the open findings ────────────────────────────────────────────────────
+    // ── the findings of the review ───────────────────────────────────────────
     //
-    // Each test below states the secure behaviour and fails today. See
-    // `docs/security/macos.md`. Run them with `--include-ignored`.
+    // Each test below states the secure behaviour. See
+    // `docs/security/macos.md`. MAC-1, MAC-2 and MAC-3 have a fix, so these
+    // tests run in the normal suite. MAC-4 has no fix yet, so its test
+    // keeps the `ignore` mark; `--include-ignored` shows the failure.
 
     /// MAC-1. The watched program writes its own Seatbelt reports into the
-    /// unified log. The reader filters by PID only, and the PID of the
-    /// program is in the tree, so the program adds any rule it wants to its
-    /// own draft.
+    /// unified log with `/usr/bin/logger`. The reader takes only the
+    /// messages of the kernel, so these lines are not events.
     #[test]
-    #[ignore = "OPEN MAC-1: the watched program forges its own events with /usr/bin/logger"]
     fn a_program_cannot_forge_its_own_events() -> TestResult {
         if !ready("forged_by_the_program", &[SH, LOGGER]) {
             return Ok(());

@@ -1,17 +1,34 @@
 //! Read the Seatbelt reports of a process tree from the macOS unified log.
 //!
 //! The kernel writes one log line for each operation that Seatbelt denies,
-//! and for each operation that an `allow` rule with `(with report)` allows:
+//! and for each operation that an `allow` rule with `(with report)` allows.
+//! With `log stream --style syslog`, one report looks like this:
 //!
 //! ```text
-//! Sandbox: cat(1234) deny(1) file-read-data /Users/x/.ssh/id_rsa
-//! Sandbox: cat(1234) allow(1) file-read-data /Users/x/notes.txt
+//! 2026-10-25 10:00:00.000000+0200  localhost kernel[0]: (Sandbox) Sandbox: cat(1234) deny(1) file-read-data /Users/x/.ssh/id_rsa
+//! 2026-10-25 10:00:00.000000+0200  localhost kernel[0]: (Sandbox) Sandbox: cat(1234) allow(1) file-read-data /Users/x/notes.txt
 //! ```
 //!
 //! The deny form is known (the `pent run --trace` code reads it). The author
 //! did not see the form of an allow report on a Mac. The parser thus accepts
 //! the keywords `deny` and `allow`, with or without the `(<count>)` part.
 //! Test this on a Mac.
+//!
+//! # Every process can write to the unified log
+//!
+//! The watched program can call `os_log` or run `/usr/bin/logger`, so the
+//! text of a line proves nothing. The reader has three guards (see MAC-1 in
+//! `docs/security/macos.md`):
+//!
+//! 1. The predicate takes only the messages of the kernel
+//!    (`PREDICATE`: `processImagePath == "/kernel"`).
+//!    A program cannot write a message with the image path of the kernel.
+//! 2. [`parse_line`] takes only a line with the full kernel header that
+//!    `log` writes itself (`kernel[0]: `), and it reads each field of the
+//!    report at a fixed position. A program that gives its own executable a
+//!    name which looks like the header cannot reach the fields, because
+//!    `log` always writes `[<pid>]: ` after the name of the process.
+//! 3. The reader keeps only the lines of the process tree of the run.
 //!
 //! [`LogReader`] starts `log stream` before the spawn of the child, keeps
 //! only the lines of the PIDs of the child tree, and sends one
@@ -47,6 +64,15 @@ pub(crate) struct SeatbeltRecord {
     pub(crate) target: String,
 }
 
+/// The header that `log --style syslog` writes for a message of the
+/// kernel. Only the kernel has the process ID 0, and `log` writes this
+/// header itself, so a program cannot put it in its own message: after the
+/// name of the process, `log` always writes `[<pid>]: ` with the real PID.
+const KERNEL_HEADER: &str = " kernel[0]: ";
+
+/// The prefix of each Seatbelt report in the message of the kernel.
+const REPORT_PREFIX: &str = "Sandbox: ";
+
 /// Find the first `) deny` or `) allow` marker in `line`.
 ///
 /// Return the byte index of `)`, the action and the length of the marker.
@@ -61,41 +87,93 @@ fn find_marker(line: &str) -> Option<(usize, Action, usize)> {
     }
 }
 
+/// Remove the `(<sender>) ` group that `log --style syslog` writes between
+/// the header and the message. Return `text` unchanged when the group is
+/// not there.
+fn strip_sender(text: &str) -> &str {
+    let Some(rest) = text.strip_prefix('(') else {
+        return text;
+    };
+    match rest.find(") ") {
+        Some(close) => rest.get(close.saturating_add(2)..).unwrap_or(text),
+        None => text,
+    }
+}
+
+/// Return true if `name` can be the name of a process in a report.
+///
+/// A real name holds spaces and parentheses (`Code Helper (GPU)`). It does
+/// not hold `[`, `]` or `:`. These three characters are the ones that `log`
+/// writes around the PID of the process that sends a message, so this check
+/// drops a line in which the name of the process holds a false header.
+fn is_process_name(name: &str) -> bool {
+    !name.is_empty() && !name.contains(['[', ']', ':'])
+}
+
+/// Return true if `text` is a Seatbelt operation name.
+fn is_operation(text: &str) -> bool {
+    !text.is_empty()
+        && text
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '*' | '_'))
+}
+
 /// Parse one line of `log stream` output.
 ///
-/// Return `None` if the line is not a Seatbelt report. The process name can
-/// contain spaces and parentheses (`Code Helper (GPU)(77)`); the PID is the
-/// number in the last parentheses before the action keyword.
+/// Return `None` if the line is not a Seatbelt report of the kernel. The
+/// line must have this shape:
+///
+/// ```text
+/// <anything> kernel[0]: [(<sender>) ]Sandbox: <name>(<pid>) <action>[(<count>)] <operation>[ <target>]
+/// ```
+///
+/// The function reads the first kernel header of the line, so text that a
+/// program puts in a path cannot add a second report: such text stays in
+/// the target of the real report.
+///
+/// The process name can contain spaces and parentheses
+/// (`Code Helper (GPU)(77)`); the PID is the number in the last parentheses
+/// before the action keyword.
 pub(crate) fn parse_line(line: &str) -> Option<SeatbeltRecord> {
-    const PREFIX: &str = "Sandbox: ";
-    let (marker, action, marker_len) = find_marker(line)?;
-    let head = line.get(..marker)?;
-    let open = head.rfind('(')?;
-    let pid: u32 = head.get(open.checked_add(1)?..)?.trim().parse().ok()?;
-    let name_part = head.get(..open)?;
-    let process = match name_part.rfind(PREFIX) {
-        Some(i) => name_part.get(i.checked_add(PREFIX.len())?..)?,
-        None => name_part.rsplit(char::is_whitespace).next()?,
-    }
-    .trim();
-    if process.is_empty() {
+    // One report is one line. A control character belongs to no field.
+    if line.contains(char::is_control) {
         return None;
     }
-    let mut rest = line.get(marker.checked_add(marker_len)?..)?;
+    let header = line.find(KERNEL_HEADER)?;
+    let after_header = line.get(header.checked_add(KERNEL_HEADER.len())?..)?;
+    let message = strip_sender(after_header).strip_prefix(REPORT_PREFIX)?;
+
+    let (marker, action, marker_len) = find_marker(message)?;
+    let head = message.get(..marker)?;
+    let open = head.rfind('(')?;
+    let digits = head.get(open.checked_add(1)?..)?;
+    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let pid: u32 = digits.parse().ok()?;
+    let process = head.get(..open)?;
+    if !is_process_name(process) {
+        return None;
+    }
+    let mut rest = message.get(marker.checked_add(marker_len)?..)?;
     // The keyword must end here: "allowed" or "denying" is not a report.
-    if !(rest.starts_with('(') || rest.starts_with(char::is_whitespace)) {
+    if !(rest.starts_with('(') || rest.starts_with(' ')) {
         return None;
     }
     // Skip the "(1)" count when it is present.
     if let Some(after_open) = rest.strip_prefix('(') {
         let close = after_open.find(')')?;
+        let count = after_open.get(..close)?;
+        if count.is_empty() || !count.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
         rest = after_open.get(close.checked_add(1)?..)?;
     }
-    let rest = rest.trim();
+    let rest = rest.strip_prefix(' ')?;
     let (operation, target) = rest
-        .split_once(char::is_whitespace)
-        .map_or((rest, ""), |(op, target)| (op, target.trim()));
-    if operation.is_empty() {
+        .split_once(' ')
+        .map_or((rest, ""), |(op, tail)| (op, tail));
+    if !is_operation(operation) {
         return None;
     }
     Some(SeatbeltRecord {
@@ -325,10 +403,20 @@ mod runtime {
     /// The `log stream` predicate.
     ///
     /// The kernel writes each Seatbelt report as
-    /// "Sandbox: <name>(<pid>) <action>(<count>) <operation> <target>". The
-    /// sender of these messages is the `Sandbox` kernel extension. The
-    /// predicate accepts both, so a change of one does not lose all reports.
-    const PREDICATE: &str = r#"sender == "Sandbox" OR eventMessage CONTAINS ") deny(" OR eventMessage CONTAINS ") allow(""#;
+    /// "Sandbox: <name>(<pid>) <action>(<count>) <operation> <target>", and
+    /// the sender of these messages is the `Sandbox` part of the kernel.
+    ///
+    /// The first term is the important one: every process can write to the
+    /// unified log, but only the kernel has the process image path
+    /// `/kernel`. A message of the watched program therefore never reaches
+    /// the reader (MAC-1 in `docs/security/macos.md`). The second term
+    /// keeps the stream small; it accepts the sender and also the text, so
+    /// a change of one of the two does not lose all reports.
+    ///
+    /// The author did not run this predicate on a Mac. If a first run gives
+    /// no event at all, the predicate is the first thing to check:
+    /// `log stream --predicate 'processImagePath == "/kernel"' --style syslog`.
+    const PREDICATE: &str = r#"processImagePath == "/kernel" AND (sender == "Sandbox" OR eventMessage BEGINSWITH "Sandbox: ")"#;
 
     /// The process tree and the time of its last refresh.
     struct Tree {
@@ -540,10 +628,20 @@ mod tests {
     use super::*;
     use pent_profile::{guard_rules, GuardClass};
 
+    /// The header that `log --style syslog` writes before the message of
+    /// the kernel.
+    const HEAD: &str = "2026-10-25 10:00:00.000000+0200  localhost kernel[0]: (Sandbox) ";
+
+    /// One log line of the kernel with the message `message`.
+    fn kernel_line(message: &str) -> String {
+        format!("{HEAD}{message}")
+    }
+
     // A test helper: a line that does not parse must fail the test.
     #[allow(clippy::panic)]
-    fn record(line: &str) -> SeatbeltRecord {
-        match parse_line(line) {
+    fn record(message: &str) -> SeatbeltRecord {
+        let line = kernel_line(message);
+        match parse_line(&line) {
             Some(r) => r,
             None => panic!("line did not parse: {line}"),
         }
@@ -551,10 +649,7 @@ mod tests {
 
     #[test]
     fn parses_syslog_deny_line() {
-        let r = record(
-            "2026-10-25 10:00:00.000000+0200  localhost kernel[0]: (Sandbox) \
-             Sandbox: cat(1234) deny(1) file-read-data /Users/x/.ssh/id_rsa",
-        );
+        let r = record("Sandbox: cat(1234) deny(1) file-read-data /Users/x/.ssh/id_rsa");
         assert_eq!(r.process, "cat");
         assert_eq!(r.pid, 1234);
         assert_eq!(r.action, Action::Deny);
@@ -564,13 +659,22 @@ mod tests {
 
     #[test]
     fn parses_allow_report_with_and_without_count() {
-        let r = record("kernel: Sandbox: node(42) allow(1) file-write-create /w/a b.txt");
+        let r = record("Sandbox: node(42) allow(1) file-write-create /w/a b.txt");
         assert_eq!(r.action, Action::Allow);
         assert_eq!(r.operation, "file-write-create");
         assert_eq!(r.target, "/w/a b.txt");
         let r = record("Sandbox: node(42) allow file-read-data /w/x");
         assert_eq!(r.action, Action::Allow);
         assert_eq!(r.target, "/w/x");
+    }
+
+    /// The sender group of the syslog style is not in every line, and the
+    /// text before the header is not fixed.
+    #[test]
+    fn parses_a_line_without_the_sender_group() {
+        let line = "2026-10-25 10:00:00.000000+0200  mac kernel[0]: \
+                    Sandbox: cat(7) deny(1) file-read-data /a";
+        assert_eq!(parse_line(line).map(|r| r.pid), Some(7));
     }
 
     #[test]
@@ -588,33 +692,123 @@ mod tests {
         assert_eq!(r.target, "/w/x) deny(1) y");
     }
 
-    /// Any process can write to the unified log. The parser accepts a line
-    /// that has no `Sandbox: ` prefix, so only the process-tree filter
-    /// keeps a forged line out of the record. See MAC-1 in
-    /// `docs/security/macos.md`.
+    /// A path can hold the text of a whole kernel header. The parser reads
+    /// the first header of the line, so the text stays in the target of the
+    /// real report and gives no second event.
     #[test]
-    fn a_line_from_another_sender_still_parses() {
-        let r = record("logger[55]: Sandbox: evil(1234) allow(1) file-read-data /etc/passwd");
+    fn a_header_inside_a_path_gives_no_second_event() {
+        let r = record(
+            "Sandbox: cat(5) deny(1) file-read-data \
+             /w/ kernel[0]: (Sandbox) Sandbox: evil(9) allow(1) file-read-data /etc/passwd",
+        );
+        assert_eq!(r.pid, 5);
+        assert_eq!(r.action, Action::Deny);
+        assert_eq!(
+            r.target,
+            "/w/ kernel[0]: (Sandbox) Sandbox: evil(9) allow(1) file-read-data /etc/passwd"
+        );
+    }
+
+    /// MAC-1. Every process can write to the unified log. A line of
+    /// another sender is not a report: it has no kernel header. The
+    /// predicate of `log stream` already drops such a line; the parser is
+    /// the second guard. See `docs/security/macos.md`.
+    #[test]
+    fn a_line_from_another_sender_is_not_a_report() {
+        for line in [
+            "2026-10-25 10:00:00.000000+0200  localhost logger[55]: (libsystem.dylib) \
+             Sandbox: evil(1234) allow(1) file-read-data /etc/passwd",
+            "logger[55]: Sandbox: evil(1234) allow(1) file-read-data /etc/passwd",
+            "Sandbox: evil(1234) allow(1) file-read-data /etc/passwd",
+            // The PID of the kernel is 0. Another PID is another process.
+            "2026-10-25 10:00:00.000000+0200  localhost kernel[7]: (Sandbox) \
+             Sandbox: evil(1234) allow(1) file-read-data /etc/passwd",
+        ] {
+            assert_eq!(parse_line(line), None, "{line}");
+        }
+    }
+
+    /// MAC-1. A program can give its own executable a name that looks like
+    /// a kernel header. `log` always writes `[<pid>]: ` after the name of
+    /// the process, so the name of the forged report holds `[`, `]` and
+    /// `:`, and the parser drops the line.
+    #[test]
+    fn a_process_name_that_looks_like_a_header_is_not_a_report() {
+        let line = "2026-10-25 10:00:00.000000+0200  localhost \
+                    kernel[0]: (Sandbox) Sandbox: evil(99[55]: (x) ) allow(1) \
+                    file-read-data /etc/passwd";
+        assert_eq!(parse_line(line), None, "{line}");
+    }
+
+    /// A line that the parser must drop, with the reason in the name of the
+    /// case.
+    #[test]
+    fn rejects_other_lines() {
+        for (reason, line) in [
+            (
+                "no report",
+                "Filtering the log data using \"...\"".to_string(),
+            ),
+            (
+                "no header",
+                "Sandbox: cat(1) deny(1) file-read-data /a".to_string(),
+            ),
+            (
+                "the PID is not a number",
+                kernel_line("Sandbox: cat(x) deny(1) file-read-data /a"),
+            ),
+            (
+                "another word",
+                kernel_line("Sandbox: app(12) allowed something"),
+            ),
+            (
+                "no process name",
+                kernel_line("Sandbox: (12) deny(1) file-read-data /a"),
+            ),
+            (
+                "no message prefix",
+                kernel_line("cat(12) deny(1) file-read-data /a"),
+            ),
+            (
+                "truncated after the action",
+                kernel_line("Sandbox: cat(12) deny(1)"),
+            ),
+            ("truncated in the name", kernel_line("Sandbox: cat(12")),
+            (
+                "truncated after the count",
+                kernel_line("Sandbox: cat(12) deny(1) "),
+            ),
+            (
+                "the count is not a number",
+                kernel_line("Sandbox: cat(12) deny(x) file-read-data /a"),
+            ),
+            (
+                "the operation is not a name",
+                kernel_line("Sandbox: cat(12) deny(1) FILE_READ /a"),
+            ),
+            (
+                "a second line in one line",
+                format!(
+                    "{}\n{}",
+                    kernel_line("Sandbox: cat(12) deny(1) file-read-data /a"),
+                    kernel_line("Sandbox: evil(13) allow(1) file-read-data /etc/passwd")
+                ),
+            ),
+        ] {
+            assert_eq!(parse_line(&line), None, "{reason}: {line}");
+        }
+    }
+
+    /// The reader keeps only the lines of the process tree of the run, so a
+    /// report of another sandboxed process on the system is not an event.
+    #[test]
+    fn a_pid_outside_the_tree_is_not_in_the_record() {
+        let r = record("Sandbox: other(1234) deny(1) file-read-data /etc/passwd");
         assert_eq!(r.pid, 1234);
-        assert_eq!(r.action, Action::Allow);
-        assert_eq!(r.target, "/etc/passwd");
-        // The tree of a run holds only its own PIDs, so the filter drops
-        // this line when 1234 is not in the tree.
         let mut tree = ProcessTree::new(10);
         assert!(tree.update(&parse_ps_output("10 1 S\n")));
         assert!(tree.contains(10));
-        assert!(!tree.contains(1234));
-    }
-
-    #[test]
-    fn rejects_other_lines() {
-        assert_eq!(parse_line("Filtering the log data using \"...\""), None);
-        assert_eq!(
-            parse_line("Sandbox: cat(x) deny(1) file-read-data /a"),
-            None
-        );
-        assert_eq!(parse_line("app(12) allowed something"), None);
-        assert_eq!(parse_line("Sandbox: (12) deny(1) file-read-data /a"), None);
+        assert!(!tree.contains(r.pid));
     }
 
     #[test]
