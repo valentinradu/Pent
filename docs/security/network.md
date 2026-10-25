@@ -26,7 +26,8 @@ Test files:
 |----|----------|----------|-------|------|
 | NET-1 | Critical | The Tailscale daemon socket is not masked; its `ts-dial` call gives full network egress past the proxy. | Fixed | `tailscale_localapi_socket_is_masked` |
 | NET-2 | High | The system D-Bus socket is reachable; it resolves names and reaches network services past the proxy. | Fixed | `system_dbus_socket_is_masked` |
-| NET-3 | High | One profile path below a private directory restores the whole subtree above it, so the sibling sockets of the host come back. | **Open** | `a_profile_path_below_a_private_dir_keeps_its_siblings_hidden` |
+| NET-3 | High | One profile path below a private directory restores the whole subtree above it, so the sibling sockets of the host come back. | Fixed by `dedaf2e` | `a_profile_path_below_a_private_dir_keeps_its_siblings_hidden` |
+| NET-4 | Medium | Pent refuses each address of the Unix family, so a program cannot use its own abstract socket. | Fixed by `bfac3e0` | `child_cannot_reach_a_host_abstract_unix_socket`, `the_default_profile_refuses_a_path_but_keeps_the_unix_family` |
 
 ### NET-1 — the Tailscale daemon socket gives full egress (Critical)
 
@@ -109,10 +110,16 @@ resolver and an egress path.
 
 ### NET-3 — a profile path below a private directory restores its siblings (High)
 
-**State: open.** The test
-`a_profile_path_below_a_private_dir_keeps_its_siblings_hidden` in
-`crates/pent/tests/security_network_e2e.rs` has the mark
-`#[ignore = "OPEN NET-3: ..."]`. It fails on its own assertion today.
+**State: fixed by `dedaf2e`.** `bind_back_paths` in
+`crates/pent-sandbox/src/linux.rs` gives the paths that the configuration
+names itself, without the traversal paths. The plan binds the named path
+(a file over a file, a directory over a directory) and makes the
+directories above it inside the private tmpfs with `mount_point_parents`.
+The test `a_profile_path_below_a_private_dir_keeps_its_siblings_hidden`
+in `crates/pent/tests/security_network_e2e.rs` has no `#[ignore]` any
+more. The connect control of LS-1 already refused the sibling socket, so
+the test also lists the parent directory: with the bug the listing holds
+each sibling of the host, with the fix only the named directory.
 
 **Attack.** The user gives the profile one path below a private directory,
 for example `read_write = ["/run/user/1000/myapp"]` or a directory below
@@ -140,37 +147,66 @@ VICTIM REACHED b'PENT_VICTIM_SECRET'
 The profile named only the directory of `ALLOWED`. `VICTIM` is a sibling of
 it, and the child read its content.
 
-**Recommended fix.** Do not put the traversal paths of a configured path in
-the `keep` list of `plan_private_dirs`. Bind the configured path itself and
-make only the directories above it with `mount_point_parents`, which the plan
-already does for a path that does not exist.
+**The fix.** `plan_private_dirs` does not take the traversal paths of a
+configured path any more. It binds the configured path itself and makes
+only the directories above it with `mount_point_parents`, which the plan
+already did for a path that does not exist.
 
 ## NET-4 — pent refuses each address of the Unix family
 
-**Severity: medium (it limits the use of pent, it does not open it). Open.**
+**Severity: medium (it limits the use of pent, it does not open it).
+State: fixed by `bfac3e0`.**
 
-The fix of LS-1 makes the supervisor perform each permitted connection to
-a Unix socket. Two parts of that fix are wider than they need to be.
+The fix of LS-1 made the supervisor perform each permitted connection to
+a Unix socket. Two parts of that fix were wider than they needed to be.
 
-1. When the profile names no Unix socket, the filter refuses
-   `socket(AF_UNIX, ...)` itself. The child then cannot make a socket of
-   that family at all, not even one that it uses only with itself.
-2. The supervisor refuses each abstract address. The network namespace of
+1. When the profile named no Unix socket, the filter refused
+   `socket(AF_UNIX, ...)` itself. The child then could not make a socket
+   of that family at all, not even one that it used only with itself.
+2. The supervisor refused each abstract address. The network namespace of
    the child already separates the abstract names of the sandbox from the
    names of the host, so an abstract address of the child is harmless.
 
-Together they stop a program from using its own abstract socket, which
-some runtimes need. The test
-`child_cannot_reach_a_host_abstract_unix_socket` states the behaviour that
-pent must have: the child reaches its own abstract socket, and it does not
-reach the abstract name of a host process.
+Together they stopped a program from using its own abstract socket, which
+some runtimes need.
 
-The reason for part 1 is real: a datagram socket sends to a path with
+The reason for part 1 was real: a datagram socket sends to a path with
 `sendto(2)`, with no `connect(2)`, so the control of `connect` alone does
-not cover it. The fix is to control `sendto` and `sendmsg` in the same way
-as `connect`, and then to permit the family again. Pent must still refuse
-an abstract address when the child has no network namespace of its own
-(`--network unrestricted`).
+not cover it (finding CT-2 in `docs/security/containment.md` measured
+it).
+
+**The fix.** The supervisor controls each call that carries an address,
+and the filter permits the family again:
+
+- `connect(2)`, `sendto(2)` and `sendmsg(2)`: the supervisor performs the
+  call for a path that the profile names, and refuses every other path
+  with `EACCES`. A message with ancillary data gets `EOPNOTSUPP`,
+  because the supervisor cannot pass the descriptors of the child.
+- `sendmmsg(2)`: one call carries several messages, so the supervisor
+  refuses a path address instead of performing the call.
+- A call with no address, and a call on a socket of another family, keep
+  their behaviour. The filter tests the address argument of `sendto(2)`
+  in the BPF program, so a `send(2)` costs no notification.
+- An abstract address follows the network namespace: the supervisor
+  makes the call on the socket of the child when the child has its own
+  namespace, and the child gets `EACCES` with `--network unrestricted`,
+  where the names of the host are in reach.
+
+Each decision makes the same event as the connect path, so watch mode
+proposes the socket and `pent run --trace` reports the denial. The tests
+are `child_cannot_reach_a_host_abstract_unix_socket`,
+`the_default_profile_refuses_a_path_but_keeps_the_unix_family` and
+`an_abstract_address_is_refused_without_a_network_namespace` in
+`crates/pent/tests/security_network_e2e.rs`, and the unit tests of
+`crates/pent-sandbox/src/linux_watch.rs` and
+`crates/pent-sandbox/src/linux_unixconn.rs`.
+
+**What the fix costs.** The child cannot hand the seccomp listener over
+with `SCM_RIGHTS` any more, because the filter traps `sendmsg(2)` and
+the supervisor cannot answer a notification before it holds the
+listener. The child sends a pidfd of itself first and the supervisor
+takes the listener with `pidfd_getfd(2)`. Each `sendmsg(2)` on a
+datagram socket of the Unix family now costs one notification.
 
 ## Verified defenses
 
@@ -210,9 +246,18 @@ End to end (`crates/pent/tests/security_network_e2e.rs`):
   `system_dbus_socket_is_masked` for NET-2)
 - The child cannot reach a service on the host loopback.
   (`child_cannot_reach_a_host_loopback_service`)
-- The child cannot reach a host abstract Unix socket. The new network
-  namespace isolates the abstract socket namespace.
-  (`child_cannot_reach_a_host_abstract_unix_socket`)
+- The child cannot reach a host abstract Unix socket, and it does reach
+  its own. The new network namespace isolates the abstract socket
+  namespace. (`child_cannot_reach_a_host_abstract_unix_socket`)
+- With `--network unrestricted` the child gets `EACCES` for each
+  abstract address: it shares the names of the host there.
+  (`an_abstract_address_is_refused_without_a_network_namespace`)
+- The default profile keeps the Unix family and refuses each path that
+  it does not name, with `connect` and with a datagram `sendto`.
+  (`the_default_profile_refuses_a_path_but_keeps_the_unix_family`)
+- A profile path below a private directory does not bring the siblings
+  of the host back.
+  (`a_profile_path_below_a_private_dir_keeps_its_siblings_hidden`)
 - The child has no raw UDP egress out of the namespace.
   (`child_has_no_raw_udp_egress`)
 - The child cannot bind the proxy port again, with `SO_REUSEPORT` or not, to
@@ -260,7 +305,27 @@ cannot fix them. pent must document them. Each has a test with the name prefix
    the directory, not the name. The mask lists in
    `crates/pent-sandbox/src/linux.rs` stay as the second layer, and as the
    data that a user setting can extend later.
-2. **NET-3: open.** Bind the configured path itself in `plan_private_dirs`,
-   not the outermost traversal path above it.
-3. **Documentation.** Add the inherent limits above to the README, next to the
+2. **NET-3: done** (`dedaf2e`). `plan_private_dirs` binds the configured
+   path itself, not the outermost traversal path above it.
+3. **NET-4: done** (`bfac3e0`). The supervisor controls each call that
+   carries an address, and the child keeps the Unix family and its own
+   abstract names.
+4. **Documentation.** Add the inherent limits above to the README, next to the
    limits that it already names.
+
+## What stays open
+
+Each finding of this report is fixed. The limits that stay are the
+inherent ones above, and these:
+
+- `sendmmsg(2)` with a path address gets `EACCES`, also for a path that
+  the profile names. A program that must reach a named socket uses
+  `sendto(2)`, `sendmsg(2)`, or a `connect(2)` and then a send with no
+  address.
+- A message with ancillary data (`SCM_RIGHTS`, `SCM_CREDENTIALS`) to a
+  named path on a datagram socket gets `EOPNOTSUPP`: the supervisor
+  sends the message itself and cannot pass the descriptors or the
+  credentials of the child. A stream socket is not affected.
+- A performed send comes from a socket of the supervisor, which has no
+  name, so an answer of the server reaches nobody. A notification
+  protocol works; a datagram protocol that waits for an answer does not.

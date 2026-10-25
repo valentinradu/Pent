@@ -164,6 +164,124 @@ pub(crate) fn recv_fds(sock: &OwnedFd) -> std::io::Result<Option<Vec<OwnedFd>>> 
     Ok(Some(fds))
 }
 
+/// Open a pidfd of the calling process.
+///
+/// A pidfd names a process and follows it through a `fork`, so the parent
+/// can use it without knowing the process identifier of the child in the
+/// PID namespace of the host.
+///
+/// # Safety
+/// Async-signal-safe: the function uses only `getpid` and `pidfd_open`.
+///
+/// # Errors
+/// Returns the OS error of `pidfd_open(2)`.
+pub(crate) unsafe fn self_pidfd() -> std::io::Result<RawFd> {
+    // SAFETY: getpid has no preconditions, and pidfd_open takes integers.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, libc::getpid(), 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    libc::c_int::try_from(fd).map_err(|_| std::io::Error::from_raw_os_error(libc::EBADF))
+}
+
+/// Open a pidfd of the process `pid`.
+///
+/// `pid` must be the identifier of a process (a thread group leader) in
+/// the PID namespace of the caller.
+///
+/// # Errors
+/// Returns the OS error of `pidfd_open(2)`.
+pub(crate) fn open_pidfd(pid: u32) -> std::io::Result<OwnedFd> {
+    let pid =
+        libc::pid_t::try_from(pid).map_err(|_| std::io::Error::from_raw_os_error(libc::ESRCH))?;
+    // SAFETY: pidfd_open takes integers and gives a new descriptor.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let fd =
+        libc::c_int::try_from(fd).map_err(|_| std::io::Error::from_raw_os_error(libc::EBADF))?;
+    // SAFETY: `fd` is a new, open descriptor that nothing else owns.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Take a copy of the descriptor `fd` of the process that `pidfd` names.
+///
+/// `pidfd_getfd(2)` needs the same permission as `process_vm_readv(2)`,
+/// which the supervisor already uses on the child.
+///
+/// # Errors
+/// Returns the OS error of `pidfd_getfd(2)`.
+pub(crate) fn take_remote_fd(pidfd: &OwnedFd, fd: RawFd) -> std::io::Result<OwnedFd> {
+    // SAFETY: the system call takes integers and gives a new descriptor.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let got = unsafe { libc::syscall(libc::SYS_pidfd_getfd, pidfd.as_raw_fd(), fd, 0) };
+    if got < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let got =
+        libc::c_int::try_from(got).map_err(|_| std::io::Error::from_raw_os_error(libc::EBADF))?;
+    // SAFETY: `got` is a new, open descriptor that nothing else owns.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    Ok(unsafe { OwnedFd::from_raw_fd(got) })
+}
+
+/// Write all of `buf` to `fd`. Async-signal-safe.
+///
+/// # Safety
+/// `fd` must be an open file descriptor.
+///
+/// # Errors
+/// Returns the OS error of `write(2)`.
+pub(crate) unsafe fn write_all(fd: RawFd, buf: &[u8]) -> std::io::Result<()> {
+    let mut done = 0usize;
+    while done < buf.len() {
+        let rest = buf.get(done..).unwrap_or_default();
+        // SAFETY: `rest` has `rest.len()` readable bytes.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let n = unsafe { libc::write(fd, rest.as_ptr().cast::<libc::c_void>(), rest.len()) };
+        if n > 0 {
+            done = done.saturating_add(usize::try_from(n).unwrap_or(0));
+            continue;
+        }
+        let err = std::io::Error::last_os_error();
+        if n < 0 && err.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// Read one message of `buf.len()` bytes from `fd`. Returns `false` at the
+/// end of the stream. Async-signal-safe.
+///
+/// # Safety
+/// `fd` must be an open file descriptor.
+///
+/// # Errors
+/// Returns the OS error of `read(2)`.
+pub(crate) unsafe fn read_message(fd: RawFd, buf: &mut [u8]) -> std::io::Result<bool> {
+    loop {
+        // SAFETY: `buf` has `buf.len()` writable bytes.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
+        if n == 0 {
+            return Ok(false);
+        }
+        if n > 0 {
+            return Ok(usize::try_from(n).unwrap_or(0) == buf.len());
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
+}
+
 /// Create a `SOCK_SEQPACKET` socket pair with `O_CLOEXEC`.
 ///
 /// # Errors

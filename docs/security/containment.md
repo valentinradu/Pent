@@ -3,7 +3,7 @@
 This report covers the containment that landed after the audit of
 `linux-sandbox.md`: the private mount namespace with the empty tmpfs over
 `/tmp`, `/var/tmp` and `/run`, the PID namespace with a private `proc`,
-the seccomp supervisor that controls `connect(2)` to a Unix socket, and
+the seccomp supervisor that controls each call to a Unix socket, and
 the guard of watch mode with its recorder.
 
 The work started from the properties that `README.md`,
@@ -20,7 +20,7 @@ namespaces and no root.
 |------|------|
 | `crates/pent/tests/containment_private_dirs.rs` | The private `/tmp`, `/var/tmp` and `/run`, the binds, the masks and the mounts |
 | `crates/pent/tests/containment_pid_namespace.rs` | The PID namespace, the exit status, the signals and the end of the session |
-| `crates/pent/tests/containment_supervisor.rs` | The control of `connect(2)` to a Unix socket |
+| `crates/pent/tests/containment_supervisor.rs` | The control of `connect(2)` and of an addressed send to a Unix socket |
 | `crates/pent/tests/containment_guard.rs` | The guard of watch mode and the recorder |
 | `crates/pent/tests/containment_doc_claims.rs` | The other limits that the documents claim |
 
@@ -41,18 +41,19 @@ cargo test -p pent --test 'containment_*' -- --include-ignored  # also the findi
 
 | ID | Severity | One line | State | Test |
 |----|----------|----------|-------|------|
-| CT-1 | High | A second thread changes the address family of `connect(2)` after the supervisor read it, and the child reaches any Unix socket of the host. | **Open** | `a_second_thread_cannot_change_the_address_family` |
-| CT-2 | High | `sendto(2)` is not trapped, so the child sends data to any Unix socket that it can resolve. | **Open** | `sendto_cannot_reach_a_socket_outside_the_profile` |
+| CT-1 | High | A second thread changes the address family of `connect(2)` after the supervisor read it, and the child reaches any Unix socket of the host. | Fixed by `c3162d9` | `a_second_thread_cannot_change_the_address_family` |
+| CT-2 | High | `sendto(2)` is not trapped, so the child sends data to any Unix socket that it can resolve. | Fixed by `bfac3e0` | `sendto_cannot_reach_a_socket_outside_the_profile` |
 | CT-3 | Low | `SIGKILL` of the command gave pent the exit code 137, not the signal. | **Fixed** by `fix(cli): die from the signal of the command, also SIGKILL` | `sigkill_of_the_command_reaches_the_caller` |
-| CT-4 | Low | A socket that only `unix_sockets` names stays covered with `/dev/null`, against what the README says. | **Open** | `a_socket_that_the_configuration_names_is_not_hidden` |
+| CT-4 | Low | A socket that only `unix_sockets` names stays covered with `/dev/null`, against what the README says. | Fixed by `c3162d9` | `a_socket_that_the_configuration_names_is_not_hidden` |
 
-CT-1 and CT-2 need a non-empty `unix_sockets` list. With the default
-profile, which names no socket, the filter refuses `socket(AF_UNIX, ...)`
-in the BPF program, and neither way works.
+CT-1 and CT-2 needed a non-empty `unix_sockets` list at the time of the
+audit: with the default profile the filter refused `socket(AF_UNIX, ...)`
+in the BPF program. The fix of NET-4 permits the family again, so the
+control of the address now carries the whole weight, for each profile.
 
 ### CT-1 — the address family of `connect(2)` is a time-of-check value
 
-**Severity: high. State: open.**
+**Severity: high. State: fixed by `c3162d9`.**
 
 **The attack.** The supervisor reads the address of `connect(2)` one
 time from the memory of the child. When the first two bytes are not
@@ -77,18 +78,34 @@ under "What stays open", and `docs/security/README.md` repeats it under
 "The limits that pent cannot remove". The audit of that round wrote no
 test, so nothing measured how easy the race is. It is easy.
 
-**The recommended fix.** Do not trust the family that the supervisor
-read. Trap `socket(2)` as well and keep the set of descriptors of the
-family `AF_UNIX` for each task; then answer `CONTINUE` only for a
-descriptor that is not in the set. The descriptor number of `connect(2)`
-is a register, so no thread can change it. A cheaper form reads
-`/proc/<tid>/fd/<fd>` and `/proc/<tid>/net/unix` for each `connect(2)`
-with a family that is not `AF_UNIX`, and refuses when the descriptor is a
-Unix socket. `linux_unixconn::socket_kind` already does that lookup.
+**The fix.** The supervisor does not trust the family that it read. It
+asks the socket instead: `pidfd_getfd(2)` gives it a copy of the
+descriptor of the child, and `SO_DOMAIN` and `SO_TYPE` give the family
+and the kind. Neither ever changes, and the descriptor number is a
+register, so no thread can change the answer.
+
+- A socket of another family keeps `CONTINUE`.
+- A `connect(2)` on an `AF_UNIX` socket never gets `CONTINUE`. The
+  supervisor connects a socket of its own to a path on the list, and it
+  makes every other call on the socket of the child itself: an abstract
+  name, which lives in the network namespace of that socket, and an
+  address of another family, which includes the `AF_UNSPEC` address that
+  breaks the association of a datagram socket.
+- A send uses its address only on a datagram socket. A stream socket
+  refuses an address (`EISCONN` or `ENOTCONN`) and a sequential packet
+  socket drops it, so a send on either of them keeps its way, with its
+  ancillary data. A send on an `AF_UNIX` datagram socket never gets
+  `CONTINUE`: with an address the policy decides, and with none the
+  supervisor sends on the socket of the child.
+
+Without `pidfd_getfd(2)` the supervisor reads `/proc/<tid>/fd/<fd>` and
+`/proc/<tid>/net/unix` (`linux_unixconn::is_unix_socket`). It then knows
+the family but cannot make a call on the socket of the child, so it
+refuses each call that it cannot make itself.
 
 ### CT-2 — `sendto(2)` carries an address that the supervisor does not see
 
-**Severity: high. State: open.**
+**Severity: high. State: fixed by `bfac3e0`.**
 
 **The attack.** A datagram socket needs no `connect(2)`. The child makes
 `socket(AF_UNIX, SOCK_DGRAM, 0)` and calls `sendto(2)` with the path of
@@ -104,11 +121,14 @@ same run.
 out through a socket that the profile does not name. It does not read an
 answer, because the answer needs a bound address of the child.
 
-**The recommended fix.** Trap `sendto` and `sendmsg` with the same code
-path as `connect`, as `docs/security/network.md` (NET-4) already
-proposes. A `sendto` with a non-null address goes to the supervisor; the
-supervisor refuses an address that the profile does not name. A `sendto`
-on a connected socket has a null address and can keep `CONTINUE`.
+**The fix.** The filter traps `sendto`, `sendmsg` and `sendmmsg`, and the
+supervisor applies the policy of `connect` to each of them (NET-4 in
+`docs/security/network.md`). It performs a `sendto` and a `sendmsg` to a
+path that the profile names, and refuses every other path with `EACCES`.
+A `sendmmsg` with a path address gets `EACCES`, because one call carries
+several messages. The filter tests the address argument of `sendto` in
+the BPF program, so a `sendto` on a connected socket (a null address)
+costs no notification.
 
 ### CT-3 — `SIGKILL` of the command gave the exit code 137 (fixed)
 
@@ -154,7 +174,7 @@ if changed || sig == libc::SIGKILL || sig == libc::SIGSTOP {
 
 ### CT-4 — a socket that only `unix_sockets` names stays covered
 
-**Severity: low. State: open.**
+**Severity: low. State: fixed by `c3162d9`.**
 
 **The claim.** README, about the sockets that pent covers with
 `/dev/null`: "If your configuration names one of these paths, Pent does
@@ -176,10 +196,13 @@ client libraries report "not a socket" and stop. The test
 `a_named_agent_socket_still_works_behind_the_mask` holds the half that
 works.
 
-**The recommended fix.** Add `config.unix_sockets` to
-`configured_paths`, so that `is_explicitly_allowed` sees a socket that
-the profile names. Nothing else changes: the supervisor still decides
-each connection.
+**The fix.** `configured_paths` holds `config.unix_sockets` now, so
+`is_explicitly_allowed` sees a socket that the profile names and pent
+does not mask it. Nothing else changes: the supervisor still decides
+each connection. A socket below a private directory (`/run`, `/tmp`)
+stays hidden, because the tmpfs covers the whole directory; the
+connection works, as before, because the supervisor connects from the
+host.
 
 ## The claims in the documents that are wrong
 
@@ -187,7 +210,7 @@ each connection.
 |----------|----------|--------------|
 | `README.md`, "Processes" | (corrected) "Watch mode (`pent watch`) does not take a PID namespace: it must not change how the program runs." | Watch mode does take a PID namespace with a private `proc`. `linux.rs` sets `CLONE_NEWPID` for `enforce \|\| watch`, `docs/design/watch.md` and `docs/security/linux-sandbox.md` (LS-3) both describe it, and the test `watch_mode_also_hides_the_processes_of_the_host` proves it. Only the end differs (`Orphans::Wait`). Remove the sentence. |
 | `README.md`, "Processes" | "The exit code and the signal of the command reach you unchanged." | True now for each signal, `SIGKILL` included. CT-3 is fixed. |
-| `README.md`, "Unix sockets" | "If your configuration names one of these paths, Pent does not hide it." | True for a path rule, false for `unix_sockets` and `--unix-socket`. See CT-4. |
+| `README.md`, "Unix sockets" | "If your configuration names one of these paths, Pent does not hide it." | True now for a path rule and for `unix_sockets` and `--unix-socket`. CT-4 is fixed. |
 
 ## Verified defenses
 
@@ -263,12 +286,14 @@ Each test below passes. It guards a property that holds.
 
 ## The next step
 
-1. **CT-1 and CT-2** close the two ways that a non-empty `unix_sockets`
-   list opens. Both need the same change in `linux_watch.rs` and
-   `linux_unixconn.rs`: mark each Unix socket of the child, and trap
-   `sendto` and `sendmsg`. Until then, a profile that names a socket
-   gives a hostile program a way out, and the documents must say that in
-   the README, not only in the audit.
-2. **CT-3** is three lines in `session.rs`.
-3. **CT-4** is one line in `configured_paths`.
+Each finding of this report is fixed. What stays open is smaller, and
+`docs/security/network.md` names it with NET-4:
+
+1. `sendmmsg(2)` with a path address gets `EACCES`, also for a path that
+   the profile names.
+2. A message with ancillary data to a named path on a datagram socket
+   gets `EOPNOTSUPP`: the supervisor cannot pass the descriptors or the
+   credentials of the child.
+3. A performed send comes from a socket of the supervisor, which has no
+   name, so an answer of the server reaches nobody.
 4. Correct the three sentences in the table above.

@@ -289,18 +289,15 @@ fn system_dbus_socket_is_masked() -> TestResult {
     daemon_socket_is_masked("system_dbus_socket_is_masked", "dbus", SYSTEM_BUS)
 }
 
-/// NET-3 (open). A profile path below a private directory must give the
-/// child that path, not the whole subtree above it.
+/// NET-3. A profile path below a private directory gives the child that
+/// path, not the whole subtree above it.
 ///
-/// `plan_private_dirs` keeps the traversal paths of each configured path,
-/// and it binds only the outermost path of a subtree. The outermost path
-/// of `/run/user/<uid>/x` is `/run/user`, thus one profile rule for a
-/// directory below the runtime directory restores the whole runtime
-/// directory of the user, with each daemon socket in it. See
-/// `docs/security/network.md`.
+/// `plan_private_dirs` binds the path that the profile names and makes the
+/// directories above it inside the private tmpfs. The traversal paths of a
+/// rule are not in the bind-back list, so a rule for a directory below the
+/// runtime directory of the user does not restore the whole runtime
+/// directory with its daemon sockets. See `docs/security/network.md`.
 #[test]
-#[ignore = "OPEN NET-3: a profile path below /run or /tmp binds the whole \
-            parent subtree back, so the sibling sockets of the host return"]
 fn a_profile_path_below_a_private_dir_keeps_its_siblings_hidden() -> TestResult {
     let test = "a_profile_path_below_a_private_dir_keeps_its_siblings_hidden";
     if !ready(test) {
@@ -332,9 +329,29 @@ fn a_profile_path_below_a_private_dir_keeps_its_siblings_hidden() -> TestResult 
     )?;
     let allowed = Victim::bind(allowed_dir.join("allowed.sock"), ALLOWED_BANNER.as_bytes())?;
     let victim = Victim::bind(base.join("victim.sock"), VICTIM_SECRET.as_bytes())?;
+    // A file of the host next to the named directory. The child must not
+    // see it and must not read it.
+    std::fs::write(base.join("victim.txt"), VICTIM_SECRET)?;
 
+    // The child also lists the parent of the named directory. The bind of
+    // the parent is the shape of NET-3: the listing then holds each sibling
+    // of the host, and the daemon sockets of `/run/user/<uid>` with them.
     let targets = vec![("ALLOWED", allowed.text()), ("VICTIM", victim.text())];
-    let out = run_sandboxed(&env, &unix_probe_script(&targets))?;
+    let script = format!(
+        "{}\nimport os\n\
+         try:\n\
+         \x20   print('PARENT LIST', sorted(os.listdir({base:?})))\n\
+         except OSError as e:\n\
+         \x20   print('PARENT BLOCKED', e)\n\
+         try:\n\
+         \x20   print('FILE READ', open({file:?}).read())\n\
+         except OSError as e:\n\
+         \x20   print('FILE BLOCKED', e)\n",
+        unix_probe_script(&targets),
+        base = base.display().to_string(),
+        file = base.join("victim.txt").display().to_string(),
+    );
+    let out = run_sandboxed(&env, &script)?;
     let text = out_text(&out);
     let _ = std::fs::remove_dir_all(&base);
 
@@ -349,6 +366,26 @@ fn a_profile_path_below_a_private_dir_keeps_its_siblings_hidden() -> TestResult 
         base.display()
     );
     assert_eq!(victim.reached(), 0, "the sibling socket got a client");
+    // The directory that the profile names is the only entry that the bind
+    // brings back. A listing with `victim.sock` or `victim.txt` in it means
+    // that pent bound the parent of the named path.
+    let listing = text
+        .lines()
+        .find(|l| l.starts_with("PARENT "))
+        .unwrap_or_default();
+    assert!(
+        !listing.contains("victim"),
+        "NET-3: the child sees the siblings of the named path in {}:\n{text}",
+        base.display()
+    );
+    assert!(
+        listing == "PARENT LIST ['allowed']" || listing.starts_with("PARENT BLOCKED"),
+        "the parent of the named path must hold only that path:\n{text}"
+    );
+    assert!(
+        !text.contains(VICTIM_SECRET),
+        "the content of a file of the host reached the child:\n{text}"
+    );
     Ok(())
 }
 
@@ -415,53 +452,168 @@ except OSError as e:
     Ok(())
 }
 
-/// With no socket in the profile, the child cannot make a socket of the
-/// Unix family at all.
-///
-/// The supervisor makes each permitted connection itself, but a datagram
-/// socket can send without a connection, so the default refuses the family
-/// in the filter. The filter reads the family from a register, so no other
-/// thread can change it.
+/// NET-4. With no socket in the profile the child still makes a socket of
+/// the Unix family, for its own use. The control of the address refuses
+/// each path that the profile does not name, with `connect` and with a
+/// datagram `sendto`, which needs no connection.
 #[test]
-fn the_default_profile_refuses_the_unix_family() -> TestResult {
-    if !ready("the_default_profile_refuses_the_unix_family") {
+fn the_default_profile_refuses_a_path_but_keeps_the_unix_family() -> TestResult {
+    let test = "the_default_profile_refuses_a_path_but_keeps_the_unix_family";
+    if !ready(test) {
         return Ok(());
     }
     let env = TestEnv::new()?;
     env.install_profile("probe", PROFILE)?;
-    let script = r#"
+    // A victim socket of the host, outside each private directory, so the
+    // refusal comes from the control of the address and not from a mount.
+    let victim_path = env.root.join("victim.sock");
+    let victim = Victim::bind(victim_path.clone(), VICTIM_SECRET.as_bytes())?;
+    let dgram_path = env.root.join("victim-dgram.sock");
+    let dgram = std::os::unix::net::UnixDatagram::bind(&dgram_path)?;
+    dgram.set_read_timeout(Some(Duration::from_millis(200)))?;
+    let script = format!(
+        r#"
 import socket
 print("PENT_CHILD_RAN")
 try:
-    socket.socket(socket.AF_UNIX); print("FAMILY ALLOWED")
+    s = socket.socket(socket.AF_UNIX); print("FAMILY ALLOWED")
 except OSError as e:
     print("FAMILY REFUSED", e)
 try:
-    a, b = socket.socketpair(); print("SOCKETPAIR ALLOWED")
+    a, b = socket.socketpair()
+    a.sendall(b"PAIR"); print("SOCKETPAIR", b.recv(8))
 except OSError as e:
     print("SOCKETPAIR REFUSED", e)
-"#;
-    let out = run_sandboxed(&env, script)?;
+# Its own abstract socket works: the network namespace holds the name.
+try:
+    own = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    own.bind("\0pent-own-name")
+    peer = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    peer.sendto(b"OWN", "\0pent-own-name")
+    print("ABSTRACT", own.recv(8))
+except OSError as e:
+    print("ABSTRACT REFUSED", e)
+try:
+    c = socket.socket(socket.AF_UNIX); c.settimeout(3)
+    c.connect({victim:?}); print("CONNECT REACHED", c.recv(32))
+except OSError as e:
+    print("CONNECT BLOCKED", e)
+try:
+    d = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    d.sendto(b"PING", {dgram:?}); print("SENDTO SENT")
+except OSError as e:
+    print("SENDTO BLOCKED", e)
+"#,
+        victim = victim_path.display().to_string(),
+        dgram = dgram_path.display().to_string(),
+    );
+    let out = run_sandboxed(&env, &script)?;
     let text = out_text(&out);
     assert!(
         text.contains("PENT_CHILD_RAN"),
         "the child did not run:\n{text}"
     );
+    // The positive controls: the family, `socketpair` and the own
+    // abstract name all work. Several runtimes need them.
     assert!(
-        text.contains("FAMILY REFUSED"),
-        "a profile with no socket must refuse the Unix family:\n{text}"
+        text.contains("FAMILY ALLOWED"),
+        "the child must make a socket of the Unix family:\n{text}"
     );
-    // socketpair makes a pair that reaches nothing outside the child, so
-    // it stays available: many runtimes need it to talk to their children.
     assert!(
-        text.contains("SOCKETPAIR ALLOWED"),
+        text.contains("SOCKETPAIR b'PAIR'"),
         "socketpair must stay available:\n{text}"
+    );
+    assert!(
+        text.contains("ABSTRACT b'OWN'"),
+        "the child must reach its own abstract socket:\n{text}"
+    );
+    // The denials: a path that the profile does not name.
+    assert!(
+        text.contains("CONNECT BLOCKED"),
+        "a connect to a path outside the profile must fail:\n{text}"
+    );
+    assert!(
+        text.contains("SENDTO BLOCKED"),
+        "a sendto to a path outside the profile must fail:\n{text}"
+    );
+    assert_eq!(victim.reached(), 0, "the victim socket got a client");
+    let mut buf = [0u8; 8];
+    assert!(dgram.recv(&mut buf).is_err(), "the victim got a datagram");
+    Ok(())
+}
+
+/// NET-4. With `--network unrestricted` the child shares the abstract
+/// names of the host, so pent refuses each abstract address.
+#[test]
+fn an_abstract_address_is_refused_without_a_network_namespace() -> TestResult {
+    let test = "an_abstract_address_is_refused_without_a_network_namespace";
+    if !ready(test) {
+        return Ok(());
+    }
+    // The victim: an abstract socket of the host. The child must not
+    // reach it, and it must not reach an abstract name of its own either:
+    // with the network namespace of the host, the two are the same space.
+    let name = format!("pent-sec-unrestricted-{}", std::process::id());
+    let addr =
+        <std::os::unix::net::SocketAddr as std::os::linux::net::SocketAddrExt>::from_abstract_name(
+            name.as_bytes(),
+        )
+        .map_err(|e| format!("the abstract name {name:?} is not valid: {e}"))?;
+    let listener = UnixListener::bind_addr(&addr)
+        .map_err(|e| format!("the test must bind the abstract socket {name:?}: {e}"))?;
+    let reached = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&reached);
+    std::thread::spawn(move || {
+        for mut s in listener.incoming().flatten() {
+            count.fetch_add(1, Ordering::SeqCst);
+            let _ = s.write_all(b"VICTIM");
+        }
+    });
+    let env = TestEnv::new()?;
+    env.install_profile("probe", PROFILE)?;
+    // The positive control: a file that the profile allows. It proves
+    // that the child ran and that only the socket call failed.
+    let script = format!(
+        r#"
+import socket
+print("FILE", len(open("/etc/hostname").read()) >= 0)
+h = socket.socket(socket.AF_UNIX); h.settimeout(3)
+try:
+    h.connect("\0" + {name:?}); print("HOST REACHED", h.recv(16))
+except OSError as e:
+    print("HOST BLOCKED", e)
+"#
+    );
+    let out = env.pent(&[
+        "run",
+        "--profile",
+        "probe",
+        "--network",
+        "unrestricted",
+        "--",
+        "python3",
+        "-I",
+        "-c",
+        &script,
+    ])?;
+    let text = out_text(&out);
+    assert!(text.contains("FILE True"), "the child did not run:\n{text}");
+    assert!(
+        text.contains("HOST BLOCKED"),
+        "pent must refuse an abstract address without a network namespace:\n{text}"
+    );
+    assert_eq!(
+        reached.load(Ordering::SeqCst),
+        0,
+        "the abstract socket of the host accepted a client from the child"
     );
     Ok(())
 }
 
+/// NET-4. The child reaches its own abstract socket, and it does not
+/// reach the abstract name of a host process: the network namespace of
+/// the child holds its own abstract names.
 #[test]
-#[ignore = "OPEN NET-4: pent refuses each abstract address, so a program cannot reach its own abstract socket"]
 fn child_cannot_reach_a_host_abstract_unix_socket() -> TestResult {
     let test = "child_cannot_reach_a_host_abstract_unix_socket";
     if !ready(test) {
