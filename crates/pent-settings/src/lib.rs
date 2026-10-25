@@ -802,4 +802,68 @@ mod tests {
         let err = PentConfig::parse("invalid toml :::").unwrap_err();
         assert!(!err.to_string().is_empty());
     }
+
+    /// A lone `~` expands to the home directory, with no separator at the
+    /// end. A path under `~` keeps the rest of the path.
+    #[test]
+    fn test_expand_tilde_gives_the_home_directory_without_a_trailing_separator() {
+        let home = Path::new("/home/u");
+        assert_eq!(
+            expand_tilde(Path::new("~"), Some(home)).as_os_str(),
+            home.as_os_str()
+        );
+        assert_eq!(
+            expand_tilde(Path::new("~/a/b"), Some(home)),
+            PathBuf::from("/home/u/a/b")
+        );
+        assert_eq!(
+            expand_tilde(Path::new("~other/a"), Some(home)),
+            PathBuf::from("~other/a"),
+            "only the component \"~\" expands"
+        );
+        assert_eq!(
+            expand_tilde(Path::new("~/a"), None),
+            PathBuf::from("~/a"),
+            "the path stays when the home directory is not known"
+        );
+    }
+
+    /// [`expand_home`] expands a leading `~` and keeps every other path.
+    #[test]
+    fn test_expand_home_keeps_an_absolute_path_and_expands_a_tilde() {
+        assert_eq!(expand_home(Path::new("/abs/x")), PathBuf::from("/abs/x"));
+        assert_eq!(
+            expand_home(Path::new("relative/x")),
+            PathBuf::from("relative/x")
+        );
+        match dirs::home_dir() {
+            Some(home) => assert_eq!(expand_home(Path::new("~/x")), home.join("x")),
+            // Without a home directory the path does not change.
+            None => assert_eq!(expand_home(Path::new("~/x")), PathBuf::from("~/x")),
+        }
+    }
+
+    /// Each value of the `mode` key gives the matching [`NetworkMode`].
+    #[test]
+    fn test_network_mode_parses_each_mode() {
+        let cases = [
+            ("unrestricted", NetworkMode::Unrestricted),
+            ("localhost_only", NetworkMode::LocalhostOnly),
+            ("blocked", NetworkMode::Blocked),
+            (
+                "proxy_only",
+                NetworkMode::ProxyOnly {
+                    proxy_addr: default_proxy_addr(),
+                    dns_port: 0,
+                },
+            ),
+        ];
+        for (mode, expected) in cases {
+            let parsed: Result<NetworkMode, _> = toml::from_str(&format!("mode = \"{mode}\"\n"));
+            assert!(parsed.is_ok(), "{mode}: {parsed:?}");
+            assert_eq!(parsed.ok(), Some(expected), "{mode}");
+        }
+        assert!(toml::from_str::<NetworkMode>("mode = \"none\"\n").is_err());
+        assert!(toml::from_str::<NetworkMode>("mode = \"blocked\"\nextra = 1\n").is_err());
+    }
 }
