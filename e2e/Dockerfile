@@ -58,5 +58,11 @@ RUN cargo build --workspace --tests
 #
 # The run does not use --include-ignored: an ignored test holds the proof
 # of a finding that is open, so it fails by design.
+#
+# `--nocapture` keeps the lines that a test prints. A test of the PID
+# namespace prints `SKIP (container)` with its reason, because the kernel
+# gives no private `proc` mount here (see LS-3 in
+# docs/security/linux-sandbox.md). A skip that nobody can read is not a
+# loud skip.
 ENV PENT_REQUIRE_ALL_TESTS=1
-CMD ["cargo", "test", "--workspace", "--no-fail-fast"]
+CMD ["cargo", "test", "--workspace", "--no-fail-fast", "--", "--nocapture"]
