@@ -96,6 +96,14 @@ pub struct SandboxConfig {
     /// enforcement, and return them in [`crate::SandboxChild::events`].
     /// Used by `pent run --trace`.
     pub record_events: bool,
+
+    /// The Unix socket paths that the child can connect to.
+    ///
+    /// Landlock does not control `connect(2)` on a Unix socket that has a
+    /// path, so the supervisor makes each connection itself and gives the
+    /// connected socket to the child. A path that is not in this list gets
+    /// `EACCES`. An empty list permits no connection to a Unix socket.
+    pub unix_sockets: Vec<PathBuf>,
 }
 
 impl SandboxConfig {
@@ -117,6 +125,7 @@ impl SandboxConfig {
             cwd,
             no_enforcement: false,
             record_events: false,
+            unix_sockets: Vec::new(),
         }
     }
 

@@ -31,6 +31,13 @@ pub struct FilesystemRules {
     /// Paths with read and execute access.
     #[serde(default)]
     pub execute: Vec<String>,
+    /// Unix socket paths that the program can connect to.
+    ///
+    /// Landlock cannot control a connection to a Unix socket, so pent makes
+    /// each permitted connection itself. A socket that is not in this list
+    /// is not reachable, also when a rule gives access to its directory.
+    #[serde(default)]
+    pub unix_sockets: Vec<String>,
 }
 
 /// The network rules of a profile.
@@ -78,6 +85,7 @@ impl ProfileDoc {
         self.filesystem.read.is_empty()
             && self.filesystem.read_write.is_empty()
             && self.filesystem.execute.is_empty()
+            && self.filesystem.unix_sockets.is_empty()
             && self.network.domains.is_empty()
     }
 
@@ -97,6 +105,10 @@ impl ProfileDoc {
             &other.filesystem.read_write,
         );
         add(&mut self.filesystem.execute, &other.filesystem.execute);
+        add(
+            &mut self.filesystem.unix_sockets,
+            &other.filesystem.unix_sockets,
+        );
         add(&mut self.network.domains, &other.network.domains);
     }
 }

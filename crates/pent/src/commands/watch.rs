@@ -109,6 +109,9 @@ pub(crate) async fn watch(args: WatchArgs, cwd: PathBuf) -> Result<(), CliError>
             &home,
             &[store.dirs().config.clone(), store.dirs().state.clone()],
         ),
+        // Watch mode records each connection to a Unix socket and refuses
+        // it, so that the review can propose the path.
+        unix_sockets: Vec::new(),
     };
 
     let mut signals = SignalRelay::install()?;

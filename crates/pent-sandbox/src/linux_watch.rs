@@ -1948,7 +1948,10 @@ mod tests {
         let script = "cat /etc/hostname >/dev/null; echo x > $T/new; ls $T >/dev/null; rm $T/new";
         let watched = crate::spawn_watched(
             &s.config,
-            &WatchOptions { guard: Vec::new() },
+            &WatchOptions {
+                guard: Vec::new(),
+                unix_sockets: Vec::new(),
+            },
             &s.sh.to_string_lossy(),
             &sh_args(script),
         )?;
@@ -2006,7 +2009,10 @@ mod tests {
         let script = "cat $T/secret > $T/out; echo evil >> $T/rc; true";
         let watched = crate::spawn_watched(
             &s.config,
-            &WatchOptions { guard },
+            &WatchOptions {
+                guard,
+                unix_sockets: Vec::new(),
+            },
             &s.sh.to_string_lossy(),
             &sh_args(script),
         )?;
@@ -2030,7 +2036,10 @@ mod tests {
         let script = "(sleep 0.2; cat /etc/hostname >/dev/null) &";
         let watched = crate::spawn_watched(
             &s.config,
-            &WatchOptions { guard: Vec::new() },
+            &WatchOptions {
+                guard: Vec::new(),
+                unix_sockets: Vec::new(),
+            },
             &s.sh.to_string_lossy(),
             &sh_args(script),
         )?;
@@ -2119,7 +2128,10 @@ mod tests {
             for _ in 0..runs {
                 let watched = crate::spawn_watched(
                     &s.config,
-                    &WatchOptions { guard: Vec::new() },
+                    &WatchOptions {
+                        guard: Vec::new(),
+                        unix_sockets: Vec::new(),
+                    },
                     &prog.to_string_lossy(),
                     &args,
                 )?;

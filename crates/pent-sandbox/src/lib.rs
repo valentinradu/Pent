@@ -120,6 +120,10 @@ pub fn implicit_allowed_paths(path_env: &str) -> Vec<std::path::PathBuf> {
 pub struct WatchOptions {
     /// The dangerous accesses to block (see [`pent_profile::guard_rules`]).
     pub guard: Vec<pent_profile::GuardRule>,
+    /// The Unix socket paths that the child can connect to. See
+    /// [`SandboxConfig::unix_sockets`]. Watch mode records each connection
+    /// that it refuses, so the review can propose the path.
+    pub unix_sockets: Vec<std::path::PathBuf>,
 }
 
 /// A process that runs in watch mode.
