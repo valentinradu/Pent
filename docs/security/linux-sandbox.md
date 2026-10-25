@@ -37,11 +37,15 @@ hole: the kernel reads the address again after the answer, so another
 thread of the child could change it. The code is
 `crates/pent-sandbox/src/linux_unixconn.rs`.
 
-1. The filter traps `connect(2)`. The supervisor reads the address one
+1. The filter traps `connect(2)`, `sendto(2)` with an address,
+   `sendmsg(2)` and `sendmmsg(2)`. The supervisor reads the address one
    time from the memory of the child.
-2. For an address family that is not `AF_UNIX` the supervisor answers
-   `CONTINUE`, as before.
-3. For an `AF_UNIX` address it never answers `CONTINUE` again. It resolves
+2. For a socket of a family that is not `AF_UNIX` the supervisor answers
+   `CONTINUE`, as before. It takes the family from the socket
+   (`SO_DOMAIN` on a copy of the descriptor), not from the address: the
+   memory of the child is a time-of-check value (CT-1 in
+   `docs/security/containment.md`).
+3. For an `AF_UNIX` socket it never answers `CONTINUE` again. It resolves
    a relative path against `/proc/<pid>/cwd` and compares the canonical
    form with `SandboxConfig::unix_sockets`, which comes from the
    `unix_sockets` key of the profile. A path that does not canonicalize is
@@ -57,24 +61,20 @@ thread of the child could change it. The code is
    number of the new descriptor, and `connect(2)` must return 0. The child
    waits in the notification during both steps, and a task that dies makes
    both of them fail with `ENOENT`.
-5. Every other `AF_UNIX` address, an abstract name included, gets
-   `EACCES`.
+5. Every other `AF_UNIX` path gets `EACCES`. An abstract name follows
+   the network namespace: the supervisor makes the call on the socket of
+   the child when the child has its own namespace, and refuses it with
+   `--network unrestricted` (NET-4 in `docs/security/network.md`).
 
 The control needs the supervisor, so `pent run` starts the recorder also
-without `--trace`. Without `--trace` the filter traps only `connect` and
-the recorder makes no event. The cost is one notification for each
-connection of the child.
+without `--trace`. Without `--trace` the filter traps only these calls
+and the recorder makes no event. The cost is one notification for each
+such call of the child.
 
-**The second layer.** With an empty allowlist the child needs no Unix
-socket of its own. The filter then refuses `socket(AF_UNIX, ...)` with
-`EAFNOSUPPORT` in the BPF program. The domain of `socket(2)` is a
-register, so no thread can change it after the test. This closes the two
-ways that the `connect` control alone leaves open: a program with two
-threads that shows another address family to the supervisor and `AF_UNIX`
-to the kernel, and `sendto(2)`, which carries an address too. The default
-profile names no socket, so the default has neither way. `socketpair(2)`
-is another system call and stays allowed, so the usual IPC of a runtime
-keeps working.
+**The family.** The filter does not refuse `socket(AF_UNIX, ...)` any
+more: the child makes a socket of that family for its own use, and the
+control of the address decides what it reaches. `socketpair(2)` stays
+allowed too, so the usual IPC of a runtime keeps working.
 
 **What the new descriptor cannot keep.** The socket of the child goes
 away and the socket of the supervisor takes its number:
@@ -91,11 +91,11 @@ away and the socket of the supervisor takes its number:
 - A socket that exists only in the private `/tmp` of the child has no host
   path, so the profile cannot name it and the child cannot reach it.
 
-**What stays open.** With a non-empty allowlist, the two ways above come
-back for a hostile program: the address family is a value in memory, and
-`sendto(2)` is not trapped. A profile that names a socket thus trusts the
-program not to race the supervisor. The next step is a trap on `sendto`
-and a `socket(AF_UNIX)` trap that marks each Unix socket of the child.
+**What stays open.** Three limits of the control itself (NET-4):
+`sendmmsg(2)` with a path gets `EACCES`, also for a path on the list; a
+message with ancillary data to a named path on a datagram socket gets
+`EOPNOTSUPP`; and a performed send comes from a socket of the
+supervisor, which has no name, so an answer reaches nobody.
 
 **The lower layer stays.** The private tmpfs over `/tmp`, `/var/tmp` and
 `/run` and the masks of `ESCAPE_SOCKETS`, `RESOLVER_SOCKETS` and
@@ -108,8 +108,15 @@ program that only lists a directory.
 `unix_connect_outside_the_list_gets_eacces`,
 `unix_connect_to_an_abstract_name_is_refused`,
 `unix_connect_works_for_a_datagram_socket`,
-`a_tcp_connect_is_not_affected` and
-`an_empty_list_refuses_the_unix_family`.
+`a_tcp_connect_is_not_affected`,
+`an_empty_list_permits_the_family_and_refuses_each_path`,
+`sendto_a_socket_on_the_list_arrives`,
+`sendto_outside_the_list_gets_eacces`,
+`sendmsg_outside_the_list_gets_eacces`,
+`an_abstract_address_works_in_a_private_network_namespace` and
+`an_abstract_address_is_refused_without_a_network_namespace`. The
+containment report adds `a_second_thread_cannot_change_the_address_family`
+and `sendto_cannot_reach_a_socket_outside_the_profile`.
 
 ### LS-2 — `/tmp` is read-write and shared with the host
 
@@ -317,5 +324,7 @@ Every finding of this report is fixed. The open points are smaller:
 
 - H-14 (above): `guard_rules_with` moves only the `PentFiles` rules to the
   XDG directories of the session.
-- With a non-empty `unix_sockets` list, `sendto(2)` and the address family
-  of `connect(2)` stay time-of-check values (see LS-1).
+- The three limits of the control of the Unix sockets (see LS-1, "What
+  stays open"): `sendmmsg(2)` with a path, a message with ancillary data
+  to a named path on a datagram socket, and the answer to a performed
+  send.
