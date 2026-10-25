@@ -29,6 +29,7 @@ pub use event::{FsOp, GuardClass, NetProtocol, Outcome, ProcessInfo, WatchEvent}
 pub use guard::{classify, guard_rules, GuardAccess, GuardRule, GuardTarget};
 pub use name::{ProfileName, ProfileNameError};
 pub use render::{render_draft, render_profile, render_terminal, Reasons, WatchHeader};
+pub use review::{review, Selection};
 pub use summary::{
     summarize, FsAccess, Grant, Item, ItemNote, Section, Stats, Summary, SummaryContext,
 };
