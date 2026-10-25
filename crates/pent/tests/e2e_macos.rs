@@ -3,7 +3,6 @@
 //! Ports `e2e/test-macos-agents.sh` to native Rust so the tests always run
 //! against the freshly-built binary without a separate bash step.
 //!
-//! Network containment is not tested on macOS — see README for details.
 //! No root required.
 //!
 //! Run with:
@@ -11,6 +10,8 @@
 //! ```
 //! cargo test --test e2e_macos -- --nocapture
 //! ```
+
+mod common;
 
 #[cfg(target_os = "macos")]
 mod macos {
@@ -25,47 +26,52 @@ mod macos {
 
     // ── config setup ─────────────────────────────────────────────────────────
 
-    /// Create a temp $HOME, run `pent config add --global @{agent}`, and return
-    /// the resulting config file path.
+    /// Create a temp $HOME with the trusted `{agent}` profile
+    /// (`common::agent_profile`), and return the home directory.
     ///
-    /// On macOS `dirs::config_dir()` = `~/Library/Application Support`, so
-    /// the config lands at:
-    ///   `$HOME/Library/Application Support/pent/pent.toml`
+    /// Pent uses the XDG paths on macOS too, so the profile lands at
+    /// `$HOME/.config/pent/profiles/{agent}.toml`.
     fn agent_config(
         agent: &str,
         configs_root: &Path,
     ) -> Result<PathBuf, Box<dyn std::error::Error>> {
         let home = configs_root.join(format!("{agent}_home"));
-        fs::create_dir_all(&home)?;
+        let drafts = home.join(".local/state/pent/drafts");
+        fs::create_dir_all(&drafts)?;
+        fs::write(
+            drafts.join(format!("{agent}.toml")),
+            super::common::agent_profile(agent),
+        )?;
         let status = Command::new(PENT_BIN)
-            .args(["config", "add", "--global", &format!("@{agent}")])
+            .args(["trust", agent, "--yes"])
             .env("HOME", &home)
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("XDG_STATE_HOME")
+            .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()?;
         if !status.success() {
-            return Err(format!("pent config add --global @{agent} failed").into());
+            return Err(format!("pent trust {agent} --yes failed").into());
         }
-        Ok(home
-            .join("Library")
-            .join("Application Support")
-            .join("pent")
-            .join("pent.toml"))
+        Ok(home)
     }
 
     // ── run_pent helper ──────────────────────────────────────────────────────
 
+    /// Run `pent run --profile {agent}` with the profile in `home`. The
+    /// sandboxed command still sees the real `$HOME` of the test process
+    /// only through the paths of the profile.
     fn run_pent(
-        config: &Path,
+        home: &Path,
+        agent: &str,
         cwd: &Path,
         cmd: &[&str],
     ) -> Result<(ExitStatus, String), Box<dyn std::error::Error>> {
         let out = Command::new(PENT_BIN)
-            .arg("run")
-            .arg("--no-config")
-            .arg("--config")
-            .arg(config)
-            .arg("--")
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("XDG_STATE_HOME", home.join(".local/state"))
+            .args(["run", "--profile", agent, "--"])
             .args(cmd)
             .current_dir(cwd)
             .stdin(Stdio::null())
@@ -86,13 +92,14 @@ mod macos {
     fn test_filesystem(agent: &str) -> TestResult {
         let configs = TempDir::new()?;
         let ws = TempDir::new()?;
-        let config = agent_config(agent, configs.path())?;
+        let home = agent_config(agent, configs.path())?;
         let sentinel = ws.path().join(format!("sentinel-{agent}.txt"));
         let sentinel_s = path_str(&sentinel)?;
 
         // 1. Workspace write must succeed.
         let (status, stderr) = run_pent(
-            &config,
+            &home,
+            agent,
             ws.path(),
             &["/bin/sh", "-c", &format!("echo ok > '{sentinel_s}'")],
         )?;
@@ -103,7 +110,7 @@ mod macos {
         );
 
         // 2. Workspace read must succeed.
-        let (status, stderr) = run_pent(&config, ws.path(), &["/bin/cat", sentinel_s])?;
+        let (status, stderr) = run_pent(&home, agent, ws.path(), &["/bin/cat", sentinel_s])?;
         assert!(
             status.success(),
             "{agent}: workspace read failed\nstderr: {stderr}"
@@ -124,7 +131,8 @@ mod macos {
 
         // The exit status is not important: the check is the file below.
         let _ = run_pent(
-            &config,
+            &home,
+            agent,
             ws.path(),
             &[
                 "/bin/sh",
@@ -139,24 +147,25 @@ mod macos {
         // Cleanup only; the file must not exist.
         let _ = fs::remove_file(&blocked);
 
-        // 4. Write to <workspace>/.pent must be blocked: the project config
-        //    controls the sandbox of the next run.
+        // 4. Write to <workspace>/.pent must be blocked: pent writes its
+        //    trace log there.
         let pent_dir = ws.path().join(".pent");
         fs::create_dir_all(&pent_dir)?;
-        let project_config = pent_dir.join("pent.toml");
-        let project_config_s = path_str(&project_config)?;
+        let pent_file = pent_dir.join("pent.toml");
+        let pent_file_s = path_str(&pent_file)?;
         // The exit status is not important: the check is the file below.
         let _ = run_pent(
-            &config,
+            &home,
+            agent,
             ws.path(),
             &[
                 "/bin/sh",
                 "-c",
-                &format!("echo x > '{project_config_s}' 2>/dev/null; exit 0"),
+                &format!("echo x > '{pent_file_s}' 2>/dev/null; exit 0"),
             ],
         )?;
         assert!(
-            !project_config.exists(),
+            !pent_file.exists(),
             "{agent}: write to .pent/pent.toml was NOT blocked"
         );
         Ok(())

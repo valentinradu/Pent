@@ -13,6 +13,8 @@
 //!
 //! Tests are skipped (not failed) when not running as root.
 
+mod common;
+
 #[cfg(target_os = "linux")]
 mod linux {
     use std::fs;
@@ -148,9 +150,16 @@ mod linux {
             // Phase 3: actually enforcing? (behavioral probe)
             let probe = "/etc/pent-landlock-probe";
             let _ = fs::remove_file(probe);
-            let _ = Command::new(PENT_BIN)
+            let Ok(xdg) = super::common::Xdg::new() else {
+                return false;
+            };
+            if xdg.install_profile(super::common::TEST_PROFILE, "").is_err() {
+                return false;
+            }
+            let _ = xdg
+                .apply(&mut Command::new(PENT_BIN))
                 .args([
-                    "run", "--no-config",
+                    "run", "--profile", super::common::TEST_PROFILE,
                     "--network", "unrestricted",
                     "--",
                     "bash", "-c",
@@ -172,38 +181,43 @@ mod linux {
 
     // ── config setup ─────────────────────────────────────────────────────────
 
-    /// Create a temp $HOME, run `pent config add --global @{agent}`, and return
-    /// the `TempDir` (keep alive) and the resulting config file path.
+    /// Create a temp $HOME with the trusted `{agent}` profile
+    /// (`common::agent_profile`), and return the home directory.
     ///
-    /// On Linux `dirs::config_dir()` = `~/.config`, so the config lands at
-    /// `$HOME/.config/pent/pent.toml`.
-    /// Returns `(home_dir, config_path)`.
+    /// The profile lands at `$HOME/.config/pent/profiles/{agent}.toml`.
     #[allow(clippy::unwrap_used, clippy::panic)] // infrastructure helper: TempDir/spawn failures are test setup failures
-    fn agent_config(agent: &str, configs_root: &Path) -> (PathBuf, PathBuf) {
+    fn agent_config(agent: &str, configs_root: &Path) -> PathBuf {
         let home = configs_root.join(format!("{agent}_home"));
-        fs::create_dir_all(&home).unwrap();
+        let drafts = home.join(".local/state/pent/drafts");
+        fs::create_dir_all(&drafts).unwrap();
+        fs::write(
+            drafts.join(format!("{agent}.toml")),
+            super::common::agent_profile(agent),
+        )
+        .unwrap();
         let status = Command::new(PENT_BIN)
-            .args(["config", "add", "--global", &format!("@{agent}")])
+            .args(["trust", agent, "--yes"])
             .env("HOME", &home)
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("XDG_STATE_HOME")
+            .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
-            .unwrap_or_else(|e| panic!("pent config add @{agent}: {e}"));
-        assert!(status.success(), "pent config add --global @{agent} failed");
-        let config = home.join(".config").join("pent").join("pent.toml");
-        (home, config)
+            .unwrap_or_else(|e| panic!("pent trust {agent}: {e}"));
+        assert!(status.success(), "pent trust {agent} --yes failed");
+        home
     }
 
     // ── run_pent helper ──────────────────────────────────────────────────────
 
     #[allow(clippy::panic)] // infrastructure helper: spawn failure is a hard test setup error
-    fn run_pent(home: &Path, config: &Path, extra: &[&str], cmd: &[&str]) -> (ExitStatus, String) {
+    fn run_pent(home: &Path, agent: &str, extra: &[&str], cmd: &[&str]) -> (ExitStatus, String) {
         let out = Command::new(PENT_BIN)
             .env("HOME", home)
-            .arg("run")
-            .arg("--no-config")
-            .arg("--config")
-            .arg(config)
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("XDG_STATE_HOME")
+            .args(["run", "--profile", agent])
             .args(extra)
             .arg("--")
             .args(cmd)
@@ -226,7 +240,7 @@ mod linux {
 
         let configs = TempDir::new()?;
         let ws = TempDir::new()?;
-        let (home, config) = agent_config(agent, configs.path());
+        let home = agent_config(agent, configs.path());
         let sentinel = ws.path().join(format!("sentinel-{agent}.txt"));
         let sentinel_s = sentinel
             .to_str()
@@ -235,7 +249,7 @@ mod linux {
         // 1. Workspace write must succeed.
         let (status, stderr) = run_pent(
             &home,
-            &config,
+            agent,
             &["--network", "unrestricted"],
             &["bash", "-c", &format!("echo ok > '{sentinel_s}'")],
         );
@@ -248,7 +262,7 @@ mod linux {
         // 2. Workspace read must succeed.
         let (status, stderr) = run_pent(
             &home,
-            &config,
+            agent,
             &["--network", "unrestricted"],
             &["bash", "-c", &format!("cat '{sentinel_s}'")],
         );
@@ -262,7 +276,7 @@ mod linux {
         let _ = fs::remove_file(&blocked);
         let _ = run_pent(
             &home,
-            &config,
+            agent,
             &["--network", "unrestricted"],
             &[
                 "bash",
@@ -314,7 +328,7 @@ mod linux {
         let _routing = RoutingGuard::install();
 
         let configs = TempDir::new()?;
-        let (home, config) = agent_config(agent, configs.path());
+        let home = agent_config(agent, configs.path());
 
         // 4. Allowed domain reachable through proxy.
         //    curl exit 0=success  7=connect refused (DNS worked)  22=HTTP error (tunnel worked)
@@ -323,7 +337,7 @@ mod linux {
         // trigger curl exit 23 because the sandbox may block opening /dev/null for write).
         let (status, stderr) = run_pent(
             &home,
-            &config,
+            agent,
             &[],
             &[
                 "curl",
@@ -344,7 +358,7 @@ mod linux {
         //    curl exit 6=NXDOMAIN  56=proxy rejected CONNECT
         let (status, stderr) = run_pent(
             &home,
-            &config,
+            agent,
             &[],
             &[
                 "curl",
