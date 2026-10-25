@@ -87,11 +87,14 @@ impl FromStr for Profile {
 }
 
 /// Returns the direct dependencies of a profile.
+///
+/// A dependency must not give access to secrets that the user does not
+/// expect. For this reason no profile depends on `@keychain`: the user must
+/// add `@keychain` explicitly.
 #[must_use]
 pub fn profile_requires(p: Profile) -> &'static [Profile] {
     static NODE_DEP: [Profile; 1] = [Profile::Node];
     static SSH_DEP: [Profile; 1] = [Profile::Ssh];
-    static KEYCHAIN_DEP: [Profile; 1] = [Profile::Keychain];
     static NODE_BASE_DEP: [Profile; 2] = [Profile::Node, Profile::Base];
     static NPM_SSH_GIT_DEP: [Profile; 3] = [Profile::Npm, Profile::Ssh, Profile::Git];
     static NPM_DEP: [Profile; 1] = [Profile::Npm];
@@ -101,7 +104,6 @@ pub fn profile_requires(p: Profile) -> &'static [Profile] {
         Profile::Gemini => &NODE_DEP,
         Profile::Npm => &NODE_BASE_DEP,
         Profile::Gh => &SSH_DEP,
-        Profile::Git => &KEYCHAIN_DEP,
         _ => &[],
     }
 }
@@ -374,8 +376,8 @@ fn profile_config(p: Profile) -> PentConfig {
                         "~/.config/git".to_string(),
                         // Common machine-local include (often referenced from .gitconfig)
                         "~/.gitconfig_local".to_string(),
-                        // GitHub CLI config (read for auth; @gh adds read_write if needed)
-                        "~/.config/gh".to_string(),
+                        // ~/.config/gh is not here: it contains the GitHub token.
+                        // Add @gh to give access to it.
                     ],
                     ..Default::default()
                 },
@@ -405,6 +407,9 @@ fn profile_config(p: Profile) -> PentConfig {
             ..Default::default()
         },
 
+        // ── @keychain ─────────────────────────────────────────────────────────
+        // Opt-in only: it gives access to the keyrings and the password store.
+        // No other profile depends on it.
         Profile::Keychain => PentConfig {
             sandbox: SandboxSettings {
                 paths: SandboxPaths {
@@ -596,6 +601,45 @@ mod tests {
         let err = "@unknown-profile".parse::<Profile>().unwrap_err();
         assert!(err.contains("unknown profile"));
         assert!(err.contains("@unknown-profile"));
+    }
+
+    #[test]
+    fn test_no_profile_depends_on_keychain() {
+        let all: Vec<Profile> = Profile::all().filter(|p| *p != Profile::Keychain).collect();
+        let expanded = profile_deps_transitive(&all);
+        assert!(
+            !expanded.contains(&Profile::Keychain),
+            "no profile may pull in @keychain: {expanded:?}"
+        );
+    }
+
+    #[test]
+    fn test_claude_does_not_grant_secrets() {
+        let config = build_profiles_config(&profile_deps_transitive(&[Profile::Claude]));
+        let paths = &config.sandbox.paths;
+        let all: Vec<&String> = paths
+            .read
+            .iter()
+            .chain(&paths.read_write)
+            .chain(&paths.execute)
+            .collect();
+        for secret in [
+            "~/.local/share/keyrings",
+            "~/.local/share/kwalletd",
+            "~/.password-store",
+            "~/Library/Keychains",
+            "~/.config/gh",
+            "~/.ssh",
+        ] {
+            assert!(
+                !all.iter().any(|p| p.as_str() == secret),
+                "@claude must not grant {secret}: {all:?}"
+            );
+        }
+        assert!(
+            !all.iter().any(|p| p.starts_with("~/.ssh/id_")),
+            "@claude must not grant SSH private keys: {all:?}"
+        );
     }
 
     #[test]
