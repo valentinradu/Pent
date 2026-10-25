@@ -46,6 +46,9 @@ mod linux_netns;
 #[cfg(target_os = "linux")]
 mod linux_overlayfs;
 
+#[cfg(target_os = "linux")]
+mod linux_watch;
+
 pub use config::{system_default_paths, SandboxConfig};
 pub use env::{build_env, resolve_path_directories, resolve_path_dirs_from};
 #[cfg(target_os = "linux")]
@@ -100,8 +103,15 @@ pub fn spawn_watched(
     cmd: &str,
     args: &[String],
 ) -> Result<WatchedChild, SandboxError> {
-    let _ = (config, options, cmd, args);
-    Err(SandboxError::UnsupportedPlatform)
+    #[cfg(target_os = "linux")]
+    {
+        linux_watch::spawn_watched(config, options, cmd, args)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (config, options, cmd, args);
+        Err(SandboxError::UnsupportedPlatform)
+    }
 }
 
 /// A sandboxed child process, optionally with an overlayfs handle.
@@ -261,13 +271,19 @@ pub fn spawn_sandboxed(
                 path_dirs.push(p);
             }
         }
-        let (child, overlay, netns) =
-            linux::spawn_with_landlock(config, cmd, args, &config.env, &path_dirs)?;
+        let spawned = linux::spawn_linux(
+            config,
+            cmd,
+            args,
+            &config.env,
+            &path_dirs,
+            linux::SpawnMode::Sandbox,
+        )?;
         Ok(SandboxChild {
-            child,
-            overlay,
-            netns,
-            events: None,
+            child: spawned.child,
+            overlay: spawned.overlay,
+            netns: spawned.netns,
+            events: spawned.events,
         })
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
