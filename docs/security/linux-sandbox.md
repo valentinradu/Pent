@@ -202,6 +202,34 @@ and an orphan of the program must keep its events.
 `test_exit_status_passes_through_the_namespace` and
 `test_signal_status_passes_through_the_namespace`.
 
+## The mounts of the watch guard
+
+Watch mode does not sandbox the program; it records what the program does
+and blocks the dangerous accesses with mounts (see
+`docs/security/watch-and-profiles.md`).
+
+**H-13 — fixed.** A `GuardTarget::FilesInDir` rule matches a file at any
+depth below its directory, and the pattern can be a name prefix (`id_`) or a
+name suffix (`*_rsa`, `*.pem`, `*.key`). `plan_guard` enumerated only the
+direct children of the directory, so a key in a subdirectory got no mount:
+the summary and the review called the read blocked, but the kernel let it
+through. `plan_guard` now walks the tree, down to `GUARD_WALK_DEPTH` levels
+and `GUARD_WALK_ENTRIES` entries, and matches with `GuardRule::matches` (the
+same function that `classify` uses), so the mounts cover exactly the rules
+that the recorder reports. The walk does not follow a symbolic link: it
+reads the type of each entry with `symlink_metadata`, so a link in the
+directory is not a way out.
+
+The doc comment of `GuardTarget::FilesInDir` in `crates/pent-profile` still
+says that the kernel backends mask only the direct children. That is true
+for the macOS backend now, not for Linux.
+
+**H-14 — open, small.** `guard_rules_with(home, pent_dirs)` moves only the
+`PentFiles` rules to the XDG directories of the session. Another rule that
+names a path under `~/.config` still uses the default location, so a
+session with a different `XDG_CONFIG_HOME` guards the wrong path. The fix
+belongs in `crates/pent-profile/src/guard.rs`.
+
 ## Verified defenses
 
 Each test below passes. It guards a defense that works.
