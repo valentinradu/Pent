@@ -124,7 +124,7 @@ pub(crate) fn safe(text: &str) -> Cow<'_, str> {
 }
 
 /// Replace with escapes (`\u{1b}`) each character that
-/// [`is_unsafe_char`] names, but keep the newline. Use this function for a
+/// `is_unsafe_char` names, but keep the newline. Use this function for a
 /// text with more than one line, for example the text of a draft or of a
 /// profile file.
 ///
@@ -511,7 +511,7 @@ type DraftEntry = (String, Option<String>);
 /// Encode `text` as a TOML basic string, with escapes.
 ///
 /// The function escapes each control character and each format character
-/// (see [`is_unsafe_char`]), so the text of the draft shows the true rule.
+/// (see `safe`), so the text of the draft shows the true rule.
 /// The string parses back to `text`.
 #[must_use]
 pub fn toml_string(text: &str) -> String {

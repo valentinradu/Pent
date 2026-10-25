@@ -13,11 +13,11 @@
 //! review shows each wildcard to the user, so the user can reject it.
 //!
 //! The entries come from the list of 2026-10-22 (commit `8437e52`), except
-//! the six that [`FORMER_SUFFIXES`] names. To update the subset, compare it
+//! the six that `FORMER_SUFFIXES` names. To update the subset, compare it
 //! with <https://publicsuffix.org/list/public_suffix_list.dat>.
 //!
 //! The subset has no wildcard rule (`*.replit.dev`). A suffix with such a
-//! rule goes into [`NO_WILDCARD_BELOW`] instead, so pent makes no wildcard
+//! rule goes into `NO_WILDCARD_BELOW` instead, so pent makes no wildcard
 //! at any depth below it.
 
 /// Multi-label public suffixes. Single-label suffixes (`com`, `uk`, ...) do
