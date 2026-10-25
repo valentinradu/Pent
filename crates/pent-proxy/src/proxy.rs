@@ -1438,14 +1438,9 @@ mod tests {
     // TcpProxy Creation Tests
     // ========================================================================
 
-    #[test]
-    fn test_tcp_proxy_new_with_valid_config() {
-        use crate::SharedState;
-        let config = TcpProxyConfig::default();
-        let state = Arc::new(SharedState::new(vec!["example.com".to_string()]));
-        let proxy = TcpProxy::new(config, state);
-        assert!(proxy.is_ok());
-    }
+    // `TcpProxy::new` has no fallible step, so a test of its `Ok` cannot
+    // fail. `test_tcp_proxy_new_initializes_connection_count` covers the
+    // constructor.
 
     #[test]
     fn test_tcp_proxy_new_initializes_connection_count() {
@@ -2013,10 +2008,15 @@ mod tests {
         socks5_connect(&mut client, dest_addr).await;
         drop(client); // Close client connection
 
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
+        // The assertion lives in the task of the server, so the test must
+        // join it. A dropped join result hides a panic in the task.
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(5), server_handle).await;
         proxy_handle.abort();
-        let _ = server_handle.await;
+        match joined {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => panic!("the destination did not see the FIN of the client: {e}"),
+            Err(_) => panic!("the destination did not see the FIN of the client after 5 s"),
+        }
     }
 
     #[tokio::test]
@@ -2067,8 +2067,15 @@ mod tests {
         let n = client.read(&mut buf).await.unwrap();
         assert_eq!(n, 0); // EOF
 
+        // The task of the destination accepts the connection; a panic in
+        // it must fail the test.
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(5), server_handle).await;
         proxy_handle.abort();
-        let _ = server_handle.await;
+        match joined {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => panic!("the destination task failed: {e}"),
+            Err(_) => panic!("the destination task did not end after 5 s"),
+        }
     }
 
     #[tokio::test]
@@ -2508,14 +2515,16 @@ mod tests {
     // Connection Counter Safety Tests
     // ========================================================================
 
-    /// This test verifies that the connection counter is safely shared with spawned tasks.
-    /// Previously, the implementation used a raw pointer which could cause use-after-free
-    /// if `run()` was aborted. Now it uses `Arc<AtomicUsize>` for safe sharing.
+    /// The connection counter is an `Arc<AtomicUsize>` that the accept loop
+    /// shares with each connection task. An earlier version used a raw
+    /// pointer, which an abort of `run()` turned into a dangling reference.
     ///
-    /// The test verifies that:
-    /// 1. Connections can be established while the proxy runs
-    /// 2. Aborting the proxy doesn't cause crashes or undefined behavior
-    /// 3. The Arc-based counter remains valid even after proxy abort
+    /// The test asserts the count at each step:
+    /// 1. zero before the first connection;
+    /// 2. one for each open connection while the proxy runs;
+    /// 3. zero after the abort of `run()`, which ends each connection
+    ///    task. The read of the counter after the abort is safe, because
+    ///    each task holds its own `Arc`.
     #[tokio::test]
     async fn test_connection_counter_safe_with_arc() {
         use crate::SharedState;
@@ -2532,45 +2541,55 @@ mod tests {
             ..Default::default()
         };
 
-        // Spawn multiple connections that will be in-flight when we abort
         let proxy = TcpProxy::new(config.clone(), state).unwrap();
+        // The counter of the proxy, so the test can read it after the
+        // accept loop moves into its own task.
+        let counter = Arc::clone(&proxy.connection_count);
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
         let handle = tokio::spawn(async move { proxy.run().await });
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        // Open several connections that start SOCKS5 handshake but don't complete
+        // Open five connections that start the SOCKS5 greeting and never
+        // finish it. Each one keeps a task of the proxy busy.
         let mut streams = Vec::new();
         for _ in 0..5 {
             if let Ok(mut stream) = TcpStream::connect(config.bind_addr).await {
-                // Send partial SOCKS5 greeting to keep connection open
                 let _ = stream.write_all(&[0x05, 0x01, 0x00]).await;
                 streams.push(stream);
             }
         }
-
-        // Small delay to ensure spawned tasks are running
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-
-        // Abort the proxy - with Arc<AtomicUsize>, the counter remains valid
-        // because each spawned task holds its own Arc reference
-        assert!(
-            proxy_answers_greeting(config.bind_addr).await,
-            "the proxy must still answer a SOCKS5 greeting after this traffic"
+        assert_eq!(streams.len(), 5, "the test could not open the connections");
+        wait_for_count(&counter, 5).await;
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            5,
+            "the counter must hold one entry for each open connection"
         );
 
+        // `run()` owns the task set, so the abort ends each connection
+        // task. Every guard gives its entry back, and the counter is still
+        // readable: each task holds its own `Arc`.
         handle.abort();
         let _ = handle.await;
+        wait_for_count(&counter, 0).await;
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            0,
+            "an aborted connection task must give its entry back"
+        );
 
-        // Give spawned tasks time to clean up - they should safely decrement counter
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        // Clean up - drop connections
         for mut stream in streams {
             let _ = stream.shutdown().await;
         }
+    }
 
-        // If we got here, the Arc-based implementation is working correctly
-        // No crashes, no undefined behavior
+    /// Wait up to two seconds until `counter` holds `want`.
+    async fn wait_for_count(counter: &Arc<AtomicUsize>, want: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while counter.load(Ordering::Relaxed) != want && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 
     // ========================================================================
