@@ -1,4 +1,5 @@
-//! The control of `connect(2)` to a Unix socket on Linux.
+//! The control of `connect(2)` and of an addressed send to a Unix socket
+//! on Linux.
 //!
 //! Landlock up to ABI v6 does not control a connection to a Unix socket
 //! that has a path, and the kernel needs no file right to walk through a
@@ -9,21 +10,52 @@
 //! A check in the supervisor that answers `SECCOMP_USER_NOTIF_FLAG_CONTINUE`
 //! does not close the hole: the kernel reads the address again after the
 //! answer, so another thread of the child can change it (a time-of-check to
-//! time-of-use race). Thus the supervisor **makes the connection itself**:
+//! time-of-use race). Thus the supervisor **makes the call itself**:
 //!
 //! 1. It reads the address one time from the memory of the child.
 //! 2. It compares the path with the allowlist
 //!    ([`crate::SandboxConfig::unix_sockets`]). The compare uses the
 //!    canonical form of both paths. A path that does not canonicalize is
 //!    refused.
-//! 3. For a path on the list it makes its own socket of the same kind,
-//!    connects it, and gives it to the child with
-//!    `SECCOMP_IOCTL_NOTIF_ADDFD` at the descriptor number of the child.
-//!    The child continues with a connected socket and sees the value 0.
-//! 4. For every other `AF_UNIX` address the child gets `EACCES`.
+//! 3. For a path on the list it makes its own socket of the same kind.
+//!    `connect(2)` gives that socket to the child with
+//!    `SECCOMP_IOCTL_NOTIF_ADDFD` at the descriptor number of the child,
+//!    and the child sees the value 0. A send writes the payload of the
+//!    child on that socket and gives the byte count back.
+//! 4. For every other `AF_UNIX` path the child gets `EACCES`.
 //!
 //! The supervisor never answers `CONTINUE` after it reads an `AF_UNIX`
-//! address, so the race above cannot change the result.
+//! path, so the race above cannot change the result.
+//!
+//! # The four calls
+//!
+//! A datagram socket reaches a path with no `connect(2)`, so the control
+//! covers each call that carries an address. The supervisor has two
+//! answers for a permitted path — it performs the call, or it refuses it —
+//! and never a third, because `CONTINUE` would let the kernel read the
+//! address a second time.
+//!
+//! | Call | A path on the list | Why |
+//! |------|--------------------|-----|
+//! | `connect(2)` | performed | The supervisor connects its own socket and gives it to the child, so the child keeps a working connection. |
+//! | `sendto(2)` | performed | One message with one address. The supervisor copies the payload and sends it. |
+//! | `sendmsg(2)` | performed | One message too. The supervisor reads the payload from the `iovec` array of the message. A message with ancillary data gets `EOPNOTSUPP`: the supervisor cannot pass the descriptors or the credentials of the child. |
+//! | `sendmmsg(2)` | refused with `EACCES` | One call carries several messages, and a partial failure has no clean form. A program that must reach a named socket uses `sendto(2)`, `sendmsg(2)`, or a `connect(2)` and then a send with no address. |
+//!
+//! A call with no address (a connected socket) and a call with an address
+//! of another family keep the behaviour that they have without the
+//! control: the kernel runs them. The filter tests the address argument of
+//! `sendto(2)` in the BPF program, so a `send(2)` costs no notification.
+//!
+//! # The abstract names
+//!
+//! An abstract name (the first byte of `sun_path` is zero) belongs to the
+//! network namespace of the socket, not to the filesystem. With its own
+//! network namespace the child reaches only the abstract names of the
+//! sandbox, so the policy permits them ([`AbstractNames::Private`]) and
+//! the kernel runs the call. With `--network unrestricted` the child shares
+//! the names of the host, so the policy refuses each abstract address
+//! ([`AbstractNames::Shared`]).
 //!
 //! # What the new descriptor cannot keep
 //!
@@ -47,32 +79,44 @@
 //! the server is full. The new descriptor keeps `O_NONBLOCK` and
 //! `FD_CLOEXEC` of the descriptor of the child.
 //!
+//! # What a performed send cannot keep
+//!
+//! The supervisor sends the payload from a socket of its own, so the
+//! socket of the child keeps its state and only the message changes hands:
+//!
+//! - The sender address of the message is the socket of the supervisor,
+//!   which has no name. An answer of the server reaches nobody. A datagram
+//!   protocol that waits for an answer does not work; a notification
+//!   protocol (`NOTIFY_SOCKET`, the log socket of the system) does.
+//! - `SO_PASSCRED` on the other side names pent, not the child.
+//! - A payload longer than [`SEND_PAYLOAD_LIMIT`] gets `EMSGSIZE`.
+//!
 //! # What stays open
 //!
 //! - The supervisor answers `CONTINUE` for an address family that is not
 //!   `AF_UNIX`, so the family itself is a time-of-check value. A program
 //!   with two threads can show `AF_INET` to the supervisor and `AF_UNIX` to
-//!   the kernel. The filter removes this way when the allowlist is empty:
-//!   it then refuses `socket(AF_UNIX, ...)` in the BPF program, where the
-//!   domain is a register and no memory can change.
-//! - `sendto(2)` on a datagram socket carries an address too, and the
-//!   supervisor does not trap it. The refusal of `socket(AF_UNIX, ...)`
-//!   covers this way as well, again only when the allowlist is empty.
+//!   the kernel.
 //! - A descriptor that the child inherited (its standard streams) can be a
-//!   Unix socket. The control covers `connect(2)` on it, not the data that
-//!   the child already can send on it.
+//!   Unix socket. The control covers `connect(2)` and an addressed send on
+//!   it, not the data that the child already can send on a connected
+//!   socket.
 
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-#[cfg(test)]
 use pent_profile::Outcome;
 
 /// The longest time that the supervisor waits for one connection. A
 /// notification holds the thread of the child and the supervisor loop, so
 /// the wait must end.
 pub(crate) const CONNECT_LIMIT: Duration = Duration::from_secs(5);
+
+/// The longest payload that the supervisor sends for the child. The
+/// kernel takes at most the send buffer of the socket for one datagram,
+/// which is of the same order. A longer payload gets `EMSGSIZE`.
+pub(crate) const SEND_PAYLOAD_LIMIT: usize = 256 * 1024;
 
 /// The time between two tries of a connection that the server cannot take
 /// yet (its queue is full).
@@ -83,9 +127,8 @@ const RETRY_PAUSE: Duration = Duration::from_millis(2);
 pub(crate) enum UnixAddr {
     /// A path in the filesystem.
     Path(PathBuf),
-    /// An abstract name: the first byte of `sun_path` is zero. The network
-    /// namespace of the sandbox already separates these names from the
-    /// host, and the supervisor refuses them.
+    /// An abstract name: the first byte of `sun_path` is zero. The name
+    /// belongs to the network namespace of the socket.
     Abstract(String),
 }
 
@@ -100,20 +143,58 @@ impl UnixAddr {
     }
 }
 
-/// The Unix socket paths that the child can reach.
+/// Where the abstract Unix names of the child live.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum AbstractNames {
+    /// The child has its own network namespace, so its abstract names are
+    /// separate from the names of the host. The policy permits an abstract
+    /// address.
+    #[default]
+    Private,
+    /// The child uses the network namespace of the host
+    /// (`--network unrestricted`), so an abstract name of a host process is
+    /// in reach. The policy refuses an abstract address.
+    Shared,
+}
+
+/// What the supervisor does with one `AF_UNIX` address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UnixDecision {
+    /// The supervisor makes the call itself, to this canonical path.
+    Perform(PathBuf),
+    /// The kernel runs the call. Only an abstract address of a child with
+    /// its own network namespace gets this answer: the name is out of
+    /// reach of the host, and no path leaves the sandbox.
+    Kernel,
+    /// The child gets `EACCES`.
+    Refuse,
+}
+
+impl UnixDecision {
+    /// The outcome of the decision for the recorded event.
+    pub(crate) const fn outcome(&self) -> Outcome {
+        match self {
+            Self::Perform(_) | Self::Kernel => Outcome::Allowed,
+            Self::Refuse => Outcome::Denied,
+        }
+    }
+}
+
+/// The Unix socket addresses that the child can reach.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct UnixPolicy {
     /// The canonical form of each path of the allowlist.
     allowed: Vec<PathBuf>,
-    /// The number of paths that the profile named. A path that does not
-    /// exist yet has no canonical form, so `allowed` can be shorter.
-    named: usize,
+    /// Where the abstract names of the child live.
+    abstract_names: AbstractNames,
 }
 
 impl UnixPolicy {
     /// Build the policy from the paths of the profile. A path that does not
     /// canonicalize does not enter the list: no path can match it.
-    pub(crate) fn new(paths: &[PathBuf]) -> Self {
+    /// `abstract_names` says whether the child has its own network
+    /// namespace.
+    pub(crate) fn new(paths: &[PathBuf], abstract_names: AbstractNames) -> Self {
         let mut allowed: Vec<PathBuf> = paths
             .iter()
             .filter_map(|p| std::fs::canonicalize(p).ok())
@@ -122,47 +203,45 @@ impl UnixPolicy {
         allowed.dedup();
         Self {
             allowed,
-            named: paths.len(),
+            abstract_names,
         }
     }
 
-    /// True if the profile names no Unix socket. The child then needs no
-    /// Unix socket of its own, and the filter refuses the whole family.
-    ///
-    /// The test uses the paths of the profile, not the paths that exist:
-    /// a daemon can make its socket after the start of the child.
-    pub(crate) fn names_nothing(&self) -> bool {
-        self.named == 0
-    }
-
-    /// The canonical path to connect to, if `addr` is on the allowlist.
+    /// What the supervisor does with the address `addr`.
     ///
     /// The compare uses the canonical form of both paths, so a symbolic
     /// link to a permitted socket also matches. A path that does not
-    /// canonicalize is not on the list. The supervisor connects to the
-    /// canonical path, so a symbolic link cannot change the target between
-    /// the compare and the connection.
-    pub(crate) fn allowed_target(&self, addr: &UnixAddr) -> Option<PathBuf> {
-        let UnixAddr::Path(path) = addr else {
-            return None;
+    /// canonicalize is not on the list. The supervisor uses the canonical
+    /// path, so a symbolic link cannot change the target between the
+    /// compare and the call.
+    pub(crate) fn decide(&self, addr: &UnixAddr) -> UnixDecision {
+        let path = match addr {
+            UnixAddr::Abstract(_) => {
+                return match self.abstract_names {
+                    AbstractNames::Private => UnixDecision::Kernel,
+                    AbstractNames::Shared => UnixDecision::Refuse,
+                }
+            }
+            UnixAddr::Path(path) => path,
         };
-        let real = std::fs::canonicalize(path).ok()?;
-        self.allowed.iter().find(|a| **a == real).cloned()
+        let Ok(real) = std::fs::canonicalize(path) else {
+            return UnixDecision::Refuse;
+        };
+        self.allowed
+            .iter()
+            .find(|a| **a == real)
+            .map_or(UnixDecision::Refuse, |a| UnixDecision::Perform(a.clone()))
     }
 
-    /// True if `addr` is on the allowlist.
-    #[cfg(test)]
-    pub(crate) fn permits(&self, addr: &UnixAddr) -> bool {
-        self.allowed_target(addr).is_some()
-    }
-
-    /// The outcome of a `connect(2)` to `addr` for the recorded event.
-    #[cfg(test)]
-    pub(crate) fn outcome(&self, addr: &UnixAddr) -> Outcome {
-        if self.permits(addr) {
-            Outcome::Allowed
-        } else {
-            Outcome::Denied
+    /// The decision for an address in a `sendmmsg(2)`.
+    ///
+    /// One `sendmmsg(2)` carries several messages, and the supervisor does
+    /// not perform it (see the module documentation), so a path address is
+    /// refused also when the profile names it.
+    pub(crate) fn decide_many(&self, addr: &UnixAddr) -> UnixDecision {
+        match self.decide(addr) {
+            UnixDecision::Kernel => UnixDecision::Kernel,
+            UnixDecision::Perform(_) | UnixDecision::Refuse => UnixDecision::Refuse,
         }
     }
 }
@@ -413,6 +492,82 @@ pub(crate) fn connect_for_child(
     Ok(sock)
 }
 
+/// Send `payload` to `path` from a socket of the same kind as the socket
+/// `fd` of the process `tid`.
+///
+/// `flags` are the flags of the call of the child. The supervisor adds
+/// `MSG_NOSIGNAL`: a closed socket must give an error, not a signal in
+/// pent.
+///
+/// # Errors
+/// Returns the error number for the child: `EACCES` if the kind of the
+/// socket of the child is not known, `ETIMEDOUT` if the server does not
+/// take the message within `limit`, or the error of `socket(2)` or
+/// `sendto(2)`.
+pub(crate) fn send_for_child(
+    tid: u32,
+    fd: RawFd,
+    path: &Path,
+    payload: &[u8],
+    flags: libc::c_int,
+    limit: Duration,
+) -> Result<usize, i32> {
+    // Without the kind of the socket of the child, a new socket would have
+    // the wrong semantics. Refuse instead of guessing.
+    let kind = socket_kind(tid, fd).ok_or(libc::EACCES)?;
+    let (addr, len) = sockaddr_un(path)?;
+    let sock = make_socket(kind)?;
+    let nonblock = flags & libc::MSG_DONTWAIT != 0;
+    send_once(&sock, &addr, len, payload, flags, nonblock, limit)
+}
+
+/// Send `payload` on `sock`. The socket has `O_NONBLOCK`, so the call
+/// returns at once. `nonblock` tells whether the call of the child also
+/// asked for it: a blocking call gets a retry until `limit`, a
+/// non-blocking call gets `EAGAIN` back.
+fn send_once(
+    sock: &OwnedFd,
+    addr: &libc::sockaddr_un,
+    len: libc::socklen_t,
+    payload: &[u8],
+    flags: libc::c_int,
+    nonblock: bool,
+    limit: Duration,
+) -> Result<usize, i32> {
+    let deadline = Instant::now() + limit;
+    loop {
+        // SAFETY: `payload` has `payload.len()` readable bytes and `addr`
+        // is a valid `sockaddr_un` of `len` bytes.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let sent = unsafe {
+            libc::sendto(
+                sock.as_raw_fd(),
+                payload.as_ptr().cast::<libc::c_void>(),
+                payload.len(),
+                flags | libc::MSG_NOSIGNAL,
+                std::ptr::from_ref(addr).cast::<libc::sockaddr>(),
+                len,
+            )
+        };
+        if sent >= 0 {
+            return usize::try_from(sent).map_err(|_| libc::EIO);
+        }
+        match errno() {
+            libc::EINTR => {}
+            // The queue of the server is full. The kernel gives the same
+            // error to a non-blocking call, and makes a blocking call
+            // wait.
+            libc::EAGAIN if !nonblock => {
+                if Instant::now() >= deadline {
+                    return Err(libc::ETIMEDOUT);
+                }
+                std::thread::sleep(RETRY_PAUSE);
+            }
+            e => return Err(e),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -468,22 +623,102 @@ mod tests {
         let real = dir.join("real.sock");
         let _listener = UnixListener::bind(&real)?;
         std::os::unix::fs::symlink(&real, dir.join("link.sock"))?;
-        let policy = UnixPolicy::new(std::slice::from_ref(&real));
-        assert!(!policy.names_nothing());
-        assert!(policy.permits(&UnixAddr::Path(real.clone())));
-        assert!(policy.permits(&UnixAddr::Path(dir.join("link.sock"))));
-        assert!(!policy.permits(&UnixAddr::Path(dir.join("other.sock"))));
-        assert!(!policy.permits(&UnixAddr::Abstract("name".into())));
-        assert_eq!(policy.outcome(&UnixAddr::Path(real)), Outcome::Allowed);
+        let policy = UnixPolicy::new(std::slice::from_ref(&real), AbstractNames::Private);
+        let perform = UnixDecision::Perform(real.clone());
+        assert_eq!(policy.decide(&UnixAddr::Path(real.clone())), perform);
         assert_eq!(
-            policy.outcome(&UnixAddr::Abstract("n".into())),
-            Outcome::Denied
+            policy.decide(&UnixAddr::Path(dir.join("link.sock"))),
+            perform
         );
-        // A path that does not exist yet still counts as a named socket.
-        let pending = UnixPolicy::new(&[dir.join("missing.sock")]);
-        assert!(!pending.names_nothing());
-        assert!(!pending.permits(&UnixAddr::Path(dir.join("missing.sock"))));
-        assert!(UnixPolicy::new(&[]).names_nothing());
+        assert_eq!(
+            policy.decide(&UnixAddr::Path(dir.join("other.sock"))),
+            UnixDecision::Refuse
+        );
+        assert_eq!(perform.outcome(), Outcome::Allowed);
+        assert_eq!(UnixDecision::Refuse.outcome(), Outcome::Denied);
+        assert_eq!(UnixDecision::Kernel.outcome(), Outcome::Allowed);
+        // A path that does not exist yet matches nothing.
+        let pending = UnixPolicy::new(&[dir.join("missing.sock")], AbstractNames::Private);
+        assert_eq!(
+            pending.decide(&UnixAddr::Path(dir.join("missing.sock"))),
+            UnixDecision::Refuse
+        );
+        Ok(())
+    }
+
+    /// An abstract name follows the network namespace of the child, not
+    /// the allowlist of the paths.
+    #[test]
+    fn the_policy_permits_an_abstract_name_in_a_private_namespace() {
+        let name = UnixAddr::Abstract("own".into());
+        let private = UnixPolicy::new(&[], AbstractNames::Private);
+        assert_eq!(private.decide(&name), UnixDecision::Kernel);
+        let shared = UnixPolicy::new(&[], AbstractNames::Shared);
+        assert_eq!(shared.decide(&name), UnixDecision::Refuse);
+    }
+
+    /// `sendmmsg(2)` carries several messages, so the supervisor refuses a
+    /// path address, also one that the profile names. An abstract address
+    /// keeps the answer of the policy.
+    #[test]
+    fn sendmmsg_refuses_each_path() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        let dir = std::fs::canonicalize(tmp.path())?;
+        let real = dir.join("real.sock");
+        let _listener = UnixListener::bind(&real)?;
+        let policy = UnixPolicy::new(std::slice::from_ref(&real), AbstractNames::Private);
+        assert_eq!(
+            policy.decide_many(&UnixAddr::Path(real)),
+            UnixDecision::Refuse
+        );
+        assert_eq!(
+            policy.decide_many(&UnixAddr::Abstract("own".into())),
+            UnixDecision::Kernel
+        );
+        Ok(())
+    }
+
+    /// The supervisor sends the payload of the child to a socket that the
+    /// profile names, and gives the byte count back.
+    #[test]
+    fn the_supervisor_sends_a_datagram() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        let path = std::fs::canonicalize(tmp.path())?.join("d.sock");
+        let server = UnixDatagram::bind(&path)?;
+        server.set_read_timeout(Some(Duration::from_secs(5)))?;
+        // A datagram socket of this process stands for the socket of the
+        // child: only its kind matters.
+        let client = UnixDatagram::unbound()?;
+        let sent = send_for_child(
+            std::process::id(),
+            client.as_raw_fd(),
+            &path,
+            b"HELLO",
+            0,
+            CONNECT_LIMIT,
+        );
+        assert_eq!(sent, Ok(5), "{sent:?}");
+        let mut buf = [0u8; 8];
+        let n = server.recv(&mut buf)?;
+        assert_eq!(buf.get(..n), Some(b"HELLO".as_slice()));
+        Ok(())
+    }
+
+    /// A send to a path with no socket gives the error of the kernel.
+    #[test]
+    fn a_send_to_a_missing_socket_fails() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        let path = std::fs::canonicalize(tmp.path())?.join("none.sock");
+        let client = UnixDatagram::unbound()?;
+        let sent = send_for_child(
+            std::process::id(),
+            client.as_raw_fd(),
+            &path,
+            b"x",
+            0,
+            CONNECT_LIMIT,
+        );
+        assert_eq!(sent, Err(libc::ENOENT), "{sent:?}");
         Ok(())
     }
 

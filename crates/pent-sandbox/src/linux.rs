@@ -2392,7 +2392,15 @@ pub(crate) fn spawn_linux(
     // it runs with enforcement too, even without `--trace`. It then traps
     // only `connect` and makes no event. The cost is one notification for
     // each connection of the child.
-    let unix_policy = crate::linux_unixconn::UnixPolicy::new(unix_sockets);
+    // An abstract name belongs to a network namespace. With its own
+    // namespace the child reaches only its own names; with
+    // `--network unrestricted` it reaches the names of the host.
+    let abstract_names = if net_flag == 0 {
+        crate::linux_unixconn::AbstractNames::Shared
+    } else {
+        crate::linux_unixconn::AbstractNames::Private
+    };
+    let unix_policy = crate::linux_unixconn::UnixPolicy::new(unix_sockets, abstract_names);
     let unix = if enforce {
         crate::linux_unixconn::UnixControl::Enforce(unix_policy)
     } else {

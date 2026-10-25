@@ -38,16 +38,28 @@
 //! observes: another thread can change the path after the check, so
 //! seccomp-notify is not usable to enforce a path rule.
 //!
-//! # The control of the Unix socket connections
+//! # The control of the Unix sockets
 //!
-//! `connect(2)` is the exception. The supervisor does not answer
-//! `CONTINUE` there; it makes each permitted connection itself and gives
-//! the connected socket to the child. This pattern has no race, because
-//! the kernel never reads the address again. See
-//! [`crate::linux_unixconn`]. The control runs in `pent run` with
+//! `connect(2)`, `sendto(2)`, `sendmsg(2)` and `sendmmsg(2)` are the
+//! exception. The supervisor does not answer `CONTINUE` for an `AF_UNIX`
+//! path there; it makes each permitted call itself, or it refuses the
+//! call. This pattern has no race, because the kernel never reads the
+//! address again. See [`crate::linux_unixconn`], which states the answer
+//! of each of the four calls. The control runs in `pent run` with
 //! enforcement, also without `--trace`: the recorder then traps only
-//! `connect` and makes no event. The cost is one notification for each
-//! connection of the child.
+//! these calls and makes no event. The cost is one notification for each
+//! such call of the child.
+//!
+//! The filter also lets a `sendto(2)` with a null address pointer through
+//! without a notification, because the address is an argument. A
+//! `sendmsg(2)` carries its address in memory, so each one costs a
+//! notification.
+//!
+//! The child must not hand the seccomp listener over with `SCM_RIGHTS`:
+//! the filter traps `sendmsg(2)`, and the supervisor cannot answer a
+//! notification before it holds the listener. It sends a pidfd of itself
+//! first and the supervisor takes the listener with `pidfd_getfd(2)`; see
+//! [`RecorderChild::install_in_child`].
 //!
 //! The filter returns `ENOSYS` for each system call of another ABI (i386
 //! and x32 on x86_64, arm32 on aarch64), so that such a call cannot bypass
@@ -59,8 +71,9 @@
 //! `linux.rs`).
 //!
 //! The filter always blocks `io_uring_setup`, because io_uring has a
-//! connect operation that seccomp does not see. A program that uses
-//! io_uring falls back to normal system calls. The filter also gives
+//! connect operation and a send operation that seccomp does not see. A
+//! program that uses io_uring falls back to normal system calls. The
+//! filter also gives
 //! `ENOSYS` to each system call of another ABI, so a 32-bit program does
 //! not run under `pent run`.
 //!
@@ -98,7 +111,7 @@ use pent_profile::{
 };
 
 use crate::linux::{AccessPolicy, SpawnMode};
-use crate::linux_unixconn::UnixAddr;
+use crate::linux_unixconn::{UnixAddr, UnixDecision};
 use crate::{SandboxChild, SandboxConfig, SandboxError, WatchOptions, WatchedChild};
 
 // ── The guard ───────────────────────────────────────────────────────────────
@@ -272,19 +285,22 @@ const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
 // The cast is exact: ENOSYS is 38.
 #[allow(clippy::cast_sign_loss)]
 const RET_ENOSYS: u32 = SECCOMP_RET_ERRNO | (libc::ENOSYS as u32);
-// The cast is exact: EAFNOSUPPORT is 97.
-#[allow(clippy::cast_sign_loss)]
-const RET_EAFNOSUPPORT: u32 = SECCOMP_RET_ERRNO | (libc::EAFNOSUPPORT as u32);
 const RET_NOTIFY: u32 = libc::SECCOMP_RET_USER_NOTIF;
 const OFF_NR: u32 = 0;
 const OFF_ARCH: u32 = 4;
-/// The offset of the low word of the first argument in
-/// `struct seccomp_data`: `nr` (4) + `arch` (4) + `instruction_pointer`
-/// (8), and then the first half of a 64-bit argument.
-const OFF_ARG0: u32 = if cfg!(target_endian = "big") { 20 } else { 16 };
-/// The `AF_UNIX` domain of `socket(2)`. The cast is exact: the value is 1.
-#[allow(clippy::cast_sign_loss)]
-const AF_UNIX_U32: u32 = libc::AF_UNIX as u32;
+/// The offset of the first argument in `struct seccomp_data`: `nr` (4) +
+/// `arch` (4) + `instruction_pointer` (8).
+const OFF_ARGS: u32 = 16;
+/// The offsets of the low and of the high word of the argument `n`. A
+/// classic BPF program reads four bytes at a time.
+const fn arg_words(n: u32) -> (u32, u32) {
+    let base = OFF_ARGS + 8 * n;
+    if cfg!(target_endian = "big") {
+        (base + 4, base)
+    } else {
+        (base, base + 4)
+    }
+}
 /// The x32 ABI on x86_64 sets this bit in the system call number.
 #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 const X32_SYSCALL_BIT: u32 = 0x4000_0000;
@@ -293,21 +309,23 @@ const SECCOMP_SET_MODE_FILTER: libc::c_uint = 1;
 /// What the recorder traps and reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RecorderScope {
-    /// The path system calls and `connect(2)`. Each call makes an event.
+    /// The path system calls and the calls of the Unix socket control.
+    /// Each call makes an event.
     Full,
-    /// Only `connect(2)`, and no event. `pent run` without `--trace` takes
-    /// this scope for the control of the Unix socket connections.
+    /// Only the calls of the Unix socket control, and no event. `pent run`
+    /// without `--trace` takes this scope.
     ConnectOnly,
 }
 
-/// What the filter does with `socket(2)` for the domain `AF_UNIX`.
+/// A system call that the supervisor needs only when it carries an
+/// address. The address of `sendto(2)` is an argument, so the filter can
+/// let a call without one through, with no cost for the child.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum UnixSocketRule {
-    /// Give `EAFNOSUPPORT`. The child then holds no Unix socket of its own,
-    /// so no `connect(2)` and no `sendto(2)` can reach one.
-    Refuse,
-    /// Leave `socket(2)` alone.
-    Allow,
+pub(crate) struct AddrCall {
+    /// The system call number.
+    pub(crate) nr: u32,
+    /// The index of the address argument.
+    pub(crate) arg: u32,
 }
 
 /// The input of [`build_filter`].
@@ -323,9 +341,9 @@ pub(crate) struct FilterSpec<'a> {
     pub(crate) enosys: &'a [u32],
     /// The system calls that go to the supervisor.
     pub(crate) notify: &'a [u32],
-    /// The number of `socket(2)`, when the filter must refuse the domain
-    /// `AF_UNIX` with `EAFNOSUPPORT`. `None` leaves `socket(2)` alone.
-    pub(crate) deny_unix_socket: Option<u32>,
+    /// The system calls that go to the supervisor only when the argument
+    /// `arg` is not a null pointer.
+    pub(crate) addr_calls: &'a [AddrCall],
 }
 
 const fn stmt(code: u16, k: u32) -> libc::sock_filter {
@@ -350,27 +368,29 @@ const fn jump(code: u16, k: u32, jt: u8, jf: u8) -> libc::sock_filter {
 /// ld nr
 /// jge FOREIGN_MIN -> ENOSYS        (x86_64 only)
 /// jeq E1 -> ENOSYS ...             (io_uring_setup)
-/// jeq N1 -> NOTIFY ...             (the path system calls)
-/// jeq socket else -> ALLOW         (only with `deny_unix_socket`)
-/// ld args[0]; jeq AF_UNIX -> EAFNOSUPPORT else -> ALLOW
+/// jeq N1 -> NOTIFY ...             (the path system calls, connect, ...)
+/// jeq sendto else -> next block    (one block for each address call)
+/// ld args[n].lo; jeq 0 else -> NOTIFY
+/// ld args[n].hi; jeq 0 -> ALLOW else -> NOTIFY
 /// ret ALLOW
 /// ret USER_NOTIF
 /// ret ERRNO(ENOSYS)
-/// ret ERRNO(EAFNOSUPPORT)          (only with `deny_unix_socket`)
 /// ```
+///
+/// A block of an address call reads both words of the pointer: a program
+/// can map a page whose address has the low word zero, and a half test
+/// would let the call through.
 ///
 /// # Errors
 /// Returns `InvalidConfig` if a jump is longer than 255 instructions.
 pub(crate) fn build_filter(spec: &FilterSpec<'_>) -> Result<Vec<libc::sock_filter>, SandboxError> {
-    let socket_rule = usize::from(spec.deny_unix_socket.is_some());
     let checks = spec.enosys.len() + spec.notify.len() + usize::from(spec.foreign_nr_min.is_some());
-    // The three returns, the two loads and the arch check, plus the three
-    // instructions of the `socket(2)` rule.
-    let len = checks + 6 + socket_rule * 4;
-    let ret_allow = len - 3 - socket_rule;
-    let ret_notify = len - 2 - socket_rule;
-    let ret_enosys = len - 1 - socket_rule;
-    let ret_eafnosupport = len - 1;
+    // The three returns, the two loads and the arch check, plus the five
+    // instructions of each address call.
+    let len = checks + 6 + spec.addr_calls.len() * 5;
+    let ret_allow = len - 3;
+    let ret_notify = len - 2;
+    let ret_enosys = len - 1;
     let offset = |from: usize, to: usize| -> Result<u8, SandboxError> {
         to.checked_sub(from + 1)
             .and_then(|d| u8::try_from(d).ok())
@@ -397,25 +417,27 @@ pub(crate) fn build_filter(spec: &FilterSpec<'_>) -> Result<Vec<libc::sock_filte
         let i = prog.len();
         prog.push(jump(BPF_JMP_JEQ_K, nr, offset(i, ret_notify)?, 0));
     }
-    if let Some(nr) = spec.deny_unix_socket {
-        // `socket(2)`: fall through to the domain check, or allow.
+    for call in spec.addr_calls {
+        // The block keeps the system call number in the accumulator for
+        // the next block: the jump of another call leaves it alone.
+        let (low, high) = arg_words(call.arg);
         let i = prog.len();
-        prog.push(jump(BPF_JMP_JEQ_K, nr, 0, offset(i, ret_allow)?));
-        prog.push(stmt(BPF_LD_W_ABS, OFF_ARG0));
+        prog.push(jump(BPF_JMP_JEQ_K, call.nr, 0, offset(i, i + 5)?));
+        prog.push(stmt(BPF_LD_W_ABS, low));
+        let i = prog.len();
+        prog.push(jump(BPF_JMP_JEQ_K, 0, 0, offset(i, ret_notify)?));
+        prog.push(stmt(BPF_LD_W_ABS, high));
         let i = prog.len();
         prog.push(jump(
             BPF_JMP_JEQ_K,
-            AF_UNIX_U32,
-            offset(i, ret_eafnosupport)?,
+            0,
             offset(i, ret_allow)?,
+            offset(i, ret_notify)?,
         ));
     }
     prog.push(stmt(BPF_RET_K, SECCOMP_RET_ALLOW));
     prog.push(stmt(BPF_RET_K, RET_NOTIFY));
     prog.push(stmt(BPF_RET_K, RET_ENOSYS));
-    if spec.deny_unix_socket.is_some() {
-        prog.push(stmt(BPF_RET_K, RET_EAFNOSUPPORT));
-    }
     Ok(prog)
 }
 
@@ -451,6 +473,19 @@ enum Call {
     Rename(PathArg, PathArg),
     Truncate(PathArg),
     Connect,
+    /// A send that can carry a destination address.
+    Send(SendCall),
+}
+
+/// The send system calls of the Unix socket control.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendCall {
+    /// `sendto(2)`: the address and the payload are arguments.
+    To,
+    /// `sendmsg(2)`: a `struct msghdr` holds the address and the payload.
+    Msg,
+    /// `sendmmsg(2)`: an array of `struct mmsghdr`.
+    Many,
 }
 
 const fn p(path: usize) -> PathArg {
@@ -489,7 +524,6 @@ const CALLS: &[(libc::c_long, Call)] = &[
     (libc::SYS_symlink, Call::Create(p(1))),
     (libc::SYS_symlinkat, Call::Create(at(1, 2))),
     (libc::SYS_truncate, Call::Truncate(p(0))),
-    (libc::SYS_connect, Call::Connect),
 ];
 
 /// The recorded system calls of the native ABI. The generic system call
@@ -510,12 +544,36 @@ const CALLS: &[(libc::c_long, Call)] = &[
     (libc::SYS_linkat, Call::Create(at(2, 3))),
     (libc::SYS_symlinkat, Call::Create(at(1, 2))),
     (libc::SYS_truncate, Call::Truncate(p(0))),
-    (libc::SYS_connect, Call::Connect),
 ];
 
 /// No recorder exists for this CPU architecture.
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 const CALLS: &[(libc::c_long, Call)] = &[];
+
+/// The system calls of the Unix socket control. The filter traps them in
+/// both scopes: the control runs also without `--trace`.
+///
+/// `sendto(2)` is not in this list. Its address is an argument, so the
+/// filter tests it and traps only a call that carries one (see
+/// [`SENDTO_CALL`]).
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+const CONTROL_CALLS: &[(libc::c_long, Call)] = &[
+    (libc::SYS_connect, Call::Connect),
+    (libc::SYS_sendmsg, Call::Send(SendCall::Msg)),
+    (libc::SYS_sendmmsg, Call::Send(SendCall::Many)),
+];
+
+/// No recorder exists for this CPU architecture.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+const CONTROL_CALLS: &[(libc::c_long, Call)] = &[];
+
+/// `sendto(2)` and the index of its address argument.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+const SENDTO_CALL: Option<(libc::c_long, u32)> = Some((libc::SYS_sendto, 4));
+
+/// No recorder exists for this CPU architecture.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+const SENDTO_CALL: Option<(libc::c_long, u32)> = None;
 
 #[cfg(target_arch = "x86_64")]
 const NATIVE: Option<(u32, Option<u32>)> = Some((0xC000_003E, Some(X32_SYSCALL_BIT)));
@@ -527,19 +585,23 @@ const NATIVE: Option<(u32, Option<u32>)> = None;
 /// Return the call kind of the native system call `nr`.
 fn decode(nr: i32) -> Option<Call> {
     let nr = libc::c_long::from(nr);
-    CALLS.iter().find(|(n, _)| *n == nr).map(|(_, c)| *c)
+    if let Some((sendto, _)) = SENDTO_CALL {
+        if sendto == nr {
+            return Some(Call::Send(SendCall::To));
+        }
+    }
+    CALLS
+        .iter()
+        .chain(CONTROL_CALLS)
+        .find(|(n, _)| *n == nr)
+        .map(|(_, c)| *c)
 }
 
 /// Build the filter for the native ABI.
 ///
-/// `scope` selects the system calls that go to the supervisor.
-/// `refuse_unix_socket` adds the rule that gives `EAFNOSUPPORT` to
-/// `socket(AF_UNIX, ...)`. The domain of `socket(2)` is a register, so this
-/// rule needs no memory of the child and no thread can change it.
-fn native_filter(
-    scope: RecorderScope,
-    refuse_unix_socket: UnixSocketRule,
-) -> Result<Vec<libc::sock_filter>, SandboxError> {
+/// `scope` selects the system calls that go to the supervisor. The calls
+/// of the Unix socket control are in both scopes.
+fn native_filter(scope: RecorderScope) -> Result<Vec<libc::sock_filter>, SandboxError> {
     let Some((audit_arch, foreign_nr_min)) = NATIVE else {
         return Err(SandboxError::SandboxUnavailable {
             reason: "the seccomp recorder does not support this CPU architecture".into(),
@@ -549,26 +611,29 @@ fn native_filter(
     let to_u32 = |n: libc::c_long| {
         u32::try_from(n).map_err(|_| SandboxError::InvalidConfig(format!("system call {n}")))
     };
-    let notify = match scope {
-        RecorderScope::Full => CALLS
-            .iter()
-            .map(|(n, _)| to_u32(*n))
-            .collect::<Result<Vec<_>, _>>()?,
-        RecorderScope::ConnectOnly => vec![to_u32(libc::SYS_connect)?],
+    let path_calls: &[(libc::c_long, Call)] = match scope {
+        RecorderScope::Full => CALLS,
+        RecorderScope::ConnectOnly => &[],
     };
+    let notify = path_calls
+        .iter()
+        .chain(CONTROL_CALLS)
+        .map(|(n, _)| to_u32(*n))
+        .collect::<Result<Vec<_>, _>>()?;
     // io_uring hides its operations from seccomp, and it has a connect
     // operation. The filter must remove it in both scopes.
     let enosys = [to_u32(libc::SYS_io_uring_setup)?];
-    let deny_unix_socket = match refuse_unix_socket {
-        UnixSocketRule::Refuse => Some(to_u32(libc::SYS_socket)?),
-        UnixSocketRule::Allow => None,
-    };
+    let addr_calls: Vec<AddrCall> = SENDTO_CALL
+        .map(|(nr, arg)| to_u32(nr).map(|nr| AddrCall { nr, arg }))
+        .transpose()?
+        .into_iter()
+        .collect();
     build_filter(&FilterSpec {
         audit_arch,
         foreign_nr_min,
         enosys: &enosys,
         notify: &notify,
-        deny_unix_socket,
+        addr_calls: &addr_calls,
     })
 }
 
@@ -729,6 +794,80 @@ fn unix_target(
     }
 }
 
+/// The fields of a `struct msghdr` that the control of the Unix sockets
+/// needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct MsgHdr {
+    /// `msg_name`: the address of the message, or 0.
+    name: u64,
+    /// `msg_namelen`: the length of the address.
+    namelen: u64,
+    /// `msg_iov`: the array of the payload ranges.
+    iov: u64,
+    /// `msg_iovlen`: the number of entries of that array.
+    iovlen: u64,
+    /// `msg_controllen`: the length of the ancillary data.
+    controllen: u64,
+}
+
+/// The size of `struct msghdr`.
+const MSGHDR_LEN: usize = std::mem::size_of::<libc::msghdr>();
+/// The size of `struct mmsghdr`.
+const MMSGHDR_LEN: usize = std::mem::size_of::<libc::mmsghdr>();
+/// The size of `struct iovec`.
+const IOVEC_LEN: usize = std::mem::size_of::<libc::iovec>();
+/// `UIO_MAXIOV`: the greatest number of entries that the kernel takes in
+/// an `iovec` array and in one `sendmmsg(2)`.
+const UIO_MAXIOV: usize = 1024;
+
+/// Read the machine word at `at` in `bytes`.
+fn word(bytes: &[u8], at: usize) -> Option<u64> {
+    let end = at.checked_add(std::mem::size_of::<u64>())?;
+    let b = bytes.get(at..end)?;
+    Some(u64::from_ne_bytes(<[u8; 8]>::try_from(b).ok()?))
+}
+
+/// Read the 32-bit value at `at` in `bytes`.
+fn word32(bytes: &[u8], at: usize) -> Option<u64> {
+    let end = at.checked_add(std::mem::size_of::<u32>())?;
+    let b = bytes.get(at..end)?;
+    Some(u64::from(u32::from_ne_bytes(<[u8; 4]>::try_from(b).ok()?)))
+}
+
+/// Read the fields of a `struct msghdr` from its bytes. The offsets come
+/// from the type of the C library, so they follow the ABI of the target.
+fn parse_msghdr(bytes: &[u8]) -> Option<MsgHdr> {
+    // `msg_namelen` is a `socklen_t` (32 bits); the other fields are
+    // machine words.
+    Some(MsgHdr {
+        name: word(bytes, std::mem::offset_of!(libc::msghdr, msg_name))?,
+        namelen: word32(bytes, std::mem::offset_of!(libc::msghdr, msg_namelen))?,
+        iov: word(bytes, std::mem::offset_of!(libc::msghdr, msg_iov))?,
+        iovlen: word(bytes, std::mem::offset_of!(libc::msghdr, msg_iovlen))?,
+        controllen: word(bytes, std::mem::offset_of!(libc::msghdr, msg_controllen))?,
+    })
+}
+
+/// Read the `(address, length)` pairs of an `iovec` array from its bytes.
+/// The result holds one entry for each `iovec` that the array has.
+fn parse_iovecs(bytes: &[u8], count: usize) -> Vec<(u64, usize)> {
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let at = i.saturating_mul(IOVEC_LEN);
+        let (Some(base), Some(len)) = (
+            word(bytes, at + std::mem::offset_of!(libc::iovec, iov_base)),
+            word(bytes, at + std::mem::offset_of!(libc::iovec, iov_len)),
+        ) else {
+            break;
+        };
+        let Ok(len) = usize::try_from(len) else {
+            break;
+        };
+        out.push((base, len));
+    }
+    out
+}
+
 // ── The child side ──────────────────────────────────────────────────────────
 
 /// The data that the `pre_exec` hook needs to install the recorder.
@@ -740,17 +879,40 @@ pub(crate) struct RecorderChild {
 }
 
 impl RecorderChild {
-    /// Install the recorder filter, send the listener to the parent, and
+    /// Install the recorder filter, give the listener to the parent, and
     /// close the copy of the child.
+    ///
+    /// The child does **not** pass the listener with `SCM_RIGHTS`. The
+    /// filter traps `sendmsg(2)` for the control of the Unix sockets, and
+    /// the supervisor cannot answer a notification before it holds the
+    /// listener, so such a send would wait forever. Instead:
+    ///
+    /// 1. The child sends a pidfd of itself, while no filter traps the
+    ///    call.
+    /// 2. It installs the filter and writes the number of the listener
+    ///    with `write(2)`, which the filter does not trap.
+    /// 3. It waits for one byte: the parent took the listener with
+    ///    `pidfd_getfd(2)`. The number of the listener must stay valid
+    ///    until then, so the child closes it only after the answer.
     ///
     /// # Safety
     /// Call this only in a `pre_exec` hook, after `PR_SET_NO_NEW_PRIVS`. The
     /// function uses only raw system calls on data that the parent prepared.
     ///
     /// # Errors
-    /// Returns the OS error if the kernel refuses the filter or the send
-    /// fails.
+    /// Returns the OS error if the kernel refuses the filter or a step of
+    /// the hand-over fails.
     pub(crate) unsafe fn install_in_child(&self) -> std::io::Result<()> {
+        // SAFETY: the `pre_exec` hook runs in a new process of pent.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let pidfd = unsafe { crate::linux_fdpass::self_pidfd() }?;
+        // SAFETY: `pidfd` and `self.sock` are open file descriptors.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let sent = unsafe { crate::linux_fdpass::send_fds(self.sock, &[pidfd]) };
+        // SAFETY: the parent holds its own copy of the pidfd now.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe { libc::close(pidfd) };
+        sent?;
         let len = libc::c_ushort::try_from(self.filter.len())
             .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?;
         let prog = libc::sock_fprog {
@@ -773,10 +935,15 @@ impl RecorderChild {
         }
         let fd = libc::c_int::try_from(ret)
             .map_err(|_| std::io::Error::from_raw_os_error(libc::EBADF))?;
-        // SAFETY: `fd` and `self.sock` are open file descriptors of this
-        // process.
+        // SAFETY: `self.sock` is an open file descriptor, and `write(2)`
+        // and `read(2)` are not in the filter.
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-        let sent = unsafe { crate::linux_fdpass::send_fds(self.sock, &[fd]) };
+        let done = unsafe {
+            crate::linux_fdpass::write_all(self.sock, &fd.to_ne_bytes()).and_then(|()| {
+                let mut ack = [0u8; 1];
+                crate::linux_fdpass::read_message(self.sock, &mut ack)
+            })
+        };
         // SAFETY: close the copies of this process; the parent has the
         // listener now, and `exec` does not need the socket.
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
@@ -784,7 +951,12 @@ impl RecorderChild {
             libc::close(fd);
             libc::close(self.sock);
         }
-        sent
+        match done {
+            Ok(true) => Ok(()),
+            // The parent went away before it took the listener.
+            Ok(false) => Err(std::io::Error::from_raw_os_error(libc::EPIPE)),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -887,16 +1059,7 @@ pub(crate) fn start_recorder(plan: RecorderPlan) -> Result<RecorderSetup, Sandbo
     } else {
         RecorderScope::ConnectOnly
     };
-    // With an empty allowlist the child needs no Unix socket of its own.
-    // The filter then removes the family, which closes the ways that the
-    // supervisor cannot watch (`sendto`, and a change of the address family
-    // after the test).
-    let socket_rule = if plan.unix.enforces() && plan.unix.policy().names_nothing() {
-        UnixSocketRule::Refuse
-    } else {
-        UnixSocketRule::Allow
-    };
-    let filter = native_filter(scope, socket_rule)?;
+    let filter = native_filter(scope)?;
     let (parent_sock, child_sock) = crate::linux_fdpass::seqpacket_pair()?;
     let (tx, rx) = mpsc::channel();
     std::thread::Builder::new()
@@ -915,16 +1078,8 @@ pub(crate) fn start_recorder(plan: RecorderPlan) -> Result<RecorderSetup, Sandbo
 
 /// The body of the supervisor thread.
 fn supervise(sock: &OwnedFd, plan: RecorderPlan, tx: &mpsc::Sender<WatchEvent>) {
-    let listener = match crate::linux_fdpass::recv_fds(sock) {
-        Ok(Some(fds)) => {
-            // The child sends exactly one descriptor. `recv_fds` checks
-            // that the count byte matches, so more than one is not possible
-            // from the hook; take the first and close the rest.
-            let Some(fd) = fds.into_iter().next() else {
-                return;
-            };
-            fd
-        }
+    let listener = match take_listener(sock) {
+        Ok(Some(listener)) => listener,
         Ok(None) => return,
         Err(e) => {
             // The listener closes with the socket. Then the recorded system
@@ -934,6 +1089,36 @@ fn supervise(sock: &OwnedFd, plan: RecorderPlan, tx: &mpsc::Sender<WatchEvent>) 
         }
     };
     Supervisor::new(listener, plan).run(tx);
+}
+
+/// Take the seccomp listener of the child (see
+/// [`RecorderChild::install_in_child`]). Returns `Ok(None)` when the child
+/// died before the hand-over.
+///
+/// # Errors
+/// Returns the OS error of a step of the hand-over.
+fn take_listener(sock: &OwnedFd) -> std::io::Result<Option<OwnedFd>> {
+    let Some(fds) = crate::linux_fdpass::recv_fds(sock)? else {
+        return Ok(None);
+    };
+    // The child sends exactly one descriptor. `recv_fds` checks that the
+    // count byte matches, so more than one is not possible from the hook;
+    // take the first and close the rest.
+    let Some(pidfd) = fds.into_iter().next() else {
+        return Ok(None);
+    };
+    let mut number = [0u8; std::mem::size_of::<RawFd>()];
+    // SAFETY: the socket of the parent is open.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    if !unsafe { crate::linux_fdpass::read_message(sock.as_raw_fd(), &mut number) }? {
+        return Ok(None);
+    }
+    let listener = crate::linux_fdpass::take_remote_fd(&pidfd, RawFd::from_ne_bytes(number))?;
+    // The child waits for this byte before it closes the listener.
+    // SAFETY: the socket of the parent is open.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    unsafe { crate::linux_fdpass::write_all(sock.as_raw_fd(), &[1u8]) }?;
+    Ok(Some(listener))
 }
 
 /// Build an ioctl request number (`_IOC`) for the seccomp magic `'!'`.
@@ -1033,12 +1218,50 @@ impl ProcCache {
     }
 }
 
+/// The address that the supervisor read from the memory of the child.
+enum SeenAddr {
+    /// An address of another family. The call keeps its behaviour.
+    Other,
+    /// An `AF_UNIX` address with a name.
+    Unix(UnixAddr),
+    /// An `AF_UNIX` address with no name. The kernel gives `EINVAL`.
+    Unnamed,
+    /// The memory of the address is not readable. The kernel gives
+    /// `EFAULT`.
+    Unreadable,
+}
+
+/// One send that carries an address, as the supervisor read it.
+struct SeenSend<'a> {
+    /// The thread that made the call.
+    tid: u32,
+    /// The socket of the child.
+    sockfd: RawFd,
+    /// The flags of the call.
+    flags: u64,
+    /// The payload of the message, in the memory of the child.
+    ranges: &'a [(u64, usize)],
+    /// Whether the message carries ancillary data.
+    control: Control,
+}
+
+/// Whether a message carries ancillary data (`msg_control`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Control {
+    /// The message carries ancillary data.
+    Yes,
+    /// The message carries none.
+    No,
+}
+
 /// The answer to one notification.
 enum Answer {
     /// Let the kernel run the system call.
     Continue,
     /// Fail the call with this error number.
     Fail(i32),
+    /// The supervisor did the work; the call returns this value.
+    Return(i64),
     /// Put `fd` at the number `at` in the child and return the value 0.
     Give {
         /// The connected socket of the supervisor.
@@ -1067,6 +1290,8 @@ struct Supervisor {
     resp: Vec<u64>,
     /// The buffer for a path from the memory of the process.
     path_buf: Box<[u8]>,
+    /// The buffer for the payload of a send that the supervisor performs.
+    send_buf: Vec<u8>,
     /// The events of the current notification.
     out: Vec<WatchEvent>,
     /// The number of unexpected errors (the log shows only the first few).
@@ -1116,6 +1341,7 @@ impl Supervisor {
             req: aligned_buffer(req_len.max(std::mem::size_of::<libc::seccomp_notif>())),
             resp: aligned_buffer(resp_len.max(std::mem::size_of::<libc::seccomp_notif_resp>())),
             path_buf: vec![0u8; libc::PATH_MAX as usize].into_boxed_slice(),
+            send_buf: Vec::new(),
             out: Vec::new(),
             errors: 0,
         }
@@ -1259,6 +1485,12 @@ impl Supervisor {
                 id,
                 val: 0,
                 error: -err,
+                flags: 0,
+            },
+            Answer::Return(val) => libc::seccomp_notif_resp {
+                id,
+                val,
+                error: 0,
                 flags: 0,
             },
             Answer::Give { fd, at, cloexec } => {
@@ -1547,13 +1779,63 @@ impl Supervisor {
                 self.push_fs(&process, FsOp::Write, path, st, true);
             }
             Call::Connect => self.record_connect(notif),
+            Call::Send(kind) => self.record_send(notif, kind),
         }
+    }
+
+    /// Read the address at `addr` in the memory of `tid`.
+    ///
+    /// The supervisor reads the address one time. It never reads it again
+    /// and never lets the kernel read it again after a decision on a path,
+    /// so no other thread can change the target (see
+    /// [`crate::linux_unixconn`]).
+    fn read_unix_addr(&mut self, tid: u32, addr: u64, len: u64) -> SeenAddr {
+        let len = usize::try_from(len).unwrap_or(0).min(SOCKADDR_UN_LEN);
+        let mut sa = [0u8; SOCKADDR_UN_LEN];
+        let Some(buf) = sa.get_mut(..len) else {
+            return SeenAddr::Unreadable;
+        };
+        let n = self.read_remote(tid, addr, buf);
+        let Some(family) = sa
+            .get(..n.min(2))
+            .and_then(|b| <[u8; 2]>::try_from(b).ok())
+            .map(u16::from_ne_bytes)
+        else {
+            // The address is shorter than a family or its memory is not
+            // readable.
+            return SeenAddr::Unreadable;
+        };
+        // AF_UNIX is 1.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        if family != libc::AF_UNIX as u16 {
+            return SeenAddr::Other;
+        }
+        let sun_path = sa.get(2..n).unwrap_or_default();
+        unix_target(sun_path, |raw| {
+            resolve_path(raw, false, || Self::base_dir(tid, libc::AT_FDCWD))
+        })
+        .map_or(SeenAddr::Unnamed, SeenAddr::Unix)
+    }
+
+    /// Add the event of one decision of the Unix socket control. Watch
+    /// mode proposes the socket from it, and `pent run --trace` reports
+    /// the denial.
+    fn record_unix_event(&mut self, tid: u32, target: &UnixAddr, outcome: Outcome) {
+        if self.judge.is_none() {
+            return;
+        }
+        let process = self.procs.get(tid);
+        self.out.push(WatchEvent::UnixConnect {
+            target: target.display(),
+            process,
+            outcome,
+        });
     }
 
     /// Control a `connect()` to a Unix socket.
     ///
     /// The supervisor answers `CONTINUE` only while it does not know that
-    /// the address is an `AF_UNIX` address. After that it makes the
+    /// the address is an `AF_UNIX` path. After that it makes the
     /// connection itself or fails the call, because the kernel reads the
     /// address again after a `CONTINUE` (see [`crate::linux_unixconn`]).
     fn record_connect(&mut self, notif: &libc::seccomp_notif) {
@@ -1566,41 +1848,16 @@ impl Supervisor {
         // The kernel uses the low 32 bits of a descriptor argument.
         #[allow(clippy::cast_possible_truncation)]
         let sockfd = sockfd as RawFd;
-        let len = usize::try_from(len).unwrap_or(0).min(SOCKADDR_UN_LEN);
-        let mut sa = [0u8; SOCKADDR_UN_LEN];
-        let Some(buf) = sa.get_mut(..len) else {
-            return;
+        let target = match self.read_unix_addr(tid, addr, len) {
+            SeenAddr::Other => return,
+            // A `CONTINUE` here would trust memory that the supervisor
+            // could not read. The kernel gives the same error.
+            SeenAddr::Unreadable => return self.fail_if_enforced(libc::EFAULT),
+            // An `AF_UNIX` address without a name.
+            SeenAddr::Unnamed => return self.fail_if_enforced(libc::EINVAL),
+            SeenAddr::Unix(target) => target,
         };
-        let n = self.read_remote(tid, addr, buf);
-        let family = sa
-            .get(..n.min(2))
-            .and_then(|b| <[u8; 2]>::try_from(b).ok())
-            .map(u16::from_ne_bytes);
-        // AF_UNIX is 1.
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let is_unix = family == Some(libc::AF_UNIX as u16);
-        if !is_unix {
-            if family.is_none() && self.unix.enforces() {
-                // The address is shorter than a family or its memory is
-                // not readable. The kernel would give the same error, and
-                // a `CONTINUE` here would trust memory that the supervisor
-                // could not read.
-                self.answer = Answer::Fail(libc::EFAULT);
-            }
-            return;
-        }
-        let sun_path = sa.get(2..n).unwrap_or_default();
-        let target = unix_target(sun_path, |raw| {
-            resolve_path(raw, false, || Self::base_dir(tid, libc::AT_FDCWD))
-        });
-        let Some(target) = target else {
-            // An `AF_UNIX` address without a name. The kernel gives EINVAL.
-            if self.unix.enforces() {
-                self.answer = Answer::Fail(libc::EINVAL);
-            }
-            return;
-        };
-        let permitted = self.unix.policy().allowed_target(&target);
+        let decision = self.unix.policy().decide(&target);
         if self.unix.enforces() {
             // The address must belong to a task that still runs: a dead
             // task must get no descriptor, and its identifier can belong
@@ -1608,8 +1865,8 @@ impl Supervisor {
             if !self.id_valid(notif.id) {
                 return;
             }
-            self.answer = match &permitted {
-                Some(path) => {
+            self.answer = match &decision {
+                UnixDecision::Perform(path) => {
                     let flags = crate::linux_unixconn::fd_flags(tid, sockfd);
                     match crate::linux_unixconn::connect_for_child(
                         tid,
@@ -1626,22 +1883,284 @@ impl Supervisor {
                         Err(err) => Answer::Fail(err),
                     }
                 }
-                None => Answer::Fail(libc::EACCES),
+                UnixDecision::Kernel => Answer::Continue,
+                UnixDecision::Refuse => Answer::Fail(libc::EACCES),
             };
         }
-        if self.judge.is_some() {
-            let process = self.procs.get(tid);
-            let outcome = if permitted.is_some() {
-                Outcome::Allowed
-            } else {
-                Outcome::Denied
-            };
-            self.out.push(WatchEvent::UnixConnect {
-                target: target.display(),
-                process,
-                outcome,
-            });
+        self.record_unix_event(tid, &target, decision.outcome());
+    }
+
+    /// Fail the current call with `err`, but only with enforcement. Watch
+    /// mode records and changes nothing.
+    fn fail_if_enforced(&mut self, err: i32) {
+        if self.unix.enforces() {
+            self.answer = Answer::Fail(err);
         }
+    }
+
+    /// Control a send that carries an address.
+    fn record_send(&mut self, notif: &libc::seccomp_notif, kind: SendCall) {
+        match kind {
+            SendCall::To => self.record_send_to(notif),
+            SendCall::Msg => self.record_send_msg(notif),
+            SendCall::Many => self.record_send_many(notif),
+        }
+    }
+
+    /// `sendto(fd, buf, len, flags, addr, addrlen)`.
+    fn record_send_to(&mut self, notif: &libc::seccomp_notif) {
+        let tid = notif.pid;
+        let args = notif.data.args;
+        let (Some(&sockfd), Some(&buf), Some(&buflen), Some(&flags)) =
+            (args.first(), args.get(1), args.get(2), args.get(3))
+        else {
+            return;
+        };
+        let (Some(&addr), Some(&addrlen)) = (args.get(4), args.get(5)) else {
+            return;
+        };
+        if addr == 0 || addrlen == 0 {
+            // A connected socket: the call carries no address.
+            return;
+        }
+        let target = match self.read_unix_addr(tid, addr, addrlen) {
+            SeenAddr::Other => return,
+            SeenAddr::Unreadable => return self.fail_if_enforced(libc::EFAULT),
+            SeenAddr::Unnamed => return self.fail_if_enforced(libc::EINVAL),
+            SeenAddr::Unix(target) => target,
+        };
+        // The kernel uses the low 32 bits of a descriptor argument.
+        #[allow(clippy::cast_possible_truncation)]
+        let sockfd = sockfd as RawFd;
+        let ranges = [(buf, usize::try_from(buflen).unwrap_or(0))];
+        let send = SeenSend {
+            tid,
+            sockfd,
+            flags,
+            ranges: &ranges,
+            control: Control::No,
+        };
+        self.decide_send(notif, &target, &send);
+    }
+
+    /// `sendmsg(fd, msghdr, flags)`.
+    fn record_send_msg(&mut self, notif: &libc::seccomp_notif) {
+        let tid = notif.pid;
+        let args = notif.data.args;
+        let (Some(&sockfd), Some(&hdr), Some(&flags)) = (args.first(), args.get(1), args.get(2))
+        else {
+            return;
+        };
+        let Some(msg) = self.read_msghdr(tid, hdr) else {
+            return self.fail_if_enforced(libc::EFAULT);
+        };
+        if msg.name == 0 || msg.namelen == 0 {
+            // A connected socket: the message carries no address.
+            return;
+        }
+        let target = match self.read_unix_addr(tid, msg.name, msg.namelen) {
+            SeenAddr::Other => return,
+            SeenAddr::Unreadable => return self.fail_if_enforced(libc::EFAULT),
+            SeenAddr::Unnamed => return self.fail_if_enforced(libc::EINVAL),
+            SeenAddr::Unix(target) => target,
+        };
+        let Some(ranges) = self.read_iovecs(tid, msg.iov, msg.iovlen) else {
+            return self.fail_if_enforced(libc::EFAULT);
+        };
+        let control = if msg.controllen == 0 {
+            Control::No
+        } else {
+            Control::Yes
+        };
+        // The kernel uses the low 32 bits of a descriptor argument.
+        #[allow(clippy::cast_possible_truncation)]
+        let sockfd = sockfd as RawFd;
+        let send = SeenSend {
+            tid,
+            sockfd,
+            flags,
+            ranges: &ranges,
+            control,
+        };
+        self.decide_send(notif, &target, &send);
+    }
+
+    /// `sendmmsg(fd, mmsghdr[], vlen, flags)`.
+    ///
+    /// One call carries several messages, so the supervisor does not
+    /// perform it. A message with an `AF_UNIX` path fails the whole call
+    /// with `EACCES`, also for a path that the profile names (see
+    /// [`crate::linux_unixconn`]).
+    fn record_send_many(&mut self, notif: &libc::seccomp_notif) {
+        let tid = notif.pid;
+        let args = notif.data.args;
+        let (Some(&base), Some(&vlen)) = (args.get(1), args.get(2)) else {
+            return;
+        };
+        let count = usize::try_from(vlen).unwrap_or(0).min(UIO_MAXIOV);
+        let mut refuse = false;
+        for i in 0..count {
+            let Some(at) = u64::try_from(i.saturating_mul(MMSGHDR_LEN))
+                .ok()
+                .and_then(|off| base.checked_add(off))
+            else {
+                break;
+            };
+            let Some(msg) = self.read_msghdr(tid, at) else {
+                return self.fail_if_enforced(libc::EFAULT);
+            };
+            if msg.name == 0 || msg.namelen == 0 {
+                continue;
+            }
+            let target = match self.read_unix_addr(tid, msg.name, msg.namelen) {
+                SeenAddr::Other | SeenAddr::Unnamed => continue,
+                SeenAddr::Unreadable => return self.fail_if_enforced(libc::EFAULT),
+                SeenAddr::Unix(target) => target,
+            };
+            let decision = self.unix.policy().decide_many(&target);
+            refuse = refuse || decision == UnixDecision::Refuse;
+            self.record_unix_event(tid, &target, decision.outcome());
+        }
+        if refuse {
+            self.fail_if_enforced(libc::EACCES);
+        }
+    }
+
+    /// Apply the policy to one send that carries the `AF_UNIX` address
+    /// `target`, and record the decision.
+    fn decide_send(&mut self, notif: &libc::seccomp_notif, target: &UnixAddr, send: &SeenSend) {
+        let decision = self.unix.policy().decide(target);
+        if self.unix.enforces() {
+            // The call must belong to a task that still runs: its
+            // identifier can belong to another process now.
+            if !self.id_valid(notif.id) {
+                return;
+            }
+            self.answer = match &decision {
+                UnixDecision::Perform(path) => {
+                    let path = path.clone();
+                    self.perform_send(&path, send)
+                }
+                UnixDecision::Kernel => Answer::Continue,
+                UnixDecision::Refuse => Answer::Fail(libc::EACCES),
+            };
+        }
+        self.record_unix_event(send.tid, target, decision.outcome());
+    }
+
+    /// Send the payload of the child to `path` and return the answer for
+    /// the call.
+    fn perform_send(&mut self, path: &Path, send: &SeenSend) -> Answer {
+        if send.control == Control::Yes {
+            // The supervisor sends from a socket of its own, so it cannot
+            // pass the descriptors or the credentials of the child.
+            return Answer::Fail(libc::EOPNOTSUPP);
+        }
+        let len = match self.read_payload(send.tid, send.ranges) {
+            Ok(len) => len,
+            Err(err) => return Answer::Fail(err),
+        };
+        // The kernel uses the low 32 bits of the flags argument.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let flags = send.flags as libc::c_int;
+        let payload = self.send_buf.get(..len).unwrap_or_default();
+        match crate::linux_unixconn::send_for_child(
+            send.tid,
+            send.sockfd,
+            path,
+            payload,
+            flags,
+            crate::linux_unixconn::CONNECT_LIMIT,
+        ) {
+            Ok(sent) => i64::try_from(sent).map_or(Answer::Fail(libc::EIO), Answer::Return),
+            Err(err) => Answer::Fail(err),
+        }
+    }
+
+    /// Read a `struct msghdr` at `addr` in the memory of `tid`.
+    fn read_msghdr(&mut self, tid: u32, addr: u64) -> Option<MsgHdr> {
+        let mut bytes = [0u8; MSGHDR_LEN];
+        if self.read_remote(tid, addr, &mut bytes) < MSGHDR_LEN {
+            return None;
+        }
+        parse_msghdr(&bytes)
+    }
+
+    /// Read the payload ranges of a `struct msghdr` from the `iovec` array
+    /// at `addr`. An empty list is a message with no payload; `None` means
+    /// that the supervisor cannot read the array, and the call then fails
+    /// with `EFAULT`, as it would in the kernel.
+    fn read_iovecs(&mut self, tid: u32, addr: u64, count: u64) -> Option<Vec<(u64, usize)>> {
+        let count = usize::try_from(count).unwrap_or(0).min(UIO_MAXIOV);
+        if count == 0 || addr == 0 {
+            return Some(Vec::new());
+        }
+        let mut bytes = vec![0u8; count.saturating_mul(IOVEC_LEN)];
+        let n = self.read_ranges(tid, &[(addr, bytes.len())], &mut bytes);
+        if n < bytes.len() {
+            return None;
+        }
+        Some(parse_iovecs(&bytes, count))
+    }
+
+    /// Copy the payload of `ranges` into the buffer of the supervisor and
+    /// return its length.
+    ///
+    /// # Errors
+    /// Returns `EMSGSIZE` for a payload above
+    /// [`crate::linux_unixconn::SEND_PAYLOAD_LIMIT`], and `EFAULT` when the
+    /// memory of the child is not readable.
+    fn read_payload(&mut self, tid: u32, ranges: &[(u64, usize)]) -> Result<usize, i32> {
+        let mut total: usize = 0;
+        for (_, len) in ranges {
+            total = total.checked_add(*len).ok_or(libc::EMSGSIZE)?;
+        }
+        if total > crate::linux_unixconn::SEND_PAYLOAD_LIMIT {
+            return Err(libc::EMSGSIZE);
+        }
+        if ranges.is_empty() && total == 0 {
+            // A message with no payload. `sendto` with a null pointer and
+            // the length 0 is one of them.
+            self.send_buf.clear();
+            return Ok(0);
+        }
+        let mut buf = std::mem::take(&mut self.send_buf);
+        buf.clear();
+        buf.resize(total, 0);
+        let n = self.read_ranges(tid, ranges, &mut buf);
+        self.send_buf = buf;
+        if n < total {
+            return Err(libc::EFAULT);
+        }
+        Ok(total)
+    }
+
+    /// Read the memory ranges `ranges` of the process `pid` into `buf`.
+    /// Returns the number of bytes that the call read.
+    fn read_ranges(&self, pid: u32, ranges: &[(u64, usize)], buf: &mut [u8]) -> usize {
+        let Ok(pid) = libc::pid_t::try_from(pid) else {
+            return 0;
+        };
+        let remote: Vec<libc::iovec> = ranges
+            .iter()
+            .map(|(addr, len)| libc::iovec {
+                iov_base: *addr as usize as *mut libc::c_void,
+                iov_len: *len,
+            })
+            .collect();
+        let Ok(count) = libc::c_ulong::try_from(remote.len()) else {
+            return 0;
+        };
+        let local = libc::iovec {
+            iov_base: buf.as_mut_ptr().cast(),
+            iov_len: buf.len(),
+        };
+        // SAFETY: `local` points to `buf.len()` writable bytes; the remote
+        // ranges are only read in the other process.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let n =
+            unsafe { libc::process_vm_readv(pid, &raw const local, 1, remote.as_ptr(), count, 0) };
+        usize::try_from(n).unwrap_or(0)
     }
 }
 
@@ -1708,16 +2227,24 @@ mod tests {
     /// A small classic BPF interpreter for the instructions that
     /// `build_filter` uses. Returns `None` for an invalid program.
     fn run_bpf(prog: &[libc::sock_filter], nr: u32, arch: u32) -> Option<u32> {
-        run_bpf_with_arg0(prog, nr, arch, 0)
+        run_bpf_with_args(prog, nr, arch, &[])
     }
 
-    /// The same interpreter, with a value for the first argument of the
-    /// system call.
-    fn run_bpf_with_arg0(prog: &[libc::sock_filter], nr: u32, arch: u32, arg0: u64) -> Option<u32> {
+    /// The same interpreter, with the arguments of the system call.
+    fn run_bpf_with_args(
+        prog: &[libc::sock_filter],
+        nr: u32,
+        arch: u32,
+        args: &[u64],
+    ) -> Option<u32> {
         let mut data = [0u8; 64];
         data.get_mut(0..4)?.copy_from_slice(&nr.to_ne_bytes());
         data.get_mut(4..8)?.copy_from_slice(&arch.to_ne_bytes());
-        data.get_mut(16..24)?.copy_from_slice(&arg0.to_ne_bytes());
+        for (i, arg) in args.iter().enumerate() {
+            let at = 16 + i * 8;
+            data.get_mut(at..at + 8)?
+                .copy_from_slice(&arg.to_ne_bytes());
+        }
         let mut acc = 0u32;
         let mut pc = 0usize;
         for _ in 0..prog.len() {
@@ -1748,7 +2275,7 @@ mod tests {
             foreign_nr_min: Some(X32_SYSCALL_BIT),
             enosys: &[425],
             notify: &[2, 257, 42],
-            deny_unix_socket: None,
+            addr_calls: &[],
         };
         let prog = build_filter(&spec)?;
         let arch = spec.audit_arch;
@@ -1774,7 +2301,7 @@ mod tests {
             foreign_nr_min: None,
             enosys: &[425],
             notify: &[56],
-            deny_unix_socket: None,
+            addr_calls: &[],
         };
         let prog = build_filter(&spec)?;
         assert_eq!(run_bpf(&prog, 56, 0xC000_00B7), Some(RET_NOTIFY));
@@ -1794,7 +2321,7 @@ mod tests {
             foreign_nr_min: None,
             enosys: &[],
             notify: &notify,
-            deny_unix_socket: None,
+            addr_calls: &[],
         };
         assert!(build_filter(&spec).is_err());
     }
@@ -1802,11 +2329,11 @@ mod tests {
     #[test]
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     fn native_filter_covers_the_calls() -> TestResult {
-        let prog = native_filter(RecorderScope::Full, UnixSocketRule::Allow)?;
+        let prog = native_filter(RecorderScope::Full)?;
         let Some((arch, _)) = NATIVE else {
             return Err("no native spec".into());
         };
-        for (nr, _) in CALLS {
+        for (nr, _) in CALLS.iter().chain(CONTROL_CALLS) {
             assert_eq!(run_bpf(&prog, u32::try_from(*nr)?, arch), Some(RET_NOTIFY));
         }
         let uring = u32::try_from(libc::SYS_io_uring_setup)?;
@@ -1831,69 +2358,185 @@ mod tests {
         assert_eq!(std::mem::size_of::<NotifAddfd>(), 24);
     }
 
-    /// The filter refuses `socket(AF_UNIX, ...)` and leaves every other
-    /// domain alone. The domain is a register, so no thread of the child
-    /// can change it after the test.
+    /// A call with an address goes to the supervisor; the same call
+    /// without one runs with no notification. The filter reads both words
+    /// of the pointer: a program can map a page whose address has the low
+    /// word zero.
     #[test]
-    fn filter_refuses_the_unix_domain_of_socket() -> TestResult {
+    fn filter_traps_a_send_that_carries_an_address() -> TestResult {
         let spec = FilterSpec {
             audit_arch: 0xC000_003E,
             foreign_nr_min: Some(X32_SYSCALL_BIT),
             enosys: &[425],
             notify: &[42],
-            deny_unix_socket: Some(41),
+            addr_calls: &[AddrCall { nr: 44, arg: 4 }, AddrCall { nr: 307, arg: 1 }],
         };
         let prog = build_filter(&spec)?;
         let arch = spec.audit_arch;
-        // The cast is exact: the families are small positive numbers.
-        #[allow(clippy::cast_sign_loss)]
-        let (unix, inet) = (libc::AF_UNIX as u64, libc::AF_INET as u64);
+        let with_addr = [0, 0, 0, 0, 0x7fff_0000_1234, 110];
+        let no_addr = [0, 0, 0, 0, 0, 0];
+        // Only the low word is zero: the pointer is not null.
+        let high_only = [0u64, 0, 0, 0, 0x1_0000_0000, 110];
         assert_eq!(
-            run_bpf_with_arg0(&prog, 41, arch, unix),
-            Some(RET_EAFNOSUPPORT)
+            run_bpf_with_args(&prog, 44, arch, &with_addr),
+            Some(RET_NOTIFY)
         );
         assert_eq!(
-            run_bpf_with_arg0(&prog, 41, arch, inet),
+            run_bpf_with_args(&prog, 44, arch, &no_addr),
+            Some(SECCOMP_RET_ALLOW)
+        );
+        assert_eq!(
+            run_bpf_with_args(&prog, 44, arch, &high_only),
+            Some(RET_NOTIFY)
+        );
+        // The second block reads its own argument.
+        assert_eq!(
+            run_bpf_with_args(&prog, 307, arch, &[0, 0x4242, 0, 0, 0, 0]),
+            Some(RET_NOTIFY)
+        );
+        assert_eq!(
+            run_bpf_with_args(&prog, 307, arch, &no_addr),
             Some(SECCOMP_RET_ALLOW)
         );
         // The other classes keep their answer.
-        assert_eq!(run_bpf_with_arg0(&prog, 42, arch, unix), Some(RET_NOTIFY));
+        assert_eq!(
+            run_bpf_with_args(&prog, 42, arch, &no_addr),
+            Some(RET_NOTIFY)
+        );
         assert_eq!(run_bpf(&prog, 425, arch), Some(RET_ENOSYS));
         assert_eq!(run_bpf(&prog, 39, arch), Some(SECCOMP_RET_ALLOW));
         assert_eq!(run_bpf(&prog, 5, 0x4000_0003), Some(RET_ENOSYS));
         Ok(())
     }
 
-    /// The connect-only scope traps `connect(2)` and nothing else, and it
-    /// keeps `io_uring_setup` away: io_uring has a connect operation that
-    /// seccomp does not see.
+    /// The filter leaves `socket(2)` and `socketpair(2)` alone: the child
+    /// makes a Unix socket of its own, and the control of the address
+    /// decides what it reaches.
     #[test]
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-    fn connect_only_filter_traps_connect() -> TestResult {
-        let prog = native_filter(RecorderScope::ConnectOnly, UnixSocketRule::Refuse)?;
+    fn filter_permits_the_unix_family() -> TestResult {
         let Some((arch, _)) = NATIVE else {
             return Err("no native spec".into());
         };
-        let connect = u32::try_from(libc::SYS_connect)?;
-        assert_eq!(run_bpf(&prog, connect, arch), Some(RET_NOTIFY));
+        // The cast is exact: AF_UNIX is 1.
+        #[allow(clippy::cast_sign_loss)]
+        let unix = libc::AF_UNIX as u64;
+        for scope in [RecorderScope::Full, RecorderScope::ConnectOnly] {
+            let prog = native_filter(scope)?;
+            for call in [libc::SYS_socket, libc::SYS_socketpair] {
+                let nr = u32::try_from(call)?;
+                assert_eq!(
+                    run_bpf_with_args(&prog, nr, arch, &[unix, 0, 0, 0, 0, 0]),
+                    Some(SECCOMP_RET_ALLOW),
+                    "the call {call} of the scope {scope:?} must run"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// The connect-only scope traps the calls of the Unix socket control
+    /// and nothing else, and it keeps `io_uring_setup` away: io_uring has
+    /// a connect operation that seccomp does not see.
+    #[test]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    fn connect_only_filter_traps_the_control_calls() -> TestResult {
+        let prog = native_filter(RecorderScope::ConnectOnly)?;
+        let Some((arch, _)) = NATIVE else {
+            return Err("no native spec".into());
+        };
+        for call in [libc::SYS_connect, libc::SYS_sendmsg, libc::SYS_sendmmsg] {
+            assert_eq!(
+                run_bpf(&prog, u32::try_from(call)?, arch),
+                Some(RET_NOTIFY),
+                "the call {call} must go to the supervisor"
+            );
+        }
+        // `sendto` goes to the supervisor only with an address.
+        let sendto = u32::try_from(libc::SYS_sendto)?;
+        assert_eq!(
+            run_bpf_with_args(&prog, sendto, arch, &[3, 0, 0, 0, 0x7fff_0000, 110]),
+            Some(RET_NOTIFY)
+        );
+        assert_eq!(
+            run_bpf_with_args(&prog, sendto, arch, &[3, 0, 0, 0, 0, 0]),
+            Some(SECCOMP_RET_ALLOW)
+        );
         let openat = u32::try_from(libc::SYS_openat)?;
         assert_eq!(run_bpf(&prog, openat, arch), Some(SECCOMP_RET_ALLOW));
         let uring = u32::try_from(libc::SYS_io_uring_setup)?;
         assert_eq!(run_bpf(&prog, uring, arch), Some(RET_ENOSYS));
-        let socket = u32::try_from(libc::SYS_socket)?;
-        // The cast is exact: AF_UNIX is 1.
-        #[allow(clippy::cast_sign_loss)]
-        let unix = libc::AF_UNIX as u64;
-        assert_eq!(
-            run_bpf_with_arg0(&prog, socket, arch, unix),
-            Some(RET_EAFNOSUPPORT)
-        );
-        let socketpair = u32::try_from(libc::SYS_socketpair)?;
-        assert_eq!(
-            run_bpf_with_arg0(&prog, socketpair, arch, unix),
-            Some(SECCOMP_RET_ALLOW)
-        );
         Ok(())
+    }
+
+    /// The offsets of `struct msghdr` and the parse of its fields.
+    #[test]
+    fn msghdr_fields_come_from_the_bytes() {
+        assert_eq!(MSGHDR_LEN, 56, "the layout of a 64-bit kernel");
+        assert_eq!(MMSGHDR_LEN, 64);
+        assert_eq!(IOVEC_LEN, 16);
+        let mut bytes = [0u8; MSGHDR_LEN];
+        let put = |b: &mut [u8; MSGHDR_LEN], at: usize, v: u64| {
+            if let Some(slot) = b.get_mut(at..at + 8) {
+                slot.copy_from_slice(&v.to_ne_bytes());
+            }
+        };
+        put(
+            &mut bytes,
+            std::mem::offset_of!(libc::msghdr, msg_name),
+            0x11,
+        );
+        put(
+            &mut bytes,
+            std::mem::offset_of!(libc::msghdr, msg_namelen),
+            110,
+        );
+        put(
+            &mut bytes,
+            std::mem::offset_of!(libc::msghdr, msg_iov),
+            0x22,
+        );
+        put(
+            &mut bytes,
+            std::mem::offset_of!(libc::msghdr, msg_iovlen),
+            2,
+        );
+        put(
+            &mut bytes,
+            std::mem::offset_of!(libc::msghdr, msg_controllen),
+            16,
+        );
+        assert_eq!(
+            parse_msghdr(&bytes),
+            Some(MsgHdr {
+                name: 0x11,
+                namelen: 110,
+                iov: 0x22,
+                iovlen: 2,
+                controllen: 16,
+            })
+        );
+        // `msg_namelen` is 32 bits wide: the next field does not leak in.
+        assert_eq!(parse_msghdr(&[0u8; 8]), None);
+    }
+
+    /// The payload ranges come from the `iovec` array of the message.
+    #[test]
+    fn iovecs_give_the_payload_ranges() {
+        let mut bytes = [0u8; 2 * IOVEC_LEN];
+        let put = |b: &mut [u8], at: usize, v: u64| {
+            if let Some(slot) = b.get_mut(at..at + 8) {
+                slot.copy_from_slice(&v.to_ne_bytes());
+            }
+        };
+        put(&mut bytes, 0, 0x1000);
+        put(&mut bytes, 8, 4);
+        put(&mut bytes, IOVEC_LEN, 0x2000);
+        put(&mut bytes, IOVEC_LEN + 8, 7);
+        assert_eq!(parse_iovecs(&bytes, 2), vec![(0x1000, 4), (0x2000, 7)]);
+        // A count above the bytes stops at the end of the array.
+        assert_eq!(parse_iovecs(&bytes, 4), vec![(0x1000, 4), (0x2000, 7)]);
+        assert!(parse_iovecs(&[], 2).is_empty());
     }
 
     // ── Flags and paths ────────────────────────────────────────────────────
@@ -2649,7 +3292,9 @@ mod tests {
         Ok(())
     }
 
-    /// An abstract address is refused: the allowlist holds paths only.
+    /// An abstract address is refused when the child has no network
+    /// namespace of its own: the names of the host are then in reach. The
+    /// `setup` configuration has `--network unrestricted`.
     #[test]
     #[serial]
     fn unix_connect_to_an_abstract_name_is_refused() -> TestResult {
@@ -2723,12 +3368,12 @@ mod tests {
         Ok(())
     }
 
-    /// With an empty allowlist the filter refuses the family itself, so the
-    /// child holds no Unix socket and no race can reach one. `socketpair`
-    /// is another system call and stays allowed.
+    /// With an empty allowlist the child still makes a Unix socket: the
+    /// control of the address decides what it reaches, and every path gets
+    /// `EACCES`. `socketpair` keeps working too.
     #[test]
     #[serial]
-    fn an_empty_list_refuses_the_unix_family() -> TestResult {
+    fn an_empty_list_permits_the_family_and_refuses_each_path() -> TestResult {
         let Some(s) = setup()? else {
             return Ok(());
         };
@@ -2739,15 +3384,199 @@ mod tests {
         };
         let script = probe_script("SOCK_STREAM", &format!("{:?}", sock.to_string_lossy()));
         let text = run_probe(&s, &config, &py, &script)?;
-        assert_eq!(text, format!("ERR {}", libc::EAFNOSUPPORT), "{text}");
+        assert_eq!(text, format!("ERR {}", libc::EACCES), "{text}");
         let pair = "import socket, sys\n\
                     out = open(sys.argv[1], 'w')\n\
                     a, b = socket.socketpair()\n\
                     a.sendall(b'PAIR')\n\
-                    out.write(repr(b.recv(8)))\n\
+                    c = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)\n\
+                    out.write(repr(b.recv(8)) + ' FAMILY OK')\n\
                     out.close()\n";
         let text = run_probe(&s, &config, &py, pair)?;
         assert!(text.contains("PAIR"), "{text}");
+        assert!(text.contains("FAMILY OK"), "{text}");
+        Ok(())
+    }
+
+    /// The body of one datagram probe: `sendto` to a path, and the result
+    /// in the file.
+    fn sendto_script(target: &str) -> String {
+        format!(
+            "import socket, sys\n\
+             out = open(sys.argv[1], 'w')\n\
+             s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)\n\
+             try:\n\
+             \x20   n = s.sendto(b'PING', {target})\n\
+             \x20   out.write('OK %d' % n)\n\
+             except OSError as e:\n\
+             \x20   out.write('ERR %d' % (e.errno or 0))\n\
+             out.close()\n"
+        )
+    }
+
+    /// A `sendto` to a socket that the allowlist names arrives: the
+    /// supervisor sends the payload itself.
+    #[test]
+    #[serial]
+    fn sendto_a_socket_on_the_list_arrives() -> TestResult {
+        let Some(s) = setup()? else {
+            return Ok(());
+        };
+        let sock = s.dir.join("notify.sock");
+        let server = std::os::unix::net::UnixDatagram::bind(&sock)?;
+        server.set_read_timeout(Some(Duration::from_secs(10)))?;
+        let Some((config, py)) = python_sandbox(&s, vec![sock.clone()]) else {
+            return Ok(());
+        };
+        let script = sendto_script(&format!("{:?}", sock.to_string_lossy()));
+        let text = run_probe(&s, &config, &py, &script)?;
+        assert_eq!(text, "OK 4", "{text}");
+        let mut buf = [0u8; 8];
+        let n = server.recv(&mut buf)?;
+        assert_eq!(buf.get(..n), Some(b"PING".as_slice()));
+        Ok(())
+    }
+
+    /// A `sendto` to a socket that the allowlist does not name gets
+    /// `EACCES`, and the message does not arrive. A datagram needs no
+    /// `connect`, so the control of `connect` alone would miss it.
+    #[test]
+    #[serial]
+    fn sendto_outside_the_list_gets_eacces() -> TestResult {
+        let Some(s) = setup()? else {
+            return Ok(());
+        };
+        let allowed = s.dir.join("allowed.sock");
+        let denied = s.dir.join("denied.sock");
+        let _keep = std::os::unix::net::UnixDatagram::bind(&allowed)?;
+        let victim = std::os::unix::net::UnixDatagram::bind(&denied)?;
+        victim.set_read_timeout(Some(Duration::from_millis(200)))?;
+        let Some((config, py)) = python_sandbox(&s, vec![allowed]) else {
+            return Ok(());
+        };
+        let script = sendto_script(&format!("{:?}", denied.to_string_lossy()));
+        let text = run_probe(&s, &config, &py, &script)?;
+        assert_eq!(text, format!("ERR {}", libc::EACCES), "{text}");
+        let mut buf = [0u8; 8];
+        assert!(
+            victim.recv(&mut buf).is_err(),
+            "the victim socket got a message"
+        );
+        Ok(())
+    }
+
+    /// `sendmsg` takes the same way as `sendto`: the address is in the
+    /// `struct msghdr`, and a path outside the list gets `EACCES`.
+    #[test]
+    #[serial]
+    fn sendmsg_outside_the_list_gets_eacces() -> TestResult {
+        let Some(s) = setup()? else {
+            return Ok(());
+        };
+        let allowed = s.dir.join("allowed.sock");
+        let denied = s.dir.join("denied.sock");
+        let _keep = std::os::unix::net::UnixDatagram::bind(&allowed)?;
+        let victim = std::os::unix::net::UnixDatagram::bind(&denied)?;
+        victim.set_read_timeout(Some(Duration::from_millis(200)))?;
+        let Some((config, py)) = python_sandbox(&s, vec![allowed.clone()]) else {
+            return Ok(());
+        };
+        // `sendmsg` of python takes a list of buffers, so the message has
+        // two `iovec` entries.
+        let script = format!(
+            "import socket, sys\n\
+             out = open(sys.argv[1], 'w')\n\
+             s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)\n\
+             def send(path):\n\
+             \x20   return s.sendmsg([b'PI', b'NG'], [], 0, path)\n\
+             try:\n\
+             \x20   out.write('ALLOWED %d ' % send({allowed:?}))\n\
+             except OSError as e:\n\
+             \x20   out.write('ALLOWED ERR %d ' % (e.errno or 0))\n\
+             try:\n\
+             \x20   out.write('DENIED %d' % send({denied:?}))\n\
+             except OSError as e:\n\
+             \x20   out.write('DENIED ERR %d' % (e.errno or 0))\n\
+             out.close()\n",
+            allowed = allowed.to_string_lossy(),
+            denied = denied.to_string_lossy(),
+        );
+        let text = run_probe(&s, &config, &py, &script)?;
+        assert_eq!(
+            text,
+            format!("ALLOWED 4 DENIED ERR {}", libc::EACCES),
+            "{text}"
+        );
+        let mut buf = [0u8; 8];
+        assert!(
+            victim.recv(&mut buf).is_err(),
+            "the victim socket got a message"
+        );
+        Ok(())
+    }
+
+    /// Without a network namespace of its own the child shares the
+    /// abstract names of the host, so each abstract address is refused.
+    /// The `setup` configuration has `--network unrestricted`.
+    #[test]
+    #[serial]
+    fn an_abstract_address_is_refused_without_a_network_namespace() -> TestResult {
+        let Some(s) = setup()? else {
+            return Ok(());
+        };
+        let Some((config, py)) = python_sandbox(&s, Vec::new()) else {
+            return Ok(());
+        };
+        assert_eq!(config.network, crate::NetworkMode::Unrestricted);
+        let script = probe_script("SOCK_STREAM", "'\\0pent-test-abstract'");
+        let text = run_probe(&s, &config, &py, &script)?;
+        assert_eq!(text, format!("ERR {}", libc::EACCES), "{text}");
+        let script = sendto_script("'\\0pent-test-abstract'");
+        let text = run_probe(&s, &config, &py, &script)?;
+        assert_eq!(text, format!("ERR {}", libc::EACCES), "{text}");
+        Ok(())
+    }
+
+    /// With its own network namespace the child reaches its own abstract
+    /// socket, with `connect` and with `sendto`. The names of the host are
+    /// not in that namespace.
+    #[test]
+    #[serial]
+    fn an_abstract_address_works_in_a_private_network_namespace() -> TestResult {
+        let Some(s) = setup()? else {
+            return Ok(());
+        };
+        let Some((mut config, py)) = python_sandbox(&s, Vec::new()) else {
+            return Ok(());
+        };
+        config.network = crate::NetworkMode::LocalhostOnly;
+        let script = "import socket, sys, threading\n\
+             out = open(sys.argv[1], 'w')\n\
+             name = '\\0pent-own-abstract'\n\
+             srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n\
+             srv.bind(name); srv.listen(1)\n\
+             def serve():\n\
+             \x20   c, _ = srv.accept(); c.sendall(b'OWN'); c.close()\n\
+             threading.Thread(target=serve, daemon=True).start()\n\
+             c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n\
+             c.settimeout(5)\n\
+             try:\n\
+             \x20   c.connect(name)\n\
+             \x20   out.write('CONNECT ' + repr(c.recv(8)) + ' ')\n\
+             except OSError as e:\n\
+             \x20   out.write('CONNECT ERR %d ' % (e.errno or 0))\n\
+             d = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)\n\
+             d.bind('\\0pent-own-dgram-peer')\n\
+             peer = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)\n\
+             peer.settimeout(5)\n\
+             try:\n\
+             \x20   peer.sendto(b'PING', '\\0pent-own-dgram-peer')\n\
+             \x20   out.write('SENDTO ' + repr(d.recv(8)))\n\
+             except OSError as e:\n\
+             \x20   out.write('SENDTO ERR %d' % (e.errno or 0))\n\
+             out.close()\n";
+        let text = run_probe(&s, &config, &py, script)?;
+        assert_eq!(text, "CONNECT b'OWN' SENDTO b'PING'", "{text}");
         Ok(())
     }
 
