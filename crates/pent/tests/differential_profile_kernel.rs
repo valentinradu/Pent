@@ -325,7 +325,6 @@ printf 'rc=%s\n' "$?"
     /// of the host does not change (the table holds that row). Inside the
     /// run the write succeeds and every later read gives the new content.
     #[test]
-    #[ignore = "OPEN DIFF-3: a write to a read-only rule succeeds inside the run"]
     fn diff_3_a_write_to_a_read_only_rule_succeeds_in_the_run() -> TestResult {
         let test = "fs_diff_3_write_in_the_run";
         if !ready(test) {

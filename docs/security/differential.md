@@ -150,9 +150,14 @@ reaches it. No kernel interface can separate the two names. The access is
 the same content, and the user named that content, so the row now states
 `allow`.
 
-### DIFF-3 — a write to a read-only rule succeeds inside the run
+### DIFF-3 — a write to a read-only rule succeeded inside the run (fixed)
 
-**Severity:** Low. **Wrong description:** the kernel.
+**Severity:** Low. **Wrong description:** the kernel. **Fixed** by
+`fix(sandbox): keep a read-only overlay directory read-only (DIFF-3)`:
+Landlock joins the rights of each rule on one path, so the wide rule of
+the overlay gave the write back. A directory that the profile names
+`read` or `traversal`, and that holds nothing the profile may write, now
+keeps the read rights only.
 
 **Test:** `differential_profile_kernel.rs`,
 `diff_3_a_write_to_a_read_only_rule_succeeds_in_the_run`.

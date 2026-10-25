@@ -548,8 +548,30 @@ fn add_ruleset_rules(
     // The rule gives no execution: a `read` entry is not an `execute`
     // entry, and the overlay must not turn one into the other (DIFF-4).
     // The right to run a file comes from the rule of its own entry.
+    //
+    // A directory that the profile names `read` or `traversal`, and that
+    // holds nothing that the profile may write, keeps the read rights
+    // only. Landlock joins the rights of each rule on one path, so the
+    // wider rule of the overlay would otherwise give the write back, and a
+    // write to a `read` entry would work inside the run (DIFF-3).
+    let read_only_dirs: Vec<&PathBuf> = read
+        .iter()
+        .chain(&traversal)
+        .map(|(path, _)| path)
+        .filter(|path| {
+            !write_set.iter().any(|w| w.starts_with(path))
+                && !rw.iter().any(|(w, _)| w.starts_with(path))
+                && *path != &config.workspace
+                && *path != &config.data_dir
+        })
+        .collect();
     for dir in overlay_dirs {
-        ruleset.add_rule(dir, access::ALL_NO_EXECUTE);
+        let rights = if read_only_dirs.iter().any(|p| **p == *dir) {
+            access::READ
+        } else {
+            access::ALL_NO_EXECUTE
+        };
+        ruleset.add_rule(dir, rights);
     }
     // PATH directories and system libraries: the dynamic linker must open()
     // binaries and shared libraries, so these get ReadFile too.

@@ -1287,8 +1287,14 @@ mod no_hang {
             ],
         );
 
-        // Step 1: wait up to 8 s for the TUI to render.
-        let output = drain_pty(master, Duration::from_secs(8));
+        // Step 1: wait for the TUI to render.
+        //
+        // The budget is generous: the test starts a real agent under a real
+        // sandbox, and a loaded machine needs much longer than a quiet one.
+        // A budget that flakes under load tells nothing about pent, and it
+        // trains the reader to ignore a red suite. The test still fails in
+        // a sensible time when the TUI never comes.
+        let output = drain_pty(master, Duration::from_secs(60));
         let printable = String::from_utf8_lossy(&output);
 
         if !looks_like_prompt(&output) {
@@ -1296,7 +1302,7 @@ mod no_hang {
             child.wait().ok();
             unsafe { libc::close(master) };
             panic!(
-                "pent run -- {agent}: PTY output within 8s was empty or contained errors\n\
+                "pent run -- {agent}: the TUI gave no prompt within 60s\n\
                  output: {printable:?}\n\
                  hint: sandbox may be blocking a resource the binary needs"
             );
