@@ -162,10 +162,12 @@ pub(crate) enum AbstractNames {
 pub(crate) enum UnixDecision {
     /// The supervisor makes the call itself, to this canonical path.
     Perform(PathBuf),
-    /// The kernel runs the call. Only an abstract address of a child with
-    /// its own network namespace gets this answer: the name is out of
-    /// reach of the host, and no path leaves the sandbox.
-    Kernel,
+    /// The supervisor makes the call on the socket of the child itself.
+    /// Only an abstract address of a child with its own network
+    /// namespace gets this answer: the name belongs to the network
+    /// namespace of that socket, which a socket of the supervisor does
+    /// not reach, and it is out of reach of the host.
+    Child,
     /// The child gets `EACCES`.
     Refuse,
 }
@@ -174,7 +176,7 @@ impl UnixDecision {
     /// The outcome of the decision for the recorded event.
     pub(crate) const fn outcome(&self) -> Outcome {
         match self {
-            Self::Perform(_) | Self::Kernel => Outcome::Allowed,
+            Self::Perform(_) | Self::Child => Outcome::Allowed,
             Self::Refuse => Outcome::Denied,
         }
     }
@@ -218,7 +220,7 @@ impl UnixPolicy {
         let path = match addr {
             UnixAddr::Abstract(_) => {
                 return match self.abstract_names {
-                    AbstractNames::Private => UnixDecision::Kernel,
+                    AbstractNames::Private => UnixDecision::Child,
                     AbstractNames::Shared => UnixDecision::Refuse,
                 }
             }
@@ -240,7 +242,7 @@ impl UnixPolicy {
     /// refused also when the profile names it.
     pub(crate) fn decide_many(&self, addr: &UnixAddr) -> UnixDecision {
         match self.decide(addr) {
-            UnixDecision::Kernel => UnixDecision::Kernel,
+            UnixDecision::Child => UnixDecision::Child,
             UnixDecision::Perform(_) | UnixDecision::Refuse => UnixDecision::Refuse,
         }
     }
@@ -304,6 +306,87 @@ fn parse_fdinfo_flags(text: &str) -> Option<libc::c_int> {
         return Some(0);
     }
     libc::c_int::from_str_radix(value, 8).ok()
+}
+
+/// The socket of the child that a trapped call names.
+///
+/// The supervisor takes a copy of the descriptor with `pidfd_getfd(2)`
+/// and reads the domain and the type of the socket from it. Both are
+/// properties of the socket, which no thread of the child can change,
+/// unlike the family in the `sockaddr` (finding CT-1 in
+/// `docs/security/containment.md`).
+pub(crate) struct ChildSocket {
+    /// The copy of the descriptor of the child. The two descriptors name
+    /// the same socket, so a call on this one changes the socket of the
+    /// child.
+    fd: OwnedFd,
+    /// `SO_DOMAIN`: the address family of the socket.
+    domain: libc::c_int,
+    /// `SO_TYPE`: `SOCK_STREAM`, `SOCK_DGRAM` or `SOCK_SEQPACKET`.
+    kind: libc::c_int,
+}
+
+impl ChildSocket {
+    /// True when the socket belongs to the `AF_UNIX` family.
+    pub(crate) fn is_unix(&self) -> bool {
+        self.domain == libc::AF_UNIX
+    }
+
+    /// True when the kernel uses the address of a send on this socket.
+    ///
+    /// Only a datagram socket does. A stream socket refuses a send that
+    /// carries an address (`EISCONN` or `ENOTCONN`), and a sequential
+    /// packet socket drops the address and sends to its peer. Thus a send
+    /// on either of them cannot reach another socket, whatever another
+    /// thread writes in the address.
+    pub(crate) fn send_uses_the_address(&self) -> bool {
+        self.kind == libc::SOCK_DGRAM
+    }
+
+    /// The type of the socket.
+    pub(crate) fn kind(&self) -> libc::c_int {
+        self.kind
+    }
+}
+
+/// Take a copy of the socket `fd` of the process `pid` and read its
+/// domain and its type.
+///
+/// Returns `None` when the copy fails (the task died, or the kernel has
+/// no `pidfd_getfd(2)`) or when the descriptor is not a socket.
+pub(crate) fn child_socket(pid: u32, fd: RawFd) -> Option<ChildSocket> {
+    let pidfd = crate::linux_fdpass::open_pidfd(pid).ok()?;
+    let fd = crate::linux_fdpass::take_remote_fd(&pidfd, fd).ok()?;
+    let domain = sock_opt(&fd, libc::SO_DOMAIN)?;
+    let kind = sock_opt(&fd, libc::SO_TYPE)?;
+    Some(ChildSocket { fd, domain, kind })
+}
+
+/// Read the integer socket option `name` at the level `SOL_SOCKET`.
+fn sock_opt(sock: &OwnedFd, name: libc::c_int) -> Option<libc::c_int> {
+    let mut value: libc::c_int = 0;
+    let mut len = libc::socklen_t::try_from(std::mem::size_of::<libc::c_int>()).ok()?;
+    // SAFETY: the kernel writes one `c_int` into `value` and the length
+    // into `len`; both live until the call returns.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let ret = unsafe {
+        libc::getsockopt(
+            sock.as_raw_fd(),
+            libc::SOL_SOCKET,
+            name,
+            std::ptr::from_mut(&mut value).cast::<libc::c_void>(),
+            &raw mut len,
+        )
+    };
+    (ret == 0).then_some(value)
+}
+
+/// True when the descriptor `fd` of the task `tid` is a Unix socket.
+///
+/// This is the answer for a kernel without `pidfd_getfd(2)`. It costs a
+/// read of `/proc/<tid>/net/unix`, so [`child_socket`] comes first.
+pub(crate) fn is_unix_socket(tid: u32, fd: RawFd) -> bool {
+    socket_kind(tid, fd).is_some()
 }
 
 /// Return the kind of the Unix socket `fd` of the process `tid`
@@ -431,23 +514,17 @@ fn set_nonblock(sock: &OwnedFd, want: bool) -> Result<(), i32> {
 /// non-blocking socket gets `EAGAIN` back.
 fn connect_once(
     sock: &OwnedFd,
-    addr: &libc::sockaddr_un,
+    addr: *const libc::sockaddr,
     len: libc::socklen_t,
     nonblock: bool,
     limit: Duration,
 ) -> Result<(), i32> {
     let deadline = Instant::now() + limit;
     loop {
-        // SAFETY: `addr` is a valid `sockaddr_un` of `len` bytes and `sock`
-        // is an open Unix socket.
+        // SAFETY: `addr` points to `len` readable bytes of an address and
+        // `sock` is an open socket.
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-        let ret = unsafe {
-            libc::connect(
-                sock.as_raw_fd(),
-                std::ptr::from_ref(addr).cast::<libc::sockaddr>(),
-                len,
-            )
-        };
+        let ret = unsafe { libc::connect(sock.as_raw_fd(), addr, len) };
         if ret == 0 {
             return Ok(());
         }
@@ -478,18 +555,141 @@ fn connect_once(
 pub(crate) fn connect_for_child(
     tid: u32,
     fd: RawFd,
+    kind: Option<libc::c_int>,
     path: &Path,
     flags: FdFlags,
     limit: Duration,
 ) -> Result<OwnedFd, i32> {
     // Without the kind of the socket of the child, a new socket would have
     // the wrong semantics. Refuse instead of guessing.
-    let kind = socket_kind(tid, fd).ok_or(libc::EACCES)?;
+    let kind = kind.or_else(|| socket_kind(tid, fd)).ok_or(libc::EACCES)?;
     let (addr, len) = sockaddr_un(path)?;
     let sock = make_socket(kind)?;
-    connect_once(&sock, &addr, len, flags.nonblock, limit)?;
+    connect_once(
+        &sock,
+        std::ptr::from_ref(&addr).cast::<libc::sockaddr>(),
+        len,
+        flags.nonblock,
+        limit,
+    )?;
     set_nonblock(&sock, flags.nonblock)?;
     Ok(sock)
+}
+
+/// Connect the socket of the child itself to the address `addr`, as the
+/// child wrote it.
+///
+/// The supervisor uses this for an address that it must not hand to the
+/// kernel through `CONTINUE` and that it cannot reach with a socket of
+/// its own: an abstract name, which belongs to the network namespace of
+/// the socket, and an address of another family, which includes the
+/// `AF_UNSPEC` address that breaks the association of a datagram socket.
+///
+/// The call sets `O_NONBLOCK` on the socket of the child while it runs,
+/// so that the wait ends at `limit`, and it puts the flag back after.
+///
+/// # Errors
+/// Returns the error number for the child: the error of `connect(2)`, or
+/// `ETIMEDOUT` when the server does not take the connection within
+/// `limit`.
+pub(crate) fn connect_child_socket(
+    sock: &ChildSocket,
+    addr: &[u8],
+    flags: FdFlags,
+    limit: Duration,
+) -> Result<(), i32> {
+    let len = libc::socklen_t::try_from(addr.len()).map_err(|_| libc::EINVAL)?;
+    if !flags.nonblock {
+        set_nonblock(&sock.fd, true)?;
+    }
+    let done = connect_once(
+        &sock.fd,
+        addr.as_ptr().cast::<libc::sockaddr>(),
+        len,
+        flags.nonblock,
+        limit,
+    );
+    if !flags.nonblock {
+        // The socket of the child keeps the flags that it had.
+        set_nonblock(&sock.fd, false)?;
+    }
+    done
+}
+
+/// Send `payload` on the socket of the child itself, with no address.
+///
+/// The supervisor uses this for a send on a connected datagram socket of
+/// the `AF_UNIX` family: the kernel would read the address of the message
+/// again after a `CONTINUE`, and another thread could put one there.
+///
+/// # Errors
+/// Returns the error number for the child: the error of `sendto(2)`, or
+/// `ETIMEDOUT` when the peer does not take the message within `limit`.
+pub(crate) fn send_on_child_socket(
+    sock: &ChildSocket,
+    payload: &[u8],
+    flags: libc::c_int,
+    fd_flags: FdFlags,
+    limit: Duration,
+) -> Result<usize, i32> {
+    let nonblock = fd_flags.nonblock || flags & libc::MSG_DONTWAIT != 0;
+    if !fd_flags.nonblock {
+        set_nonblock(&sock.fd, true)?;
+    }
+    let done = send_once(
+        &sock.fd,
+        std::ptr::null(),
+        0,
+        payload,
+        flags,
+        nonblock,
+        limit,
+    );
+    if !fd_flags.nonblock {
+        // The socket of the child keeps the flags that it had.
+        set_nonblock(&sock.fd, false)?;
+    }
+    done
+}
+
+/// Send `payload` to the address `addr` on the socket of the child
+/// itself.
+///
+/// The supervisor uses this for an abstract name: the name belongs to the
+/// network namespace of the socket, which only the socket of the child
+/// reaches.
+///
+/// # Errors
+/// Returns the error number for the child: the error of `sendto(2)`, or
+/// `ETIMEDOUT` when the receiver does not take the message within
+/// `limit`.
+pub(crate) fn send_to_name_on_child_socket(
+    sock: &ChildSocket,
+    addr: &[u8],
+    payload: &[u8],
+    flags: libc::c_int,
+    fd_flags: FdFlags,
+    limit: Duration,
+) -> Result<usize, i32> {
+    let len = libc::socklen_t::try_from(addr.len()).map_err(|_| libc::EINVAL)?;
+    let nonblock = fd_flags.nonblock || flags & libc::MSG_DONTWAIT != 0;
+    if !fd_flags.nonblock {
+        set_nonblock(&sock.fd, true)?;
+    }
+    let done = send_once(
+        &sock.fd,
+        addr.as_ptr().cast::<libc::sockaddr>(),
+        len,
+        payload,
+        flags,
+        nonblock,
+        limit,
+    );
+    if !fd_flags.nonblock {
+        // The socket of the child keeps the flags that it had.
+        set_nonblock(&sock.fd, false)?;
+    }
+    done
 }
 
 /// Send `payload` to `path` from a socket of the same kind as the socket
@@ -507,6 +707,7 @@ pub(crate) fn connect_for_child(
 pub(crate) fn send_for_child(
     tid: u32,
     fd: RawFd,
+    kind: Option<libc::c_int>,
     path: &Path,
     payload: &[u8],
     flags: libc::c_int,
@@ -514,11 +715,19 @@ pub(crate) fn send_for_child(
 ) -> Result<usize, i32> {
     // Without the kind of the socket of the child, a new socket would have
     // the wrong semantics. Refuse instead of guessing.
-    let kind = socket_kind(tid, fd).ok_or(libc::EACCES)?;
+    let kind = kind.or_else(|| socket_kind(tid, fd)).ok_or(libc::EACCES)?;
     let (addr, len) = sockaddr_un(path)?;
     let sock = make_socket(kind)?;
     let nonblock = flags & libc::MSG_DONTWAIT != 0;
-    send_once(&sock, &addr, len, payload, flags, nonblock, limit)
+    send_once(
+        &sock,
+        std::ptr::from_ref(&addr).cast::<libc::sockaddr>(),
+        len,
+        payload,
+        flags,
+        nonblock,
+        limit,
+    )
 }
 
 /// Send `payload` on `sock`. The socket has `O_NONBLOCK`, so the call
@@ -527,7 +736,7 @@ pub(crate) fn send_for_child(
 /// non-blocking call gets `EAGAIN` back.
 fn send_once(
     sock: &OwnedFd,
-    addr: &libc::sockaddr_un,
+    addr: *const libc::sockaddr,
     len: libc::socklen_t,
     payload: &[u8],
     flags: libc::c_int,
@@ -536,8 +745,8 @@ fn send_once(
 ) -> Result<usize, i32> {
     let deadline = Instant::now() + limit;
     loop {
-        // SAFETY: `payload` has `payload.len()` readable bytes and `addr`
-        // is a valid `sockaddr_un` of `len` bytes.
+        // SAFETY: `payload` has `payload.len()` readable bytes, and `addr`
+        // is either null with `len` 0 or an address of `len` bytes.
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let sent = unsafe {
             libc::sendto(
@@ -545,7 +754,7 @@ fn send_once(
                 payload.as_ptr().cast::<libc::c_void>(),
                 payload.len(),
                 flags | libc::MSG_NOSIGNAL,
-                std::ptr::from_ref(addr).cast::<libc::sockaddr>(),
+                addr,
                 len,
             )
         };
@@ -636,7 +845,7 @@ mod tests {
         );
         assert_eq!(perform.outcome(), Outcome::Allowed);
         assert_eq!(UnixDecision::Refuse.outcome(), Outcome::Denied);
-        assert_eq!(UnixDecision::Kernel.outcome(), Outcome::Allowed);
+        assert_eq!(UnixDecision::Child.outcome(), Outcome::Allowed);
         // A path that does not exist yet matches nothing.
         let pending = UnixPolicy::new(&[dir.join("missing.sock")], AbstractNames::Private);
         assert_eq!(
@@ -652,7 +861,7 @@ mod tests {
     fn the_policy_permits_an_abstract_name_in_a_private_namespace() {
         let name = UnixAddr::Abstract("own".into());
         let private = UnixPolicy::new(&[], AbstractNames::Private);
-        assert_eq!(private.decide(&name), UnixDecision::Kernel);
+        assert_eq!(private.decide(&name), UnixDecision::Child);
         let shared = UnixPolicy::new(&[], AbstractNames::Shared);
         assert_eq!(shared.decide(&name), UnixDecision::Refuse);
     }
@@ -673,7 +882,7 @@ mod tests {
         );
         assert_eq!(
             policy.decide_many(&UnixAddr::Abstract("own".into())),
-            UnixDecision::Kernel
+            UnixDecision::Child
         );
         Ok(())
     }
@@ -692,6 +901,7 @@ mod tests {
         let sent = send_for_child(
             std::process::id(),
             client.as_raw_fd(),
+            None,
             &path,
             b"HELLO",
             0,
@@ -713,6 +923,7 @@ mod tests {
         let sent = send_for_child(
             std::process::id(),
             client.as_raw_fd(),
+            None,
             &path,
             b"x",
             0,
@@ -739,6 +950,7 @@ mod tests {
         let fd = connect_for_child(
             std::process::id(),
             client.as_raw_fd(),
+            None,
             &path,
             flags,
             CONNECT_LIMIT,

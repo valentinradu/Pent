@@ -9,13 +9,14 @@
 //! 3. The supervisor never answers `SECCOMP_USER_NOTIF_FLAG_CONTINUE`
 //!    after it read an `AF_UNIX` address, so a second thread that changes
 //!    the address cannot change the result.
-//! 4. With an empty allowlist the filter refuses `socket(AF_UNIX, ...)`
-//!    and `socketpair(2)` still works.
+//! 4. The child makes a socket of the `AF_UNIX` family for its own use,
+//!    with an empty allowlist too, and `socketpair(2)` still works.
 //!
-//! The same document names two ways that stay open with a non-empty
-//! allowlist: the address family of `connect(2)` is a value in memory,
-//! and `sendto(2)` is not trapped. The two tests of those ways carry an
-//! `#[ignore = "OPEN CT-..."]` mark and keep the secure assertion.
+//! The supervisor takes the family from the socket, not from the
+//! `sockaddr`: a second thread can change the memory of the child after
+//! the check, the domain of a socket never (CT-1). It controls each call
+//! that carries an address, `sendto(2)` and `sendmsg(2)` with it (CT-2
+//! and NET-4 in `docs/security/network.md`).
 //!
 //! Each test that asserts a refusal also proves in the same run that the
 //! child ran and that the permitted socket worked.
@@ -707,28 +708,37 @@ fn a_symbolic_link_cannot_change_the_target_after_the_check() -> TestResult {
 
 // ── Property 5: the empty allowlist ────────────────────────────────────────
 
-/// With an empty allowlist the filter refuses `socket(AF_UNIX, ...)` with
-/// `EAFNOSUPPORT`, and `socketpair(2)` still works.
+/// With an empty allowlist the child still makes a socket of the
+/// `AF_UNIX` family, for its own use. `socketpair(2)` works, and each
+/// path that the profile does not name gets `EACCES` (NET-4 in
+/// `docs/security/network.md`).
 #[test]
-fn an_empty_allowlist_refuses_the_family_and_keeps_socketpair() -> TestResult {
-    let test = "an_empty_allowlist_refuses_the_family_and_keeps_socketpair";
+fn an_empty_allowlist_keeps_the_family_and_refuses_each_path() -> TestResult {
+    let test = "an_empty_allowlist_keeps_the_family_and_refuses_each_path";
     if !ready(test) {
         return Ok(());
     }
     let env = TestEnv::new()?;
+    let victim = Server::bind(env.root.join("victim.sock"), VICTIM_SECRET)?;
     env.install_profile("python3", "[filesystem]\nread = []\n")?;
     let script = format!(
         "import socket\n\
          print('{RAN}')\n\
          try:\n\
-         \x20   socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); print('SOCKET OK')\n\
+         \x20   s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); print('SOCKET OK')\n\
          except OSError as e:\n\
          \x20   print('SOCKET ERR', e.errno)\n\
          a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)\n\
          a.sendall(b'PENT_PAIR')\n\
          print('PAIR', b.recv(16).decode())\n\
-         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n\
-         print('INET OK')\n"
+         socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n\
+         print('INET OK')\n\
+         s.settimeout(5)\n\
+         try:\n\
+         \x20   s.connect({v:?}); print('VICTIM', s.recv(64).decode())\n\
+         except OSError as e:\n\
+         \x20   print('VICTIM ERR', e.errno)\n",
+        v = victim.text(),
     );
     let out = run(&env, &script)?;
     let all = assert_ran(&out);
@@ -741,8 +751,17 @@ fn an_empty_allowlist_refuses_the_family_and_keeps_socketpair() -> TestResult {
         "the filter also refuses AF_INET, so the test proves nothing:\n{all}"
     );
     assert!(
-        all.contains(&format!("SOCKET ERR {}", libc::EAFNOSUPPORT)),
-        "the filter did not refuse socket(AF_UNIX, ...) with EAFNOSUPPORT:\n{all}"
+        all.contains("SOCKET OK"),
+        "the child must make a socket of the Unix family for its own use:\n{all}"
+    );
+    assert!(
+        all.contains(&format!("VICTIM ERR {}", libc::EACCES)),
+        "a path that the profile does not name must get EACCES:\n{all}"
+    );
+    assert_eq!(
+        victim.reached.load(Ordering::SeqCst),
+        0,
+        "a connection of the child reached the socket:\n{all}"
     );
     Ok(())
 }
@@ -759,7 +778,6 @@ fn an_empty_allowlist_refuses_the_family_and_keeps_socketpair() -> TestResult {
 /// `docs/security/linux-sandbox.md` names this way under "What stays
 /// open"; no test held it until now.
 #[test]
-#[ignore = "OPEN CT-1: a second thread changes the address family after the check and reaches any socket"]
 fn a_second_thread_cannot_change_the_address_family() -> TestResult {
     let test = "a_second_thread_cannot_change_the_address_family";
     if !ready(test) {
@@ -820,7 +838,6 @@ fn a_second_thread_cannot_change_the_address_family() -> TestResult {
 /// socket file that it can resolve. `docs/security/linux-sandbox.md`
 /// names this way under "What stays open"; no test held it until now.
 #[test]
-#[ignore = "OPEN CT-2: sendto(2) reaches a Unix socket that the profile does not name"]
 fn sendto_cannot_reach_a_socket_outside_the_profile() -> TestResult {
     let test = "sendto_cannot_reach_a_socket_outside_the_profile";
     if !ready(test) {

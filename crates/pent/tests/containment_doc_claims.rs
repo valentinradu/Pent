@@ -389,14 +389,13 @@ fn a_named_agent_socket_still_works_behind_the_mask() -> TestResult {
 /// "If your configuration names one of these paths, Pent does not hide
 /// it." (README, about the sockets that pent covers with `/dev/null`)
 ///
-/// A path rule keeps the claim. A name in `filesystem.unix_sockets`, or
-/// `pent run --unix-socket PATH`, does not: `configured_paths` in
-/// `crates/pent-sandbox/src/linux.rs` does not hold the Unix socket
-/// list, so pent still binds `/dev/null` over the socket. The connection
-/// works, because the supervisor connects from the host, but a program
-/// that reads the kind of the file first does not try the connection.
+/// A path rule keeps the claim, and so does a name in
+/// `filesystem.unix_sockets` or `pent run --unix-socket PATH`:
+/// `configured_paths` in `crates/pent-sandbox/src/linux.rs` holds the
+/// Unix socket list, so pent does not bind `/dev/null` over the socket.
+/// A program that reads the kind of the file before it connects then
+/// finds a socket (CT-4).
 #[test]
-#[ignore = "OPEN CT-4: a socket that only `unix_sockets` names stays covered with /dev/null"]
 fn a_socket_that_the_configuration_names_is_not_hidden() -> TestResult {
     let test = "a_socket_that_the_configuration_names_is_not_hidden";
     if !ready(test) {

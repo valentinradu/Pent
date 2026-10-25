@@ -185,6 +185,29 @@ pub(crate) unsafe fn self_pidfd() -> std::io::Result<RawFd> {
     libc::c_int::try_from(fd).map_err(|_| std::io::Error::from_raw_os_error(libc::EBADF))
 }
 
+/// Open a pidfd of the process `pid`.
+///
+/// `pid` must be the identifier of a process (a thread group leader) in
+/// the PID namespace of the caller.
+///
+/// # Errors
+/// Returns the OS error of `pidfd_open(2)`.
+pub(crate) fn open_pidfd(pid: u32) -> std::io::Result<OwnedFd> {
+    let pid =
+        libc::pid_t::try_from(pid).map_err(|_| std::io::Error::from_raw_os_error(libc::ESRCH))?;
+    // SAFETY: pidfd_open takes integers and gives a new descriptor.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let fd =
+        libc::c_int::try_from(fd).map_err(|_| std::io::Error::from_raw_os_error(libc::EBADF))?;
+    // SAFETY: `fd` is a new, open descriptor that nothing else owns.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
 /// Take a copy of the descriptor `fd` of the process that `pidfd` names.
 ///
 /// `pidfd_getfd(2)` needs the same permission as `process_vm_readv(2)`,

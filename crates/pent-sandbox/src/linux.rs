@@ -1226,6 +1226,11 @@ pub(crate) fn is_explicitly_allowed(mask: &Path, configured: &[PathBuf]) -> bool
 }
 
 /// Return all paths that the configuration names explicitly.
+///
+/// The Unix socket list is in the result: a socket that the profile names
+/// must not get a mask of `/dev/null`, because a program reads the kind
+/// of the file before it connects (finding CT-4 in
+/// `docs/security/containment.md`).
 fn configured_paths(config: &SandboxConfig) -> Vec<PathBuf> {
     let (traversal, read, execute, rw) = config.paths.expand_paths();
     let mut v: Vec<PathBuf> = traversal
@@ -1236,6 +1241,7 @@ fn configured_paths(config: &SandboxConfig) -> Vec<PathBuf> {
         .map(|(p, _)| p)
         .collect();
     v.extend(config.mounts.iter().map(|m| m.path.clone()));
+    v.extend(config.unix_sockets.iter().cloned());
     v.push(config.workspace.clone());
     v.push(config.data_dir.clone());
     v.push(config.cwd.clone());
@@ -1263,6 +1269,9 @@ fn bind_back_paths(config: &SandboxConfig) -> Vec<PathBuf> {
         .map(|(p, _)| p)
         .collect();
     v.extend(config.mounts.iter().map(|m| m.path.clone()));
+    // The Unix socket list is not here. A socket below a private
+    // directory stays hidden, and the supervisor connects to it from the
+    // host, where the tmpfs of the child does not apply.
     v.push(config.workspace.clone());
     v.push(config.data_dir.clone());
     v.push(config.cwd.clone());

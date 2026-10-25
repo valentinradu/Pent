@@ -1219,16 +1219,72 @@ impl ProcCache {
 }
 
 /// The address that the supervisor read from the memory of the child.
-enum SeenAddr {
-    /// An address of another family. The call keeps its behaviour.
-    Other,
+struct SeenAddr {
+    /// The bytes of the address, as the child wrote them.
+    raw: [u8; SOCKADDR_UN_LEN],
+    /// The number of bytes that the supervisor read.
+    len: usize,
+    /// What the bytes name.
+    kind: AddrKind,
+}
+
+impl SeenAddr {
+    /// The bytes that the supervisor read.
+    fn bytes(&self) -> &[u8] {
+        self.raw.get(..self.len).unwrap_or_default()
+    }
+}
+
+/// What the bytes of an address name.
+enum AddrKind {
     /// An `AF_UNIX` address with a name.
     Unix(UnixAddr),
-    /// An `AF_UNIX` address with no name. The kernel gives `EINVAL`.
-    Unnamed,
+    /// An address of another family, or an `AF_UNIX` address with no
+    /// name. The policy reads nothing from it; the kernel gives its own
+    /// answer.
+    Raw,
     /// The memory of the address is not readable. The kernel gives
     /// `EFAULT`.
     Unreadable,
+}
+
+/// The socket that a trapped call names.
+enum SocketOfCall {
+    /// A socket of another family. It reaches no Unix socket, so the
+    /// control lets the call through.
+    Other,
+    /// A socket of the `AF_UNIX` family, with a copy of the descriptor.
+    Unix(crate::linux_unixconn::ChildSocket),
+    /// A socket of the `AF_UNIX` family that the supervisor could not
+    /// copy. It refuses each call that it cannot make itself.
+    UnixOpaque,
+}
+
+impl SocketOfCall {
+    /// True when the socket belongs to the `AF_UNIX` family.
+    fn is_unix(&self) -> bool {
+        !matches!(self, Self::Other)
+    }
+
+    /// True when the kernel uses the address of a send on this socket.
+    /// Only a datagram socket of the `AF_UNIX` family does.
+    fn uses_the_send_address(&self) -> bool {
+        match self {
+            Self::Other => false,
+            Self::Unix(sock) => sock.send_uses_the_address(),
+            // Without the type of the socket the supervisor takes the
+            // careful answer.
+            Self::UnixOpaque => true,
+        }
+    }
+
+    /// The type of the socket (`SOCK_DGRAM`, ...), when it is known.
+    fn kind(&self) -> Option<libc::c_int> {
+        match self {
+            Self::Unix(sock) => Some(sock.kind()),
+            Self::Other | Self::UnixOpaque => None,
+        }
+    }
 }
 
 /// One send that carries an address, as the supervisor read it.
@@ -1786,35 +1842,62 @@ impl Supervisor {
     /// Read the address at `addr` in the memory of `tid`.
     ///
     /// The supervisor reads the address one time. It never reads it again
-    /// and never lets the kernel read it again after a decision on a path,
-    /// so no other thread can change the target (see
+    /// and never lets the kernel read it again after a decision, so no
+    /// other thread can change the target (see
     /// [`crate::linux_unixconn`]).
     fn read_unix_addr(&mut self, tid: u32, addr: u64, len: u64) -> SeenAddr {
         let len = usize::try_from(len).unwrap_or(0).min(SOCKADDR_UN_LEN);
-        let mut sa = [0u8; SOCKADDR_UN_LEN];
-        let Some(buf) = sa.get_mut(..len) else {
-            return SeenAddr::Unreadable;
+        let mut seen = SeenAddr {
+            raw: [0u8; SOCKADDR_UN_LEN],
+            len: 0,
+            kind: AddrKind::Unreadable,
+        };
+        let Some(buf) = seen.raw.get_mut(..len) else {
+            return seen;
         };
         let n = self.read_remote(tid, addr, buf);
-        let Some(family) = sa
+        seen.len = n;
+        let Some(family) = seen
+            .raw
             .get(..n.min(2))
             .and_then(|b| <[u8; 2]>::try_from(b).ok())
             .map(u16::from_ne_bytes)
         else {
             // The address is shorter than a family or its memory is not
             // readable.
-            return SeenAddr::Unreadable;
+            return seen;
         };
         // AF_UNIX is 1.
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         if family != libc::AF_UNIX as u16 {
-            return SeenAddr::Other;
+            seen.kind = AddrKind::Raw;
+            return seen;
         }
-        let sun_path = sa.get(2..n).unwrap_or_default();
-        unix_target(sun_path, |raw| {
+        let sun_path = seen.raw.get(2..n).unwrap_or_default().to_vec();
+        seen.kind = unix_target(&sun_path, |raw| {
             resolve_path(raw, false, || Self::base_dir(tid, libc::AT_FDCWD))
         })
-        .map_or(SeenAddr::Unnamed, SeenAddr::Unix)
+        .map_or(AddrKind::Raw, AddrKind::Unix);
+        seen
+    }
+
+    /// The socket that a trapped call names.
+    ///
+    /// The supervisor takes the family from the socket, never from the
+    /// `sockaddr`: a second thread can change the memory of the child
+    /// after the check, the domain of a socket never (finding CT-1 in
+    /// `docs/security/containment.md`).
+    fn socket_of_call(&mut self, tid: u32, fd: RawFd) -> SocketOfCall {
+        let pid = self.procs.get(tid).pid;
+        match crate::linux_unixconn::child_socket(pid, fd) {
+            Some(sock) if sock.is_unix() => SocketOfCall::Unix(sock),
+            Some(_) => SocketOfCall::Other,
+            // Without a copy of the descriptor the supervisor asks the
+            // table of the Unix sockets of the task. It then knows the
+            // family, but it cannot make a call on the socket itself.
+            None if crate::linux_unixconn::is_unix_socket(tid, fd) => SocketOfCall::UnixOpaque,
+            None => SocketOfCall::Other,
+        }
     }
 
     /// Add the event of one decision of the Unix socket control. Watch
@@ -1832,11 +1915,11 @@ impl Supervisor {
         });
     }
 
-    /// Control a `connect()` to a Unix socket.
+    /// Control a `connect()` on a socket of the `AF_UNIX` family.
     ///
-    /// The supervisor answers `CONTINUE` only while it does not know that
-    /// the address is an `AF_UNIX` path. After that it makes the
-    /// connection itself or fails the call, because the kernel reads the
+    /// The supervisor answers `CONTINUE` only for a socket of another
+    /// family. For an `AF_UNIX` socket it makes the connection itself or
+    /// fails the call, whatever the address says: the kernel reads the
     /// address again after a `CONTINUE` (see [`crate::linux_unixconn`]).
     fn record_connect(&mut self, notif: &libc::seccomp_notif) {
         let tid = notif.pid;
@@ -1848,14 +1931,33 @@ impl Supervisor {
         // The kernel uses the low 32 bits of a descriptor argument.
         #[allow(clippy::cast_possible_truncation)]
         let sockfd = sockfd as RawFd;
-        let target = match self.read_unix_addr(tid, addr, len) {
-            SeenAddr::Other => return,
+        let socket = self.socket_of_call(tid, sockfd);
+        if !socket.is_unix() {
+            // A socket of another family reaches no Unix socket, whatever
+            // another thread writes in the address.
+            return;
+        }
+        let seen = self.read_unix_addr(tid, addr, len);
+        let flags = crate::linux_unixconn::fd_flags(tid, sockfd);
+        let target = match &seen.kind {
             // A `CONTINUE` here would trust memory that the supervisor
             // could not read. The kernel gives the same error.
-            SeenAddr::Unreadable => return self.fail_if_enforced(libc::EFAULT),
-            // An `AF_UNIX` address without a name.
-            SeenAddr::Unnamed => return self.fail_if_enforced(libc::EINVAL),
-            SeenAddr::Unix(target) => target,
+            AddrKind::Unreadable => return self.fail_if_enforced(libc::EFAULT),
+            // An address of another family, or one with no name. Only the
+            // kernel knows the right answer (`AF_UNSPEC` breaks the
+            // association of a datagram socket, every other form gives an
+            // error), so the supervisor makes the call on the socket of
+            // the child. There is no Unix target, thus no event.
+            AddrKind::Raw => {
+                if self.unix.enforces() {
+                    if !self.id_valid(notif.id) {
+                        return;
+                    }
+                    self.answer = Self::connect_on_child(&socket, &seen, flags);
+                }
+                return;
+            }
+            AddrKind::Unix(target) => target.clone(),
         };
         let decision = self.unix.policy().decide(&target);
         if self.unix.enforces() {
@@ -1867,10 +1969,10 @@ impl Supervisor {
             }
             self.answer = match &decision {
                 UnixDecision::Perform(path) => {
-                    let flags = crate::linux_unixconn::fd_flags(tid, sockfd);
                     match crate::linux_unixconn::connect_for_child(
                         tid,
                         sockfd,
+                        socket.kind(),
                         path,
                         flags,
                         crate::linux_unixconn::CONNECT_LIMIT,
@@ -1883,11 +1985,37 @@ impl Supervisor {
                         Err(err) => Answer::Fail(err),
                     }
                 }
-                UnixDecision::Kernel => Answer::Continue,
+                // An abstract name: the supervisor cannot reach it with a
+                // socket of its own, because the name belongs to the
+                // network namespace of the socket of the child.
+                UnixDecision::Child => Self::connect_on_child(&socket, &seen, flags),
                 UnixDecision::Refuse => Answer::Fail(libc::EACCES),
             };
         }
         self.record_unix_event(tid, &target, decision.outcome());
+    }
+
+    /// Connect the socket of the child itself to the address that the
+    /// supervisor read.
+    fn connect_on_child(
+        socket: &SocketOfCall,
+        seen: &SeenAddr,
+        flags: crate::linux_unixconn::FdFlags,
+    ) -> Answer {
+        let SocketOfCall::Unix(sock) = socket else {
+            // Without a copy of the descriptor the supervisor cannot make
+            // the call, and it must not give the address to the kernel.
+            return Answer::Fail(libc::EACCES);
+        };
+        match crate::linux_unixconn::connect_child_socket(
+            sock,
+            seen.bytes(),
+            flags,
+            crate::linux_unixconn::CONNECT_LIMIT,
+        ) {
+            Ok(()) => Answer::Return(0),
+            Err(err) => Answer::Fail(err),
+        }
     }
 
     /// Fail the current call with `err`, but only with enforcement. Watch
@@ -1908,6 +2036,10 @@ impl Supervisor {
     }
 
     /// `sendto(fd, buf, len, flags, addr, addrlen)`.
+    ///
+    /// The filter traps the call only with an address: the pointer is an
+    /// argument, so a null one needs no notification and no thread can
+    /// change it.
     fn record_send_to(&mut self, notif: &libc::seccomp_notif) {
         let tid = notif.pid;
         let args = notif.data.args;
@@ -1923,15 +2055,14 @@ impl Supervisor {
             // A connected socket: the call carries no address.
             return;
         }
-        let target = match self.read_unix_addr(tid, addr, addrlen) {
-            SeenAddr::Other => return,
-            SeenAddr::Unreadable => return self.fail_if_enforced(libc::EFAULT),
-            SeenAddr::Unnamed => return self.fail_if_enforced(libc::EINVAL),
-            SeenAddr::Unix(target) => target,
-        };
         // The kernel uses the low 32 bits of a descriptor argument.
         #[allow(clippy::cast_possible_truncation)]
         let sockfd = sockfd as RawFd;
+        let socket = self.socket_of_call(tid, sockfd);
+        if !socket.uses_the_send_address() {
+            return;
+        }
+        let seen = self.read_unix_addr(tid, addr, addrlen);
         let ranges = [(buf, usize::try_from(buflen).unwrap_or(0))];
         let send = SeenSend {
             tid,
@@ -1940,7 +2071,7 @@ impl Supervisor {
             ranges: &ranges,
             control: Control::No,
         };
-        self.decide_send(notif, &target, &send);
+        self.decide_send(notif, &socket, &seen, &send);
     }
 
     /// `sendmsg(fd, msghdr, flags)`.
@@ -1951,18 +2082,19 @@ impl Supervisor {
         else {
             return;
         };
-        let Some(msg) = self.read_msghdr(tid, hdr) else {
-            return self.fail_if_enforced(libc::EFAULT);
-        };
-        if msg.name == 0 || msg.namelen == 0 {
-            // A connected socket: the message carries no address.
+        // The kernel uses the low 32 bits of a descriptor argument.
+        #[allow(clippy::cast_possible_truncation)]
+        let sockfd = sockfd as RawFd;
+        let socket = self.socket_of_call(tid, sockfd);
+        if !socket.uses_the_send_address() {
+            // A stream socket refuses an address and a sequential packet
+            // socket drops it, so the message reaches only the peer of
+            // the socket. The call keeps its way, with its ancillary
+            // data.
             return;
         }
-        let target = match self.read_unix_addr(tid, msg.name, msg.namelen) {
-            SeenAddr::Other => return,
-            SeenAddr::Unreadable => return self.fail_if_enforced(libc::EFAULT),
-            SeenAddr::Unnamed => return self.fail_if_enforced(libc::EINVAL),
-            SeenAddr::Unix(target) => target,
+        let Some(msg) = self.read_msghdr(tid, hdr) else {
+            return self.fail_if_enforced(libc::EFAULT);
         };
         let Some(ranges) = self.read_iovecs(tid, msg.iov, msg.iovlen) else {
             return self.fail_if_enforced(libc::EFAULT);
@@ -1972,9 +2104,6 @@ impl Supervisor {
         } else {
             Control::Yes
         };
-        // The kernel uses the low 32 bits of a descriptor argument.
-        #[allow(clippy::cast_possible_truncation)]
-        let sockfd = sockfd as RawFd;
         let send = SeenSend {
             tid,
             sockfd,
@@ -1982,7 +2111,21 @@ impl Supervisor {
             ranges: &ranges,
             control,
         };
-        self.decide_send(notif, &target, &send);
+        if msg.name == 0 || msg.namelen == 0 {
+            // A connected datagram socket. The address of the message
+            // lives in memory, so another thread can put a path there
+            // after the check; the supervisor sends on the socket of the
+            // child itself instead of answering `CONTINUE`.
+            if self.unix.enforces() {
+                if !self.id_valid(notif.id) {
+                    return;
+                }
+                self.answer = self.send_on_child(&socket, &send);
+            }
+            return;
+        }
+        let seen = self.read_unix_addr(tid, msg.name, msg.namelen);
+        self.decide_send(notif, &socket, &seen, &send);
     }
 
     /// `sendmmsg(fd, mmsghdr[], vlen, flags)`.
@@ -1994,9 +2137,16 @@ impl Supervisor {
     fn record_send_many(&mut self, notif: &libc::seccomp_notif) {
         let tid = notif.pid;
         let args = notif.data.args;
-        let (Some(&base), Some(&vlen)) = (args.get(1), args.get(2)) else {
+        let (Some(&sockfd), Some(&base), Some(&vlen)) = (args.first(), args.get(1), args.get(2))
+        else {
             return;
         };
+        // The kernel uses the low 32 bits of a descriptor argument.
+        #[allow(clippy::cast_possible_truncation)]
+        let sockfd = sockfd as RawFd;
+        if !self.socket_of_call(tid, sockfd).uses_the_send_address() {
+            return;
+        }
         let count = usize::try_from(vlen).unwrap_or(0).min(UIO_MAXIOV);
         let mut refuse = false;
         for i in 0..count {
@@ -2010,12 +2160,14 @@ impl Supervisor {
                 return self.fail_if_enforced(libc::EFAULT);
             };
             if msg.name == 0 || msg.namelen == 0 {
+                // A message with no address reaches only the peer of the
+                // socket.
                 continue;
             }
-            let target = match self.read_unix_addr(tid, msg.name, msg.namelen) {
-                SeenAddr::Other | SeenAddr::Unnamed => continue,
-                SeenAddr::Unreadable => return self.fail_if_enforced(libc::EFAULT),
-                SeenAddr::Unix(target) => target,
+            let target = match self.read_unix_addr(tid, msg.name, msg.namelen).kind {
+                AddrKind::Raw => continue,
+                AddrKind::Unreadable => return self.fail_if_enforced(libc::EFAULT),
+                AddrKind::Unix(target) => target,
             };
             let decision = self.unix.policy().decide_many(&target);
             refuse = refuse || decision == UnixDecision::Refuse;
@@ -2026,10 +2178,23 @@ impl Supervisor {
         }
     }
 
-    /// Apply the policy to one send that carries the `AF_UNIX` address
-    /// `target`, and record the decision.
-    fn decide_send(&mut self, notif: &libc::seccomp_notif, target: &UnixAddr, send: &SeenSend) {
-        let decision = self.unix.policy().decide(target);
+    /// Apply the policy to one send on a socket of the `AF_UNIX` family,
+    /// and record the decision.
+    fn decide_send(
+        &mut self,
+        notif: &libc::seccomp_notif,
+        socket: &SocketOfCall,
+        seen: &SeenAddr,
+        send: &SeenSend,
+    ) {
+        let target = match &seen.kind {
+            AddrKind::Unreadable => return self.fail_if_enforced(libc::EFAULT),
+            // The kernel takes only an `AF_UNIX` address with a name on a
+            // Unix socket; every other form gives `EINVAL`.
+            AddrKind::Raw => return self.fail_if_enforced(libc::EINVAL),
+            AddrKind::Unix(target) => target.clone(),
+        };
+        let decision = self.unix.policy().decide(&target);
         if self.unix.enforces() {
             // The call must belong to a task that still runs: its
             // identifier can belong to another process now.
@@ -2039,24 +2204,21 @@ impl Supervisor {
             self.answer = match &decision {
                 UnixDecision::Perform(path) => {
                     let path = path.clone();
-                    self.perform_send(&path, send)
+                    self.perform_send(&path, socket, send)
                 }
-                UnixDecision::Kernel => Answer::Continue,
+                // An abstract name: only the socket of the child reaches
+                // the names of its own network namespace.
+                UnixDecision::Child => self.send_to_name_on_child(socket, seen, send),
                 UnixDecision::Refuse => Answer::Fail(libc::EACCES),
             };
         }
-        self.record_unix_event(send.tid, target, decision.outcome());
+        self.record_unix_event(send.tid, &target, decision.outcome());
     }
 
-    /// Send the payload of the child to `path` and return the answer for
-    /// the call.
-    fn perform_send(&mut self, path: &Path, send: &SeenSend) -> Answer {
-        if send.control == Control::Yes {
-            // The supervisor sends from a socket of its own, so it cannot
-            // pass the descriptors or the credentials of the child.
-            return Answer::Fail(libc::EOPNOTSUPP);
-        }
-        let len = match self.read_payload(send.tid, send.ranges) {
+    /// Send the payload of the child to `path` from a socket of the
+    /// supervisor, and return the answer for the call.
+    fn perform_send(&mut self, path: &Path, socket: &SocketOfCall, send: &SeenSend) -> Answer {
+        let len = match self.payload_of(send) {
             Ok(len) => len,
             Err(err) => return Answer::Fail(err),
         };
@@ -2067,6 +2229,7 @@ impl Supervisor {
         match crate::linux_unixconn::send_for_child(
             send.tid,
             send.sockfd,
+            socket.kind(),
             path,
             payload,
             flags,
@@ -2075,6 +2238,82 @@ impl Supervisor {
             Ok(sent) => i64::try_from(sent).map_or(Answer::Fail(libc::EIO), Answer::Return),
             Err(err) => Answer::Fail(err),
         }
+    }
+
+    /// Send the payload of the child on the socket of the child itself,
+    /// to the peer of that socket.
+    fn send_on_child(&mut self, socket: &SocketOfCall, send: &SeenSend) -> Answer {
+        let SocketOfCall::Unix(sock) = socket else {
+            return Answer::Fail(libc::EACCES);
+        };
+        let len = match self.payload_of(send) {
+            Ok(len) => len,
+            Err(err) => return Answer::Fail(err),
+        };
+        // The kernel uses the low 32 bits of the flags argument.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let flags = send.flags as libc::c_int;
+        let fd_flags = crate::linux_unixconn::fd_flags(send.tid, send.sockfd);
+        let payload = self.send_buf.get(..len).unwrap_or_default();
+        match crate::linux_unixconn::send_on_child_socket(
+            sock,
+            payload,
+            flags,
+            fd_flags,
+            crate::linux_unixconn::CONNECT_LIMIT,
+        ) {
+            Ok(sent) => i64::try_from(sent).map_or(Answer::Fail(libc::EIO), Answer::Return),
+            Err(err) => Answer::Fail(err),
+        }
+    }
+
+    /// Send the payload of the child to an abstract name, on the socket
+    /// of the child itself.
+    fn send_to_name_on_child(
+        &mut self,
+        socket: &SocketOfCall,
+        seen: &SeenAddr,
+        send: &SeenSend,
+    ) -> Answer {
+        let SocketOfCall::Unix(sock) = socket else {
+            return Answer::Fail(libc::EACCES);
+        };
+        let len = match self.payload_of(send) {
+            Ok(len) => len,
+            Err(err) => return Answer::Fail(err),
+        };
+        // The kernel uses the low 32 bits of the flags argument.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let flags = send.flags as libc::c_int;
+        let fd_flags = crate::linux_unixconn::fd_flags(send.tid, send.sockfd);
+        let payload = self.send_buf.get(..len).unwrap_or_default();
+        match crate::linux_unixconn::send_to_name_on_child_socket(
+            sock,
+            seen.bytes(),
+            payload,
+            flags,
+            fd_flags,
+            crate::linux_unixconn::CONNECT_LIMIT,
+        ) {
+            Ok(sent) => i64::try_from(sent).map_or(Answer::Fail(libc::EIO), Answer::Return),
+            Err(err) => Answer::Fail(err),
+        }
+    }
+
+    /// Put the payload of `send` in the buffer of the supervisor and
+    /// return its length.
+    ///
+    /// # Errors
+    /// Returns `EOPNOTSUPP` when the message carries ancillary data,
+    /// which the supervisor cannot pass on, and the errors of
+    /// [`Self::read_payload`].
+    fn payload_of(&mut self, send: &SeenSend) -> Result<usize, i32> {
+        if send.control == Control::Yes {
+            // The supervisor cannot pass the descriptors or the
+            // credentials of the child.
+            return Err(libc::EOPNOTSUPP);
+        }
+        self.read_payload(send.tid, send.ranges)
     }
 
     /// Read a `struct msghdr` at `addr` in the memory of `tid`.
