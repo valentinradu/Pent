@@ -11,11 +11,15 @@
 //! no root and no capability. The tests find `sh`, `curl`, `getent`, `sleep`
 //! and `sudo` in `PATH`. A test skips (it prints `SKIP` and passes) when the
 //! sandbox is not available or a tool is missing. The network tests need
-//! the internet; they are `#[ignore]` and skip when
-//! `curl https://example.com` fails without pent.
+//! the internet; they skip when `curl https://example.com` fails without
+//! pent.
+//!
+//! No test has an `#[ignore]` mark: a test that the continuous integration
+//! must run never carries one. Set `PENT_REQUIRE_ALL_TESTS=1` to make each
+//! skip a failure.
 //!
 //! ```text
-//! cargo test -p pent --test e2e_linux -- --include-ignored
+//! cargo test -p pent --test e2e_linux -- --nocapture
 //! ```
 
 mod common;
@@ -178,19 +182,16 @@ mod linux {
     }
 
     #[test]
-    #[ignore = "needs the internet"]
     fn network_claude() -> TestResult {
         agent_network("claude", "api.anthropic.com")
     }
 
     #[test]
-    #[ignore = "needs the internet"]
     fn network_codex() -> TestResult {
         agent_network("codex", "api.openai.com")
     }
 
     #[test]
-    #[ignore = "needs the internet"]
     fn network_gemini() -> TestResult {
         agent_network("gemini", "generativelanguage.googleapis.com")
     }
@@ -605,7 +606,6 @@ mod linux {
     /// other domains, also at the DNS level. A direct connection past the
     /// proxy fails. `pent trust --review` adds a denied domain.
     #[test]
-    #[ignore = "needs the internet"]
     fn network_watch_trust_run_review() -> TestResult {
         if !ready("network_flow", &["curl", "sh"]) || !internet("network_flow") {
             return Ok(());

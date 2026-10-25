@@ -9,6 +9,12 @@
 //!
 //! The tests find the tools (`sh`, `curl`, `getent`, ...) in `PATH`. When a
 //! tool is missing, the test prints `SKIP` with the reason and passes.
+//!
+//! # `PENT_REQUIRE_ALL_TESTS`
+//!
+//! A test that skips proves nothing. Set `PENT_REQUIRE_ALL_TESTS=1` to make
+//! each skip a failure. The continuous integration sets the variable, so a
+//! test that stops working makes the build red. See [`skip`].
 
 use std::io::{Read as _, Write as _};
 use std::os::fd::{FromRawFd as _, OwnedFd};
@@ -69,6 +75,47 @@ fn clean_env(cmd: &mut Command) -> &mut Command {
         cmd.env_remove(var);
     }
     cmd
+}
+
+/// The name of the variable that makes each skip a failure.
+pub const REQUIRE_ALL_TESTS: &str = "PENT_REQUIRE_ALL_TESTS";
+
+/// Return true if the caller asks for all tests.
+///
+/// The value `0` and the empty value mean "no".
+pub fn require_all_tests() -> bool {
+    std::env::var_os(REQUIRE_ALL_TESTS).is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+/// Print `SKIP <test>: <reason>` and return false.
+///
+/// With `PENT_REQUIRE_ALL_TESTS=1` the function fails the test instead. Use
+/// it for each environment limit that the continuous integration must not
+/// have: a missing sandbox, a missing tool, or a missing internet
+/// connection.
+///
+/// # Panics
+/// Fails the test when `PENT_REQUIRE_ALL_TESTS` is set.
+#[track_caller]
+pub fn skip(test: &str, reason: &str) -> bool {
+    assert!(
+        !require_all_tests(),
+        "{REQUIRE_ALL_TESTS}=1 but {test} skips: {reason}. \
+         The test must run here. Fix the environment, or remove the test."
+    );
+    eprintln!("SKIP {test}: {reason}");
+    false
+}
+
+/// Print `SKIP (optional) <test>: <reason>` and return false.
+///
+/// Use it only for a program of another project (`claude`, `codex`,
+/// `gemini`). A continuous integration runner cannot install them, so
+/// `PENT_REQUIRE_ALL_TESTS` does not make this skip a failure. Never use it
+/// for the sandbox, for a system tool, or for the network.
+pub fn skip_optional(test: &str, reason: &str) -> bool {
+    eprintln!("SKIP (optional) {test}: {reason}");
+    false
 }
 
 /// The directories of one test.
@@ -143,6 +190,28 @@ impl TestEnv {
         self.state_dir()
             .join("pent/trace")
             .join(format!("{name}.log"))
+    }
+
+    /// The directory with the raw events of each watch run of `name`.
+    pub fn watch_dir(&self, name: &str) -> PathBuf {
+        self.state_dir().join("pent/watch").join(name)
+    }
+
+    /// The raw events of every watch run of `name`, as one text.
+    ///
+    /// Returns an empty string when the directory does not exist. Use it in
+    /// the message of a failed assertion: it tells whether the recorder saw
+    /// the access at all.
+    pub fn watch_events(&self, name: &str) -> String {
+        let Ok(entries) = std::fs::read_dir(self.watch_dir(name)) else {
+            return String::new();
+        };
+        let mut files: Vec<PathBuf> = entries.filter_map(Result::ok).map(|e| e.path()).collect();
+        files.sort();
+        files
+            .iter()
+            .filter_map(|p| std::fs::read_to_string(p).ok())
+            .collect()
     }
 
     /// The path of `rel` in the home directory.
@@ -237,6 +306,39 @@ impl TestEnv {
     }
 }
 
+/// The string list `key` in the table `table` of a profile or a draft.
+///
+/// Returns an empty set when the table or the key is absent.
+///
+/// # Errors
+/// Returns an error if the text is not valid TOML, or if the key is not a
+/// list of strings.
+pub fn rules(
+    toml_text: &str,
+    table: &str,
+    key: &str,
+) -> Result<std::collections::BTreeSet<String>, BoxError> {
+    let doc: toml::Value = toml::from_str(toml_text)?;
+    let Some(list) = doc.get(table).and_then(|t| t.get(key)) else {
+        return Ok(std::collections::BTreeSet::new());
+    };
+    let list = list
+        .as_array()
+        .ok_or_else(|| format!("{table}.{key} is not a list"))?;
+    list.iter()
+        .map(|v| {
+            v.as_str()
+                .map(str::to_string)
+                .ok_or_else(|| BoxError::from(format!("{table}.{key} has a non-string value")))
+        })
+        .collect()
+}
+
+/// A set of strings, for the comparisons.
+pub fn set(items: &[&str]) -> std::collections::BTreeSet<String> {
+    items.iter().map(|s| (*s).to_string()).collect()
+}
+
 /// The text of stdout.
 pub fn stdout(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
@@ -268,9 +370,14 @@ pub fn have_tools(test: &str, tools: &[&str]) -> bool {
     if missing.is_empty() {
         return true;
     }
-    eprintln!("SKIP {test}: not in PATH: {}", missing.join(", "));
-    false
+    skip(test, &format!("not in PATH: {}", missing.join(", ")))
 }
+
+/// The messages that a shell prints when the sandbox denies a write.
+///
+/// Landlock gives `EACCES` ("Permission denied"); Seatbelt gives `EPERM`
+/// ("Operation not permitted").
+const DENIAL_MESSAGES: &[&str] = &["Permission denied", "Operation not permitted"];
 
 /// Return true if pent can make its sandbox on this host. Else print the
 /// skip reason for `test` and return false.
@@ -301,23 +408,18 @@ pub fn sandbox_ready(test: &str) -> bool {
             if outside.exists() {
                 return Ok(Err("the sandbox does not enforce its rules".to_string()));
             }
-            if stderr(&out).contains("Permission denied") {
+            let err = stderr(&out);
+            if DENIAL_MESSAGES.iter().any(|m| err.contains(m)) {
                 Ok(Ok(()))
             } else {
-                Ok(Err(format!(
-                    "the probe run did not get a denial:\n{}",
-                    stderr(&out)
-                )))
+                Ok(Err(format!("the probe run did not get a denial:\n{err}")))
             }
         };
         probe().unwrap_or_else(|e| Err(format!("the probe failed: {e}")))
     });
     match ready {
         Ok(()) => true,
-        Err(why) => {
-            eprintln!("SKIP {test}: {why}");
-            false
-        }
+        Err(why) => skip(test, why),
     }
 }
 
@@ -346,9 +448,12 @@ pub fn internet(test: &str) -> bool {
             .is_ok_and(|s| s.success())
     });
     if !online {
-        eprintln!("SKIP {test}: curl https://example.com fails without pent (no internet)");
+        return skip(
+            test,
+            "curl https://example.com fails without pent (no internet)",
+        );
     }
-    online
+    true
 }
 
 /// Wait until `child` exits.

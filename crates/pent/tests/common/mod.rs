@@ -6,6 +6,9 @@
 #[cfg(unix)]
 pub mod e2e;
 
+#[cfg(target_os = "macos")]
+pub mod macos;
+
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
