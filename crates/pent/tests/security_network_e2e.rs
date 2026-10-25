@@ -289,18 +289,15 @@ fn system_dbus_socket_is_masked() -> TestResult {
     daemon_socket_is_masked("system_dbus_socket_is_masked", "dbus", SYSTEM_BUS)
 }
 
-/// NET-3 (open). A profile path below a private directory must give the
-/// child that path, not the whole subtree above it.
+/// NET-3. A profile path below a private directory gives the child that
+/// path, not the whole subtree above it.
 ///
-/// `plan_private_dirs` keeps the traversal paths of each configured path,
-/// and it binds only the outermost path of a subtree. The outermost path
-/// of `/run/user/<uid>/x` is `/run/user`, thus one profile rule for a
-/// directory below the runtime directory restores the whole runtime
-/// directory of the user, with each daemon socket in it. See
-/// `docs/security/network.md`.
+/// `plan_private_dirs` binds the path that the profile names and makes the
+/// directories above it inside the private tmpfs. The traversal paths of a
+/// rule are not in the bind-back list, so a rule for a directory below the
+/// runtime directory of the user does not restore the whole runtime
+/// directory with its daemon sockets. See `docs/security/network.md`.
 #[test]
-#[ignore = "OPEN NET-3: a profile path below /run or /tmp binds the whole \
-            parent subtree back, so the sibling sockets of the host return"]
 fn a_profile_path_below_a_private_dir_keeps_its_siblings_hidden() -> TestResult {
     let test = "a_profile_path_below_a_private_dir_keeps_its_siblings_hidden";
     if !ready(test) {
@@ -332,9 +329,29 @@ fn a_profile_path_below_a_private_dir_keeps_its_siblings_hidden() -> TestResult 
     )?;
     let allowed = Victim::bind(allowed_dir.join("allowed.sock"), ALLOWED_BANNER.as_bytes())?;
     let victim = Victim::bind(base.join("victim.sock"), VICTIM_SECRET.as_bytes())?;
+    // A file of the host next to the named directory. The child must not
+    // see it and must not read it.
+    std::fs::write(base.join("victim.txt"), VICTIM_SECRET)?;
 
+    // The child also lists the parent of the named directory. The bind of
+    // the parent is the shape of NET-3: the listing then holds each sibling
+    // of the host, and the daemon sockets of `/run/user/<uid>` with them.
     let targets = vec![("ALLOWED", allowed.text()), ("VICTIM", victim.text())];
-    let out = run_sandboxed(&env, &unix_probe_script(&targets))?;
+    let script = format!(
+        "{}\nimport os\n\
+         try:\n\
+         \x20   print('PARENT LIST', sorted(os.listdir({base:?})))\n\
+         except OSError as e:\n\
+         \x20   print('PARENT BLOCKED', e)\n\
+         try:\n\
+         \x20   print('FILE READ', open({file:?}).read())\n\
+         except OSError as e:\n\
+         \x20   print('FILE BLOCKED', e)\n",
+        unix_probe_script(&targets),
+        base = base.display().to_string(),
+        file = base.join("victim.txt").display().to_string(),
+    );
+    let out = run_sandboxed(&env, &script)?;
     let text = out_text(&out);
     let _ = std::fs::remove_dir_all(&base);
 
@@ -349,6 +366,26 @@ fn a_profile_path_below_a_private_dir_keeps_its_siblings_hidden() -> TestResult 
         base.display()
     );
     assert_eq!(victim.reached(), 0, "the sibling socket got a client");
+    // The directory that the profile names is the only entry that the bind
+    // brings back. A listing with `victim.sock` or `victim.txt` in it means
+    // that pent bound the parent of the named path.
+    let listing = text
+        .lines()
+        .find(|l| l.starts_with("PARENT "))
+        .unwrap_or_default();
+    assert!(
+        !listing.contains("victim"),
+        "NET-3: the child sees the siblings of the named path in {}:\n{text}",
+        base.display()
+    );
+    assert!(
+        listing == "PARENT LIST ['allowed']" || listing.starts_with("PARENT BLOCKED"),
+        "the parent of the named path must hold only that path:\n{text}"
+    );
+    assert!(
+        !text.contains(VICTIM_SECRET),
+        "the content of a file of the host reached the child:\n{text}"
+    );
     Ok(())
 }
 

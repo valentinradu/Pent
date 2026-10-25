@@ -1242,6 +1242,33 @@ fn configured_paths(config: &SandboxConfig) -> Vec<PathBuf> {
     v
 }
 
+/// Return the paths that pent binds back into a private tmpfs.
+///
+/// The list holds each path that the configuration names itself: the read,
+/// the execute and the read-write paths, each mount, the workspace, the data
+/// directory and the working directory.
+///
+/// The traversal paths are **not** in the list. The CLI puts each parent
+/// directory of a rule in the traversal list, so that the program can
+/// resolve the path. A bind of such a parent brings the whole subtree of the
+/// host back into the tmpfs, with each socket of the host in it (finding
+/// NET-3 in `docs/security/network.md`). The plan makes the directories
+/// above a bind inside the tmpfs instead (see [`mount_point_parents`]).
+fn bind_back_paths(config: &SandboxConfig) -> Vec<PathBuf> {
+    let (_traversal, read, execute, rw) = config.paths.expand_paths();
+    let mut v: Vec<PathBuf> = read
+        .into_iter()
+        .chain(execute)
+        .chain(rw)
+        .map(|(p, _)| p)
+        .collect();
+    v.extend(config.mounts.iter().map(|m| m.path.clone()));
+    v.push(config.workspace.clone());
+    v.push(config.data_dir.clone());
+    v.push(config.cwd.clone());
+    v
+}
+
 /// The plan for the private temporary and runtime directories of the child.
 #[derive(Debug, Default)]
 struct PrivatePlan {
@@ -1284,6 +1311,12 @@ fn mount_point_parents(target: &Path, root: &Path) -> Vec<CString> {
 /// `PATH`, the system paths, and `extra` (the overlay mount points and the
 /// write targets of the watch guard).
 ///
+/// Pent binds the path that the configuration names, not a parent of it: a
+/// file over a file and a directory over a directory. The directories above
+/// the bind come from [`mount_point_parents`] and stay inside the tmpfs, so
+/// a rule for one path below `/run` or `/tmp` does not bring the siblings of
+/// the host back (see [`bind_back_paths`]).
+///
 /// `TMPDIR` and `XDG_RUNTIME_DIR` get an empty directory inside the tmpfs
 /// when they point into a covered directory, so that a program that reads
 /// them still finds a place to write. A `TMPDIR` outside the covered
@@ -1321,7 +1354,7 @@ fn plan_private_dirs(
         return plan;
     }
 
-    let mut keep: Vec<PathBuf> = configured_paths(config);
+    let mut keep: Vec<PathBuf> = bind_back_paths(config);
     keep.extend(path_dirs.iter().cloned());
     keep.extend(SYSTEM_PATHS.iter().chain(PRIVATE_KEEP).map(PathBuf::from));
     keep.extend(extra.iter().cloned());
@@ -4296,6 +4329,67 @@ mod tests {
             plan.hides(Path::new("/run/user/4242/bus")),
             "the runtime directory stays empty"
         );
+    }
+
+    /// NET-3. A rule for one path below a private directory gives the child
+    /// that path only. The parent of the path stays an empty directory of
+    /// the tmpfs, so the sibling sockets of the host do not come back.
+    #[test]
+    fn test_private_dirs_bind_the_named_path_not_its_parent() -> TestResult {
+        let temp = tempfile::Builder::new()
+            .prefix("pent-net3-")
+            .tempdir_in("/tmp")?;
+        let base = std::fs::canonicalize(temp.path())?;
+        let allowed = base.join("allowed");
+        std::fs::create_dir_all(&allowed)?;
+        let mut config = make_test_config();
+        config.paths.read_write = vec![allowed.to_string_lossy().into_owned()];
+        // The CLI adds each parent of a rule to the traversal list.
+        config.paths.traversal = base
+            .ancestors()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        let plan = plan_private_dirs(&config, &[], &[], 4242);
+        assert!(
+            plan.visible.contains(&allowed),
+            "the named directory must stay visible: {:?}",
+            plan.visible
+        );
+        assert!(
+            plan.hides(&base.join("victim.sock")),
+            "a sibling of the named directory must stay hidden"
+        );
+        assert!(
+            !plan.visible.contains(&base),
+            "the parent of the named directory must not be bound: {:?}",
+            plan.visible
+        );
+        Ok(())
+    }
+
+    /// NET-3. A rule for a file below a private directory binds that file,
+    /// not the directory that holds it.
+    #[test]
+    fn test_private_dirs_bind_a_named_file() -> TestResult {
+        let temp = tempfile::Builder::new()
+            .prefix("pent-net3-file-")
+            .tempdir_in("/tmp")?;
+        let base = std::fs::canonicalize(temp.path())?;
+        let file = base.join("config.toml");
+        std::fs::write(&file, b"x")?;
+        let mut config = make_test_config();
+        config.paths.read = vec![file.to_string_lossy().into_owned()];
+        config.paths.traversal = vec![base.to_string_lossy().into_owned()];
+        let plan = plan_private_dirs(&config, &[], &[], 4242);
+        let target = CString::new(file.to_string_lossy().as_bytes()).unwrap_or_default();
+        let bind = plan.binds.iter().find(|b| b.target == target);
+        assert_eq!(
+            bind.map(|b| b.kind),
+            Some(BindKind::File),
+            "the plan must bind the file itself"
+        );
+        assert!(plan.hides(&base.join("secret")));
+        Ok(())
     }
 
     #[test]
