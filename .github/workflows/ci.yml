@@ -70,21 +70,35 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           cat > "$RUNNER_TEMP/measure.c" <<'PENT_MEASURE_EOF'
-          /* The measurement of MAC-10 and MAC-12 on a macOS runner.
+          /* The second measurement of MAC-10 and MAC-12 on a macOS runner.
            *
-           * It must be the FIRST step of the job that touches the unified log,
-           * because MAC-12 shows only on the first `log stream` of a machine.
+           * Round one gave:
+           *   - the first `log stream` of a machine loses the reports of a probe
+           *     that runs 17 ms after the header, and the next stream loses none;
+           *   - sysctl KERN_PROC_ALL costs 0.107 ms, a fork of ps costs 35 ms;
+           *   - proc_listchildpids costs 0.0056 ms;
+           *   - a sleep of 5 ms gives a real interval of about 32 ms, so the poll
+           *     interval does not follow the number that the code asks for.
+           *
+           * This round answers: how long the cold stream stays cold, which sleep
+           * gives a real interval of a few milliseconds, how long the forked child
+           * lives, and whether the cheap calls see a zombie.
            */
           #include <errno.h>
           #include <fcntl.h>
+          #include <pthread.h>
           #include <signal.h>
+          #include <stdint.h>
           #include <stdio.h>
           #include <stdlib.h>
           #include <string.h>
           #include <time.h>
           #include <unistd.h>
 
+          #include <mach/mach_time.h>
           #include <sys/proc.h>
+          #include <sys/proc_info.h>
+          #include <sys/qos.h>
           #include <sys/resource.h>
           #include <sys/select.h>
           #include <sys/stat.h>
@@ -92,13 +106,20 @@ jobs:
           #include <sys/types.h>
           #include <sys/wait.h>
 
-          /* Declared here, so that the build does not depend on the SDK
-           * header that holds it. */
           extern int proc_listchildpids(pid_t ppid, void *buffer, int buffersize);
-          
+          extern int proc_listallpids(void *buffer, int buffersize);
+          extern int proc_pidinfo(int pid, int flavor, uint64_t arg, void *buffer,
+                                  int buffersize);
+          extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
+
           #define PREDICATE                                                              \
             "processImagePath == \"/kernel\" AND (sender == \"Sandbox\" OR "             \
             "eventMessage BEGINSWITH \"Sandbox: \")"
+
+          /* The profile of the warm-up probe: no path, so no escaping. The deny of
+           * process-exec stops the program before it runs, and the kernel writes
+           * one report with the process ID of the probe. */
+          #define PROBE_PROFILE "(version 1)(allow default)(deny process-exec)"
 
           static double now_ms(void) {
             struct timespec ts;
@@ -114,22 +135,7 @@ jobs:
             return u + s;
           }
 
-          static struct kinfo_proc *snap(size_t *count) {
-            int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
-            size_t len = 0;
-            if (sysctl(mib, 4, NULL, &len, NULL, 0) < 0)
-              return NULL;
-            len += len / 8 + 65536;
-            struct kinfo_proc *buf = (struct kinfo_proc *)malloc(len);
-            if (!buf)
-              return NULL;
-            if (sysctl(mib, 4, buf, &len, NULL, 0) < 0) {
-              free(buf);
-              return NULL;
-            }
-            *count = len / sizeof(struct kinfo_proc);
-            return buf;
-          }
+          /* ── the reader of the log ─────────────────────────────────────────────── */
 
           typedef struct {
             int fd;
@@ -172,7 +178,6 @@ jobs:
             close(r->fd);
           }
 
-          /* Return 1 and fill out when a whole line arrives before deadline. */
           static int next_line(LineReader *r, char *out, size_t outn, double deadline) {
             for (;;) {
               char *nl = (char *)memchr(r->buf, '\n', r->used);
@@ -194,8 +199,7 @@ jobs:
               fd_set set;
               FD_ZERO(&set);
               FD_SET(r->fd, &set);
-              int rc = select(r->fd + 1, &set, NULL, NULL, &tv);
-              if (rc <= 0)
+              if (select(r->fd + 1, &set, NULL, NULL, &tv) <= 0)
                 return 0;
               if (r->used >= sizeof r->buf - 1)
                 r->used = 0;
@@ -206,6 +210,170 @@ jobs:
             }
           }
 
+          /* Run one probe and return its process ID. */
+          static pid_t run_probe(void) {
+            pid_t pid = fork();
+            if (pid == 0) {
+              int devnull = open("/dev/null", O_RDWR);
+              dup2(devnull, 0);
+              dup2(devnull, 1);
+              dup2(devnull, 2);
+              execl("/usr/bin/sandbox-exec", "sandbox-exec", "-p", PROBE_PROFILE,
+                    "/usr/bin/true", (char *)NULL);
+              _exit(127);
+            }
+            if (pid > 0)
+              waitpid(pid, NULL, 0);
+            return pid;
+          }
+
+          /* MAC-12. Start a log stream, then fire a probe every `gap_ms` until a
+           * report of one of the probes arrives. */
+          static void warm_up_round(int round, int gap_ms, double limit_ms) {
+            LineReader r;
+            double t0 = now_ms();
+            if (spawn_log(&r) < 0) {
+              printf("MAC12 round %d: log stream did not start\n", round);
+              return;
+            }
+            char line[8192];
+            double t_header = -1;
+            if (next_line(&r, line, sizeof line, t0 + 15000))
+              t_header = now_ms() - t0;
+
+            double t_start = now_ms();
+            pid_t probes[4096];
+            int n_probes = 0;
+            double found_at = -1;
+            int found_probe = -1;
+            int lines = 0;
+            double next_probe = t_start;
+            while (found_at < 0 && now_ms() - t_start < limit_ms) {
+              if (now_ms() >= next_probe && n_probes < 4096) {
+                probes[n_probes++] = run_probe();
+                next_probe = now_ms() + gap_ms;
+              }
+              double wait_to = now_ms() + 50;
+              if (wait_to > t_start + limit_ms)
+                wait_to = t_start + limit_ms;
+              while (next_line(&r, line, sizeof line, wait_to)) {
+                lines++;
+                for (int i = 0; i < n_probes; i++) {
+                  char needle[32];
+                  snprintf(needle, sizeof needle, "(%d) deny", (int)probes[i]);
+                  if (strstr(line, needle)) {
+                    found_at = now_ms() - t_start;
+                    found_probe = i;
+                    break;
+                  }
+                }
+                if (found_at >= 0)
+                  break;
+              }
+            }
+            printf("MAC12 round %d: header %.0f ms, %d probes, the report of probe %d "
+                   "arrived after %.0f ms, %d lines\n",
+                   round, t_header, n_probes, found_probe, found_at, lines);
+            fflush(stdout);
+            stop_log(&r);
+          }
+
+          /* ── the sleep ─────────────────────────────────────────────────────────── */
+
+          static mach_timebase_info_data_t tb;
+
+          static void sleep_ns_nanosleep(long ns) {
+            struct timespec ts = {ns / 1000000000L, ns % 1000000000L};
+            nanosleep(&ts, NULL);
+          }
+
+          static void sleep_ns_mach(long ns) {
+            uint64_t ticks = (uint64_t)ns * (uint64_t)tb.denom / (uint64_t)tb.numer;
+            mach_wait_until(mach_absolute_time() + ticks);
+          }
+
+          static void sleep_ns_select(long ns) {
+            struct timeval tv = {0, (suseconds_t)(ns / 1000)};
+            select(0, NULL, NULL, NULL, &tv);
+          }
+
+          static void granularity(const char *label, int ms, int n, int how) {
+            double t = now_ms();
+            for (int i = 0; i < n; i++) {
+              if (how == 0)
+                sleep_ns_nanosleep((long)ms * 1000000L);
+              else if (how == 1)
+                sleep_ns_mach((long)ms * 1000000L);
+              else
+                sleep_ns_select((long)ms * 1000000L);
+            }
+            printf("a sleep of %2d ms with %-12s gives %6.2f ms\n", ms, label,
+                   (now_ms() - t) / n);
+            fflush(stdout);
+          }
+
+          /* ── the cost of the cheap calls ───────────────────────────────────────── */
+
+          static void listallpids_cost(int rounds) {
+            int pids[8192];
+            struct proc_bsdinfo info;
+            int n = proc_listallpids(pids, (int)sizeof pids) / (int)sizeof(int);
+            struct rusage before, after;
+            getrusage(RUSAGE_SELF, &before);
+            double t = now_ms();
+            for (int i = 0; i < rounds; i++) {
+              int got = proc_listallpids(pids, (int)sizeof pids) / (int)sizeof(int);
+              for (int k = 0; k < got; k++)
+                proc_pidinfo(pids[k], PROC_PIDTBSDINFO, 0, &info, (int)sizeof info);
+            }
+            double wall = (now_ms() - t) / rounds;
+            getrusage(RUSAGE_SELF, &after);
+            printf("proc_listallpids with one proc_pidinfo each: %d processes, "
+                   "%.3f ms wall, %.3f ms cpu per snapshot\n",
+                   n, wall, cpu_ms(&after, &before) / rounds);
+            fflush(stdout);
+          }
+
+          static void pidpath_cost(int rounds) {
+            char path[4096];
+            double t = now_ms();
+            int last = 0;
+            for (int i = 0; i < rounds; i++)
+              last = proc_pidpath((int)getpid(), path, (uint32_t)sizeof path);
+            printf("proc_pidpath: answer %d (%s), %.4f ms per call\n", last,
+                   last > 0 ? path : "none", (now_ms() - t) / rounds);
+            fflush(stdout);
+          }
+
+          /* Does a cheap call still see a child that exited and that nobody
+           * reaped? The recorder needs the process ID of such a child. */
+          static void zombie_visibility(void) {
+            pid_t pid = fork();
+            if (pid == 0)
+              _exit(0);
+            usleep(200000);
+            pid_t kids[64];
+            int n = proc_listchildpids(getpid(), kids, (int)sizeof kids);
+            int in_children = 0;
+            for (int i = 0; i < n / (int)sizeof(pid_t); i++)
+              if (kids[i] == pid)
+                in_children = 1;
+            struct proc_bsdinfo info;
+            int got = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, (int)sizeof info);
+            printf("a zombie child: proc_listchildpids holds it: %s; "
+                   "proc_pidinfo answers %d, status %u (SZOMB is %d), name %s, ppid %u\n",
+                   in_children ? "yes" : "no", got, got > 0 ? info.pbi_status : 0, SZOMB,
+                   got > 0 ? info.pbi_comm : "none", got > 0 ? info.pbi_ppid : 0);
+            char path[4096];
+            int pp = proc_pidpath(pid, path, (uint32_t)sizeof path);
+            printf("a zombie child: proc_pidpath answers %d (%s)\n", pp,
+                   pp > 0 ? path : "none");
+            fflush(stdout);
+            waitpid(pid, NULL, 0);
+          }
+
+          /* ── the window of the fork ────────────────────────────────────────────── */
+
           static void write_file(const char *path, const char *text) {
             FILE *f = fopen(path, "w");
             if (f) {
@@ -214,171 +382,16 @@ jobs:
             }
           }
 
-          /* One round of MAC-12: start a log stream, then make one allow report and
-           * one deny report, and measure when each arrives. */
-          static void warm_round(int round) {
-            char marker[64], dir[192], adir[256], ddir[256];
-            char afile[320], dfile[320], prof[320], line[8192];
-            snprintf(marker, sizeof marker, "pentwarm-%d-%d", (int)getpid(), round);
-            snprintf(dir, sizeof dir, "/private/tmp/%s", marker);
-            snprintf(adir, sizeof adir, "%s/a", dir);
-            snprintf(ddir, sizeof ddir, "%s/d", dir);
-            mkdir(dir, 0755);
-            mkdir(adir, 0755);
-            mkdir(ddir, 0755);
-            snprintf(afile, sizeof afile, "%s/probe.txt", adir);
-            snprintf(dfile, sizeof dfile, "%s/probe.txt", ddir);
-            write_file(afile, "a\n");
-            write_file(dfile, "d\n");
-            snprintf(prof, sizeof prof, "%s/p.sb", dir);
-            {
-              FILE *f = fopen(prof, "w");
-              if (f) {
-                fprintf(f,
-                        "(version 1)\n(allow default)\n"
-                        "(allow file-read-data (subpath \"%s\") (with report))\n"
-                        "(deny file-read-data (subpath \"%s\"))\n",
-                        adir, ddir);
-                fclose(f);
-              }
-            }
-
-            LineReader r;
-            double t0 = now_ms();
-            if (spawn_log(&r) < 0) {
-              printf("round %d: log stream did not start\n", round);
-              return;
-            }
-            double t_header = -1;
-            if (next_line(&r, line, sizeof line, t0 + 15000))
-              t_header = now_ms() - t0;
-
-            double t_spawn = now_ms();
-            char shell[1200];
-            snprintf(shell, sizeof shell, "cat %s >/dev/null 2>&1; cat %s >/dev/null 2>&1",
-                     afile, dfile);
-            pid_t pid = fork();
-            if (pid == 0) {
-              int devnull = open("/dev/null", O_WRONLY);
-              dup2(devnull, 1);
-              dup2(devnull, 2);
-              execl("/usr/bin/sandbox-exec", "sandbox-exec", "-f", prof, "/bin/sh", "-c",
-                    shell, (char *)NULL);
-              _exit(127);
-            }
-            int st = 0;
-            if (pid > 0)
-              waitpid(pid, &st, 0);
-            double t_done = now_ms() - t_spawn;
-
-            char amark[256], dmark[256];
-            snprintf(amark, sizeof amark, "%s/a/probe.txt", marker);
-            snprintf(dmark, sizeof dmark, "%s/d/probe.txt", marker);
-            double a_at = -1, d_at = -1;
-            double deadline = t_spawn + 30000;
-            int lines = 0;
-            while ((a_at < 0 || d_at < 0) && next_line(&r, line, sizeof line, deadline)) {
-              lines++;
-              if (a_at < 0 && strstr(line, amark))
-                a_at = now_ms() - t_spawn;
-              if (d_at < 0 && strstr(line, dmark))
-                d_at = now_ms() - t_spawn;
-            }
-            printf("MAC12 round %d: header %.0f ms, probe exit %d after %.0f ms, "
-                   "allow report %.0f ms, deny report %.0f ms, %d lines\n",
-                   round, t_header, st, t_done, a_at, d_at, lines);
-            fflush(stdout);
-            stop_log(&r);
-          }
-
-          static void sysctl_cost(int rounds) {
-            size_t n = 0;
-            struct kinfo_proc *b = snap(&n);
-            size_t procs = n;
-            free(b);
-            struct rusage before, after;
-            getrusage(RUSAGE_SELF, &before);
-            double t = now_ms();
-            for (int i = 0; i < rounds; i++) {
-              b = snap(&n);
-              free(b);
-            }
-            double wall = (now_ms() - t) / rounds;
-            getrusage(RUSAGE_SELF, &after);
-            printf("sysctl KERN_PROC_ALL: %zu processes, %.3f ms wall, %.3f ms cpu "
-                   "per call\n",
-                   procs, wall, cpu_ms(&after, &before) / rounds);
-            fflush(stdout);
-          }
-
-          static void listchildren_cost(int rounds) {
-            pid_t kids[512];
-            struct rusage before, after;
-            getrusage(RUSAGE_SELF, &before);
-            double t = now_ms();
-            int last = 0;
-            for (int i = 0; i < rounds; i++)
-              last = proc_listchildpids(getpid(), kids, (int)sizeof kids);
-            double wall = (now_ms() - t) / rounds;
-            getrusage(RUSAGE_SELF, &after);
-            printf("proc_listchildpids: answer %d, %.4f ms wall, %.4f ms cpu per call\n",
-                   last, wall, cpu_ms(&after, &before) / rounds);
-            fflush(stdout);
-          }
-
-          static void ps_cost(int rounds) {
-            struct rusage before, after;
-            getrusage(RUSAGE_CHILDREN, &before);
-            double t = now_ms();
-            for (int i = 0; i < rounds; i++) {
-              pid_t pid = fork();
-              if (pid == 0) {
-                int devnull = open("/dev/null", O_WRONLY);
-                dup2(devnull, 1);
-                dup2(devnull, 2);
-                execl("/bin/ps", "ps", "-A", "-o", "pid=,ppid=,stat=,comm=",
-                      (char *)NULL);
-                _exit(127);
-              }
-              waitpid(pid, NULL, 0);
-            }
-            double wall = (now_ms() - t) / rounds;
-            getrusage(RUSAGE_CHILDREN, &after);
-            printf("fork of ps: %.3f ms wall, %.3f ms child cpu per call\n", wall,
-                   cpu_ms(&after, &before) / rounds);
-            fflush(stdout);
-          }
-
-          static void poll_cost(int interval_ms, int seconds) {
-            struct rusage before, after;
-            getrusage(RUSAGE_SELF, &before);
-            double end = now_ms() + seconds * 1000.0;
-            int polls = 0;
-            while (now_ms() < end) {
-              size_t n = 0;
-              struct kinfo_proc *b = snap(&n);
-              free(b);
-              polls++;
-              struct timespec ts = {0, (long)interval_ms * 1000000L};
-              nanosleep(&ts, NULL);
-            }
-            getrusage(RUSAGE_SELF, &after);
-            double cpu = cpu_ms(&after, &before);
-            printf("a poll of %d ms for %d s: %d polls, %.0f ms cpu (%.1f%% of one "
-                   "core)\n",
-                   interval_ms, seconds, polls, cpu, cpu / (seconds * 1000.0) * 100.0);
-            fflush(stdout);
-          }
-
-          /* How often a poll of `interval_ms` sees the short-lived child of
-           * `sh -c 'cat FILE; echo END'`. */
-          static void catch_rate(int interval_ms, int rounds) {
+          /* The true life of the child of `sh -c 'cat FILE; echo END'`, with a spin
+           * on proc_listchildpids, which costs 6 microseconds. */
+          static void child_life(int rounds) {
             char file[256];
-            snprintf(file, sizeof file, "/private/tmp/pentcatch-%d.txt", (int)getpid());
+            snprintf(file, sizeof file, "/private/tmp/pentlife-%d.txt", (int)getpid());
             write_file(file, "x\n");
             char shell[512];
             snprintf(shell, sizeof shell, "cat %s >/dev/null; echo END >/dev/null", file);
-            int seen = 0, named = 0;
+            double total = 0, worst = 1e9, best = 0;
+            int seen = 0;
             for (int i = 0; i < rounds; i++) {
               pid_t pid = fork();
               if (pid == 0) {
@@ -388,60 +401,117 @@ jobs:
                 execl("/bin/sh", "sh", "-c", shell, (char *)NULL);
                 _exit(127);
               }
-              /* A real poll is not synchronised with the fork: start at a random
-               * phase of the interval. */
-              usleep((useconds_t)(rand() % (interval_ms * 1000)));
-              int found = 0, found_named = 0;
+              double first = -1, last = -1;
+              pid_t kids[64];
               for (;;) {
-                size_t n = 0;
-                struct kinfo_proc *b = snap(&n);
-                if (b) {
-                  for (size_t k = 0; k < n; k++) {
-                    if (b[k].kp_eproc.e_ppid == pid) {
-                      found = 1;
-                      if (strncmp(b[k].kp_proc.p_comm, "cat", 4) == 0)
-                        found_named = 1;
-                    }
-                  }
-                  free(b);
+                int n = proc_listchildpids(pid, kids, (int)sizeof kids);
+                if (n > 0) {
+                  if (first < 0)
+                    first = now_ms();
+                  last = now_ms();
                 }
                 if (waitpid(pid, NULL, WNOHANG) == pid)
                   break;
-                struct timespec ts = {interval_ms / 1000,
-                                      (long)(interval_ms % 1000) * 1000000L};
-                nanosleep(&ts, NULL);
+              }
+              if (first > 0) {
+                double life = last - first;
+                total += life;
+                seen++;
+                if (life < worst)
+                  worst = life;
+                if (life > best)
+                  best = life;
+              }
+            }
+            printf("the forked child of sh: seen in %d of %d runs with a spin; "
+                   "the spin held it for %.2f ms on average, %.2f ms at least, "
+                   "%.2f ms at most\n",
+                   seen, rounds, seen ? total / seen : 0.0, seen ? worst : 0.0, best);
+            fflush(stdout);
+          }
+
+          /* How often a poll of `interval_ms` with `mach_wait_until` sees the
+           * forked child. */
+          static void catch_rate(int interval_ms, int rounds) {
+            char file[256];
+            snprintf(file, sizeof file, "/private/tmp/pentcatch2-%d.txt", (int)getpid());
+            write_file(file, "x\n");
+            char shell[512];
+            snprintf(shell, sizeof shell, "cat %s >/dev/null; echo END >/dev/null", file);
+            int seen = 0;
+            struct rusage before, after;
+            getrusage(RUSAGE_SELF, &before);
+            double t_all = now_ms();
+            for (int i = 0; i < rounds; i++) {
+              pid_t pid = fork();
+              if (pid == 0) {
+                int devnull = open("/dev/null", O_WRONLY);
+                dup2(devnull, 1);
+                dup2(devnull, 2);
+                execl("/bin/sh", "sh", "-c", shell, (char *)NULL);
+                _exit(127);
+              }
+              sleep_ns_mach((long)(rand() % (interval_ms * 1000)) * 1000L);
+              int found = 0;
+              pid_t kids[64];
+              for (;;) {
+                if (proc_listchildpids(pid, kids, (int)sizeof kids) > 0)
+                  found = 1;
+                if (waitpid(pid, NULL, WNOHANG) == pid)
+                  break;
+                sleep_ns_mach((long)interval_ms * 1000000L);
               }
               if (found)
                 seen++;
-              if (found_named)
-                named++;
             }
-            printf("a poll of %3d ms: the table held the forked child in %2d of %d "
-                   "runs, with the name cat in %2d\n",
-                   interval_ms, seen, rounds, named);
+            getrusage(RUSAGE_SELF, &after);
+            printf("a poll of %3d ms with mach_wait_until: the child was there in "
+                   "%2d of %d runs; %.0f ms wall, %.0f ms cpu\n",
+                   interval_ms, seen, rounds, now_ms() - t_all,
+                   cpu_ms(&after, &before));
             fflush(stdout);
           }
 
           int main(void) {
-            srand(1);
+            srand(7);
+            mach_timebase_info(&tb);
             printf("=== MAC-12: the first log stream of this machine ===\n");
             fflush(stdout);
-            for (int round = 0; round < 3; round++)
-              warm_round(round);
-            printf("=== MAC-10: the cost of a snapshot ===\n");
+            warm_up_round(0, 250, 60000);
+            warm_up_round(1, 250, 20000);
+
+            printf("=== the sleep ===\n");
             fflush(stdout);
-            sysctl_cost(200);
-            listchildren_cost(2000);
-            ps_cost(20);
-            poll_cost(100, 2);
-            poll_cost(10, 2);
-            poll_cost(5, 2);
+            for (int how = 0; how < 3; how++) {
+              const char *label =
+                  how == 0 ? "nanosleep" : (how == 1 ? "mach_wait_until" : "select");
+              granularity(label, 1, 100, how);
+              granularity(label, 5, 60, how);
+              granularity(label, 10, 40, how);
+            }
+            pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+            printf("--- the same after the thread asks for the interactive class ---\n");
+            for (int how = 0; how < 3; how++) {
+              const char *label =
+                  how == 0 ? "nanosleep" : (how == 1 ? "mach_wait_until" : "select");
+              granularity(label, 1, 100, how);
+              granularity(label, 5, 60, how);
+            }
+
+            printf("=== MAC-10: the cheap calls ===\n");
+            fflush(stdout);
+            listallpids_cost(50);
+            pidpath_cost(2000);
+            zombie_visibility();
+
             printf("=== MAC-10: the window of the fork ===\n");
             fflush(stdout);
+            child_life(30);
             catch_rate(100, 40);
             catch_rate(10, 40);
             catch_rate(5, 40);
             catch_rate(2, 40);
+            catch_rate(1, 40);
             return 0;
           }
           PENT_MEASURE_EOF
