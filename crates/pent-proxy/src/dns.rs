@@ -219,7 +219,16 @@ impl DnsServerConfig {
 
     /// Read system DNS resolvers from /etc/resolv.conf.
     fn read_system_resolvers() -> Option<Vec<SocketAddr>> {
-        parse_resolv_conf(&std::fs::read_to_string(RESOLV_CONF).ok()?)
+        Self::read_resolvers(std::path::Path::new(RESOLV_CONF))
+    }
+
+    /// Read the resolvers from the file at `path`.
+    ///
+    /// The caller gives the path, thus a test can give another file.
+    /// Returns `None` when pent cannot read the file, and when the file
+    /// holds no usable `nameserver` line.
+    fn read_resolvers(path: &std::path::Path) -> Option<Vec<SocketAddr>> {
+        parse_resolv_conf(&std::fs::read_to_string(path).ok()?)
     }
 
     /// The TTL bounds in seconds: `(min, max)`.
@@ -712,10 +721,12 @@ impl DnsServer {
             let mut len_buf = [0u8; 2];
             match tokio::time::timeout(TCP_IDLE_TIMEOUT, stream.read_exact(&mut len_buf)).await {
                 Ok(Ok(_)) => {}
-                // EOF or a read error: the client is gone.
-                Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
-                Ok(Err(e)) => return Err(e),
-                Err(_) => return Ok(()),
+                // The client is gone: it closed the connection, the read
+                // failed, or the connection was idle for too long. The
+                // server holds no state between two queries of one
+                // connection, thus it ends the connection in each case.
+                // The server itself continues with the next client.
+                Ok(Err(_)) | Err(_) => return Ok(()),
             }
             let len = usize::from(u16::from_be_bytes(len_buf));
             let mut query = vec![0u8; len];
@@ -2141,6 +2152,52 @@ mod tests {
         assert_eq!(parse_resolv_conf("nameservers 192.0.2.1\n"), None);
     }
 
+    /// The read of the resolver file gives the resolvers of the file, and
+    /// `None` for each file that holds no usable address. The caller then
+    /// takes the fallback resolvers.
+    #[test]
+    fn the_resolver_file_gives_the_resolvers_or_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let read = |name: &str| DnsServerConfig::read_resolvers(&dir.path().join(name));
+
+        // A file that is not there.
+        assert_eq!(read("missing"), None);
+        // A directory at the path: the read fails with another error.
+        std::fs::create_dir(dir.path().join("a-directory")).unwrap();
+        assert_eq!(read("a-directory"), None);
+        // An empty file.
+        std::fs::write(dir.path().join("empty"), "").unwrap();
+        assert_eq!(read("empty"), None);
+        // A file with no nameserver line.
+        std::fs::write(dir.path().join("no-nameserver"), "search example.com\n").unwrap();
+        assert_eq!(read("no-nameserver"), None);
+        // A file with an address that the parser does not accept.
+        std::fs::write(dir.path().join("bad-address"), "nameserver 300.1.2.3\n").unwrap();
+        assert_eq!(read("bad-address"), None);
+        // A file with one good address and one bad address.
+        std::fs::write(
+            dir.path().join("good"),
+            "nameserver 300.1.2.3\nnameserver 192.0.2.1\n",
+        )
+        .unwrap();
+        assert_eq!(read("good"), Some(vec!["192.0.2.1:53".parse().unwrap()]));
+    }
+
+    /// The resolvers of the system come from the file of the system. The
+    /// test reads the same file and compares, thus it does not depend on
+    /// the content. It ends when the machine has no usable file.
+    #[test]
+    fn the_system_resolvers_come_from_the_file_of_the_system() {
+        let expected = std::fs::read_to_string(RESOLV_CONF)
+            .ok()
+            .and_then(|text| parse_resolv_conf(&text));
+        let Some(expected) = expected else {
+            crate::test_support::skip("this machine has no usable /etc/resolv.conf");
+            return;
+        };
+        assert_eq!(DnsServerConfig::read_system_resolvers(), Some(expected));
+    }
+
     /// The transaction ID of an upstream query must not be the same each
     /// time. A fixed ID lets a remote host answer before the real server.
     #[test]
@@ -2489,5 +2546,90 @@ mod tests {
             rx.try_recv().unwrap(),
             dns_event("nx.example.com", "A", Outcome::Allowed)
         );
+    }
+
+    /// A client that closes the connection in the middle of the length
+    /// prefix must not stop the server, and it must not hold its place.
+    /// The next client gets its answer on a new connection.
+    ///
+    /// The server of the test serves one connection at a time
+    /// (`max_concurrent_queries` is 1). Thus the test sees the end of the
+    /// broken connection: the next connection gets an answer only when the
+    /// server gave the place of the broken connection back.
+    #[tokio::test]
+    async fn a_broken_length_prefix_does_not_stop_the_tcp_server() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let Ok(listener) = tokio::net::TcpListener::bind("127.0.0.1:0").await else {
+            crate::test_support::skip("this machine cannot bind a TCP socket on the loopback");
+            return;
+        };
+        let Ok(addr) = listener.local_addr() else {
+            crate::test_support::skip("this machine gives no address for a TCP listener");
+            return;
+        };
+        let state = Arc::new(SharedState::new(vec!["allowed.com".to_string()]));
+        let config = DnsServerConfig {
+            max_concurrent_queries: 1,
+            ..Default::default()
+        };
+        let server = DnsServer::new(config, state).unwrap();
+        let task = tokio::spawn(async move {
+            let _ = server.run_tcp_on(listener).await;
+        });
+
+        // One byte of the two-byte length prefix, then the close.
+        let mut broken = tokio::net::TcpStream::connect(addr).await.unwrap();
+        broken.write_all(&[0x00]).await.unwrap();
+        drop(broken);
+
+        // A new connection with a complete query. The name is not on the
+        // allowlist, thus the server answers NXDOMAIN and asks no upstream.
+        let query = build_test_dns_query("blocked.example", rtype::A);
+        let mut request = u16::try_from(query.len()).unwrap().to_be_bytes().to_vec();
+        request.extend_from_slice(&query);
+
+        let mut answer = None;
+        // The server ends the broken connection in its own task. The test
+        // gives it up to two seconds for that.
+        for _ in 0..20u32 {
+            let Ok(mut client) = tokio::net::TcpStream::connect(addr).await else {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            };
+            if client.write_all(&request).await.is_err() {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+            let mut len_buf = [0u8; 2];
+            let read = client.read_exact(&mut len_buf);
+            let complete = matches!(
+                tokio::time::timeout(Duration::from_millis(100), read).await,
+                Ok(Ok(_))
+            );
+            if !complete {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+            let mut response = vec![0u8; usize::from(u16::from_be_bytes(len_buf))];
+            let read = client.read_exact(&mut response);
+            assert!(
+                tokio::time::timeout(Duration::from_secs(5), read)
+                    .await
+                    .is_ok(),
+                "the answer is shorter than its length"
+            );
+            answer = Some(response);
+            break;
+        }
+
+        let Some(response) = answer else {
+            task.abort();
+            panic!("the server gave no answer after the broken connection");
+        };
+        assert_eq!(rcode_of(&response), rcode::NXDOMAIN);
+        assert_eq!(response.get(..2), query.get(..2), "another transaction");
+
+        task.abort();
     }
 }
