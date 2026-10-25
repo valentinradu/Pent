@@ -112,6 +112,20 @@ impl Drop for Harness {
     }
 }
 
+/// The marker that each probe prints first. It is the positive control:
+/// a test that asserts the absence of a secret also needs the proof that
+/// the child ran. Without it a child that never started passes the test.
+const RAN: &str = "PENT_CHILD_RAN";
+
+/// Fail when the child did not run.
+#[track_caller]
+fn assert_child_ran(text: &str) {
+    assert!(
+        text.contains(RAN),
+        "the child did not run, so the test proves nothing:\n{text}"
+    );
+}
+
 /// The combined stdout and stderr of an output, for messages and markers.
 fn combined(out: &Output) -> String {
     format!(
@@ -121,13 +135,38 @@ fn combined(out: &Output) -> String {
     )
 }
 
-/// True when the output shows that the sandbox is not available on this host
-/// (no Landlock or no user namespace). The caller then skips the test.
-fn sandbox_unavailable(out: &Output) -> bool {
-    let text = combined(out);
-    text.contains("Landlock")
-        || text.contains("user namespace")
-        || text.contains("sandbox is not available")
+/// True when this host can run the sandbox.
+///
+/// The answer comes from `pent check`, one time, before any test runs. An
+/// earlier version read the output of the test itself and skipped when it
+/// held the words "Landlock" or "user namespace". A real defect of pent
+/// prints those words too, so a broken sandbox passed every test in this
+/// file. A guard must never read the result that it guards.
+fn sandbox_ready() -> bool {
+    use std::sync::OnceLock;
+    static READY: OnceLock<bool> = OnceLock::new();
+    *READY.get_or_init(|| {
+        Command::new(PENT)
+            .arg("check")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    })
+}
+
+/// Skip the test when the sandbox cannot run here. The skip prints its
+/// reason, and it fails the test when `PENT_REQUIRE_ALL_TESTS` is set.
+#[track_caller]
+fn skip_without_sandbox() -> bool {
+    if sandbox_ready() {
+        return false;
+    }
+    assert!(
+        std::env::var_os("PENT_REQUIRE_ALL_TESTS").is_none(),
+        "the sandbox does not run on this host, and PENT_REQUIRE_ALL_TESTS is set"
+    );
+    eprintln!("SKIP: the sandbox does not run on this host");
+    true
 }
 
 /// The path of `python3`, or `None` when it is not in `PATH`.
@@ -149,15 +188,18 @@ const EMPTY_PROFILE: &str = "[filesystem]\nread = []\nread_write = []\nexecute =
 /// The child cannot read a file outside its profile.
 #[test]
 fn test_read_outside_profile_denied() -> TestResult {
+    if skip_without_sandbox() {
+        return Ok(());
+    }
     let h = Harness::new("sh", EMPTY_PROFILE)?;
     let secret = h.outside.join("secret");
     std::fs::write(&secret, "SECRETDATA")?;
-    let script = h.script("probe.sh", &format!("cat '{}'\n", secret.display()))?;
+    let script = h.script(
+        "probe.sh",
+        &format!("echo PENT_CHILD_RAN\ncat '{}'\n", secret.display()),
+    )?;
     let out = h.run(&["sh", script.to_str().unwrap()])?;
-    if sandbox_unavailable(&out) {
-        eprintln!("skip: sandbox not available on this host");
-        return Ok(());
-    }
+    assert_child_ran(&combined(&out));
     let text = combined(&out);
     assert!(
         !text.contains("SECRETDATA"),
@@ -169,17 +211,20 @@ fn test_read_outside_profile_denied() -> TestResult {
 /// The child cannot write a file outside its profile.
 #[test]
 fn test_write_outside_profile_denied() -> TestResult {
+    if skip_without_sandbox() {
+        return Ok(());
+    }
     let h = Harness::new("sh", EMPTY_PROFILE)?;
     let target = h.outside.join("written");
     let script = h.script(
         "probe.sh",
-        &format!("echo hi > '{}'; echo rc=$?\n", target.display()),
+        &format!(
+            "echo PENT_CHILD_RAN\necho hi > '{}'; echo rc=$?\n",
+            target.display()
+        ),
     )?;
     let out = h.run(&["sh", script.to_str().unwrap()])?;
-    if sandbox_unavailable(&out) {
-        eprintln!("skip: sandbox not available on this host");
-        return Ok(());
-    }
+    assert_child_ran(&combined(&out));
     assert!(
         !target.exists(),
         "the child wrote a file outside its profile: {}",
@@ -192,6 +237,9 @@ fn test_write_outside_profile_denied() -> TestResult {
 /// of a host process.
 #[test]
 fn test_abstract_unix_socket_blocked() -> TestResult {
+    if skip_without_sandbox() {
+        return Ok(());
+    }
     let Some(py) = python3() else {
         eprintln!("skip: no python3");
         return Ok(());
@@ -217,19 +265,16 @@ fn test_abstract_unix_socket_blocked() -> TestResult {
     let probe = h.script(
         "c.py",
         &format!(
-            "import socket\n\
+            "print('PENT_CHILD_RAN')\nimport socket\n\
              s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.settimeout(2)\n\
              try:\n    s.connect('\\0{name}'); print('CONNECTED', s.recv(16))\n\
              except Exception as e:\n    print('BLOCKED', e)\n"
         ),
     )?;
     let out = h.run(&[py.to_str().unwrap(), "-I", probe.to_str().unwrap()])?;
+    assert_child_ran(&combined(&out));
     victim.kill().ok();
     victim.wait().ok();
-    if sandbox_unavailable(&out) {
-        eprintln!("skip: sandbox not available on this host");
-        return Ok(());
-    }
     let text = combined(&out);
     assert!(
         !text.contains("CONNECTED"),
@@ -243,6 +288,9 @@ fn test_abstract_unix_socket_blocked() -> TestResult {
 /// empty tmpfs covers it.
 #[test]
 fn test_runtime_dir_masked() -> TestResult {
+    if skip_without_sandbox() {
+        return Ok(());
+    }
     let Some(py) = python3() else {
         eprintln!("skip: no python3");
         return Ok(());
@@ -256,17 +304,14 @@ fn test_runtime_dir_masked() -> TestResult {
     let probe = h.script(
         "c.py",
         &format!(
-            "import os\n\
+            "print('PENT_CHILD_RAN')\nimport os\n\
              try:\n    print('COUNT', len(os.listdir('{}')))\n\
              except Exception as e:\n    print('COUNT 0', e)\n",
             runtime.display()
         ),
     )?;
     let out = h.run(&[py.to_str().unwrap(), "-I", probe.to_str().unwrap()])?;
-    if sandbox_unavailable(&out) {
-        eprintln!("skip: sandbox not available on this host");
-        return Ok(());
-    }
+    assert_child_ran(&combined(&out));
     let text = combined(&out);
     assert!(
         text.contains("COUNT 0"),
@@ -279,6 +324,9 @@ fn test_runtime_dir_masked() -> TestResult {
 /// user namespace blocks it (EPERM).
 #[test]
 fn test_signal_to_host_process_denied() -> TestResult {
+    if skip_without_sandbox() {
+        return Ok(());
+    }
     let Some(py) = python3() else {
         eprintln!("skip: no python3");
         return Ok(());
@@ -288,18 +336,15 @@ fn test_signal_to_host_process_denied() -> TestResult {
     let probe = h.script(
         "c.py",
         &format!(
-            "import os\n\
+            "print('PENT_CHILD_RAN')\nimport os\n\
              try:\n    os.kill({pid}, 0); print('SIGNAL_ALLOWED')\n\
              except Exception as e:\n    print('SIGNAL_DENIED', e)\n"
         ),
     )?;
     let out = h.run(&[py.to_str().unwrap(), "-I", probe.to_str().unwrap()])?;
+    assert_child_ran(&combined(&out));
     victim.kill().ok();
     victim.wait().ok();
-    if sandbox_unavailable(&out) {
-        eprintln!("skip: sandbox not available on this host");
-        return Ok(());
-    }
     let text = combined(&out);
     assert!(
         !text.contains("SIGNAL_ALLOWED"),
@@ -313,6 +358,9 @@ fn test_signal_to_host_process_denied() -> TestResult {
 /// refuses (EACCES).
 #[test]
 fn test_proc_environ_of_host_process_denied() -> TestResult {
+    if skip_without_sandbox() {
+        return Ok(());
+    }
     let Some(py) = python3() else {
         eprintln!("skip: no python3");
         return Ok(());
@@ -322,16 +370,13 @@ fn test_proc_environ_of_host_process_denied() -> TestResult {
     let probe = h.script(
         "c.py",
         &format!(
-            "import os\nd=b''\ntry:\n    d=open('/proc/{pid}/environ','rb').read()\nexcept Exception as e:\n    print('ENVIRON_DENIED', e)\nprint('ENVIRON_SECRET' if b'TOPSECRET_ENV' in d else 'ENVIRON_EMPTY')\n"
+            "print('PENT_CHILD_RAN')\nimport os\nd=b''\ntry:\n    d=open('/proc/{pid}/environ','rb').read()\nexcept Exception as e:\n    print('ENVIRON_DENIED', e)\nprint('ENVIRON_SECRET' if b'TOPSECRET_ENV' in d else 'ENVIRON_EMPTY')\n"
         ),
     )?;
     let out = h.run(&[py.to_str().unwrap(), "-I", probe.to_str().unwrap()])?;
+    assert_child_ran(&combined(&out));
     victim.kill().ok();
     victim.wait().ok();
-    if sandbox_unavailable(&out) {
-        eprintln!("skip: sandbox not available on this host");
-        return Ok(());
-    }
     let text = combined(&out);
     assert!(
         !text.contains("ENVIRON_SECRET"),
@@ -344,6 +389,9 @@ fn test_proc_environ_of_host_process_denied() -> TestResult {
 /// capability after `execve` and `NO_NEW_PRIVS` is set.
 #[test]
 fn test_cannot_unshare_or_umount() -> TestResult {
+    if skip_without_sandbox() {
+        return Ok(());
+    }
     let Some(py) = python3() else {
         eprintln!("skip: no python3");
         return Ok(());
@@ -353,17 +401,14 @@ fn test_cannot_unshare_or_umount() -> TestResult {
     let probe = h.script(
         "c.py",
         &format!(
-            "import ctypes\n\
+            "print('PENT_CHILD_RAN')\nimport ctypes\n\
              libc=ctypes.CDLL('libc.so.6',use_errno=True)\n\
              print('UNSHARE', libc.unshare(0x00020000))\n\
              print('UMOUNT', libc.umount2(b'{runtime}',0))\n"
         ),
     )?;
     let out = h.run(&[py.to_str().unwrap(), "-I", probe.to_str().unwrap()])?;
-    if sandbox_unavailable(&out) {
-        eprintln!("skip: sandbox not available on this host");
-        return Ok(());
-    }
+    assert_child_ran(&combined(&out));
     let text = combined(&out);
     assert!(
         text.contains("UNSHARE -1"),
@@ -380,6 +425,9 @@ fn test_cannot_unshare_or_umount() -> TestResult {
 /// into the terminal input queue of the parent shell.
 #[test]
 fn test_tiocsti_blocked() -> TestResult {
+    if skip_without_sandbox() {
+        return Ok(());
+    }
     let Some(py) = python3() else {
         eprintln!("skip: no python3");
         return Ok(());
@@ -389,16 +437,13 @@ fn test_tiocsti_blocked() -> TestResult {
     // returns EPERM (1) before the fd check.
     let probe = h.script(
         "c.py",
-        "import ctypes\n\
+        "print('PENT_CHILD_RAN')\nimport ctypes\n\
          libc=ctypes.CDLL('libc.so.6',use_errno=True)\n\
          r=libc.ioctl(-1,0x5412,ctypes.byref(ctypes.c_char(b'x')))\n\
          print('TIOCSTI errno', ctypes.get_errno())\n",
     )?;
     let out = h.run(&[py.to_str().unwrap(), "-I", probe.to_str().unwrap()])?;
-    if sandbox_unavailable(&out) {
-        eprintln!("skip: sandbox not available on this host");
-        return Ok(());
-    }
+    assert_child_ran(&combined(&out));
     let text = combined(&out);
     assert!(
         text.contains("TIOCSTI errno 1"),
@@ -413,21 +458,24 @@ fn test_tiocsti_blocked() -> TestResult {
 /// there.
 #[test]
 fn test_tmp_not_shared_with_host() -> TestResult {
+    if skip_without_sandbox() {
+        return Ok(());
+    }
     let h = Harness::new("sh", EMPTY_PROFILE)?;
     // A host file under /tmp, outside the workspace, owned by this test.
     let victim = std::env::temp_dir().join(format!("pent-victim-{}", std::process::id()));
     std::fs::write(&victim, "HOST_TMP_DATA")?;
     let script = h.script(
         "probe.sh",
-        &format!("cat '{v}'\necho TAMPERED > '{v}'\n", v = victim.display()),
+        &format!(
+            "echo PENT_CHILD_RAN\ncat '{v}'\necho TAMPERED > '{v}'\n",
+            v = victim.display()
+        ),
     )?;
     let out = h.run(&["sh", script.to_str().unwrap()])?;
+    assert_child_ran(&combined(&out));
     let after = std::fs::read_to_string(&victim).unwrap_or_default();
     let _ = std::fs::remove_file(&victim);
-    if sandbox_unavailable(&out) {
-        eprintln!("skip: sandbox not available on this host");
-        return Ok(());
-    }
     let text = combined(&out);
     assert!(
         !text.contains("HOST_TMP_DATA"),
@@ -446,6 +494,9 @@ fn test_tmp_not_shared_with_host() -> TestResult {
 /// runs outside the sandbox.
 #[test]
 fn test_tmp_unix_socket_unreachable() -> TestResult {
+    if skip_without_sandbox() {
+        return Ok(());
+    }
     let Some(py) = python3() else {
         eprintln!("skip: no python3");
         return Ok(());
@@ -462,7 +513,7 @@ fn test_tmp_unix_socket_unreachable() -> TestResult {
     let probe = h.script(
         "c.py",
         &format!(
-            "import socket\n\
+            "print('PENT_CHILD_RAN')\nimport socket\n\
              s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.settimeout(2)\n\
              try:\n    s.connect('{}'); print('CONNECTED', s.recv(32))\n\
              except Exception as e:\n    print('BLOCKED', e)\n",
@@ -470,16 +521,13 @@ fn test_tmp_unix_socket_unreachable() -> TestResult {
         ),
     )?;
     let out = h.run(&[py.to_str().unwrap(), "-I", probe.to_str().unwrap()])?;
+    assert_child_ran(&combined(&out));
     // Unblock the listener thread if the child never connected.
     if let Ok(s) = std::os::unix::net::UnixStream::connect(&sock) {
         drop(s);
     }
     handle.join().ok();
     let _ = std::fs::remove_file(&sock);
-    if sandbox_unavailable(&out) {
-        eprintln!("skip: sandbox not available on this host");
-        return Ok(());
-    }
     let text = combined(&out);
     assert!(
         !text.contains("TMUX_SECRET"),
@@ -493,6 +541,9 @@ fn test_tmp_unix_socket_unreachable() -> TestResult {
 /// paths that a program needs.
 #[test]
 fn test_run_not_shared_with_host() -> TestResult {
+    if skip_without_sandbox() {
+        return Ok(());
+    }
     let Some(py) = python3() else {
         eprintln!("skip: no python3");
         return Ok(());
@@ -510,13 +561,10 @@ fn test_run_not_shared_with_host() -> TestResult {
     ];
     let probe = h.script(
         "c.py",
-        "import os\nprint('RUN', ' '.join(sorted(os.listdir('/run'))))\n",
+        "print('PENT_CHILD_RAN')\nimport os\nprint('RUN', ' '.join(sorted(os.listdir('/run'))))\n",
     )?;
     let out = h.run(&[py.to_str().unwrap(), "-I", probe.to_str().unwrap()])?;
-    if sandbox_unavailable(&out) {
-        eprintln!("skip: sandbox not available on this host");
-        return Ok(());
-    }
+    assert_child_ran(&combined(&out));
     let text = combined(&out);
     let line = text
         .lines()
@@ -535,6 +583,9 @@ fn test_run_not_shared_with_host() -> TestResult {
 /// tmpfs. A user can keep a scratch workspace there.
 #[test]
 fn test_workspace_under_tmp_still_works() -> TestResult {
+    if skip_without_sandbox() {
+        return Ok(());
+    }
     let h = Harness::new("sh", EMPTY_PROFILE)?;
     let ws = std::env::temp_dir().join(format!("pent-ws-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&ws);
@@ -552,10 +603,6 @@ fn test_workspace_under_tmp_still_works() -> TestResult {
     let out = cmd.output()?;
     let written = std::fs::read_to_string(ws.join("output")).unwrap_or_default();
     let _ = std::fs::remove_dir_all(&ws);
-    if sandbox_unavailable(&out) {
-        eprintln!("skip: sandbox not available on this host");
-        return Ok(());
-    }
     let text = combined(&out);
     assert!(
         text.contains("WORKSPACE_DATA"),
@@ -575,6 +622,9 @@ fn test_workspace_under_tmp_still_works() -> TestResult {
 /// the sandbox.
 #[test]
 fn test_proc_cmdline_of_host_process_denied() -> TestResult {
+    if skip_without_sandbox() {
+        return Ok(());
+    }
     let Some(py) = python3() else {
         eprintln!("skip: no python3");
         return Ok(());
@@ -584,16 +634,13 @@ fn test_proc_cmdline_of_host_process_denied() -> TestResult {
     let probe = h.script(
         "c.py",
         &format!(
-            "d=b''\ntry:\n    d=open('/proc/{pid}/cmdline','rb').read()\nexcept Exception as e:\n    print('CMDLINE_DENIED', e)\nprint('CMDLINE_SECRET' if b'TOPSECRET_ARG' in d else 'CMDLINE_EMPTY')\n"
+            "print('PENT_CHILD_RAN')\nd=b''\ntry:\n    d=open('/proc/{pid}/cmdline','rb').read()\nexcept Exception as e:\n    print('CMDLINE_DENIED', e)\nprint('CMDLINE_SECRET' if b'TOPSECRET_ARG' in d else 'CMDLINE_EMPTY')\n"
         ),
     )?;
     let out = h.run(&[py.to_str().unwrap(), "-I", probe.to_str().unwrap()])?;
+    assert_child_ran(&combined(&out));
     victim.kill().ok();
     victim.wait().ok();
-    if sandbox_unavailable(&out) {
-        eprintln!("skip: sandbox not available on this host");
-        return Ok(());
-    }
     let text = combined(&out);
     assert!(
         !text.contains("CMDLINE_SECRET"),
@@ -607,6 +654,9 @@ fn test_proc_cmdline_of_host_process_denied() -> TestResult {
 /// namespace exits.
 #[test]
 fn test_background_process_does_not_outlive_pent() -> TestResult {
+    if skip_without_sandbox() {
+        return Ok(());
+    }
     let h = Harness::new("sh", EMPTY_PROFILE)?;
     let marker = h.workspace.join("alive");
     // The background process writes the marker every 200 ms for 30 s.
@@ -614,17 +664,14 @@ fn test_background_process_does_not_outlive_pent() -> TestResult {
         "probe.sh",
         &format!(
             "( i=0; while [ $i -lt 150 ]; do echo $i > '{}'; sleep 0.2; i=$((i+1)); done ) &\n\
-             echo STARTED\n",
+             echo PENT_CHILD_RAN\n",
             marker.display()
         ),
     )?;
     let out = h.run(&["sh", script.to_str().unwrap()])?;
-    if sandbox_unavailable(&out) {
-        eprintln!("skip: sandbox not available on this host");
-        return Ok(());
-    }
+    assert_child_ran(&combined(&out));
     let text = combined(&out);
-    assert!(text.contains("STARTED"), "the probe did not start:\n{text}");
+    assert!(text.contains(RAN), "the probe did not start:\n{text}");
     // Pent has exited. The marker must stop to change.
     std::thread::sleep(std::time::Duration::from_millis(600));
     let first = std::fs::read_to_string(&marker).unwrap_or_default();
@@ -642,13 +689,13 @@ fn test_background_process_does_not_outlive_pent() -> TestResult {
 /// status on.
 #[test]
 fn test_exit_status_passes_through_the_namespace() -> TestResult {
-    let h = Harness::new("sh", EMPTY_PROFILE)?;
-    let script = h.script("probe.sh", "exit 42\n")?;
-    let out = h.run(&["sh", script.to_str().unwrap()])?;
-    if sandbox_unavailable(&out) {
-        eprintln!("skip: sandbox not available on this host");
+    if skip_without_sandbox() {
         return Ok(());
     }
+    let h = Harness::new("sh", EMPTY_PROFILE)?;
+    // The exit status is the positive control: only the child can give 42.
+    let script = h.script("probe.sh", "exit 42\n")?;
+    let out = h.run(&["sh", script.to_str().unwrap()])?;
     assert_eq!(
         out.status.code(),
         Some(42),
@@ -662,14 +709,15 @@ fn test_exit_status_passes_through_the_namespace() -> TestResult {
 /// command that a signal ends must end pent with the same signal.
 #[test]
 fn test_signal_status_passes_through_the_namespace() -> TestResult {
-    use std::os::unix::process::ExitStatusExt as _;
-    let h = Harness::new("sh", EMPTY_PROFILE)?;
-    let script = h.script("probe.sh", "kill -TERM $$\nsleep 5\n")?;
-    let out = h.run(&["sh", script.to_str().unwrap()])?;
-    if sandbox_unavailable(&out) {
-        eprintln!("skip: sandbox not available on this host");
+    if skip_without_sandbox() {
         return Ok(());
     }
+    use std::os::unix::process::ExitStatusExt as _;
+    let h = Harness::new("sh", EMPTY_PROFILE)?;
+    // The signal status is the positive control: only the child can die
+    // from the signal that it sends to itself.
+    let script = h.script("probe.sh", "kill -TERM $$\nsleep 5\n")?;
+    let out = h.run(&["sh", script.to_str().unwrap()])?;
     assert_eq!(
         out.status.signal(),
         Some(libc::SIGTERM),
@@ -688,6 +736,9 @@ fn test_signal_status_passes_through_the_namespace() -> TestResult {
 /// refuses the family `AF_UNIX` already in the BPF program.
 #[test]
 fn test_unix_socket_connect_outside_profile() -> TestResult {
+    if skip_without_sandbox() {
+        return Ok(());
+    }
     let Some(py) = python3() else {
         eprintln!("skip: no python3");
         return Ok(());
@@ -705,7 +756,7 @@ fn test_unix_socket_connect_outside_profile() -> TestResult {
     let probe = h.script(
         "c.py",
         &format!(
-            "import socket\n\
+            "print('PENT_CHILD_RAN')\nimport socket\n\
              s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.settimeout(2)\n\
              try:\n    s.connect('{}'); print('CONNECTED', s.recv(32))\n\
              except Exception as e:\n    print('BLOCKED', e)\n",
@@ -713,15 +764,12 @@ fn test_unix_socket_connect_outside_profile() -> TestResult {
         ),
     )?;
     let out = h.run(&[py.to_str().unwrap(), "-I", probe.to_str().unwrap()])?;
+    assert_child_ran(&combined(&out));
     // Unblock the listener thread if the child never connected.
     if let Ok(s) = std::os::unix::net::UnixStream::connect(&sock) {
         drop(s);
     }
     handle.join().ok();
-    if sandbox_unavailable(&out) {
-        eprintln!("skip: sandbox not available on this host");
-        return Ok(());
-    }
     let text = combined(&out);
     assert!(
         !text.contains("VICTIM_SECRET"),
