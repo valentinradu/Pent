@@ -58,6 +58,12 @@ pub mod access {
     // Bits 4 to 12 are REMOVE_DIR, REMOVE_FILE, MAKE_CHAR, MAKE_DIR,
     // MAKE_REG, MAKE_SOCK, MAKE_FIFO, MAKE_BLOCK and MAKE_SYM. Pent grants
     // them only together, through `ALL`.
+    /// Remove a file from a directory. Only the policy prediction of the
+    /// recorder uses this bit by itself.
+    pub const REMOVE_FILE: u64 = 1 << 5;
+    /// Create a regular file in a directory. Only the policy prediction of
+    /// the recorder uses this bit by itself.
+    pub const MAKE_REG: u64 = 1 << 8;
     /// Link or rename a file from or to a different directory (ABI v2).
     pub const REFER: u64 = 1 << 13;
     /// Truncate a file (ABI v3).

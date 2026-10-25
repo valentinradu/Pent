@@ -52,6 +52,9 @@ mod linux_netns;
 #[cfg(target_os = "linux")]
 mod linux_overlayfs;
 
+#[cfg(target_os = "linux")]
+mod linux_watch;
+
 pub use config::{system_default_paths, SandboxConfig};
 pub use env::{build_env, resolve_path_directories, resolve_path_dirs_from};
 #[cfg(target_os = "linux")]
@@ -101,11 +104,18 @@ pub struct WatchedChild {
 /// tree into events. macOS limits the rate of the reports, so the events are
 /// a lower bound.
 ///
-/// CONTRACT STUB: the Linux recorder is not implemented yet.
+/// On Linux, a seccomp filter with user notification reports the path
+/// syscalls of the process tree to a supervisor thread, and masks in the
+/// private mount namespace of the child enforce the guard.
+///
+/// The event channel closes only after the caller reaps the last process of
+/// the tree, because a zombie still holds the seccomp filter. Call `wait()`
+/// on the child (and `teardown_overlay` when pent is a child subreaper)
+/// before you wait for the channel to close.
 ///
 /// # Errors
-/// Returns [`SandboxError::UnsupportedPlatform`] until a recorder exists for
-/// the platform, [`SandboxError::SandboxUnavailable`] on macOS if
+/// Returns [`SandboxError::UnsupportedPlatform`] on a platform without a
+/// recorder, [`SandboxError::SandboxUnavailable`] on macOS if
 /// `log stream` cannot start, or a spawn error.
 pub fn spawn_watched(
     config: &SandboxConfig,
@@ -117,7 +127,11 @@ pub fn spawn_watched(
     {
         macos::spawn_watched(config, options, cmd, args)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        linux_watch::spawn_watched(config, options, cmd, args)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = (config, options, cmd, args);
         Err(SandboxError::UnsupportedPlatform)
@@ -141,8 +155,12 @@ pub struct SandboxChild {
     /// Events that the policy denies have [`pent_profile::Outcome::Denied`].
     ///
     /// On macOS, the channel has the Seatbelt denials of the process tree.
-    /// It is `None` if `log stream` cannot start. CONTRACT STUB: Linux does
-    /// not fill this channel yet.
+    /// It is `None` if `log stream` cannot start.
+    ///
+    /// On Linux, the seccomp recorder reports each access, and the outcome is
+    /// `Denied` when the Landlock policy does not allow the access. The
+    /// channel closes only after the caller reaps the last process of the
+    /// tree.
     pub events: Option<std::sync::mpsc::Receiver<pent_profile::WatchEvent>>,
 }
 
@@ -251,13 +269,19 @@ pub fn spawn_sandboxed(
                 path_dirs.push(p);
             }
         }
-        let (child, overlay, netns) =
-            linux::spawn_with_landlock(config, cmd, args, &config.env, &path_dirs)?;
+        let spawned = linux::spawn_linux(
+            config,
+            cmd,
+            args,
+            &config.env,
+            &path_dirs,
+            linux::SpawnMode::Sandbox,
+        )?;
         Ok(SandboxChild {
-            child,
-            overlay,
-            netns,
-            events: None,
+            child: spawned.child,
+            overlay: spawned.overlay,
+            netns: spawned.netns,
+            events: spawned.events,
         })
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]

@@ -22,6 +22,11 @@
 //! control (`/run/user/<uid>`, the Docker and Podman sockets) and makes
 //! `<workspace>/.pent` read-only.
 //!
+//! Watch mode (`SpawnMode::Watch`) also creates a user namespace and a
+//! mount namespace, but applies no Landlock, no overlay and no masks. The
+//! mount namespace holds only the mounts of the watch guard (see
+//! `linux_watch.rs`).
+//!
 //! # Landlock architecture
 //!
 //! ```text
@@ -122,9 +127,9 @@ const ESCAPE_SOCKETS: &[&str] = &[
 
 /// Compute the set of paths the sandboxed process is allowed to read/execute.
 ///
-/// This mirrors the accessible set built inside `spawn_with_landlock` and is used
-/// by the filesystem trace watcher (`--no-sandbox --trace`) to determine which
-/// file opens would have been denied by the sandbox policy.
+/// The set is a part of the accessible set that `spawn_with_landlock` gives
+/// to the overlay setup. The set does not tell the access type. To predict
+/// whether the policy denies one access, the recorder uses [`AccessPolicy`].
 #[must_use]
 pub fn compute_accessible_set(config: &SandboxConfig, path_dirs: &[PathBuf]) -> HashSet<PathBuf> {
     let (_, read_expanded, execute_expanded, rw_expanded) = config.paths.expand_paths();
@@ -156,6 +161,107 @@ pub fn compute_accessible_set(config: &SandboxConfig, path_dirs: &[PathBuf]) -> 
     accessible
 }
 
+/// A destination for Landlock rules: the real ruleset, or the prediction of
+/// the recorder. Both get the same rules from `add_ruleset_rules`.
+trait RuleSink {
+    /// Grant `access` beneath `path`.
+    fn add_rule(&mut self, path: &Path, access: u64);
+}
+
+impl RuleSink for PreparedRuleset {
+    fn add_rule(&mut self, path: &Path, access: u64) {
+        self.add(path, access);
+    }
+}
+
+/// The Landlock policy of a sandbox as a list of path prefixes.
+///
+/// The seccomp recorder of `pent run --trace` sees each system call before
+/// Landlock decides. Thus the recorder predicts the decision with this
+/// policy. The policy has the same rules as the real ruleset (see
+/// `add_ruleset_rules`). Landlock binds a rule to an inode, so the policy
+/// keeps the canonical path of each rule and also the path as written.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct AccessPolicy {
+    rules: Vec<(PathBuf, u64)>,
+    /// The paths that the private mounts hide (a connection to a socket
+    /// below them fails).
+    hidden: Vec<PathBuf>,
+    /// True if a connection to an abstract Unix socket outside the sandbox
+    /// fails (a new network namespace, or the Landlock scope of ABI v6).
+    abstract_denied: bool,
+}
+
+impl RuleSink for AccessPolicy {
+    fn add_rule(&mut self, path: &Path, access: u64) {
+        // Landlock skips a rule for a path that does not exist.
+        let Ok(real) = std::fs::canonicalize(path) else {
+            return;
+        };
+        if real != path {
+            self.rules.push((path.to_path_buf(), access));
+        }
+        self.rules.push((real, access));
+    }
+}
+
+impl AccessPolicy {
+    /// Return the Landlock rights that the policy grants for `path`. Landlock
+    /// adds the rights of all rules on the path and on its ancestors.
+    fn rights(&self, path: &Path) -> u64 {
+        self.rules
+            .iter()
+            .filter(|(p, _)| path.starts_with(p))
+            .fold(0, |acc, (_, a)| acc | a)
+    }
+
+    /// Predict the result of the operation `op` on `path`. `is_dir` tells
+    /// whether the path is a directory (a read of a directory needs only
+    /// `READ_DIR`).
+    #[must_use]
+    pub(crate) fn predict(
+        &self,
+        op: pent_profile::FsOp,
+        path: &Path,
+        is_dir: bool,
+    ) -> pent_profile::Outcome {
+        use pent_profile::FsOp;
+        let (subject, needed) = match op {
+            FsOp::Read if is_dir => (path, access::READ_DIR),
+            FsOp::Read => (path, access::READ_FILE),
+            FsOp::Write if is_dir => (path, access::MAKE_REG),
+            FsOp::Write => (path, access::WRITE_FILE),
+            FsOp::Exec => (path, access::EXECUTE),
+            // Landlock checks a new or a removed entry on the parent
+            // directory.
+            FsOp::Create => (path.parent().unwrap_or(path), access::MAKE_REG),
+            FsOp::Delete => (path.parent().unwrap_or(path), access::REMOVE_FILE),
+        };
+        if self.rights(subject) & needed == needed {
+            pent_profile::Outcome::Allowed
+        } else {
+            pent_profile::Outcome::Denied
+        }
+    }
+
+    /// Predict the result of a `connect()` to the Unix socket `target` (a
+    /// path, or `@name` for an abstract socket).
+    #[must_use]
+    pub(crate) fn predict_unix(&self, target: &str) -> pent_profile::Outcome {
+        let denied = if target.starts_with('@') {
+            self.abstract_denied
+        } else {
+            let path = Path::new(target);
+            self.hidden.iter().any(|h| path.starts_with(h))
+        };
+        if denied {
+            pent_profile::Outcome::Denied
+        } else {
+            pent_profile::Outcome::Allowed
+        }
+    }
+}
+
 /// Check that Landlock is enabled and supports the minimum ABI.
 ///
 /// # Errors
@@ -171,21 +277,21 @@ pub fn check_available() -> Result<(), SandboxError> {
 ///   the overlay parent directory rule covers them).
 /// * `overlay_dirs` - directories with an overlay mount (read/write).
 fn add_ruleset_rules(
-    ruleset: &mut PreparedRuleset,
+    ruleset: &mut impl RuleSink,
     config: &SandboxConfig,
     path_dirs: &[PathBuf],
     write_set: &HashSet<PathBuf>,
     overlay_dirs: &HashSet<PathBuf>,
 ) {
-    ruleset.add(&config.workspace, access::ALL);
-    ruleset.add(&config.data_dir, access::ALL);
+    ruleset.add_rule(&config.workspace, access::ALL);
+    ruleset.add_rule(&config.data_dir, access::ALL);
     for mount in &config.mounts {
         let a = if mount.readonly {
             access::READ
         } else {
             access::ALL
         };
-        ruleset.add(&mount.path, a);
+        ruleset.add_rule(&mount.path, a);
     }
 
     // Configured SandboxPaths (from profiles and TOML config).
@@ -195,37 +301,37 @@ fn add_ruleset_rules(
     // read_write = all access rights.
     let (traversal, read, execute, rw) = config.paths.expand_paths();
     for (path, _) in &traversal {
-        ruleset.add(path, access::TRAVERSAL);
+        ruleset.add_rule(path, access::TRAVERSAL);
     }
     for (path, _) in &read {
-        ruleset.add(path, access::READ);
+        ruleset.add_rule(path, access::READ);
     }
     for (path, _) in &execute {
-        ruleset.add(path, access::EXECUTE_ONLY);
+        ruleset.add_rule(path, access::EXECUTE_ONLY);
     }
     for (path, _) in &rw {
         if !write_set.contains(path) {
-            ruleset.add(path, access::ALL);
+            ruleset.add_rule(path, access::ALL);
         }
     }
     // Overlay parent directories: inside the namespace, writes go to the
     // upper layer; the watcher of the parent flushes write-listed files.
     for dir in overlay_dirs {
-        ruleset.add(dir, access::ALL);
+        ruleset.add_rule(dir, access::ALL);
     }
     // PATH directories and system libraries: the dynamic linker must open()
     // binaries and shared libraries, so these get ReadFile too.
     for path_dir in path_dirs {
-        ruleset.add(path_dir, access::READ_EXECUTE);
+        ruleset.add_rule(path_dir, access::READ_EXECUTE);
     }
     for p in SYSTEM_PATHS {
-        ruleset.add(Path::new(p), access::READ_EXECUTE);
+        ruleset.add_rule(Path::new(p), access::READ_EXECUTE);
     }
     for p in TEMP_PATHS.iter().chain(DEV_RW_PATHS) {
-        ruleset.add(Path::new(p), access::ALL);
+        ruleset.add_rule(Path::new(p), access::ALL);
     }
     for p in DEV_READ_PATHS.iter().chain(PROC_PATHS) {
-        ruleset.add(Path::new(p), access::READ);
+        ruleset.add_rule(Path::new(p), access::READ);
     }
 }
 
@@ -533,13 +639,21 @@ struct MountPlan {
     make_private: bool,
     /// `resolv.conf` source to bind-mount over `/etc/resolv.conf`.
     resolv: Option<CString>,
-    /// Paths to bind-mount read-only onto themselves (`<workspace>/.pent`).
+    /// Paths to bind-mount read-only onto themselves (`<workspace>/.pent`,
+    /// and the write targets of the watch guard).
     readonly: Vec<CString>,
     /// Directories to hide with an empty tmpfs (`/run/user/<uid>` and the
     /// overlay staging root).
     mask_dirs: Vec<CString>,
     /// Socket files to hide with a bind mount of `/dev/null`.
     mask_files: Vec<CString>,
+    /// Directories that the watch guard hides with an empty, read-only
+    /// tmpfs.
+    guard_dirs: Vec<CString>,
+    /// Files that the watch guard hides with a read-only bind mount of
+    /// `/dev/null`. A write fails with EROFS, so that the program does not
+    /// lose data without an error.
+    guard_files: Vec<CString>,
 }
 
 fn to_cstring(path: &Path) -> Option<CString> {
@@ -668,37 +782,7 @@ impl MountPlan {
         }
 
         for path in &self.readonly {
-            // SAFETY: mount(2) with NUL-terminated strings that the parent
-            // prepared.
-            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-            let ret = unsafe {
-                libc::mount(
-                    path.as_ptr(),
-                    path.as_ptr(),
-                    std::ptr::null(),
-                    libc::MS_BIND | libc::MS_REC,
-                    std::ptr::null(),
-                )
-            };
-            if ret != 0 {
-                return Err(last_err(b"pent: bind-mount of .pent failed\n"));
-            }
-            let locked = locked_mount_flags(path)
-                .map_err(|_| last_err(b"pent: statfs of .pent failed\n"))?;
-            // SAFETY: as above.
-            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-            let ret = unsafe {
-                libc::mount(
-                    std::ptr::null(),
-                    path.as_ptr(),
-                    std::ptr::null(),
-                    libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY | locked,
-                    std::ptr::null(),
-                )
-            };
-            if ret != 0 {
-                return Err(last_err(b"pent: read-only remount of .pent failed\n"));
-            }
+            bind_readonly(path, path, libc::MS_REC)?;
         }
 
         for dir in &self.mask_dirs {
@@ -734,8 +818,73 @@ impl MountPlan {
                 return Err(last_err(b"pent: cannot hide a container socket\n"));
             }
         }
+
+        // The watch guard. The read-only bind mounts above come first, so a
+        // mask can be on a path below a read-only directory.
+        for dir in &self.guard_dirs {
+            // SAFETY: mount(2) with NUL-terminated strings.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            let ret = unsafe {
+                libc::mount(
+                    c"tmpfs".as_ptr(),
+                    dir.as_ptr(),
+                    c"tmpfs".as_ptr(),
+                    libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+                    c"size=4k,mode=0700".as_ptr().cast(),
+                )
+            };
+            if ret != 0 {
+                return Err(last_err(b"pent: the guard cannot hide a directory\n"));
+            }
+        }
+        for file in &self.guard_files {
+            bind_readonly(c"/dev/null", file, 0)?;
+        }
         Ok(())
     }
+}
+
+/// Bind-mount `src` on `dst` and make the new mount read-only. `extra` adds
+/// flags to the bind (for example `MS_REC`). Async-signal-safe.
+///
+/// # Errors
+/// Returns the OS error of the mount or of the remount.
+fn bind_readonly(
+    src: &std::ffi::CStr,
+    dst: &std::ffi::CStr,
+    extra: libc::c_ulong,
+) -> std::io::Result<()> {
+    // SAFETY: mount(2) with NUL-terminated strings that the parent prepared.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let ret = unsafe {
+        libc::mount(
+            src.as_ptr(),
+            dst.as_ptr(),
+            std::ptr::null(),
+            libc::MS_BIND | extra,
+            std::ptr::null(),
+        )
+    };
+    if ret != 0 {
+        return Err(last_err(b"pent: a read-only bind mount failed\n"));
+    }
+    let locked =
+        locked_mount_flags(dst).map_err(|_| last_err(b"pent: statfs of a bind mount failed\n"))?;
+    // SAFETY: as above.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let ret = unsafe {
+        libc::mount(
+            std::ptr::null(),
+            dst.as_ptr(),
+            std::ptr::null(),
+            libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY | locked,
+            std::ptr::null(),
+        )
+    };
+    if ret != 0 {
+        return Err(last_err(b"pent: a read-only remount failed\n"));
+    }
+    Ok(())
 }
 
 /// Everything that the `pre_exec` hook needs, prepared before `fork`.
@@ -751,8 +900,12 @@ struct ChildPlan {
     mounts: MountPlan,
     cwd: Option<CString>,
     bring_up_lo: bool,
-    /// `None` when enforcement is off (`--no-sandbox`).
+    /// Set `PR_SET_NO_NEW_PRIVS` and install the TIOCSTI filter.
+    no_new_privs: bool,
+    /// `None` when enforcement is off (`--no-sandbox`) and in watch mode.
     ruleset: Option<PreparedRuleset>,
+    /// The seccomp recorder (watch mode and `--trace`).
+    recorder: Option<crate::linux_watch::RecorderChild>,
 }
 
 impl ChildPlan {
@@ -763,7 +916,9 @@ impl ChildPlan {
     /// 2. All namespace work while `/proc/self` is still writable: unshare,
     ///    UID/GID maps, the ProxyOnly handshake, overlay and private mounts,
     ///    loopback.
-    /// 3. `PR_SET_NO_NEW_PRIVS`, the seccomp filter and Landlock last.
+    /// 3. `PR_SET_NO_NEW_PRIVS`, the seccomp filter and Landlock.
+    /// 4. The seccomp filter of the recorder as the last step: after it, the
+    ///    supervisor in the parent must answer each recorded system call.
     fn run(&self) -> std::io::Result<()> {
         // SAFETY: prctl with integer arguments only. PDEATHSIG fires when the
         // *thread* that forked exits, so `spawn_sandboxed` must run on a
@@ -849,7 +1004,7 @@ impl ChildPlan {
             bring_up_loopback()?;
         }
 
-        if let Some(ruleset) = &self.ruleset {
+        if self.no_new_privs {
             // SAFETY: prctl with integer arguments only.
             // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
@@ -859,11 +1014,20 @@ impl ChildPlan {
             // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe { crate::linux_landlock::install_tiocsti_filter() }
                 .map_err(|_| last_err(b"pent: seccomp filter failed\n"))?;
+        }
+        if let Some(ruleset) = &self.ruleset {
             // SAFETY: we are in the pre_exec hook and NO_NEW_PRIVS is set;
             // the function uses only raw system calls on prepared data.
             // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe { ruleset.apply_in_child() }
                 .map_err(|_| last_err(b"pent: Landlock restriction failed\n"))?;
+        }
+        if let Some(recorder) = &self.recorder {
+            // SAFETY: we are in the pre_exec hook and NO_NEW_PRIVS is set;
+            // the function uses only raw system calls on prepared data.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            unsafe { recorder.install_in_child() }
+                .map_err(|_| last_err(b"pent: the seccomp recorder failed\n"))?;
         }
         Ok(())
     }
@@ -937,7 +1101,9 @@ fn proxy_env(
 /// * `SandboxUnavailable` - If Landlock unavailable
 /// * `NetworkSetupFailed` / `PrivilegeRequired` - If the proxy network fails
 /// * `SpawnFailed` - If spawn fails
-#[allow(clippy::too_many_lines)]
+///
+/// Only the tests use this form; the crate calls [`spawn_linux`].
+#[cfg(test)]
 pub fn spawn_with_landlock(
     config: &SandboxConfig,
     cmd: &str,
@@ -952,10 +1118,62 @@ pub fn spawn_with_landlock(
     ),
     SandboxError,
 > {
+    let spawned = spawn_linux(config, cmd, args, env, path_dirs, SpawnMode::Sandbox)?;
+    Ok((spawned.child, spawned.overlay, spawned.netns))
+}
+
+/// The kind of a Linux spawn.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum SpawnMode<'a> {
+    /// The sandbox: Landlock (unless `no_enforcement`), the overlay and the
+    /// masks. The recorder runs next to it when `config.record_events` is
+    /// set.
+    Sandbox,
+    /// Watch mode: no Landlock, no overlay and no masks. The child gets the
+    /// mounts of the watch guard, and the recorder always runs.
+    Watch(&'a crate::linux_watch::GuardPlan),
+}
+
+/// The result of [`spawn_linux`].
+pub(crate) struct Spawned {
+    /// The child process.
+    pub child: std::process::Child,
+    /// The overlay handle (only with enforcement and write-listed files).
+    pub overlay: Option<super::linux_overlayfs::OverlayHandle>,
+    /// The network namespace handle for `ProxyOnly`.
+    pub netns: Option<super::linux_netns::NetnsHandle>,
+    /// The events of the recorder, if it runs.
+    pub events: Option<std::sync::mpsc::Receiver<pent_profile::WatchEvent>>,
+}
+
+/// Spawn `cmd` for the sandbox or for watch mode (see [`SpawnMode`]).
+///
+/// The child gets `PR_SET_PDEATHSIG(SIGKILL)`. Call this function on a thread
+/// that lives as long as the child.
+///
+/// # Errors
+/// * `SandboxUnavailable` - If Landlock is unavailable (sandbox mode)
+/// * `NetworkSetupFailed` / `PrivilegeRequired` - If the proxy network fails
+/// * `SpawnFailed` - If the spawn or the recorder setup fails
+#[allow(clippy::too_many_lines)]
+pub(crate) fn spawn_linux(
+    config: &SandboxConfig,
+    cmd: &str,
+    args: &[String],
+    env: &std::collections::HashMap<String, String>,
+    path_dirs: &[PathBuf],
+    mode: SpawnMode<'_>,
+) -> Result<Spawned, SandboxError> {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
-    let enforce = !config.no_enforcement;
+    let guard = match mode {
+        SpawnMode::Sandbox => None,
+        SpawnMode::Watch(plan) => Some(plan),
+    };
+    let watch = guard.is_some();
+    let enforce = !watch && !config.no_enforcement;
+    let record = watch || config.record_events;
 
     // Identify write-listed file paths (as opposed to directories) and prepare
     // overlayfs staging directories for them. Directories use regular Landlock
@@ -1067,7 +1285,7 @@ pub fn spawn_with_landlock(
         NetworkMode::Unrestricted => 0,
         _ => libc::CLONE_NEWNET,
     };
-    let unshare_flags = if enforce {
+    let unshare_flags = if enforce || watch {
         libc::CLONE_NEWUSER | libc::CLONE_NEWNS | net_flag
     } else if net_flag != 0 {
         let ns = if proxy_netns.is_some() {
@@ -1090,12 +1308,24 @@ pub fn spawn_with_landlock(
         resolv: resolv_src.as_deref().and_then(to_cstring),
         ..MountPlan::default()
     };
+    // The masks also tell the recorder which sockets the policy hides.
+    let (mut mask_dirs, mask_files) = mask_targets(config, uid);
+    if let Some(plan) = guard {
+        mounts
+            .readonly
+            .extend(plan.ro_binds.iter().filter_map(|p| to_cstring(p)));
+        mounts
+            .guard_dirs
+            .extend(plan.mask_dirs.iter().filter_map(|p| to_cstring(p)));
+        mounts
+            .guard_files
+            .extend(plan.mask_files.iter().filter_map(|p| to_cstring(p)));
+    }
     if enforce {
         let dot_pent = config.workspace.join(".pent");
         if dot_pent.exists() {
             mounts.readonly.extend(to_cstring(&dot_pent));
         }
-        let (mut mask_dirs, mask_files) = mask_targets(config, uid);
         // Hide the overlay staging root. The child can write to /tmp, and the
         // staging root holds the stub layers that hide the files which are
         // not on the allowlist. If the child deletes a whiteout there, the
@@ -1126,6 +1356,26 @@ pub fn spawn_with_landlock(
         None
     };
 
+    // The recorder. The supervisor thread starts before `spawn`: the child
+    // sends the listener file descriptor during `spawn`, and its `execve`
+    // waits for an answer from the supervisor.
+    let recorder = if record {
+        let judge = match guard {
+            Some(plan) => crate::linux_watch::Judge::Guard(plan.effective.clone()),
+            None => {
+                let mut policy = AccessPolicy::default();
+                add_ruleset_rules(&mut policy, config, path_dirs, &write_set, &overlay_dirs);
+                policy.hidden = mask_dirs.iter().chain(&mask_files).cloned().collect();
+                policy.abstract_denied = net_flag != 0
+                    || (enforce && crate::linux_landlock::abi_version().is_ok_and(|abi| abi >= 6));
+                crate::linux_watch::Judge::Policy(policy)
+            }
+        };
+        Some(crate::linux_watch::start_recorder(judge)?)
+    } else {
+        None
+    };
+
     let plan = ChildPlan {
         // The PID fits in pid_t: the kernel limit is 2^22.
         #[allow(clippy::cast_possible_wrap)]
@@ -1145,7 +1395,9 @@ pub fn spawn_with_landlock(
             None
         },
         bring_up_lo: config.network == NetworkMode::LocalhostOnly,
+        no_new_privs: ruleset.is_some() || recorder.is_some(),
         ruleset,
+        recorder: recorder.as_ref().map(|r| r.child.clone()),
     };
 
     let effective_env = match (&config.network, &proxy_netns) {
@@ -1210,6 +1462,9 @@ pub fn spawn_with_landlock(
     // before the handshake.
     drop(command);
     drop(parent_ends);
+    // Drop the parent copy of the socket end of the child. The supervisor
+    // then sees EOF if the child died before it sent the listener.
+    let events = recorder.map(crate::linux_watch::RecorderSetup::into_events);
 
     let helper_result = match helper {
         Some(h) => h.join().map_err(|_| {
@@ -1238,7 +1493,12 @@ pub fn spawn_with_landlock(
         ))
     };
 
-    Ok((child, overlay_handle, proxy_netns))
+    Ok(Spawned {
+        child,
+        overlay: overlay_handle,
+        netns: proxy_netns,
+        events,
+    })
 }
 
 #[cfg(test)]
@@ -3100,5 +3360,64 @@ mod tests {
         v.push(PathBuf::from("/usr/bin"));
         v.push(PathBuf::from("/bin"));
         v
+    }
+
+    #[test]
+    fn access_policy_predicts_landlock() -> TestResult {
+        use pent_profile::{FsOp, Outcome};
+        let dirs = make_test_dirs();
+        let mut config = SandboxConfig::new(
+            dirs.workspace.clone(),
+            SandboxPaths {
+                traversal: vec!["/".to_string()],
+                read: vec!["/etc".to_string()],
+                execute: Vec::new(),
+                read_write: Vec::new(),
+            },
+            dirs.workspace.clone(),
+        );
+        config.data_dir = dirs.data_dir.clone();
+        let mut policy = AccessPolicy::default();
+        add_ruleset_rules(&mut policy, &config, &[], &HashSet::new(), &HashSet::new());
+        let ws = std::fs::canonicalize(&dirs.workspace)?;
+        let allowed = Outcome::Allowed;
+        let denied = Outcome::Denied;
+        assert_eq!(
+            policy.predict(FsOp::Read, Path::new("/etc/passwd"), false),
+            allowed
+        );
+        assert_eq!(
+            policy.predict(FsOp::Write, Path::new("/etc/passwd"), false),
+            denied
+        );
+        assert_eq!(
+            policy.predict(FsOp::Create, Path::new("/etc/new"), false),
+            denied
+        );
+        assert_eq!(
+            policy.predict(FsOp::Create, &ws.join("new"), false),
+            allowed
+        );
+        assert_eq!(
+            policy.predict(FsOp::Delete, &ws.join("old"), false),
+            allowed
+        );
+        // The traversal grant on / allows a directory listing, not a read.
+        assert_eq!(policy.predict(FsOp::Read, Path::new("/var"), true), allowed);
+        assert_eq!(
+            policy.predict(FsOp::Read, Path::new("/var/x"), false),
+            denied
+        );
+        assert_eq!(
+            policy.predict(FsOp::Exec, Path::new("/var/x"), false),
+            denied
+        );
+        policy.hidden = vec![PathBuf::from("/run/user/1000")];
+        assert_eq!(policy.predict_unix("/run/user/1000/bus"), denied);
+        assert_eq!(policy.predict_unix("/tmp/x.sock"), allowed);
+        assert_eq!(policy.predict_unix("@abstract"), allowed);
+        policy.abstract_denied = true;
+        assert_eq!(policy.predict_unix("@abstract"), denied);
+        Ok(())
     }
 }
