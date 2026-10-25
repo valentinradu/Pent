@@ -78,47 +78,23 @@ jobs:
       - name: Build
         run: cargo build --workspace --tests
 
-      # TEMPORARY. The last round showed that `sh -c 'cat FILE'` makes
-      # no child: the shell runs `cat` with the process ID of the root.
-      # This round holds the two cases apart. The step runs the test of
-      # MAC-10 alone and then two watch commands by hand: one that runs
-      # `cat` in place and one that forks for it. The step never fails.
-      # Remove it when MAC-10 has a verdict.
+      # TEMPORARY. The test of MAC-10 shows an empty raw log, and the
+      # same command by hand records 27 accesses. The report of the test
+      # now holds the summary of the run and the listing of the directory
+      # of the runs, which tells the two causes apart. The step never
+      # fails. Remove it when MAC-10 has a verdict.
       - name: Probe the open macOS findings
         if: runner.os == 'macOS'
         run: |
           set +e
-          echo "=== PROBE the test of MAC-10 alone ==="
-          cargo test -p pent --test e2e_macos -- --include-ignored --exact \
-            macos::watch_records_a_read_of_a_short_lived_child \
-            --test-threads=1 --nocapture
-          echo "=== PROBE RESULT MAC-10 alone: exit=$? ==="
-          PENTBIN=$(cargo build -p pent --message-format=json 2>/dev/null \
-            | /usr/bin/sed -n 's/.*"executable":"\([^"]*\/pent\)".*/\1/p' | tail -1)
-          echo "pent is [$PENTBIN]"
-          probe_run() {
-            name=$1
-            shift
-            H=$(cd "$(mktemp -d)" && pwd -P)
-            mkdir -p "$H/home" "$H/ws"
-            printf 'foo\n' > "$H/home/.foorc"
-            echo "=== RUN $name: $* ==="
-            ( cd "$H/ws" && HOME="$H/home" XDG_CONFIG_HOME="$H/cfg" \
-              XDG_STATE_HOME="$H/state" "$PENTBIN" watch --yes \
-              --profile "$name" -- "$@" 2>&1 | cut -c1-200 )
-            echo "--- draft $name ---"
-            cat "$H/state/pent/drafts/$name.toml" 2>&1
-            echo "--- the process IDs and the names of the raw events ---"
-            cat "$H/state/pent/watch/$name/"* 2>&1 \
-              | /usr/bin/sed -n 's/.*"pid":\([0-9]*\),"name":"\([^"]*\)".*/\1 \2/p' \
-              | sort | uniq -c
-            echo "--- the events that name .foorc ---"
-            cat "$H/state/pent/watch/$name/"* 2>&1 | grep -a foorc | cut -c1-200
-            echo "=== END $name ==="
+          probe() {
+            echo "=== PROBE $2 ==="
+            cargo test -p pent --test "$1" -- --include-ignored --exact "$2" \
+              --test-threads=1 --nocapture
+            echo "=== PROBE RESULT $2: exit=$? ==="
           }
-          probe_run p1 /bin/sh -c 'cat ~/.foorc'
-          probe_run p2 /bin/sh -c 'cat ~/.foorc; echo END'
-          probe_run p3 /bin/sh -c 'read -r l < ~/.foorc; echo "$l"'
+          probe e2e_macos macos::watch_records_a_read_of_a_short_lived_child
+          probe e2e_macos macos::watch_records_a_read_of_a_known_file
           exit 0
 
       # The whole workspace, in debug. The macOS suites (e2e_macos,

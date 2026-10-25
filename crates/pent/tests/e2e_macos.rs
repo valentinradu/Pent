@@ -86,9 +86,28 @@ mod macos {
     }
 
     /// The text that a failed assertion of a watch test prints.
+    ///
+    /// The report holds three things, and each one tells a different
+    /// cause apart: the draft, the raw events of the run, and the
+    /// listing of the directory of the runs. An empty raw log with no
+    /// file means that pent never started a run; an empty raw log with a
+    /// file of zero bytes means that the reader got no report; a raw log
+    /// with events and no rule means that the summary dropped them.
     fn watch_report(env: &TestEnv, name: &str, draft: &str) -> String {
+        let dir = env.watch_dir(name);
+        let listing = match fs::read_dir(&dir) {
+            Ok(entries) => entries
+                .filter_map(Result::ok)
+                .map(|e| {
+                    let size = e.metadata().map_or(0, |m| m.len());
+                    format!("  {} ({size} bytes)\n", e.path().display())
+                })
+                .collect::<String>(),
+            Err(e) => format!("  cannot read {}: {e}\n", dir.display()),
+        };
         format!(
-            "--- draft {} ---\n{draft}\n--- raw watch events ---\n{}",
+            "--- draft {} ---\n{draft}\n--- the runs of {name} ---\n{listing}\
+             --- raw watch events ---\n{}",
             env.draft_path(name).display(),
             env.watch_events(name)
         )
@@ -472,7 +491,9 @@ mod macos {
         let read_write = rules(&draft, "filesystem", "read_write")?;
         assert!(
             read.contains("~/.foorc") || read_write.contains("~/.foorc"),
-            "the recorder lost the read of the child process\n{}",
+            "the recorder lost the read of the child process\n\
+             --- the summary of the run ---\n{}\n{}",
+            stderr(&out),
             watch_report(&env, "c", &draft)
         );
         Ok(())
