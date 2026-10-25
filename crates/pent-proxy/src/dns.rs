@@ -6,7 +6,11 @@
 //! # Protocol Support
 //!
 //! - UDP DNS (standard port 53 or custom)
-//! - IPv4 and IPv6 resolution
+//! - All query types. The server forwards the query type of the client to
+//!   the upstream server (A, AAAA, CNAME, TXT, MX, HTTPS, SVCB and others)
+//!   and returns the upstream answer. Zone transfers (AXFR, IXFR) get
+//!   NOTIMP.
+//! - Exactly one question per query. Other queries get FORMERR.
 //!
 //! # Resolution Flow
 //!
@@ -16,22 +20,85 @@
 //!      v
 //! DomainFilter::matches(domain)?
 //!      |
-//!      +-- yes --> Resolve via upstream DNS
+//!      +-- yes --> Forward the query (same QTYPE) to upstream DNS
 //!      |                 |
 //!      |                 v
-//!      |           Cache result in ResolutionCache
+//!      |           Clamp TTLs; cache A/AAAA answers in ResolutionCache
 //!      |                 |
 //!      |                 v
-//!      |           Return A/AAAA records
+//!      |           Return the upstream answer
 //!      |
 //!      +-- no --> Return NXDOMAIN
 //! ```
 //!
 
-use crate::{ProxyError, Result, SharedState};
-use std::net::SocketAddr;
+use crate::{normalize_hostname, ProxyError, Result, SharedState};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{debug, warn};
+
+/// DNS header length.
+const HEADER_LEN: usize = 12;
+
+/// The receive buffer size for client queries and upstream responses.
+const UDP_BUFFER_LEN: usize = 4096;
+
+/// The maximum length of a domain name in wire format.
+const MAX_WIRE_NAME_LEN: usize = 255;
+
+/// The maximum number of compression pointers that a name can follow.
+const MAX_POINTER_HOPS: usize = 32;
+
+/// Header flag: the message is a response.
+const FLAG_QR: u8 = 0x80;
+/// Header flag: the response is truncated.
+const FLAG_TC: u8 = 0x02;
+/// Header flag: recursion desired.
+const FLAG_RD: u8 = 0x01;
+/// Header flag (second byte): recursion available.
+const FLAG_RA: u8 = 0x80;
+
+/// Response codes.
+mod rcode {
+    pub(super) const NOERROR: u8 = 0;
+    pub(super) const FORMERR: u8 = 1;
+    pub(super) const SERVFAIL: u8 = 2;
+    pub(super) const NXDOMAIN: u8 = 3;
+    pub(super) const NOTIMP: u8 = 4;
+}
+
+/// Record types that the server handles in a special way.
+mod rtype {
+    pub(super) const A: u16 = 1;
+    pub(super) const AAAA: u16 = 28;
+    pub(super) const OPT: u16 = 41;
+    pub(super) const IXFR: u16 = 251;
+    pub(super) const AXFR: u16 = 252;
+}
+
+/// The class IN.
+const CLASS_IN: u16 = 1;
+
+/// The text name of a record type, for log and trace messages.
+fn qtype_name(qtype: u16) -> String {
+    let name = match qtype {
+        1 => "A",
+        2 => "NS",
+        5 => "CNAME",
+        6 => "SOA",
+        12 => "PTR",
+        15 => "MX",
+        16 => "TXT",
+        28 => "AAAA",
+        33 => "SRV",
+        64 => "SVCB",
+        65 => "HTTPS",
+        255 => "ANY",
+        other => return format!("TYPE{other}"),
+    };
+    name.to_string()
+}
 
 /// Configuration for the DNS server.
 #[derive(Debug, Clone)]
@@ -47,14 +114,30 @@ pub struct DnsServerConfig {
     /// Set explicitly to override system resolvers.
     pub upstream: Option<Vec<SocketAddr>>,
 
-    /// DNS response TTL.
-    /// Used for caching and client-side caching hints.
+    /// Maximum TTL.
+    ///
+    /// The server uses the upstream TTL, but not more than this value, for
+    /// the TTLs in the response and for the expiry of the IP-to-domain
+    /// cache.
     /// Default: 5 minutes
-    pub ttl: std::time::Duration,
+    pub ttl: Duration,
+
+    /// Minimum TTL.
+    ///
+    /// The server increases a shorter upstream TTL to this value, so that
+    /// the cache does not change too frequently. `ttl` has priority if it is
+    /// smaller.
+    /// Default: 30 seconds
+    pub min_ttl: Duration,
 
     /// Per-upstream timeout when resolving a query.
     /// Default: 5 seconds
-    pub resolve_timeout: std::time::Duration,
+    pub resolve_timeout: Duration,
+
+    /// Maximum number of client queries that the server handles at the same
+    /// time. One slow upstream query does not block the other queries.
+    /// Default: 256
+    pub max_concurrent_queries: usize,
 }
 
 impl Default for DnsServerConfig {
@@ -64,8 +147,10 @@ impl Default for DnsServerConfig {
         Self {
             bind_addr: LOCALHOST_ANY,
             upstream: None, // Use system resolvers
-            ttl: std::time::Duration::from_secs(300),
-            resolve_timeout: std::time::Duration::from_secs(5),
+            ttl: Duration::from_secs(300),
+            min_ttl: Duration::from_secs(30),
+            resolve_timeout: Duration::from_secs(5),
+            max_concurrent_queries: 256,
         }
     }
 }
@@ -84,7 +169,6 @@ impl DnsServerConfig {
         // Try to read system DNS configuration
         Self::read_system_resolvers().unwrap_or_else(|| {
             // Fallback to well-known public DNS
-            use std::net::{IpAddr, Ipv4Addr, SocketAddr};
             const CLOUDFLARE: SocketAddr =
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53);
             const GOOGLE: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53);
@@ -98,20 +182,20 @@ impl DnsServerConfig {
         let resolvers: Vec<SocketAddr> = content
             .lines()
             .filter_map(|line| {
-                let line = line.trim();
-                if line.starts_with("nameserver") {
-                    let parts: Vec<&str> = line.split_whitespace().collect();
-                    if parts.len() >= 2 {
-                        // Parse IP and add default DNS port 53
-                        parts[1]
-                            .parse::<std::net::IpAddr>()
-                            .ok()
-                            .map(|ip| SocketAddr::new(ip, 53))
-                    } else {
+                let mut parts = line.split_whitespace();
+                if parts.next() != Some("nameserver") {
+                    return None;
+                }
+                let entry = parts.next()?;
+                // Remove a zone index such as "fe80::1%eth0": the parser
+                // does not accept it.
+                let ip_text = entry.split('%').next().unwrap_or(entry);
+                match ip_text.parse::<IpAddr>() {
+                    Ok(ip) => Some(SocketAddr::new(ip, 53)),
+                    Err(_) => {
+                        warn!(nameserver = %entry, "skip the nameserver entry that is not an IP address");
                         None
                     }
-                } else {
-                    None
                 }
             })
             .collect();
@@ -122,6 +206,302 @@ impl DnsServerConfig {
             Some(resolvers)
         }
     }
+
+    /// The TTL bounds in seconds: `(min, max)`.
+    fn ttl_bounds(&self) -> (u32, u32) {
+        let max = u32::try_from(self.ttl.as_secs()).unwrap_or(u32::MAX);
+        let min = u32::try_from(self.min_ttl.as_secs()).unwrap_or(u32::MAX);
+        (min, max)
+    }
+}
+
+/// Clamp a TTL to the bounds. The maximum has priority over the minimum.
+fn clamp_ttl(ttl: u32, (min, max): (u32, u32)) -> u32 {
+    ttl.max(min).min(max)
+}
+
+/// An error in a DNS message.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+enum WireError {
+    #[error("the message is too short")]
+    Truncated,
+    #[error("a label length byte uses the reserved bits 0x40 or 0x80")]
+    ReservedLabelType,
+    #[error("a compression pointer is not permitted here")]
+    UnexpectedPointer,
+    #[error("a compression pointer does not point backward")]
+    BadPointer,
+    #[error("a label contains a dot or a byte that is not printable ASCII")]
+    BadLabelByte,
+    #[error("the name is longer than 255 bytes")]
+    NameTooLong,
+    #[error("the upstream response does not match the query")]
+    Mismatch,
+}
+
+/// Read a big-endian `u16` at `pos`.
+fn read_u16(msg: &[u8], pos: usize) -> std::result::Result<u16, WireError> {
+    match msg.get(pos..pos.saturating_add(2)) {
+        Some([a, b]) => Ok(u16::from_be_bytes([*a, *b])),
+        _ => Err(WireError::Truncated),
+    }
+}
+
+/// Read a big-endian `u32` at `pos`.
+fn read_u32(msg: &[u8], pos: usize) -> std::result::Result<u32, WireError> {
+    match msg.get(pos..pos.saturating_add(4)) {
+        Some([a, b, c, d]) => Ok(u32::from_be_bytes([*a, *b, *c, *d])),
+        _ => Err(WireError::Truncated),
+    }
+}
+
+/// How to treat compression pointers in a name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pointers {
+    /// Pointers are not permitted (a name in the question of a query).
+    Forbidden,
+    /// Pointers are permitted (names in a response).
+    Allowed,
+}
+
+/// How to treat the bytes of a label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LabelBytes {
+    /// Accept only printable ASCII without `.` (names that the server uses).
+    Strict,
+    /// Accept all bytes (owner names of records that the server skips).
+    Any,
+}
+
+/// Read a domain name at `start`.
+///
+/// Returns the name in text form (labels joined with `.`) and the position
+/// after the name in the message.
+fn read_name(
+    msg: &[u8],
+    start: usize,
+    pointers: Pointers,
+    bytes: LabelBytes,
+) -> std::result::Result<(String, usize), WireError> {
+    let mut pos = start;
+    let mut after: Option<usize> = None;
+    let mut hops = 0usize;
+    let mut wire_len = 0usize;
+    let mut labels: Vec<String> = Vec::new();
+
+    loop {
+        let len_byte = *msg.get(pos).ok_or(WireError::Truncated)?;
+        match len_byte >> 6 {
+            0b00 => {
+                let len = usize::from(len_byte);
+                wire_len = wire_len.saturating_add(len).saturating_add(1);
+                if wire_len > MAX_WIRE_NAME_LEN {
+                    return Err(WireError::NameTooLong);
+                }
+                if len == 0 {
+                    pos = pos.saturating_add(1);
+                    break;
+                }
+                let first = pos.saturating_add(1);
+                let label = msg
+                    .get(first..first.saturating_add(len))
+                    .ok_or(WireError::Truncated)?;
+                if bytes == LabelBytes::Strict
+                    && label.iter().any(|b| *b == b'.' || !b.is_ascii_graphic())
+                {
+                    return Err(WireError::BadLabelByte);
+                }
+                labels.push(String::from_utf8_lossy(label).into_owned());
+                pos = first.saturating_add(len);
+            }
+            0b11 => {
+                if pointers == Pointers::Forbidden {
+                    return Err(WireError::UnexpectedPointer);
+                }
+                let low = *msg.get(pos.saturating_add(1)).ok_or(WireError::Truncated)?;
+                let target = (usize::from(len_byte & 0x3F) << 8) | usize::from(low);
+                if after.is_none() {
+                    after = Some(pos.saturating_add(2));
+                }
+                hops = hops.saturating_add(1);
+                if target >= pos || hops > MAX_POINTER_HOPS {
+                    return Err(WireError::BadPointer);
+                }
+                pos = target;
+            }
+            _ => return Err(WireError::ReservedLabelType),
+        }
+    }
+
+    Ok((labels.join("."), after.unwrap_or(pos)))
+}
+
+/// The parsed question of a query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Question {
+    /// The name as the client sent it (labels joined with `.`).
+    name: String,
+    qtype: u16,
+    qclass: u16,
+    /// The position after the question in the message.
+    end: usize,
+}
+
+/// Read the question at offset 12.
+fn read_question(msg: &[u8], pointers: Pointers) -> std::result::Result<Question, WireError> {
+    let (name, pos) = read_name(msg, HEADER_LEN, pointers, LabelBytes::Strict)?;
+    let qtype = read_u16(msg, pos)?;
+    let qclass = read_u16(msg, pos.saturating_add(2))?;
+    Ok(Question {
+        name,
+        qtype,
+        qclass,
+        end: pos.saturating_add(4),
+    })
+}
+
+/// The useful parts of an upstream response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UpstreamReply {
+    /// The response, with the TTLs clamped.
+    message: Vec<u8>,
+    /// The response code.
+    rcode: u8,
+    /// The A and AAAA addresses in the answer section.
+    addresses: Vec<IpAddr>,
+    /// The smallest clamped TTL of the address records, in seconds.
+    address_ttl: Option<u32>,
+}
+
+/// Check an upstream response against the query, clamp all the TTLs in it,
+/// and collect the addresses in the answer section.
+fn process_upstream_response(
+    mut message: Vec<u8>,
+    expected_id: u16,
+    name: &str,
+    qtype: u16,
+    bounds: (u32, u32),
+) -> std::result::Result<UpstreamReply, WireError> {
+    if message.len() < HEADER_LEN {
+        return Err(WireError::Truncated);
+    }
+    let id = read_u16(&message, 0)?;
+    let flags = *message.get(2).ok_or(WireError::Truncated)?;
+    let rcode = *message.get(3).ok_or(WireError::Truncated)? & 0x0F;
+    if id != expected_id || flags & FLAG_QR == 0 || read_u16(&message, 4)? != 1 {
+        return Err(WireError::Mismatch);
+    }
+    let question = read_question(&message, Pointers::Allowed)?;
+    if !question.name.eq_ignore_ascii_case(name)
+        || question.qtype != qtype
+        || question.qclass != CLASS_IN
+    {
+        return Err(WireError::Mismatch);
+    }
+
+    let ancount = usize::from(read_u16(&message, 6)?);
+    let nscount = usize::from(read_u16(&message, 8)?);
+    let arcount = usize::from(read_u16(&message, 10)?);
+    let total = ancount.saturating_add(nscount).saturating_add(arcount);
+
+    let mut addresses = Vec::new();
+    let mut address_ttl: Option<u32> = None;
+    let mut pos = question.end;
+    for index in 0..total {
+        let (_, after_name) = read_name(&message, pos, Pointers::Allowed, LabelBytes::Any)?;
+        let rr_type = read_u16(&message, after_name)?;
+        let ttl_pos = after_name.saturating_add(4);
+        let ttl = read_u32(&message, ttl_pos)?;
+        let rdlen = usize::from(read_u16(&message, after_name.saturating_add(8))?);
+        let rdata_start = after_name.saturating_add(10);
+        let rdata = message
+            .get(rdata_start..rdata_start.saturating_add(rdlen))
+            .ok_or(WireError::Truncated)?;
+
+        // The TTL field of an OPT record holds flags, not a TTL.
+        let clamped = clamp_ttl(ttl, bounds);
+        if index < ancount {
+            let address = match (rr_type, rdata.len()) {
+                (rtype::A, 4) => <[u8; 4]>::try_from(rdata)
+                    .ok()
+                    .map(|o| IpAddr::V4(Ipv4Addr::from(o))),
+                (rtype::AAAA, 16) => <[u8; 16]>::try_from(rdata)
+                    .ok()
+                    .map(|o| IpAddr::V6(Ipv6Addr::from(o))),
+                _ => None,
+            };
+            if let Some(address) = address {
+                addresses.push(address);
+                address_ttl = Some(address_ttl.map_or(clamped, |t| t.min(clamped)));
+            }
+        }
+        if rr_type != rtype::OPT {
+            if let Some(field) = message.get_mut(ttl_pos..ttl_pos.saturating_add(4)) {
+                field.copy_from_slice(&clamped.to_be_bytes());
+            }
+        }
+        pos = rdata_start.saturating_add(rdlen);
+    }
+    message.truncate(pos);
+
+    Ok(UpstreamReply {
+        message,
+        rcode,
+        addresses,
+        address_ttl,
+    })
+}
+
+/// Make a transaction ID that a remote host cannot easily guess.
+fn random_id() -> u16 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos()),
+    );
+    let [a, b, ..] = hasher.finish().to_le_bytes();
+    u16::from_le_bytes([a, b])
+}
+
+/// Build a query for `name` and `qtype` with the transaction ID `id`.
+fn build_dns_query(id: u16, name: &str, qtype: u16) -> Vec<u8> {
+    let mut query = Vec::with_capacity(HEADER_LEN.saturating_add(name.len()).saturating_add(6));
+    query.extend_from_slice(&id.to_be_bytes());
+    query.extend_from_slice(&[FLAG_RD, 0x00]); // Standard query, recursion desired
+    query.extend_from_slice(&[0x00, 0x01]); // QDCOUNT: 1
+    query.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]); // AN, NS, AR
+    for label in name.split('.').filter(|l| !l.is_empty()) {
+        // normalize_hostname limits a label to 63 bytes.
+        query.push(u8::try_from(label.len()).unwrap_or(63));
+        query.extend_from_slice(label.as_bytes());
+    }
+    query.push(0); // Root label
+    query.extend_from_slice(&qtype.to_be_bytes());
+    query.extend_from_slice(&CLASS_IN.to_be_bytes());
+    query
+}
+
+/// Build a response without answers, with the response code `code`.
+///
+/// If `question_end` is `Some`, the response repeats the question of the
+/// query; otherwise its QDCOUNT is 0.
+fn build_error_response(query: &[u8], question_end: Option<usize>, code: u8) -> Vec<u8> {
+    let mut response = Vec::with_capacity(query.len().max(HEADER_LEN));
+    response.extend_from_slice(query.get(..2).unwrap_or(&[0, 0])); // ID
+    let rd = query.get(2).map_or(0, |f| f & FLAG_RD);
+    let opcode = query.get(2).map_or(0, |f| f & 0x78);
+    response.push(FLAG_QR | opcode | rd);
+    response.push(FLAG_RA | (code & 0x0F));
+    let question = question_end.and_then(|end| query.get(HEADER_LEN..end));
+    let qdcount: u16 = u16::from(question.is_some());
+    response.extend_from_slice(&qdcount.to_be_bytes());
+    response.extend_from_slice(&[0, 0, 0, 0, 0, 0]); // AN, NS, AR
+    if let Some(question) = question {
+        response.extend_from_slice(question);
+    }
+    response
 }
 
 /// DNS server that filters queries by domain allowlist.
@@ -134,10 +514,15 @@ pub struct DnsServer {
 
     /// Shared state with domain filter and resolution cache.
     state: Arc<SharedState>,
+
+    /// The upstream servers, read once at creation.
+    upstreams: Arc<[SocketAddr]>,
 }
 
 impl DnsServer {
     /// Create a new DNS server.
+    ///
+    /// Reads the upstream servers once (see [`DnsServerConfig::get_upstream`]).
     ///
     /// # Arguments
     /// * `config` - Server configuration
@@ -146,9 +531,13 @@ impl DnsServer {
     /// # Errors
     /// Currently infallible; always returns `Ok`. The `Result` return type
     /// is present for forward compatibility.
-    #[allow(clippy::missing_const_for_fn)] // Arc<T> cannot be used in const fn yet
     pub fn new(config: DnsServerConfig, state: Arc<SharedState>) -> Result<Self> {
-        Ok(Self { config, state })
+        let upstreams = config.get_upstream().into();
+        Ok(Self {
+            config,
+            state,
+            upstreams,
+        })
     }
 
     /// Start the DNS server.
@@ -178,61 +567,79 @@ impl DnsServer {
     /// Used by [`crate::ProxyServer::start`] which pre-binds the socket to
     /// obtain the actual OS-assigned port before spawning the server task.
     ///
+    /// The server handles each query in its own task, with at most
+    /// `max_concurrent_queries` tasks at the same time. The tasks belong to
+    /// this future: when the caller drops the future, the tasks stop.
+    ///
     /// # Errors
     /// * `Err(ProxyError::Internal)` - Server error
     pub async fn run_on(&self, socket: tokio::net::UdpSocket) -> Result<()> {
-        let mut buf = [0u8; 512]; // Standard DNS UDP packet size
+        let socket = Arc::new(socket);
+        let worker = Arc::new(Self {
+            config: self.config.clone(),
+            state: Arc::clone(&self.state),
+            upstreams: Arc::clone(&self.upstreams),
+        });
+        let limit = Arc::new(tokio::sync::Semaphore::new(
+            self.config.max_concurrent_queries.max(1),
+        ));
+        let mut tasks = tokio::task::JoinSet::new();
+        let mut buf = vec![0u8; UDP_BUFFER_LEN];
 
         loop {
-            let (len, src) = match socket.recv_from(&mut buf).await {
-                Ok(result) => result,
-                Err(e) => {
-                    // Log error but continue serving
-                    warn!(error = %e, "DNS recv error");
+            let (len, src) = tokio::select! {
+                received = socket.recv_from(&mut buf) => match received {
+                    Ok(result) => result,
+                    Err(e) => {
+                        // Log error but continue serving
+                        warn!(error = %e, "DNS recv error");
+                        continue;
+                    }
+                },
+                Some(finished) = tasks.join_next(), if !tasks.is_empty() => {
+                    if let Err(e) = finished {
+                        if e.is_panic() {
+                            warn!(error = %e, "DNS query task panicked");
+                        }
+                    }
                     continue;
                 }
             };
 
-            let query = &buf[..len];
-            match self.handle_query(query).await {
-                Ok(response) => {
-                    if let Err(e) = socket.send_to(&response, src).await {
-                        warn!(error = %e, "DNS send error");
-                    }
-                }
-                Err(e) => {
-                    debug!(error = %e, "DNS query handling error");
-                    // Send SERVFAIL response on error; if this send fails the client will
-                    // time out naturally, so the error is intentionally discarded.
-                    let response = Self::build_servfail_response(query);
-                    let _ = socket.send_to(&response, src).await;
-                }
+            let query = buf.get(..len).unwrap_or_default().to_vec();
+            // Ignore responses: an answer to a response can cause a loop.
+            if query.get(2).is_some_and(|flags| flags & FLAG_QR != 0) {
+                continue;
             }
+
+            let permit = Arc::clone(&limit)
+                .acquire_owned()
+                .await
+                .map_err(|e| ProxyError::Internal(format!("DNS query limiter closed: {e}")))?;
+            let worker = Arc::clone(&worker);
+            let socket = Arc::clone(&socket);
+            tasks.spawn(async move {
+                let _permit = permit;
+                let response = match worker.handle_query(&query).await {
+                    Ok(response) => response,
+                    Err(e) => {
+                        debug!(error = %e, "DNS query handling error");
+                        Self::build_servfail_response(&query)
+                    }
+                };
+                if let Err(e) = socket.send_to(&response, src).await {
+                    warn!(error = %e, "DNS send error");
+                }
+            });
         }
     }
 
     /// Build a SERVFAIL response for internal errors.
     fn build_servfail_response(query: &[u8]) -> Vec<u8> {
-        if query.len() < 12 {
-            return vec![0; 12]; // Minimal response
-        }
-
-        let mut response = Vec::with_capacity(query.len());
-        // Copy ID from query
-        response.extend_from_slice(&query[0..2]);
-        // Flags: QR=1 (response), RCODE=2 (SERVFAIL)
-        response.push(0x80); // QR=1, Opcode=0, AA=0, TC=0, RD=0
-        response.push(0x02); // RA=0, Z=0, RCODE=2
-                             // Copy question counts, zero answers
-        response.extend_from_slice(&query[4..6]); // QDCOUNT
-        response.extend_from_slice(&[0, 0]); // ANCOUNT
-        response.extend_from_slice(&[0, 0]); // NSCOUNT
-        response.extend_from_slice(&[0, 0]); // ARCOUNT
-                                             // Copy question section if present
-        if query.len() > 12 {
-            response.extend_from_slice(&query[12..]);
-        }
-        response
+        let question_end = read_question(query, Pointers::Forbidden)
+            .ok()
+            .map(|q| q.end);
+        build_error_response(query, question_end, rcode::SERVFAIL)
     }
 
     /// Handle a single DNS query.
@@ -244,455 +651,208 @@ impl DnsServer {
     /// * DNS response bytes to send back to client
     ///
     /// # Behavior
-    /// * Extracts domain from query
-    /// * Checks domain against allowlist
-    /// * If allowed: resolves via upstream, caches result, returns response
+    /// * Answers FORMERR if the query does not have exactly one valid question
+    /// * Checks the domain against the allowlist
+    /// * If allowed: forwards the query type to upstream, caches A/AAAA
+    ///   answers, returns the upstream answer
     /// * If blocked: returns NXDOMAIN response
     async fn handle_query(&self, query: &[u8]) -> Result<Vec<u8>> {
         // Validate minimum DNS header size
-        if query.len() < 12 {
+        if query.len() < HEADER_LEN {
             return Err(ProxyError::Internal("DNS query too short".to_string()));
         }
-
-        // Parse domain name from question section
-        let Some(domain) = Self::parse_domain_from_query(query) else {
-            return Err(ProxyError::Internal(
-                "Failed to parse DNS query".to_string(),
-            ));
+        let flags = query.get(2).copied().unwrap_or(0);
+        let opcode = (flags >> 3) & 0x0F;
+        if opcode != 0 {
+            return Ok(build_error_response(query, None, rcode::NOTIMP));
+        }
+        if read_u16(query, 4).ok() != Some(1) {
+            return Ok(build_error_response(query, None, rcode::FORMERR));
+        }
+        let question = match read_question(query, Pointers::Forbidden) {
+            Ok(q) => q,
+            Err(e) => {
+                debug!(error = %e, "malformed DNS question");
+                return Ok(build_error_response(query, None, rcode::FORMERR));
+            }
         };
+        let respond = |code| build_error_response(query, Some(question.end), code);
+        let type_name = qtype_name(question.qtype);
 
-        // Check domain against allowlist (case-insensitive)
-        let domain_lower = domain.to_lowercase();
-        if !self.state.is_allowed(&domain_lower) {
-            self.state.report_violation(format!(
-                "network: DNS query for \"{domain_lower}\" blocked — domain not in allowlist"
-            ));
-            return Ok(Self::build_nxdomain_response(query));
+        if question.qclass != CLASS_IN
+            || question.qtype == rtype::AXFR
+            || question.qtype == rtype::IXFR
+        {
+            return Ok(respond(rcode::NOTIMP));
         }
 
-        // Resolve via upstream DNS
-        let addresses = self.resolve_upstream(&domain_lower).await?;
-
-        // Cache the resolution
-        let resolved = crate::ResolvedAddress {
-            domain: domain_lower.clone(),
-            addresses: addresses.clone(),
-            expires_at: std::time::Instant::now() + self.config.ttl,
+        // Check domain against allowlist (ASCII case-insensitive). The server
+        // forwards the same normalized name that it checks.
+        let name = match normalize_hostname(&question.name) {
+            Ok(name) if self.state.is_allowed(&name) => name,
+            Ok(name) => {
+                self.state.report_violation(format!(
+                    "network: DNS query for \"{name}\" ({type_name}) blocked: \
+                     the domain is not in the allowlist"
+                ));
+                return Ok(respond(rcode::NXDOMAIN));
+            }
+            Err(e) => {
+                self.state.report_violation(format!(
+                    "network: DNS query for {:?} ({type_name}) blocked: {e}",
+                    question.name
+                ));
+                return Ok(respond(rcode::NXDOMAIN));
+            }
         };
-        self.state.insert_resolved(resolved);
+        self.state.report_access(format!(
+            "network: DNS query for \"{name}\" ({type_name}) allowed"
+        ));
 
-        // Build response with resolved addresses
-        #[allow(clippy::cast_possible_truncation)] // TTL is always a small number of seconds
-        let ttl = self.config.ttl.as_secs() as u32;
-        Ok(Self::build_response(query, &addresses, ttl))
+        let reply = self.query_upstream(&name, question.qtype).await?;
+
+        // Cache the addresses with the same TTL that the client gets.
+        if let Some(ttl) = reply.address_ttl {
+            self.state.insert_resolved(crate::ResolvedAddress {
+                domain: name,
+                addresses: reply.addresses.clone(),
+                expires_at: std::time::Instant::now()
+                    .checked_add(Duration::from_secs(u64::from(ttl)))
+                    .unwrap_or_else(std::time::Instant::now),
+            });
+        }
+
+        Ok(Self::finish_response(query, &question, reply.message))
     }
 
-    /// Parse the domain name from a DNS query packet.
-    fn parse_domain_from_query(query: &[u8]) -> Option<String> {
-        if query.len() < 13 {
-            return None;
+    /// Change an upstream response into the response for the client.
+    fn finish_response(query: &[u8], question: &Question, mut message: Vec<u8>) -> Vec<u8> {
+        // ID of the client.
+        if let (Some(dst), Some(src)) = (message.get_mut(..2), query.get(..2)) {
+            dst.copy_from_slice(src);
         }
-
-        let mut domain_parts = Vec::new();
-        let mut pos = 12; // Start after header
-
-        loop {
-            if pos >= query.len() {
-                return None;
-            }
-
-            let label_len = query[pos] as usize;
-            if label_len == 0 {
-                break; // End of domain name
-            }
-
-            // Check for compression pointer (first two bits set)
-            if label_len & 0xC0 == 0xC0 {
-                // DNS compression - follow pointer
-                if pos + 1 >= query.len() {
-                    return None;
-                }
-                let offset = (label_len & 0x3F) << 8 | query[pos + 1] as usize;
-                // Parse from offset (recursive case, simplified)
-                return Self::parse_domain_at_offset(query, offset);
-            }
-
-            // Check bounds
-            if pos + 1 + label_len > query.len() {
-                return None;
-            }
-
-            let label = std::str::from_utf8(&query[pos + 1..pos + 1 + label_len]).ok()?;
-            domain_parts.push(label.to_string());
-            pos += 1 + label_len;
+        // QR=1, opcode 0, AA=0, TC=0 (the server does not serve DNS over
+        // TCP, thus the client must use the records that it gets), RD from
+        // the client. RA=1, rcode from upstream.
+        let rd = query.get(2).map_or(0, |f| f & FLAG_RD);
+        if let Some(flags) = message.get_mut(2) {
+            *flags = (FLAG_QR | rd) & !FLAG_TC;
         }
-
-        if domain_parts.is_empty() {
-            None
-        } else {
-            Some(domain_parts.join("."))
+        if let Some(flags) = message.get_mut(3) {
+            *flags = FLAG_RA | (*flags & 0x0F);
         }
+        // Copy the question of the client, so that the case of the name is
+        // the same as in the query. The names have the same length, thus
+        // the compression pointers in the answers stay correct.
+        let client_question = query.get(HEADER_LEN..question.end);
+        let upstream_question = message.get_mut(HEADER_LEN..question.end);
+        if let (Some(dst), Some(src)) = (upstream_question, client_question) {
+            if dst.eq_ignore_ascii_case(src) {
+                dst.copy_from_slice(src);
+            }
+        }
+        message
     }
 
-    /// Parse domain name starting at a specific offset (for compression).
-    fn parse_domain_at_offset(query: &[u8], mut offset: usize) -> Option<String> {
-        let mut domain_parts = Vec::new();
-        let mut seen_offsets = std::collections::HashSet::new();
-
-        loop {
-            if offset >= query.len() || seen_offsets.contains(&offset) {
-                return None;
-            }
-            seen_offsets.insert(offset);
-
-            let label_len = query[offset] as usize;
-            if label_len == 0 {
-                break;
-            }
-
-            if label_len & 0xC0 == 0xC0 {
-                if offset + 1 >= query.len() {
-                    return None;
-                }
-                offset = (label_len & 0x3F) << 8 | query[offset + 1] as usize;
-                continue;
-            }
-
-            if offset + 1 + label_len > query.len() {
-                return None;
-            }
-
-            let label = std::str::from_utf8(&query[offset + 1..offset + 1 + label_len]).ok()?;
-            domain_parts.push(label.to_string());
-            offset += 1 + label_len;
-        }
-
-        if domain_parts.is_empty() {
-            None
-        } else {
-            Some(domain_parts.join("."))
-        }
-    }
-
-    /// Resolve a domain via upstream DNS.
+    /// Forward a query for `name` and `qtype` to the upstream servers.
     ///
-    /// # Arguments
-    /// * `domain` - The domain to resolve
-    ///
-    /// # Returns
-    /// * `Ok(Vec<IpAddr>)` - Resolved IP addresses
-    /// * `Err(ProxyError::DnsResolution)` - Resolution failed
-    async fn resolve_upstream(&self, domain: &str) -> Result<Vec<std::net::IpAddr>> {
+    /// Tries each upstream in turn. A NOERROR or NXDOMAIN response ends the
+    /// search; the server skips an upstream that fails, times out, or
+    /// answers SERVFAIL or REFUSED, and logs each skipped upstream.
+    async fn query_upstream(&self, name: &str, qtype: u16) -> Result<UpstreamReply> {
         use tokio::net::UdpSocket;
 
-        let upstreams = self.config.get_upstream();
-        if upstreams.is_empty() {
+        if self.upstreams.is_empty() {
             return Err(ProxyError::DnsResolution {
-                domain: domain.to_string(),
+                domain: name.to_string(),
                 message: "No upstream DNS servers configured".to_string(),
             });
         }
 
-        // Try A then AAAA records across all upstreams.
+        const ANY_V4: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+        const ANY_V6: SocketAddr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
+        let bounds = self.config.ttl_bounds();
+
         // A fresh socket is created for each upstream so that ICMP errors or
         // stale state from a non-responsive server cannot affect the next attempt.
-        for record_type in [1u16, 28u16] {
-            // 1 = A, 28 = AAAA
-            let query = Self::build_dns_query(domain, record_type);
-
-            for upstream in &upstreams {
-                let Ok(socket) = UdpSocket::bind("0.0.0.0:0").await else {
-                    continue;
-                };
-
-                if socket.connect(upstream).await.is_err() {
+        for upstream in self.upstreams.iter() {
+            let local = if upstream.is_ipv6() { ANY_V6 } else { ANY_V4 };
+            let socket = match UdpSocket::bind(local).await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(%upstream, error = %e, "skip the DNS upstream: bind failed");
                     continue;
                 }
+            };
+            if let Err(e) = socket.connect(upstream).await {
+                warn!(%upstream, error = %e, "skip the DNS upstream: connect failed");
+                continue;
+            }
+            let id = random_id();
+            let query = build_dns_query(id, name, qtype);
+            if let Err(e) = socket.send(&query).await {
+                warn!(%upstream, error = %e, "skip the DNS upstream: send failed");
+                continue;
+            }
 
-                if socket.send(&query).await.is_err() {
-                    continue;
+            match self.receive_reply(&socket, id, name, qtype, bounds).await {
+                Some(reply) if reply.rcode == rcode::NOERROR || reply.rcode == rcode::NXDOMAIN => {
+                    return Ok(reply);
                 }
-
-                let mut buf = [0u8; 512];
-                let result =
-                    tokio::time::timeout(self.config.resolve_timeout, socket.recv(&mut buf)).await;
-
-                if let Ok(Ok(len)) = result {
-                    if let Some(addresses) = Self::parse_dns_response(&buf[..len]) {
-                        if !addresses.is_empty() {
-                            return Ok(addresses);
-                        }
-                    }
+                Some(reply) => {
+                    warn!(%upstream, rcode = reply.rcode, name, "skip the DNS upstream: error response");
+                }
+                None => {
+                    warn!(%upstream, name, "skip the DNS upstream: no valid response in time");
                 }
             }
         }
 
         Err(ProxyError::DnsResolution {
-            domain: domain.to_string(),
+            domain: name.to_string(),
             message: "Failed to resolve via any upstream server".to_string(),
         })
     }
 
-    /// Build a DNS query packet for the given domain and record type.
-    fn build_dns_query(domain: &str, record_type: u16) -> Vec<u8> {
-        let mut query = Vec::new();
-
-        // Header
-        query.extend_from_slice(&[0x00, 0x01]); // ID
-        query.extend_from_slice(&[0x01, 0x00]); // Flags: standard query, recursion desired
-        query.extend_from_slice(&[0x00, 0x01]); // QDCOUNT: 1
-        query.extend_from_slice(&[0x00, 0x00]); // ANCOUNT: 0
-        query.extend_from_slice(&[0x00, 0x00]); // NSCOUNT: 0
-        query.extend_from_slice(&[0x00, 0x00]); // ARCOUNT: 0
-
-        // Question: domain name (DNS labels are at most 63 bytes)
-        for label in domain.split('.') {
-            #[allow(clippy::cast_possible_truncation)]
-            query.push(label.len() as u8);
-            query.extend_from_slice(label.as_bytes());
-        }
-        query.push(0); // Root label
-
-        // QTYPE and QCLASS
-        query.extend_from_slice(&record_type.to_be_bytes());
-        query.extend_from_slice(&[0x00, 0x01]); // QCLASS: IN
-
-        query
-    }
-
-    /// Parse DNS response and extract IP addresses.
-    fn parse_dns_response(response: &[u8]) -> Option<Vec<std::net::IpAddr>> {
-        if response.len() < 12 {
-            return None;
-        }
-
-        // Check RCODE (lower 4 bits of byte 3)
-        let rcode = response[3] & 0x0F;
-        if rcode != 0 {
-            return None; // Non-success response
-        }
-
-        // Get answer count
-        let ancount = u16::from_be_bytes([response[6], response[7]]) as usize;
-        if ancount == 0 {
-            return Some(vec![]); // Valid response with no answers
-        }
-
-        let mut addresses = Vec::new();
-        let mut pos = 12;
-
-        // Skip question section
-        while pos < response.len() {
-            let label_len = response[pos] as usize;
-            if label_len == 0 {
-                pos += 1;
-                break;
-            }
-            if label_len & 0xC0 == 0xC0 {
-                pos += 2;
-                break;
-            }
-            pos += 1 + label_len;
-        }
-        pos += 4; // QTYPE (2) + QCLASS (2)
-
-        // Parse answer records
-        for _ in 0..ancount {
-            if pos + 12 > response.len() {
-                break;
-            }
-
-            // Skip name (may be compressed)
-            while pos < response.len() {
-                let label_len = response[pos] as usize;
-                if label_len == 0 {
-                    pos += 1;
-                    break;
+    /// Receive the response that matches the query, until the resolve
+    /// timeout. The server ignores datagrams that do not match.
+    async fn receive_reply(
+        &self,
+        socket: &tokio::net::UdpSocket,
+        id: u16,
+        name: &str,
+        qtype: u16,
+        bounds: (u32, u32),
+    ) -> Option<UpstreamReply> {
+        let deadline = tokio::time::Instant::now().checked_add(self.config.resolve_timeout)?;
+        let mut buf = vec![0u8; UDP_BUFFER_LEN];
+        loop {
+            let len = match tokio::time::timeout_at(deadline, socket.recv(&mut buf)).await {
+                Ok(Ok(len)) => len,
+                Ok(Err(e)) => {
+                    debug!(error = %e, "DNS upstream receive error");
+                    return None;
                 }
-                if label_len & 0xC0 == 0xC0 {
-                    pos += 2;
-                    break;
-                }
-                pos += 1 + label_len;
+                Err(_) => return None,
+            };
+            let message = buf.get(..len).unwrap_or_default().to_vec();
+            match process_upstream_response(message, id, name, qtype, bounds) {
+                Ok(reply) => return Some(reply),
+                Err(e) => debug!(error = %e, "ignore the DNS upstream datagram"),
             }
-
-            if pos + 10 > response.len() {
-                break;
-            }
-
-            let rtype = u16::from_be_bytes([response[pos], response[pos + 1]]);
-            let rdlength = u16::from_be_bytes([response[pos + 8], response[pos + 9]]) as usize;
-            pos += 10;
-
-            if pos + rdlength > response.len() {
-                break;
-            }
-
-            match rtype {
-                1 if rdlength == 4 => {
-                    // A record (IPv4)
-                    let ip = std::net::Ipv4Addr::new(
-                        response[pos],
-                        response[pos + 1],
-                        response[pos + 2],
-                        response[pos + 3],
-                    );
-                    addresses.push(std::net::IpAddr::V4(ip));
-                }
-                28 if rdlength == 16 => {
-                    // AAAA record (IPv6)
-                    let mut octets = [0u8; 16];
-                    octets.copy_from_slice(&response[pos..pos + 16]);
-                    let ip = std::net::Ipv6Addr::from(octets);
-                    addresses.push(std::net::IpAddr::V6(ip));
-                }
-                _ => {} // Skip other record types
-            }
-
-            pos += rdlength;
         }
-
-        Some(addresses)
     }
 
     /// Build an NXDOMAIN response for a blocked domain.
     ///
     /// # Arguments
     /// * `query` - The original query (for copying ID and question)
+    #[cfg(test)]
     fn build_nxdomain_response(query: &[u8]) -> Vec<u8> {
-        if query.len() < 12 {
-            return vec![0; 12]; // Minimal response
-        }
-
-        let mut response = Vec::with_capacity(query.len());
-
-        // Copy ID from query (bytes 0-1)
-        response.extend_from_slice(&query[0..2]);
-
-        // Flags: QR=1 (response), AA=0, TC=0, RD=1, RA=1, RCODE=3 (NXDOMAIN)
-        response.push(0x81); // QR=1, Opcode=0, AA=0, TC=0, RD=1
-        response.push(0x83); // RA=1, Z=0, RCODE=3
-
-        // QDCOUNT: copy from query
-        response.extend_from_slice(&query[4..6]);
-        // ANCOUNT: 0
-        response.extend_from_slice(&[0, 0]);
-        // NSCOUNT: 0
-        response.extend_from_slice(&[0, 0]);
-        // ARCOUNT: 0
-        response.extend_from_slice(&[0, 0]);
-
-        // Copy question section from query
-        if query.len() > 12 {
-            // Find end of question section (domain + QTYPE + QCLASS)
-            let mut pos = 12;
-            while pos < query.len() {
-                let label_len = query[pos] as usize;
-                if label_len == 0 {
-                    pos += 1;
-                    break;
-                }
-                if label_len & 0xC0 == 0xC0 {
-                    pos += 2;
-                    break;
-                }
-                pos += 1 + label_len;
-            }
-            pos += 4; // QTYPE + QCLASS
-            if pos <= query.len() {
-                response.extend_from_slice(&query[12..pos]);
-            }
-        }
-
-        response
-    }
-
-    /// Build a response with resolved addresses.
-    ///
-    /// # Arguments
-    /// * `query` - The original query
-    /// * `addresses` - Resolved IP addresses to include
-    /// * `ttl` - TTL for the response records
-    fn build_response(query: &[u8], addresses: &[std::net::IpAddr], ttl: u32) -> Vec<u8> {
-        if query.len() < 12 {
-            return vec![0; 12];
-        }
-
-        let mut response = Vec::new();
-
-        // Copy ID from query (bytes 0-1)
-        response.extend_from_slice(&query[0..2]);
-
-        // Flags: QR=1 (response), AA=0, TC=0, RD=1, RA=1, RCODE=0 (no error)
-        response.push(0x81); // QR=1, Opcode=0, AA=0, TC=0, RD=1
-        response.push(0x80); // RA=1, Z=0, RCODE=0
-
-        // QDCOUNT: 1 (from query)
-        response.extend_from_slice(&query[4..6]);
-        // ANCOUNT: number of addresses (max 65535, always safe)
-        #[allow(clippy::cast_possible_truncation)]
-        let ancount = addresses.len() as u16;
-        response.extend_from_slice(&ancount.to_be_bytes());
-        // NSCOUNT: 0
-        response.extend_from_slice(&[0, 0]);
-        // ARCOUNT: 0
-        response.extend_from_slice(&[0, 0]);
-
-        // Find end of question section in query
-        let mut question_end = 12;
-        while question_end < query.len() {
-            let label_len = query[question_end] as usize;
-            if label_len == 0 {
-                question_end += 1;
-                break;
-            }
-            if label_len & 0xC0 == 0xC0 {
-                question_end += 2;
-                break;
-            }
-            question_end += 1 + label_len;
-        }
-        question_end += 4; // QTYPE + QCLASS
-
-        // Copy question section
-        if question_end <= query.len() {
-            response.extend_from_slice(&query[12..question_end]);
-        }
-
-        // Add answer records
-        for addr in addresses {
-            // Name: pointer to question (offset 12)
-            response.extend_from_slice(&[0xC0, 0x0C]);
-
-            match addr {
-                std::net::IpAddr::V4(ipv4) => {
-                    // TYPE: A (1)
-                    response.extend_from_slice(&[0x00, 0x01]);
-                    // CLASS: IN (1)
-                    response.extend_from_slice(&[0x00, 0x01]);
-                    // TTL
-                    response.extend_from_slice(&ttl.to_be_bytes());
-                    // RDLENGTH: 4
-                    response.extend_from_slice(&[0x00, 0x04]);
-                    // RDATA: IPv4 address
-                    response.extend_from_slice(&ipv4.octets());
-                }
-                std::net::IpAddr::V6(ipv6) => {
-                    // TYPE: AAAA (28)
-                    response.extend_from_slice(&[0x00, 0x1C]);
-                    // CLASS: IN (1)
-                    response.extend_from_slice(&[0x00, 0x01]);
-                    // TTL
-                    response.extend_from_slice(&ttl.to_be_bytes());
-                    // RDLENGTH: 16
-                    response.extend_from_slice(&[0x00, 0x10]);
-                    // RDATA: IPv6 address
-                    response.extend_from_slice(&ipv6.octets());
-                }
-            }
-        }
-
-        response
+        let question_end = read_question(query, Pointers::Forbidden)
+            .ok()
+            .map(|q| q.end);
+        build_error_response(query, question_end, rcode::NXDOMAIN)
     }
 }
 
@@ -971,43 +1131,6 @@ mod tests {
         assert_eq!(rcode, 3); // NXDOMAIN
     }
 
-    #[test]
-
-    fn test_build_response_includes_all_addresses() {
-        let query = build_test_dns_query("test.com", 1);
-        let addresses: Vec<std::net::IpAddr> =
-            vec!["1.2.3.4".parse().unwrap(), "5.6.7.8".parse().unwrap()];
-        let response = DnsServer::build_response(&query, &addresses, 300);
-
-        // Answer count should be 2
-        let answer_count = u16::from_be_bytes([response[6], response[7]]);
-        assert_eq!(answer_count, 2);
-    }
-
-    #[test]
-
-    fn test_build_response_sets_correct_ttl() {
-        let query = build_test_dns_query("test.com", 1);
-        let addresses: Vec<std::net::IpAddr> = vec!["1.2.3.4".parse().unwrap()];
-        let response = DnsServer::build_response(&query, &addresses, 600);
-
-        // TTL is 4 bytes in the answer section
-        // Find answer section and verify TTL = 600
-        assert!(response.len() > 20); // Has answer section
-    }
-
-    #[test]
-
-    fn test_build_response_preserves_query_question() {
-        let query = build_test_dns_query("test.com", 1);
-        let addresses: Vec<std::net::IpAddr> = vec!["1.2.3.4".parse().unwrap()];
-        let response = DnsServer::build_response(&query, &addresses, 300);
-
-        // Question count should be 1
-        let question_count = u16::from_be_bytes([response[4], response[5]]);
-        assert_eq!(question_count, 1);
-    }
-
     // ========================================================================
     // Caching Behavior
     // ========================================================================
@@ -1081,8 +1204,11 @@ mod tests {
         let config = DnsServerConfig::default();
         let server = DnsServer::new(config, state).unwrap();
 
-        let ips = server.resolve_upstream("example.com").await.unwrap();
-        assert!(!ips.is_empty(), "Should resolve to at least one IP");
+        let reply = server.query_upstream("example.com", 1).await.unwrap();
+        assert!(
+            !reply.addresses.is_empty(),
+            "Should resolve to at least one IP"
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -1096,9 +1222,10 @@ mod tests {
         let server = DnsServer::new(config, state).unwrap();
 
         let result = server
-            .resolve_upstream("nonexistent-domain-12345.invalid")
+            .query_upstream("nonexistent-domain-12345.invalid", 1)
             .await;
-        assert!(result.is_err());
+        // An NXDOMAIN answer or a failure: the result has no addresses.
+        assert!(result.map_or(true, |r| r.addresses.is_empty()));
     }
 
     #[tokio::test]
@@ -1117,7 +1244,7 @@ mod tests {
         };
         let server = DnsServer::new(config, state).unwrap();
 
-        let result = server.resolve_upstream("example.com").await;
+        let result = server.query_upstream("example.com", 1).await;
         assert!(result.is_err());
     }
 
@@ -1152,8 +1279,8 @@ mod tests {
         let server = DnsServer::new(config, state).unwrap();
 
         // Primary will time out (5 s), then the system resolver should succeed
-        let ips = server.resolve_upstream("example.com").await.unwrap();
-        assert!(!ips.is_empty());
+        let reply = server.query_upstream("example.com", 1).await.unwrap();
+        assert!(!reply.addresses.is_empty());
     }
 
     // ========================================================================
@@ -1427,5 +1554,321 @@ mod tests {
         query.extend_from_slice(&[0x00, 0x01]);
 
         query
+    }
+
+    // ========================================================================
+    // Local Fake Upstream Tests (no network access)
+    // ========================================================================
+
+    /// The name for which the fake upstream waits before it answers.
+    const SLOW_NAME: &str = "slow.example.com";
+
+    /// Build the answer of the fake upstream for one query.
+    fn fake_answer(query: &[u8]) -> Option<Vec<u8>> {
+        let question = read_question(query, Pointers::Forbidden).ok()?;
+        let mut records: Vec<Vec<u8>> = Vec::new();
+        let mut code = rcode::NOERROR;
+        let record = |rr_type: u16, ttl: u32, rdata: &[u8]| {
+            let mut r = vec![0xC0, 0x0C];
+            r.extend_from_slice(&rr_type.to_be_bytes());
+            r.extend_from_slice(&CLASS_IN.to_be_bytes());
+            r.extend_from_slice(&ttl.to_be_bytes());
+            r.extend_from_slice(&u16::try_from(rdata.len()).unwrap().to_be_bytes());
+            r.extend_from_slice(rdata);
+            r
+        };
+        if question.name.eq_ignore_ascii_case("nx.example.com") {
+            code = rcode::NXDOMAIN;
+        } else {
+            match question.qtype {
+                rtype::A => records.push(record(rtype::A, 5, &[93, 184, 216, 34])),
+                rtype::AAAA => {
+                    let ip: Ipv6Addr = "2606:2800:220:1::1".parse().unwrap();
+                    records.push(record(rtype::AAAA, 100_000, &ip.octets()));
+                }
+                16 => records.push(record(16, 60, b"\x05hello")),
+                _ => {}
+            }
+        }
+        let mut response = query.get(..2)?.to_vec();
+        response.extend_from_slice(&[0x81, 0x80 | code]);
+        response.extend_from_slice(&[0, 1]);
+        response.extend_from_slice(&u16::try_from(records.len()).unwrap().to_be_bytes());
+        response.extend_from_slice(&[0, 0, 0, 0]);
+        response.extend_from_slice(query.get(HEADER_LEN..question.end)?);
+        for r in records {
+            response.extend_from_slice(&r);
+        }
+        Some(response)
+    }
+
+    /// Start a fake upstream DNS server on `bind`. Returns `None` if the
+    /// test cannot bind the address.
+    async fn fake_upstream(bind: &str) -> Option<(SocketAddr, tokio::task::JoinHandle<()>)> {
+        let socket = Arc::new(tokio::net::UdpSocket::bind(bind).await.ok()?);
+        let addr = socket.local_addr().ok()?;
+        let handle = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            loop {
+                let Ok((len, src)) = socket.recv_from(&mut buf).await else {
+                    return;
+                };
+                let query = buf[..len].to_vec();
+                let socket = Arc::clone(&socket);
+                tokio::spawn(async move {
+                    let slow = read_question(&query, Pointers::Forbidden)
+                        .is_ok_and(|q| q.name == SLOW_NAME);
+                    if slow {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                    if let Some(answer) = fake_answer(&query) {
+                        let _ = socket.send_to(&answer, src).await;
+                    }
+                });
+            }
+        });
+        Some((addr, handle))
+    }
+
+    fn server_with_upstream(
+        upstream: SocketAddr,
+        allowlist: &[&str],
+    ) -> (
+        DnsServer,
+        Arc<SharedState>,
+        tokio::sync::mpsc::UnboundedReceiver<crate::TraceEvent>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = Arc::new(SharedState::with_violation_tx(
+            allowlist.iter().map(|s| (*s).to_string()).collect(),
+            Some(tx),
+        ));
+        let config = DnsServerConfig {
+            upstream: Some(vec![upstream]),
+            resolve_timeout: Duration::from_secs(3),
+            ..Default::default()
+        };
+        let server = DnsServer::new(config, Arc::clone(&state)).unwrap();
+        (server, state, rx)
+    }
+
+    /// Return `(type, ttl)` of the first answer record of a response.
+    fn first_answer(response: &[u8]) -> (u16, u32) {
+        let question = read_question(response, Pointers::Allowed).unwrap();
+        let (_, pos) =
+            read_name(response, question.end, Pointers::Allowed, LabelBytes::Any).unwrap();
+        (
+            read_u16(response, pos).unwrap(),
+            read_u32(response, pos + 4).unwrap(),
+        )
+    }
+
+    fn rcode_of(response: &[u8]) -> u8 {
+        response[3] & 0x0F
+    }
+
+    #[tokio::test]
+    async fn test_a_query_forwards_a_and_clamps_ttl_floor() {
+        let Some((upstream, _task)) = fake_upstream("127.0.0.1:0").await else {
+            return;
+        };
+        let (server, state, _rx) = server_with_upstream(upstream, &["example.com"]);
+        let query = build_test_dns_query("example.com", rtype::A);
+        let response = server.handle_query(&query).await.unwrap();
+
+        assert_eq!(&response[..2], &[0xAB, 0xCD], "client ID kept");
+        assert_eq!(rcode_of(&response), rcode::NOERROR);
+        assert_eq!(u16::from_be_bytes([response[6], response[7]]), 1);
+        // Upstream TTL 5 is raised to the 30 s floor.
+        assert_eq!(first_answer(&response), (rtype::A, 30));
+        let ip: IpAddr = "93.184.216.34".parse().unwrap();
+        assert_eq!(state.cache.lookup(&ip), Some("example.com".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_aaaa_query_gets_aaaa_and_ttl_max() {
+        let Some((upstream, _task)) = fake_upstream("127.0.0.1:0").await else {
+            return;
+        };
+        let (server, state, mut rx) = server_with_upstream(upstream, &["example.com"]);
+        let query = build_test_dns_query("example.com", rtype::AAAA);
+        let response = server.handle_query(&query).await.unwrap();
+
+        // Never an A record for an AAAA query; upstream TTL 100000 is
+        // reduced to the 300 s maximum.
+        assert_eq!(first_answer(&response), (rtype::AAAA, 300));
+        let ip: IpAddr = "2606:2800:220:1::1".parse().unwrap();
+        assert_eq!(state.cache.lookup(&ip), Some("example.com".to_string()));
+        let v4: IpAddr = "93.184.216.34".parse().unwrap();
+        assert_eq!(state.cache.lookup(&v4), None);
+
+        match rx.try_recv() {
+            Ok(crate::TraceEvent::Access(m)) => {
+                assert_eq!(m, "network: DNS query for \"example.com\" (AAAA) allowed");
+            }
+            other => panic!("expected an access event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_txt_query_passes_through() {
+        let Some((upstream, _task)) = fake_upstream("127.0.0.1:0").await else {
+            return;
+        };
+        let (server, state, _rx) = server_with_upstream(upstream, &["example.com"]);
+        let query = build_test_dns_query("example.com", 16);
+        let response = server.handle_query(&query).await.unwrap();
+        assert_eq!(first_answer(&response), (16, 60));
+        assert!(state.cache.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_upstream_nxdomain_passes_through() {
+        let Some((upstream, _task)) = fake_upstream("127.0.0.1:0").await else {
+            return;
+        };
+        let (server, _state, _rx) = server_with_upstream(upstream, &["*.example.com"]);
+        let query = build_test_dns_query("nx.example.com", rtype::A);
+        let response = server.handle_query(&query).await.unwrap();
+        assert_eq!(rcode_of(&response), rcode::NXDOMAIN);
+    }
+
+    #[tokio::test]
+    async fn test_response_keeps_client_case() {
+        let Some((upstream, _task)) = fake_upstream("127.0.0.1:0").await else {
+            return;
+        };
+        let (server, _state, _rx) = server_with_upstream(upstream, &["example.com"]);
+        let query = build_test_dns_query("ExAmPlE.com", rtype::A);
+        let response = server.handle_query(&query).await.unwrap();
+        let question_end = read_question(&query, Pointers::Forbidden).unwrap().end;
+        assert_eq!(&response[12..question_end], &query[12..question_end]);
+    }
+
+    #[tokio::test]
+    async fn test_ipv6_upstream_uses_ipv6_socket() {
+        let Some((upstream, _task)) = fake_upstream("[::1]:0").await else {
+            return; // No IPv6 loopback in this environment.
+        };
+        let (server, _state, _rx) = server_with_upstream(upstream, &["example.com"]);
+        let reply = server
+            .query_upstream("example.com", rtype::A)
+            .await
+            .unwrap();
+        assert_eq!(
+            reply.addresses,
+            vec!["93.184.216.34".parse::<IpAddr>().unwrap()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_qdcount_not_one_gets_formerr() {
+        let (server, _state, _rx) = server_with_upstream("127.0.0.1:9".parse().unwrap(), &[]);
+        let mut two = build_test_dns_query("example.com", rtype::A);
+        two[5] = 2;
+        let response = server.handle_query(&two).await.unwrap();
+        assert_eq!(rcode_of(&response), rcode::FORMERR);
+        assert_eq!(&response[4..6], &[0, 0]);
+
+        let mut zero = build_test_dns_query("example.com", rtype::A);
+        zero[5] = 0;
+        let response = server.handle_query(&zero).await.unwrap();
+        assert_eq!(rcode_of(&response), rcode::FORMERR);
+    }
+
+    #[tokio::test]
+    async fn test_bad_labels_get_formerr() {
+        let (server, _state, _rx) =
+            server_with_upstream("127.0.0.1:9".parse().unwrap(), &["*.example.com"]);
+        let header = [0xAB, 0xCD, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+        let tail = [0, 0, 1, 0, 1]; // root, QTYPE A, QCLASS IN
+        let cases: [&[u8]; 5] = [
+            &[0x41, b'a'],                    // length byte with 0x40 set
+            &[0x81, b'a'],                    // length byte with 0x80 set
+            &[3, b'a', b'.', b'b'],           // '.' inside a label
+            &[3, b'a', 0x01, b'b'],           // byte that is not printable
+            &[3, b'w', b'w', b'w', 0xC0, 12], // pointer in the question
+        ];
+        for case in cases {
+            let mut query = header.to_vec();
+            query.extend_from_slice(case);
+            query.extend_from_slice(&tail);
+            let response = server.handle_query(&query).await.unwrap();
+            assert_eq!(rcode_of(&response), rcode::FORMERR, "case {case:?}");
+        }
+    }
+
+    #[test]
+    fn test_read_name_rejects_forward_pointer_loop() {
+        // A pointer to itself.
+        let msg = [0u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xC0, 12];
+        assert_eq!(
+            read_name(&msg, 12, Pointers::Allowed, LabelBytes::Any),
+            Err(WireError::BadPointer)
+        );
+    }
+
+    #[test]
+    fn test_clamp_ttl_bounds() {
+        assert_eq!(clamp_ttl(5, (30, 300)), 30);
+        assert_eq!(clamp_ttl(100, (30, 300)), 100);
+        assert_eq!(clamp_ttl(100_000, (30, 300)), 300);
+        // The maximum has priority if it is smaller than the minimum.
+        assert_eq!(clamp_ttl(5, (30, 1)), 1);
+    }
+
+    #[test]
+    fn test_upstream_response_with_wrong_id_rejected() {
+        let query = build_dns_query(0x1234, "example.com", rtype::A);
+        let answer = fake_answer(&query).unwrap();
+        assert_eq!(
+            process_upstream_response(answer.clone(), 0x4321, "example.com", rtype::A, (30, 300)),
+            Err(WireError::Mismatch)
+        );
+        assert_eq!(
+            process_upstream_response(answer.clone(), 0x1234, "other.com", rtype::A, (30, 300)),
+            Err(WireError::Mismatch)
+        );
+        assert_eq!(
+            process_upstream_response(answer, 0x1234, "example.com", rtype::AAAA, (30, 300)),
+            Err(WireError::Mismatch)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_slow_upstream_does_not_block_other_queries() {
+        let Some((upstream, _task)) = fake_upstream("127.0.0.1:0").await else {
+            return;
+        };
+        let Some(server_socket) = udp_bind_or_skip("127.0.0.1:0").await else {
+            return;
+        };
+        let server_addr = server_socket.local_addr().unwrap();
+        let (server, _state, _rx) = server_with_upstream(upstream, &["*.example.com"]);
+        let run = tokio::spawn(async move { server.run_on(server_socket).await });
+
+        let client = udp_bind_or_skip("127.0.0.1:0").await.unwrap();
+        let mut slow = build_test_dns_query(SLOW_NAME, rtype::A);
+        slow[0] = 0x01;
+        let mut fast = build_test_dns_query("fast.example.com", rtype::A);
+        fast[0] = 0x02;
+        client.send_to(&slow, server_addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        client.send_to(&fast, server_addr).await.unwrap();
+
+        let mut buf = [0u8; 512];
+        let (len, _) = tokio::time::timeout(Duration::from_millis(700), client.recv_from(&mut buf))
+            .await
+            .expect("the fast query must not wait for the slow query")
+            .unwrap();
+        assert!(len > 12);
+        assert_eq!(buf[0], 0x02, "the first answer is for the fast query");
+
+        let (_, _) = tokio::time::timeout(Duration::from_secs(3), client.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(buf[0], 0x01);
+        run.abort();
     }
 }
