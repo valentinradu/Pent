@@ -114,7 +114,11 @@ pub(crate) const fn is_format_char(c: char) -> bool {
 
 /// Return true for a character that the output must escape: a control
 /// character (C0, DEL, C1) or a format character.
-pub(crate) const fn is_unsafe_char(c: char) -> bool {
+///
+/// The function is not `const`: `char::is_control` became usable in a
+/// constant only after the Rust that the end-to-end image pins, and each
+/// caller gives the function to `escape_with`, where `const` buys nothing.
+pub(crate) fn is_unsafe_char(c: char) -> bool {
     c.is_control() || is_format_char(c)
 }
 
