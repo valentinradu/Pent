@@ -1289,9 +1289,39 @@ mod tests {
     async fn tcp_listener_or_skip(addr: &str) -> Option<tokio::net::TcpListener> {
         match tokio::net::TcpListener::bind(addr).await {
             Ok(listener) => Some(listener),
-            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => None,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                crate::test_support::skip("this machine cannot bind a TCP socket on the loopback");
+                None
+            }
             Err(err) => panic!("Failed to bind TCP listener for test: {err}"),
         }
+    }
+
+    /// Return true if the proxy still speaks SOCKS5 on `addr`.
+    ///
+    /// The tests that send odd traffic use this to prove that the proxy
+    /// survives it. Without this check such a test asserts nothing.
+    async fn proxy_answers_greeting(addr: std::net::SocketAddr) -> bool {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let Ok(Ok(mut stream)) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tokio::net::TcpStream::connect(addr),
+        )
+        .await
+        else {
+            return false;
+        };
+        // The greeting of SOCKS5: version 5, one method, "no authentication".
+        if stream.write_all(&[0x05, 0x01, 0x00]).await.is_err() {
+            return false;
+        }
+        let mut answer = [0u8; 2];
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            stream.read_exact(&mut answer),
+        )
+        .await;
+        matches!(read, Ok(Ok(2))) && answer == [0x05, 0x00]
     }
 
     /// Get a free port by binding to port 0.
@@ -1729,11 +1759,21 @@ mod tests {
         request.extend_from_slice(domain);
         request.extend_from_slice(&[0x01, 0xBB]); // Port 443
 
-        // Domain requests need DNS resolution first
-        // The parser might return the domain or error asking for resolution
-        let result = parse_request(&request).await;
-        // Either succeeds with resolved IP or errors indicating domain needs resolution
-        assert!(result.is_ok() || result.is_err());
+        // The parser gives the host name as the client sent it. The proxy
+        // resolves the name later, after the allowlist permits it.
+        let mut reader = request.as_slice();
+        let parsed = read_socks5_request(&mut reader).await;
+        let Ok(parsed) = parsed else {
+            panic!("the parser must accept a request with a domain");
+        };
+        assert_eq!(parsed.cmd, socks5::CMD_CONNECT);
+        assert_eq!(
+            parsed.target,
+            Target::Domain {
+                host: "example.com".to_string(),
+                port: 443,
+            }
+        );
     }
 
     #[tokio::test]
@@ -2384,6 +2424,11 @@ mod tests {
             }
         }
 
+        assert!(
+            proxy_answers_greeting(config.bind_addr).await,
+            "the proxy must still answer a SOCKS5 greeting after this traffic"
+        );
+
         handle.abort();
         let _ = handle.await;
     }
@@ -2415,6 +2460,11 @@ mod tests {
             let _ = stream.flush().await;
         }
 
+        assert!(
+            proxy_answers_greeting(config.bind_addr).await,
+            "the proxy must still answer a SOCKS5 greeting after this traffic"
+        );
+
         handle.abort();
         let _ = handle.await;
     }
@@ -2444,6 +2494,11 @@ mod tests {
             // Half-close: shutdown write side
             let _ = stream.shutdown().await;
         }
+
+        assert!(
+            proxy_answers_greeting(config.bind_addr).await,
+            "the proxy must still answer a SOCKS5 greeting after this traffic"
+        );
 
         handle.abort();
         let _ = handle.await;
@@ -2498,6 +2553,11 @@ mod tests {
 
         // Abort the proxy - with Arc<AtomicUsize>, the counter remains valid
         // because each spawned task holds its own Arc reference
+        assert!(
+            proxy_answers_greeting(config.bind_addr).await,
+            "the proxy must still answer a SOCKS5 greeting after this traffic"
+        );
+
         handle.abort();
         let _ = handle.await;
 

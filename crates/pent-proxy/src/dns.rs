@@ -986,7 +986,10 @@ mod tests {
     async fn udp_bind_or_skip(addr: &str) -> Option<tokio::net::UdpSocket> {
         match tokio::net::UdpSocket::bind(addr).await {
             Ok(socket) => Some(socket),
-            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => None,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                crate::test_support::skip("this machine cannot bind a UDP socket on the loopback");
+                None
+            }
             Err(err) => panic!("Failed to bind UDP socket for test: {err}"),
         }
     }
@@ -1532,14 +1535,24 @@ mod tests {
         // Give server time to start
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        // Try to connect to verify it's running
+        // The proof is an answer, not a connect: a UDP connect to a port
+        // that nothing serves also succeeds.
         let Some(socket) = udp_bind_or_skip("127.0.0.1:0").await else {
             handle.abort();
             return;
         };
-        socket.connect(&config.bind_addr).await.unwrap();
-
+        let query = build_test_dns_query("blocked.example", 1);
+        socket.send_to(&query, config.bind_addr).await.unwrap();
+        let mut buf = [0u8; 512];
+        let answer =
+            tokio::time::timeout(std::time::Duration::from_secs(2), socket.recv(&mut buf)).await;
         handle.abort();
+        let Ok(Ok(len)) = answer else {
+            panic!("the DNS server did not answer the query");
+        };
+        assert!(len >= 12, "the answer is shorter than a DNS header");
+        assert_eq!(&buf[0..2], &query[0..2], "the answer has the query id");
+        assert_eq!(buf[2] & 0x80, 0x80, "the answer has the response bit");
     }
 
     #[cfg(target_os = "linux")]
@@ -1576,22 +1589,29 @@ mod tests {
             let addr = config.bind_addr;
             handles.push(tokio::spawn(async move {
                 let Some(socket) = udp_bind_or_skip("127.0.0.1:0").await else {
-                    return;
+                    return false;
                 };
                 let query = build_test_dns_query("example.com", 1);
                 socket.send_to(&query, addr).await.unwrap();
                 let mut buf = [0u8; 512];
-                let _ =
-                    tokio::time::timeout(std::time::Duration::from_secs(1), socket.recv(&mut buf))
+                let got =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), socket.recv(&mut buf))
                         .await;
+                matches!(got, Ok(Ok(len)) if len >= 12)
             }));
         }
 
+        let mut answered = 0;
         for h in handles {
-            let _ = h.await;
+            if matches!(h.await, Ok(true)) {
+                answered += 1;
+            }
         }
 
         handle.abort();
+        // The server answers each query. One lost answer means that a slow
+        // query blocks the others, which was a defect of an older server.
+        assert_eq!(answered, 10, "the server answered {answered} of 10 queries");
     }
 
     #[tokio::test]

@@ -27,11 +27,15 @@ FROM rust:1.91-slim-bookworm
 # curl            the network tests (a proxy-aware HTTP client)
 # ca-certificates the TLS roots for HTTPS in the curl tests
 # sudo            the watch guard test (sudo must not get privileges)
+# python3         the tests of the security suites that need a helper
+# dbus            /run/dbus/system_bus_socket for the socket tests
 # The base image has sh, getent (libc-bin) and the coreutils.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     ca-certificates \
     sudo \
+    python3 \
+    dbus \
     && rm -rf /var/lib/apt/lists/*
 
 RUN useradd --create-home tester
@@ -44,9 +48,15 @@ COPY --chown=tester:tester . .
 # Build before the CMD step, so that the CMD step only runs the tests.
 RUN cargo build --workspace --tests
 
-# The integration and e2e tests of the pent binary, also the tests that
-# need the internet (they skip when the internet is not available). The
-# tests run in parallel with the default number of threads.
-CMD ["cargo", "test", "-p", "pent", "--no-fail-fast", \
-     "--test", "e2e_linux", "--test", "integration_test", "--test", "profile_test", \
-     "--", "--include-ignored"]
+# Every test of the workspace, not only the tests of the pent binary: the
+# security and the hardening suites prove the containment, and they ran on
+# no machine of the CI before. The tests run in parallel with the default
+# number of threads.
+#
+# PENT_REQUIRE_ALL_TESTS makes a skip a failure: the container has each
+# tool that the tests need, so a skip means that a test stopped to work.
+#
+# The run does not use --include-ignored: an ignored test holds the proof
+# of a finding that is open, so it fails by design.
+ENV PENT_REQUIRE_ALL_TESTS=1
+CMD ["cargo", "test", "--workspace", "--no-fail-fast"]

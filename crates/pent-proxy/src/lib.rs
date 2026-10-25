@@ -76,6 +76,8 @@ mod inspect;
 mod netaddr;
 mod proxy;
 mod server;
+#[cfg(test)]
+mod test_support;
 
 pub use dns::{DnsServer, DnsServerConfig};
 pub use filter::{normalize_hostname, DomainFilter, DomainMatch, DomainNameError};

@@ -683,6 +683,7 @@ mod tests {
     macro_rules! skip_if_no_bind {
         () => {
             if !can_bind_localhost() {
+                crate::test_support::skip("this machine cannot bind a socket on the loopback");
                 return Ok(());
             }
         };
@@ -815,10 +816,22 @@ mod tests {
         let server = ProxyServer::new(config)?;
         let handle = server.start().await?;
 
+        assert!(handle.is_running(), "the server runs before the shutdown");
+        let proxy_addr = handle.proxy_addr();
         handle.shutdown().await?;
 
-        // Cannot check is_running after shutdown since handle is consumed
-        // This test verifies shutdown completes without error
+        // The shutdown takes the handle, so the proof is the port: after
+        // the shutdown nothing accepts a connection on it.
+        let addr = proxy_addr.ok_or("the proxy has no address")?;
+        let after = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tokio::net::TcpStream::connect(addr),
+        )
+        .await;
+        assert!(
+            matches!(after, Ok(Err(_)) | Err(_)),
+            "the port {addr} still accepts a connection after the shutdown"
+        );
         Ok(())
     }
 
@@ -1379,27 +1392,6 @@ mod tests {
             result.is_err(),
             "start() should fail when proxy port is in use"
         );
-        Ok(())
-    }
-
-    #[tokio::test]
-
-    async fn test_shutdown_already_stopped() -> TestResult {
-        skip_if_no_bind!();
-        let config = ProxyConfig {
-            dns_bind_addr: "127.0.0.1:25371".parse()?,
-            proxy_bind_addr: "127.0.0.1:29318".parse()?,
-            ..Default::default()
-        };
-        let server = ProxyServer::new(config)?;
-        let handle = server.start().await?;
-
-        // First shutdown
-        handle.shutdown().await?;
-
-        // Note: handle is consumed, so this tests that shutdown completes
-        // without panicking. A second shutdown on the same handle
-        // isn't possible due to ownership semantics.
         Ok(())
     }
 
