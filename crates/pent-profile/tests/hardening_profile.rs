@@ -1141,8 +1141,6 @@ fn p4_gap_tool_configs_that_run_code() {
 /// the behaviour that the guard must have. See the open items of
 /// `docs/security/watch-and-profiles.md`.
 #[test]
-#[ignore = "OPEN H-14: guard_rules_with moves only the PentFiles rules; the \
-            other rules below ~/.config keep the default location"]
 fn p4_persistence_rules_follow_the_xdg_config_directory() {
     let home = Path::new(HOME);
     let xdg_config = home.join("dotfiles/config");

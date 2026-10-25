@@ -875,12 +875,17 @@ impl DnsServer {
         if let (Some(dst), Some(src)) = (message.get_mut(..2), query.get(..2)) {
             dst.copy_from_slice(src);
         }
-        // QR=1, opcode 0, AA=0, TC=0 (the server does not serve DNS over
-        // TCP, thus the client must use the records that it gets), RD from
-        // the client. RA=1, rcode from upstream.
+        // QR=1, opcode 0, AA=0, RD from the client, RA=1, rcode from
+        // upstream.
+        //
+        // The truncation bit of the upstream answer stays. An earlier
+        // version cleared it, with the reason that pent served no DNS over
+        // TCP. Pent serves DNS over TCP now, so a client that sees the bit
+        // asks again over TCP and gets the whole answer. Without the bit
+        // the client takes a part of the answer for the whole one.
         let rd = query.get(2).map_or(0, |f| f & FLAG_RD);
         if let Some(flags) = message.get_mut(2) {
-            *flags = (FLAG_QR | rd) & !FLAG_TC;
+            *flags = FLAG_QR | rd | (*flags & FLAG_TC);
         }
         if let Some(flags) = message.get_mut(3) {
             *flags = FLAG_RA | (*flags & 0x0F);
@@ -3495,7 +3500,6 @@ mod wire_properties {
     /// the whole answer and never asks again over TCP. The server does
     /// serve DNS over TCP (`DnsServer::run_tcp_on`), so the retry works.
     #[test]
-    #[ignore = "OPEN FUZZ-2: the server clears the truncation bit of the upstream answer"]
     fn the_server_keeps_the_truncation_bit() {
         let (query, answer) = query_and_answer(FLAG_QR | FLAG_TC);
         let Ok(question) = read_question(&query, Pointers::Forbidden) else {
@@ -3509,26 +3513,6 @@ mod wire_properties {
             flags & FLAG_TC != 0,
             "the server removed the truncation bit of the upstream answer"
         );
-    }
-
-    /// The result of today for the input of FUZZ-2. This test passes; it
-    /// fails when somebody fixes the flag.
-    #[test]
-    fn the_server_clears_the_truncation_bit_today() {
-        let (query, answer) = query_and_answer(FLAG_QR | FLAG_TC);
-        let Ok(question) = read_question(&query, Pointers::Forbidden) else {
-            panic!("the query of the test must parse");
-        };
-        let response = DnsServer::finish_response(&query, &question, answer);
-        assert_eq!(
-            response.get(2).map(|f| f & FLAG_TC),
-            Some(0),
-            "the server now keeps the truncation bit; update FUZZ-2"
-        );
-        // The rest of the header is correct: the answer is a response, and
-        // the server offers recursion.
-        assert_eq!(response.get(2).map(|f| f & FLAG_QR), Some(FLAG_QR));
-        assert_eq!(response.get(3).map(|f| f & FLAG_RA), Some(FLAG_RA));
     }
 
     /// A clamped TTL is always inside the bounds, for every pair of bounds.

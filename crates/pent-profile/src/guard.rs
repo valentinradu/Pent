@@ -177,6 +177,30 @@ pub fn guard_rules_with(home: &Path, pent_dirs: &[PathBuf]) -> Vec<GuardRule> {
     use GuardAccess::{ExecName, Read, Write};
     use GuardClass::{Credential, PentFiles, Persistence, PrivilegeEscalation};
 
+    // The rules below `.config` and `.local/state` must follow the XDG
+    // variables: a user who sets `XDG_CONFIG_HOME` keeps the same files in
+    // another place, and a guard that looks only below the home directory
+    // then protects nothing. `pent_dirs` holds the directories of pent
+    // itself (`<config>/pent` and `<state>/pent`), so their parents are the
+    // roots that the user chose.
+    let extra_config: Vec<PathBuf> = pent_dirs
+        .iter()
+        .filter(|d| d.file_name().is_some_and(|n| n == "pent"))
+        .filter_map(|d| d.parent().map(Path::to_path_buf))
+        .filter(|root| *root != home.join(".config") && *root != home.join(".local/state"))
+        .collect();
+
+    // Each path of a rule, below the home directory and below each root
+    // that the user chose.
+    let paths = |rel: &str| -> Vec<PathBuf> {
+        let mut out = vec![home.join(rel)];
+        for prefix in [".config/", ".local/state/"] {
+            if let Some(rest) = rel.strip_prefix(prefix) {
+                out.extend(extra_config.iter().map(|root| root.join(rest)));
+            }
+        }
+        out
+    };
     let h = |rel: &str| home.join(rel);
     let mut rules = Vec::new();
     let mut add = |class, access, target| {
@@ -233,7 +257,9 @@ pub fn guard_rules_with(home: &Path, pent_dirs: &[PathBuf]) -> Vec<GuardRule> {
         ".psql_history",
         ".local/share/fish/fish_history",
     ] {
-        add(Credential, Read, GuardTarget::Exact(h(exact)));
+        for path in paths(exact) {
+            add(Credential, Read, GuardTarget::Exact(path));
+        }
     }
     for subtree in [
         ".aws/sso/cache",
@@ -254,7 +280,9 @@ pub fn guard_rules_with(home: &Path, pent_dirs: &[PathBuf]) -> Vec<GuardRule> {
         "Library/Application Support/Google/Chrome",
         "Library/Application Support/Firefox",
     ] {
-        add(Credential, Read, GuardTarget::Subtree(h(subtree)));
+        for path in paths(subtree) {
+            add(Credential, Read, GuardTarget::Subtree(path));
+        }
     }
 
     // ── Persistence writes ───────────────────────────────────────────────────
@@ -296,7 +324,9 @@ pub fn guard_rules_with(home: &Path, pent_dirs: &[PathBuf]) -> Vec<GuardRule> {
         ".direnvrc",
         ".config/direnv/direnvrc",
     ] {
-        add(Persistence, Write, GuardTarget::Exact(h(exact)));
+        for path in paths(exact) {
+            add(Persistence, Write, GuardTarget::Exact(path));
+        }
     }
     for subtree in [
         // Shell and session configuration.
@@ -323,7 +353,9 @@ pub fn guard_rules_with(home: &Path, pent_dirs: &[PathBuf]) -> Vec<GuardRule> {
         ".git-templates",
         ".config/git/hooks",
     ] {
-        add(Persistence, Write, GuardTarget::Subtree(h(subtree)));
+        for path in paths(subtree) {
+            add(Persistence, Write, GuardTarget::Subtree(path));
+        }
     }
     for dir in PYTHON_USER_SITE_DIRS {
         for pattern in PYTHON_STARTUP_PATTERNS {
