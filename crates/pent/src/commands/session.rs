@@ -389,8 +389,15 @@ pub(crate) fn exit_like_child(status: std::process::ExitStatus) -> ! {
         // SIGPIPE to SIG_IGN and tokio installs handlers for other signals,
         // so we set the default action first; otherwise raise() has no
         // effect.
+        //
+        // SIGKILL and SIGSTOP take no handler: signal() gives SIG_ERR for
+        // them with EINVAL. They also need none, because no handler can
+        // change what they do. An earlier version skipped the raise after
+        // SIG_ERR, so a child that died from SIGKILL made pent exit with
+        // the code 137 instead of dying from the signal.
+        let needs_default = sig != libc::SIGKILL && sig != libc::SIGSTOP;
         unsafe {
-            if libc::signal(sig, libc::SIG_DFL) != libc::SIG_ERR {
+            if !needs_default || libc::signal(sig, libc::SIG_DFL) != libc::SIG_ERR {
                 libc::raise(sig);
             }
         }

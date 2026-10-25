@@ -117,7 +117,7 @@ Each private directory is a tmpfs with `nosuid` and `nodev`, and with no size li
 
 Landlock does not control `connect(2)` on Unix sockets that have a path. The kernel also needs no file right to walk through a directory. A sandboxed process can connect to any socket file that it can find, even when the file is outside the profile. The private directories above remove the main targets: every socket under `/tmp`, `/var/tmp` and `/run` is gone, among them the socket of a terminal multiplexer (which would run a command for the process outside the sandbox), the system D-Bus socket, the `tailscaled` LocalAPI socket (which opens a TCP stream to any host, past the proxy), the Docker and Podman sockets, and the sockets of the host resolvers.
 
-A fixed list of sockets can never be complete, so Pent hides a directory, not a name. For the sockets that no private directory covers, Pent keeps a list and covers each one with `/dev/null`: the system D-Bus socket, the agent sockets of your home directory (`~/.gnupg/S.gpg-agent*`, `~/.gnupg/S.dirmngr*`, `~/.ssh/agent.*`), the container sockets, and, when the network is not `unrestricted`, the sockets of the host resolvers and of `tailscaled`. If your configuration names one of these paths, Pent does not hide it.
+A fixed list of sockets can never be complete, so Pent hides a directory, not a name. For the sockets that no private directory covers, Pent keeps a list and covers each one with `/dev/null`: the system D-Bus socket, the agent sockets of your home directory (`~/.gnupg/S.gpg-agent*`, `~/.gnupg/S.dirmngr*`, `~/.ssh/agent.*`), the container sockets, and, when the network is not `unrestricted`, the sockets of the host resolvers and of `tailscaled`. If your configuration names one of these paths, Pent does not hide it. A path in `unix_sockets` is an exception today: Pent connects to it for the program, but it still covers the path, so a `stat` says that the path is not a socket.
 
 A socket in another directory still works. The full fix is a `connect(2)` filter in the supervisor; see [`docs/security/linux-sandbox.md`](docs/security/linux-sandbox.md).
 
@@ -125,7 +125,7 @@ A profile names the sockets that the program needs in `filesystem.unix_sockets`,
 
 #### Processes
 
-The sandboxed process runs in a new PID namespace with its own `proc` mount. It sees only the processes of the sandbox, so it cannot read the command line of your other programs (a command line often holds a token). When the command exits, the kernel ends every other process of the sandbox, so no background process outlives `pent run`. The exit code and the signal of the command reach you unchanged. Watch mode (`pent watch`) does not take a PID namespace: it must not change how the program runs.
+The sandboxed process runs in a new PID namespace with its own `proc` mount. It sees only the processes of the sandbox, so it cannot read the command line of your other programs (a command line often holds a token). When the command exits, the kernel ends every other process of the sandbox, so no background process outlives `pent run`. The exit code and the signal of the command reach you unchanged. Watch mode takes a PID namespace too, and its PID 1 waits for the processes that stay, so that the recorder keeps their accesses.
 
 The sandboxed process keeps the controlling terminal, because interactive tools need it. A seccomp filter blocks `ioctl(TIOCSTI)` and `ioctl(TIOCLINUX)`, so the process cannot push keystrokes into your shell. Pent makes `<workspace>/.pent` read-only inside the sandbox.
 

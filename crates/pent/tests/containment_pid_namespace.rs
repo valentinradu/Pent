@@ -311,7 +311,6 @@ fn each_signal_of_the_command_reaches_the_caller() -> TestResult {
 /// and pent never raises the signal. The chain of the PID namespace is
 /// correct: the stub does die from `SIGKILL`.
 #[test]
-#[ignore = "OPEN CT-3: SIGKILL of the command gives the exit code 137, not the signal"]
 fn sigkill_of_the_command_reaches_the_caller() -> TestResult {
     let test = "sigkill_of_the_command_reaches_the_caller";
     if !ready(test) {

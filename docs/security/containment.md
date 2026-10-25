@@ -43,7 +43,7 @@ cargo test -p pent --test 'containment_*' -- --include-ignored  # also the findi
 |----|----------|----------|-------|------|
 | CT-1 | High | A second thread changes the address family of `connect(2)` after the supervisor read it, and the child reaches any Unix socket of the host. | **Open** | `a_second_thread_cannot_change_the_address_family` |
 | CT-2 | High | `sendto(2)` is not trapped, so the child sends data to any Unix socket that it can resolve. | **Open** | `sendto_cannot_reach_a_socket_outside_the_profile` |
-| CT-3 | Low | `SIGKILL` of the command gives pent the exit code 137, not the signal. | **Open** | `sigkill_of_the_command_reaches_the_caller` |
+| CT-3 | Low | `SIGKILL` of the command gave pent the exit code 137, not the signal. | **Fixed** by `fix(cli): die from the signal of the command, also SIGKILL` | `sigkill_of_the_command_reaches_the_caller` |
 | CT-4 | Low | A socket that only `unix_sockets` names stays covered with `/dev/null`, against what the README says. | **Open** | `a_socket_that_the_configuration_names_is_not_hidden` |
 
 CT-1 and CT-2 need a non-empty `unix_sockets` list. With the default
@@ -110,7 +110,7 @@ proposes. A `sendto` with a non-null address goes to the supervisor; the
 supervisor refuses an address that the profile does not name. A `sendto`
 on a connected socket has a null address and can keep `CONTINUE`.
 
-### CT-3 — `SIGKILL` of the command gives the exit code 137
+### CT-3 — `SIGKILL` of the command gave the exit code 137 (fixed)
 
 **Severity: low. State: open.**
 
@@ -185,8 +185,8 @@ each connection.
 
 | Document | Sentence | What is true |
 |----------|----------|--------------|
-| `README.md`, "Processes" | "Watch mode (`pent watch`) does not take a PID namespace: it must not change how the program runs." | Watch mode does take a PID namespace with a private `proc`. `linux.rs` sets `CLONE_NEWPID` for `enforce \|\| watch`, `docs/design/watch.md` and `docs/security/linux-sandbox.md` (LS-3) both describe it, and the test `watch_mode_also_hides_the_processes_of_the_host` proves it. Only the end differs (`Orphans::Wait`). Remove the sentence. |
-| `README.md`, "Processes" | "The exit code and the signal of the command reach you unchanged." | True for each signal but `SIGKILL`. See CT-3. |
+| `README.md`, "Processes" | (corrected) "Watch mode (`pent watch`) does not take a PID namespace: it must not change how the program runs." | Watch mode does take a PID namespace with a private `proc`. `linux.rs` sets `CLONE_NEWPID` for `enforce \|\| watch`, `docs/design/watch.md` and `docs/security/linux-sandbox.md` (LS-3) both describe it, and the test `watch_mode_also_hides_the_processes_of_the_host` proves it. Only the end differs (`Orphans::Wait`). Remove the sentence. |
+| `README.md`, "Processes" | "The exit code and the signal of the command reach you unchanged." | True now for each signal, `SIGKILL` included. CT-3 is fixed. |
 | `README.md`, "Unix sockets" | "If your configuration names one of these paths, Pent does not hide it." | True for a path rule, false for `unix_sockets` and `--unix-socket`. See CT-4. |
 
 ## Verified defenses
