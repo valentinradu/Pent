@@ -65,6 +65,16 @@ Pent includes a DNS and TCP proxy. The DNS side returns `NXDOMAIN` for disallowe
 
 `--allow` and `--network proxy` are accepted on macOS but do not yet enforce network policy. Pent runs with unrestricted network access until a macOS-compatible isolation mechanism is implemented. On Linux, network policy is enforced at the kernel level via network namespaces.
 
+### Linux: requirements and Unix sockets
+
+Pent requires Landlock ABI v3 or later (Linux 6.2), and Landlock must be enabled at boot. Pent uses the highest ABI up to v6. On ABI v6, the sandboxed process cannot connect to abstract Unix sockets outside the sandbox and cannot send signals to processes outside the sandbox.
+
+Landlock does not control `connect(2)` on Unix sockets that have a path. A sandboxed process can connect to any socket file that it can find. To decrease this risk, Pent hides the well-known sockets in the private mount namespace of the child: an empty tmpfs covers `/run/user/<uid>` (session D-Bus, systemd user manager, rootless Docker), and `/dev/null` covers `/run/docker.sock` and `/run/podman/podman.sock`. If your configuration names one of these paths, Pent does not hide it. Other socket files (for example the system D-Bus socket or sockets in your home directory) stay reachable.
+
+The sandboxed process keeps the controlling terminal, because interactive tools need it. A seccomp filter blocks `ioctl(TIOCSTI)` and `ioctl(TIOCLINUX)`, so the process cannot push keystrokes into your shell. Pent makes `<workspace>/.pent` read-only inside the sandbox.
+
+Proxy mode needs `CAP_NET_ADMIN` on the host, and either nft or iptables, to install the host firewall. The host accepts only the proxy and DNS ports from the sandbox and drops all other traffic from it.
+
 ## Installation
 
 ### Homebrew (macOS / Linux)
