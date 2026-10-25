@@ -164,6 +164,44 @@ impl GuardPlan {
     }
 }
 
+/// The maximum depth of the walk below the directory of a
+/// [`GuardTarget::FilesInDir`] rule.
+const GUARD_WALK_DEPTH: u32 = 8;
+
+/// The maximum number of entries that the walk of one guard directory
+/// looks at. A directory with more entries is not a store of credentials,
+/// and the walk must not hold the start of the program.
+const GUARD_WALK_ENTRIES: usize = 4096;
+
+/// Call `visit` for each regular file below `dir`, down to `depth` levels.
+///
+/// The walk does not follow a symbolic link: it reads the type of each
+/// entry with `symlink_metadata`, so a link to another directory is not a
+/// way out of `dir`. `budget` limits the number of entries.
+fn walk_guard_dir(dir: &Path, depth: u32, budget: &mut usize, visit: &mut impl FnMut(&Path)) {
+    if depth == 0 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if *budget == 0 {
+            return;
+        }
+        *budget = budget.saturating_sub(1);
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.is_dir() {
+            walk_guard_dir(&path, depth.saturating_sub(1), budget, visit);
+        } else if meta.is_file() {
+            visit(&path);
+        }
+    }
+}
+
 /// Compute the mounts for the guard `rules`. The function looks at the
 /// filesystem: only paths that exist get a mount.
 #[must_use]
@@ -185,14 +223,18 @@ pub(crate) fn plan_guard(rules: &[GuardRule]) -> GuardPlan {
                 }
             }
             (GuardAccess::Read | GuardAccess::Write, GuardTarget::FilesInDir { dir, .. }) => {
-                let Ok(entries) = std::fs::read_dir(dir) else {
-                    continue;
-                };
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if rule.matches(&path, rule.access) {
-                        plan.add_existing(rule, &path);
+                // The rule matches a file at any depth below `dir`, so the
+                // mounts must cover the whole tree. A key in a
+                // subdirectory needs a mask too.
+                let mut found: Vec<PathBuf> = Vec::new();
+                let mut budget = GUARD_WALK_ENTRIES;
+                walk_guard_dir(dir, GUARD_WALK_DEPTH, &mut budget, &mut |path| {
+                    if rule.matches(path, rule.access) {
+                        found.push(path.to_path_buf());
                     }
+                });
+                for path in &found {
+                    plan.add_existing(rule, path);
                 }
             }
             // A target that does not fit the access has no effect.
@@ -1622,6 +1664,73 @@ mod tests {
     }
 
     // ── The guard plan ─────────────────────────────────────────────────────
+
+    /// The mounts must cover each file that the rule matches, also a key in
+    /// a subdirectory and a key whose name matches a suffix pattern.
+    #[test]
+    fn guard_plan_masks_a_key_below_a_subdirectory() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        let root = std::fs::canonicalize(tmp.path())?;
+        let ssh = root.join(".ssh");
+        std::fs::create_dir_all(ssh.join("old/keys"))?;
+        std::fs::write(ssh.join("work_rsa"), "k")?;
+        std::fs::write(ssh.join("old/keys/deep_rsa"), "k")?;
+        std::fs::write(ssh.join("old/notes.txt"), "n")?;
+        let rules = vec![GuardRule {
+            class: GuardClass::Credential,
+            access: GuardAccess::Read,
+            target: GuardTarget::FilesInDir {
+                dir: ssh.clone(),
+                prefix: "*_rsa".into(),
+                exclude_suffix: Some(".pub".into()),
+            },
+        }];
+        let plan = plan_guard(&rules);
+        assert_eq!(
+            plan.mask_files,
+            vec![ssh.join("old/keys/deep_rsa"), ssh.join("work_rsa")]
+        );
+        let judge = Judge::Guard {
+            enforced: plan.effective,
+            unenforced: plan.unenforced,
+        };
+        let cred = Outcome::Blocked(GuardClass::Credential);
+        assert_eq!(judge.fs(FsOp::Read, &ssh.join("work_rsa"), false), cred);
+        assert_eq!(
+            judge.fs(FsOp::Read, &ssh.join("old/keys/deep_rsa"), false),
+            cred
+        );
+        assert_eq!(
+            judge.fs(FsOp::Read, &ssh.join("old/notes.txt"), false),
+            Outcome::Allowed
+        );
+        Ok(())
+    }
+
+    /// The walk does not follow a symbolic link to another directory.
+    #[test]
+    fn guard_plan_does_not_follow_a_link_out_of_the_directory() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        let root = std::fs::canonicalize(tmp.path())?;
+        let ssh = root.join(".ssh");
+        let other = root.join("other");
+        std::fs::create_dir(&ssh)?;
+        std::fs::create_dir(&other)?;
+        std::fs::write(other.join("id_rsa"), "k")?;
+        std::os::unix::fs::symlink(&other, ssh.join("link"))?;
+        let rules = vec![GuardRule {
+            class: GuardClass::Credential,
+            access: GuardAccess::Read,
+            target: GuardTarget::FilesInDir {
+                dir: ssh.clone(),
+                prefix: "id_".into(),
+                exclude_suffix: None,
+            },
+        }];
+        let plan = plan_guard(&rules);
+        assert!(plan.mask_files.is_empty(), "{:?}", plan.mask_files);
+        Ok(())
+    }
 
     #[test]
     fn guard_plan_expands_existing_targets() -> TestResult {

@@ -10,22 +10,29 @@
 //!
 //! # Namespaces
 //!
-//! With enforcement, the child always creates a user namespace and a mount
-//! namespace (and a network namespace unless the network is `Unrestricted`):
+//! With enforcement, the child always creates a user namespace, a mount
+//! namespace and a PID namespace (and a network namespace unless the
+//! network is `Unrestricted`):
 //! - `LocalhostOnly`: new network namespace, the child brings up loopback.
 //! - `ProxyOnly`: new network namespace; the child brings up loopback and
 //!   makes the proxy listeners in it (see `linux_proxynet.rs`).
 //! - `Blocked`: new network namespace with no interfaces.
 //! - `Unrestricted`: no network namespace.
 //!
-//! The private mount namespace hides the Unix sockets that Landlock cannot
-//! control (`/run/user/<uid>`, the Docker and Podman sockets) and makes
-//! `<workspace>/.pent` read-only.
+//! The private mount namespace gives the child its own `/tmp`, `/var/tmp`
+//! and `/run`, hides the Unix sockets that Landlock cannot control, and
+//! makes `<workspace>/.pent` read-only.
 //!
-//! Watch mode (`SpawnMode::Watch`) also creates a user namespace and a
-//! mount namespace, but applies no Landlock, no overlay and no masks. The
-//! mount namespace holds only the mounts of the watch guard (see
-//! `linux_watch.rs`).
+//! The PID namespace holds a private `proc` mount, so the child sees only
+//! the processes of the sandbox, and no background process of the sandbox
+//! outlives the command. `unshare(CLONE_NEWPID)` does not move the caller,
+//! so the `pre_exec` hook forks twice; see [`fork_pid_namespace`].
+//!
+//! Watch mode (`SpawnMode::Watch`) creates a user namespace and a mount
+//! namespace, but no PID namespace: it must not change how the program
+//! runs, and an orphan of the program must keep its events. It applies no
+//! Landlock, no overlay and no masks. The mount namespace holds the private
+//! directories and the mounts of the watch guard (see `linux_watch.rs`).
 //!
 //! # Landlock architecture
 //!
@@ -56,18 +63,31 @@
 //! `mount_overlays`) still allocate in the child. They run only when write
 //! listed files need an overlay.
 //!
+//! # Private temporary and runtime directories
+//!
+//! `/tmp`, `/var/tmp` and `/run` of the host hold the temporary files and the
+//! control sockets of the programs of the user. The child gets an empty
+//! tmpfs over each of them (see [`PRIVATE_DIRS`]), and pent binds back only
+//! the paths that the session needs: the workspace, the data directory, the
+//! working directory, each configured path, each directory of `PATH`, and
+//! the system paths of [`PRIVATE_KEEP`]. See [`plan_private_dirs`].
+//!
 //! # Limits
 //!
 //! Landlock (ABI v6 and earlier) does not control `connect(2)` on Unix
 //! sockets that have a path. A sandboxed process can connect to a socket file
-//! that it finds, if the socket is not hidden by a mount. Pent hides only the
-//! well-known sockets.
+//! that it finds, if the socket is not hidden by a mount. The private
+//! directories above hide the sockets under `/tmp`, `/var/tmp` and `/run`.
+//! A socket in the home directory needs a mask (see [`HOME_AGENT_SOCKETS`]),
+//! and a socket that the profile names stays reachable. The full fix is a
+//! `connect(2)` filter in the supervisor.
 
 use crate::linux_landlock::{access, PreparedRuleset};
 use crate::{NetworkMode, SandboxConfig, SandboxError};
 use std::collections::HashSet;
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI32, Ordering};
 
 #[cfg(test)]
 /// Minimum required Landlock ABI version.
@@ -116,20 +136,103 @@ const PROC_PATHS: &[&str] = &["/proc"];
 /// Unix sockets that give a way out of the sandbox. The child hides each one
 /// that exists with a bind mount of `/dev/null`, unless the configuration
 /// names it.
+///
+/// A fixed list can never be complete: each daemon that keeps a control
+/// socket and offers a dial or an exec operation is an escape. The private
+/// directories of [`PRIVATE_DIRS`] hide every socket under `/run`, `/tmp`
+/// and `/var/tmp`, so this list is a second layer. It is also the list that
+/// a user setting can extend later.
 const ESCAPE_SOCKETS: &[&str] = &[
     "/run/docker.sock",
     "/var/run/docker.sock",
     "/run/podman/podman.sock",
+    // The system message bus. It gives access to systemd-resolved (name
+    // resolution past the proxy), NetworkManager and polkit.
+    "/run/dbus/system_bus_socket",
+    "/var/run/dbus/system_bus_socket",
 ];
 
-/// Unix sockets of host resolvers. A query through them goes to the network
-/// of the host, past the proxy. When the network is not `Unrestricted`, the
-/// child hides each one that exists, like [`ESCAPE_SOCKETS`]. Then the C
-/// library uses `/etc/resolv.conf`.
+/// Unix sockets of host resolvers and of host network agents. A query or a
+/// connection through them goes to the network of the host, past the proxy.
+/// When the network is not `Unrestricted`, the child hides each one that
+/// exists, like [`ESCAPE_SOCKETS`]. Then the C library uses
+/// `/etc/resolv.conf`.
 const RESOLVER_SOCKETS: &[&str] = &[
     "/run/nscd/socket",
     "/var/run/nscd/socket",
     "/run/systemd/resolve/io.systemd.Resolve",
+    // The Tailscale daemon. Its LocalAPI has a "ts-dial" upgrade that opens
+    // a TCP stream to any host of the tailnet, and through an exit node or a
+    // subnet route to the public internet.
+    "/run/tailscale/tailscaled.sock",
+    "/var/run/tailscale/tailscaled.sock",
+];
+
+/// Unix sockets of an agent in the home directory, as a directory and a name
+/// prefix. The agent signs a challenge or decrypts a secret for any program
+/// that reaches its socket, so the child must not see it. The child hides
+/// each socket in `<home>/<dir>` whose name starts with `prefix`, unless the
+/// configuration names the socket.
+///
+/// The sockets under `/run/user/<uid>` need no entry here: [`PRIVATE_DIRS`]
+/// hides all of `/run`.
+const HOME_AGENT_SOCKETS: &[(&str, &str)] = &[
+    (".gnupg", "S.gpg-agent"),
+    (".gnupg", "S.dirmngr"),
+    (".ssh", "agent."),
+];
+
+/// A directory that an empty tmpfs covers in the mount namespace of the
+/// child.
+struct PrivateDir {
+    /// The directory of the host.
+    path: &'static str,
+    /// The mount data of the tmpfs.
+    ///
+    /// The data has no `size=`, so the tmpfs takes the kernel default of
+    /// half of the memory. A build writes large temporary files, and a
+    /// smaller limit breaks it.
+    data: &'static CStr,
+}
+
+/// The directories that pent replaces with an empty tmpfs in the mount
+/// namespace of the child.
+///
+/// `/tmp` and `/var/tmp` hold the temporary files of the programs of the
+/// user; `/run` holds their control sockets. The child must see neither.
+/// Each tmpfs is `nosuid` and `nodev`. `/tmp` and `/var/tmp` keep the mode
+/// `1777` of a temporary directory; `/run` keeps `0755`.
+///
+/// A path that is a symbolic link is skipped: `/var/run` points to `/run` on
+/// most systems, and the tmpfs on `/run` covers it.
+const PRIVATE_DIRS: &[PrivateDir] = &[
+    PrivateDir {
+        path: "/tmp",
+        data: c"mode=1777",
+    },
+    PrivateDir {
+        path: "/var/tmp",
+        data: c"mode=1777",
+    },
+    PrivateDir {
+        path: "/run",
+        data: c"mode=0755",
+    },
+    PrivateDir {
+        path: "/var/run",
+        data: c"mode=0755",
+    },
+];
+
+/// The paths under a private directory that pent always binds back when they
+/// exist. NixOS keeps the system profile, the setuid wrappers and the
+/// graphics drivers under `/run`, and no program starts without them.
+const PRIVATE_KEEP: &[&str] = &[
+    "/run/current-system",
+    "/run/booted-system",
+    "/run/wrappers/bin",
+    "/run/opengl-driver",
+    "/run/opengl-driver-32",
 ];
 
 /// Compute the set of paths the sandboxed process is allowed to read/execute.
@@ -194,6 +297,9 @@ pub(crate) struct AccessPolicy {
     /// The paths that the private mounts hide (a connection to a socket
     /// below them fails).
     hidden: Vec<PathBuf>,
+    /// The paths that pent binds back inside a private directory. A path
+    /// below one of them stays reachable, also when a hidden path covers it.
+    visible: Vec<PathBuf>,
     /// True if a connection to an abstract Unix socket outside the sandbox
     /// fails (a new network namespace, or the Landlock scope of ABI v6).
     abstract_denied: bool,
@@ -260,6 +366,7 @@ impl AccessPolicy {
         } else {
             let path = Path::new(target);
             self.hidden.iter().any(|h| path.starts_with(h))
+                && !self.visible.iter().any(|v| path.starts_with(v))
         };
         if denied {
             pent_profile::Outcome::Denied
@@ -279,8 +386,8 @@ pub fn check_available() -> Result<(), SandboxError> {
 }
 
 /// Check that this user can create a user namespace with a network
-/// namespace in it. The sandbox and watch mode need both, and no other
-/// privilege.
+/// namespace and a PID namespace in it. The sandbox needs all three, and no
+/// other privilege.
 ///
 /// The check forks a short-lived child that calls `unshare`.
 ///
@@ -299,7 +406,9 @@ pub fn check_user_namespaces() -> Result<(), SandboxError> {
     if pid == 0 {
         // SAFETY: unshare(2) with integer flags.
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-        let ok = unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) } == 0;
+        let ok = unsafe {
+            libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET | libc::CLONE_NEWPID)
+        } == 0;
         let code = if ok {
             0
         } else {
@@ -337,7 +446,8 @@ pub fn check_user_namespaces() -> Result<(), SandboxError> {
     };
     Err(SandboxError::SandboxUnavailable {
         reason: format!(
-            "this user cannot create a user namespace and a network namespace: {}",
+            "this user cannot create a user namespace, a network namespace and a PID \
+             namespace: {}",
             std::io::Error::from_raw_os_error(errno)
         ),
         remediation: "Let unprivileged users create user namespaces: set the sysctl \
@@ -674,6 +784,279 @@ fn cloexec_inherited_fds() {
     }
 }
 
+// ── The supervisors of the PID namespace ───────────────────────────────────
+
+/// The process that the supervisor of this process waits for. A signal
+/// handler reaches only a static, so the PID lives here.
+static SUPERVISED_PID: AtomicI32 = AtomicI32::new(0);
+
+/// The signals that a supervisor passes on.
+///
+/// The terminal sends `SIGINT`, `SIGQUIT` and `SIGWINCH` to the whole
+/// process group. A process group holds its members across a PID namespace,
+/// so the command gets these signals directly and needs no relay. The other
+/// signals come from `kill`, and pent sends them to the direct child.
+const FORWARDED_SIGNALS: [libc::c_int; 4] = [
+    libc::SIGTERM,
+    libc::SIGHUP,
+    libc::SIGUSR1,
+    libc::SIGUSR2,
+];
+
+/// Pass the signal to the supervised process. Async-signal-safe.
+extern "C" fn forward_signal(sig: libc::c_int) {
+    let pid = SUPERVISED_PID.load(Ordering::Relaxed);
+    if pid > 0 {
+        // SAFETY: kill(2) with integer arguments only.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe { libc::kill(pid, sig) };
+    }
+}
+
+/// Install [`forward_signal`] for each signal of [`FORWARDED_SIGNALS`].
+/// Async-signal-safe.
+fn install_signal_forwarders() {
+    for sig in FORWARDED_SIGNALS {
+        // SAFETY: a zeroed `sigaction` is a valid, empty structure, and the
+        // code below fills each field that `sigaction(2)` reads.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let mut act: libc::sigaction = unsafe { std::mem::zeroed() };
+        act.sa_sigaction = forward_signal as *const () as usize;
+        act.sa_flags = libc::SA_RESTART;
+        // SAFETY: `act` is a valid, writable structure, and then a valid
+        // structure that sigaction(2) reads.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe {
+            libc::sigemptyset(&raw mut act.sa_mask);
+            libc::sigaction(sig, &raw const act, std::ptr::null_mut());
+        }
+    }
+}
+
+/// Close every inherited descriptor above the standard three, except
+/// `keep`.
+///
+/// A supervisor must not keep the error pipe of `Command::spawn` open: the
+/// parent reads that pipe until every copy of it is closed, and it holds
+/// the spawn until then. Async-signal-safe.
+fn close_inherited_fds(keep: libc::c_int) {
+    let ranges = [(3, keep.saturating_sub(1)), (keep.saturating_add(1), i32::MAX)];
+    let mut ok = true;
+    for (first, last) in ranges {
+        if first > last {
+            continue;
+        }
+        // SAFETY: close_range(2) with integer arguments only.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let ret = unsafe { libc::syscall(libc::SYS_close_range, first as u32, last as u32, 0u32) };
+        ok = ok && ret == 0;
+    }
+    if ok {
+        return;
+    }
+    for fd in 3..4096 {
+        if fd == keep {
+            continue;
+        }
+        // SAFETY: close(2) on a number; EBADF for a closed number is
+        // harmless.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe { libc::close(fd) };
+    }
+}
+
+/// End this process like the wait status `status`. Async-signal-safe; it
+/// never returns.
+fn exit_like(status: libc::c_int) -> ! {
+    if libc::WIFEXITED(status) {
+        // SAFETY: _exit(2) with an integer argument.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe { libc::_exit(libc::WEXITSTATUS(status)) };
+    }
+    if libc::WIFSIGNALED(status) {
+        let sig = libc::WTERMSIG(status);
+        // SAFETY: a zeroed `sigaction` is a valid, empty structure. The
+        // default action must apply, and the signal must not be blocked,
+        // so that `raise` ends this process with the same reason.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe {
+            let mut act: libc::sigaction = std::mem::zeroed();
+            act.sa_sigaction = libc::SIG_DFL;
+            libc::sigemptyset(&raw mut act.sa_mask);
+            libc::sigaction(sig, &raw const act, std::ptr::null_mut());
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&raw mut set);
+            libc::sigaddset(&raw mut set, sig);
+            libc::sigprocmask(libc::SIG_UNBLOCK, &raw const set, std::ptr::null_mut());
+            libc::raise(sig);
+            // `raise` returned, so the default action does not end this
+            // process. Use the convention of the shell.
+            libc::_exit(128_i32.saturating_add(sig));
+        }
+    }
+    // SAFETY: _exit(2) with an integer argument.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    unsafe { libc::_exit(1) };
+}
+
+/// Wait for `pid`, pass the signals on to it, and reap every other child.
+/// Returns the wait status of `pid`. Async-signal-safe.
+fn wait_and_reap(pid: libc::pid_t) -> libc::c_int {
+    SUPERVISED_PID.store(pid, Ordering::Relaxed);
+    install_signal_forwarders();
+    loop {
+        let mut status: libc::c_int = 0;
+        // SAFETY: waitpid(2) on the children of this process, with a
+        // writable status.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let done = unsafe { libc::waitpid(-1, &raw mut status, 0) };
+        if done == pid {
+            return status;
+        }
+        if done < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            // ECHILD: the supervised process is gone and left no status.
+            write_stderr_static(b"pent: the sandbox supervisor lost the command\n");
+            // SAFETY: _exit(2) with an integer argument.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            unsafe { libc::_exit(1) };
+        }
+    }
+}
+
+/// Read all of `buf` from `fd`. Returns the number of bytes.
+/// Async-signal-safe.
+fn read_all_fd(fd: libc::c_int, buf: &mut [u8]) -> usize {
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        let Some(rest) = buf.get_mut(filled..) else {
+            break;
+        };
+        // SAFETY: `rest` is a valid, writable slice of `rest.len()` bytes.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let n = unsafe { libc::read(fd, rest.as_mut_ptr().cast(), rest.len()) };
+        if n < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
+        if n == 0 {
+            break;
+        }
+        filled = filled.saturating_add(n.unsigned_abs());
+    }
+    filled
+}
+
+/// The supervisor that stays in the old PID namespace. It is the direct
+/// child of pent, so its status is the status that pent reports.
+///
+/// PID 1 of the new namespace cannot end itself with a signal (the kernel
+/// drops a signal with the default action for the init of a namespace), so
+/// it sends the wait status of the command through `status_fd`, and this
+/// supervisor ends itself with that status.
+///
+/// Async-signal-safe; it never returns.
+fn supervise_outer(init: libc::pid_t, status_fd: libc::c_int) -> ! {
+    let status = wait_and_reap(init);
+    let mut buf = [0u8; 4];
+    if read_all_fd(status_fd, &mut buf) == buf.len() {
+        exit_like(libc::c_int::from_ne_bytes(buf));
+    }
+    exit_like(status)
+}
+
+/// The supervisor that is PID 1 of the new PID namespace. It reaps the
+/// orphans of the session. When it exits, the kernel ends every other
+/// process of the namespace, so no background process of the sandbox
+/// outlives the command.
+///
+/// Async-signal-safe; it never returns.
+fn supervise_init(command: libc::pid_t, status_fd: libc::c_int) -> ! {
+    let status = wait_and_reap(command);
+    // The outer supervisor needs the real status; see `supervise_outer`.
+    // Nothing can answer a failure here, and the exit code below still
+    // carries the reason.
+    let _ = write_all_fd(status_fd, &status.to_ne_bytes());
+    exit_like(status)
+}
+
+/// Make the two supervisors of the new PID namespace. Only the command
+/// returns from this function; each supervisor ends its process.
+///
+/// `unshare(CLONE_NEWPID)` does not move the caller, so the first child of
+/// the caller is PID 1 of the new namespace. The command must not be that
+/// PID 1: the kernel drops each signal that has the default action for the
+/// init of a namespace, so `kill` and the terminal could not stop the
+/// command. Thus pent forks twice:
+///
+/// 1. the stub, in the old namespace: it is the direct child of pent, and
+///    it passes the status and the signals of PID 1;
+/// 2. PID 1 of the new namespace: it reaps the orphans of the session and
+///    passes the status and the signals of the command;
+/// 3. the command, PID 2.
+///
+/// Each step gets `PR_SET_PDEATHSIG`, so the whole namespace ends when pent
+/// ends. Async-signal-safe.
+///
+/// # Errors
+/// Returns the OS error of `pipe2(2)`, of `fork(2)` or of `prctl(2)`.
+fn fork_pid_namespace() -> std::io::Result<()> {
+    // The pipe that carries the wait status of the command from PID 1 of
+    // the namespace to the stub; see `supervise_outer`.
+    let mut pipe_fds = [-1 as libc::c_int; 2];
+    // SAFETY: pipe2(2) writes two descriptors into a valid array.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    if unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(last_err(b"pent: the status pipe of the sandbox failed\n"));
+    }
+    let (read_fd, write_fd) = (pipe_fds[0], pipe_fds[1]);
+    // SAFETY: fork(2) has no preconditions. The child uses only
+    // async-signal-safe calls.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let init = unsafe { libc::fork() };
+    if init < 0 {
+        return Err(last_err(b"pent: fork for the PID namespace failed\n"));
+    }
+    if init > 0 {
+        close_inherited_fds(read_fd);
+        supervise_outer(init, read_fd);
+    }
+    // SAFETY: prctl(2) with integer arguments only. `fork` clears the
+    // parent-death signal, so each step sets it again.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) } != 0 {
+        return Err(last_err(b"pent: prctl(PR_SET_PDEATHSIG) failed\n"));
+    }
+    // SAFETY: as above.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let command = unsafe { libc::fork() };
+    if command < 0 {
+        return Err(last_err(b"pent: fork of the command failed\n"));
+    }
+    if command > 0 {
+        close_inherited_fds(write_fd);
+        supervise_init(command, write_fd);
+    }
+    // The command keeps no end of the status pipe.
+    // SAFETY: close(2) on descriptors that `pipe2` made.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    unsafe {
+        libc::close(read_fd);
+        libc::close(write_fd);
+    }
+    // SAFETY: prctl(2) with integer arguments only.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) } != 0 {
+        return Err(last_err(b"pent: prctl(PR_SET_PDEATHSIG) failed\n"));
+    }
+    Ok(())
+}
+
 /// Mount flags that a bind mount inherits and must keep on a remount.
 ///
 /// A remount that drops a flag of a mount from a less privileged mount
@@ -707,18 +1090,90 @@ fn locked_mount_flags(path: &std::ffi::CStr) -> std::io::Result<libc::c_ulong> {
 
 // ── Mount plan ─────────────────────────────────────────────────────────────
 
+/// The access that a private bind gives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BindAccess {
+    /// The mount keeps the access of the source.
+    ReadWrite,
+    /// A remount makes the mount read-only.
+    ReadOnly,
+}
+
+/// What the child does when a private bind fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OnFailure {
+    /// The spawn fails.
+    Stop,
+    /// The child writes a message and continues.
+    Warn,
+}
+
+/// What the child makes at the mount point of a private bind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BindKind {
+    /// Make a directory and bind the source on it.
+    Directory,
+    /// Make an empty file and bind the source on it.
+    File,
+    /// Make an empty directory with this mode and bind nothing. This keeps
+    /// `TMPDIR` and `XDG_RUNTIME_DIR` usable inside the private tmpfs.
+    EmptyDirectory(libc::mode_t),
+    /// Make the parent directories only. The program creates the path
+    /// itself.
+    ParentsOnly,
+}
+
+/// One tmpfs that covers a directory of the host.
+#[derive(Debug)]
+struct PrivateMount {
+    /// The mount point.
+    target: CString,
+    /// The mount data (see [`PrivateDir::data`]).
+    data: &'static CStr,
+}
+
+/// One mount that the child makes after the private tmpfs mounts.
+///
+/// The child opens an `O_PATH` descriptor of the source **before** the tmpfs
+/// mounts hide it, and binds from `/proc/self/fd/<n>` afterwards. This is the
+/// method of bubblewrap.
+#[derive(Debug)]
+struct PrivateBind {
+    /// The source of the mount.
+    source: CString,
+    /// The descriptor of the source. The parent only makes the slot; the
+    /// child opens the descriptor and stores it here.
+    source_fd: AtomicI32,
+    /// The mount point.
+    target: CString,
+    /// The directories to make before the mount point, outermost first.
+    parents: Vec<CString>,
+    /// What the child makes at the mount point.
+    kind: BindKind,
+    /// The access that the mount gives.
+    access: BindAccess,
+    /// What the child does when the mount fails.
+    on_failure: OnFailure,
+}
+
 /// The private mounts that the child makes before Landlock applies.
 #[derive(Debug, Default)]
 struct MountPlan {
     /// Make the mount tree private (only in a new mount namespace).
     make_private: bool,
-    /// `resolv.conf` source to bind-mount over `/etc/resolv.conf`.
-    resolv: Option<CString>,
+    /// Mount a new `proc` on `/proc`. This needs a new PID namespace, and
+    /// it then shows only the processes of the sandbox.
+    private_proc: bool,
+    /// Empty tmpfs mounts over the directories of [`PRIVATE_DIRS`].
+    private_dirs: Vec<PrivateMount>,
+    /// The mounts that restore what the session needs inside the private
+    /// tmpfs mounts, and the `resolv.conf` of the proxy.
+    private_binds: Vec<PrivateBind>,
     /// Paths to bind-mount read-only onto themselves (`<workspace>/.pent`,
     /// and the write targets of the watch guard).
     readonly: Vec<CString>,
-    /// Directories to hide with an empty tmpfs (`/run/user/<uid>` and the
-    /// overlay staging root).
+    /// Directories to hide with an empty tmpfs. Only a directory that no
+    /// private tmpfs already hides is in this list.
     mask_dirs: Vec<CString>,
     /// Socket files to hide with a bind mount of `/dev/null`.
     mask_files: Vec<CString>,
@@ -762,6 +1217,199 @@ fn configured_paths(config: &SandboxConfig) -> Vec<PathBuf> {
     v
 }
 
+/// The plan for the private temporary and runtime directories of the child.
+#[derive(Debug, Default)]
+struct PrivatePlan {
+    /// The tmpfs mounts that cover the directories of the host.
+    mounts: Vec<PrivateMount>,
+    /// The mounts that restore what the session needs inside them.
+    binds: Vec<PrivateBind>,
+    /// The directories that the tmpfs mounts cover.
+    covered: Vec<PathBuf>,
+    /// The paths that stay reachable inside the covered directories.
+    visible: Vec<PathBuf>,
+}
+
+impl PrivatePlan {
+    /// Return true when a tmpfs of the plan hides `path`.
+    fn hides(&self, path: &Path) -> bool {
+        self.covered.iter().any(|c| path.starts_with(c))
+            && !self.visible.iter().any(|v| path.starts_with(v))
+    }
+}
+
+/// Return the directories to make before the mount point `target`, from the
+/// outermost to the innermost. The list stops below `root`: the tmpfs itself
+/// gives the root.
+fn mount_point_parents(target: &Path, root: &Path) -> Vec<CString> {
+    let mut chain: Vec<&Path> = target
+        .ancestors()
+        .skip(1)
+        .take_while(|p| *p != root)
+        .collect();
+    chain.reverse();
+    chain.iter().filter_map(|p| to_cstring(p)).collect()
+}
+
+/// Plan the private temporary and runtime directories of the child.
+///
+/// Each directory of [`PRIVATE_DIRS`] gets an empty tmpfs. Pent binds back
+/// only the paths that the session needs: the workspace, the data directory,
+/// the working directory, each configured path and mount, each directory of
+/// `PATH`, the system paths, and `extra` (the overlay mount points and the
+/// write targets of the watch guard).
+///
+/// `TMPDIR` and `XDG_RUNTIME_DIR` get an empty directory inside the tmpfs
+/// when they point into a covered directory, so that a program that reads
+/// them still finds a place to write. A `TMPDIR` outside the covered
+/// directories stays as it is.
+fn plan_private_dirs(
+    config: &SandboxConfig,
+    path_dirs: &[PathBuf],
+    extra: &[PathBuf],
+    uid: libc::uid_t,
+) -> PrivatePlan {
+    let mut plan = PrivatePlan::default();
+    for dir in PRIVATE_DIRS {
+        let path = Path::new(dir.path);
+        let Ok(real) = std::fs::canonicalize(path) else {
+            continue;
+        };
+        // A symbolic link (`/var/run` points to `/run`): the target of the
+        // link gets its own tmpfs.
+        if real != path || !real.is_dir() {
+            continue;
+        }
+        if plan.covered.iter().any(|c| real.starts_with(c)) {
+            continue;
+        }
+        let Some(target) = to_cstring(&real) else {
+            continue;
+        };
+        plan.covered.push(real);
+        plan.mounts.push(PrivateMount {
+            target,
+            data: dir.data,
+        });
+    }
+    if plan.covered.is_empty() {
+        return plan;
+    }
+
+    let mut keep: Vec<PathBuf> = configured_paths(config);
+    keep.extend(path_dirs.iter().cloned());
+    keep.extend(SYSTEM_PATHS.iter().chain(PRIVATE_KEEP).map(PathBuf::from));
+    keep.extend(extra.iter().cloned());
+    keep.retain(|p| {
+        plan.covered
+            .iter()
+            .any(|c| p.starts_with(c) && p.as_path() != c.as_path())
+    });
+    keep.sort();
+    keep.dedup();
+    // One recursive bind carries a whole subtree, so pent binds only the
+    // outermost path of each subtree.
+    let outermost: Vec<PathBuf> = keep
+        .iter()
+        .filter(|p| !keep.iter().any(|q| q != *p && p.starts_with(q)))
+        .cloned()
+        .collect();
+    for path in outermost {
+        let Some(root) = plan.covered.iter().find(|c| path.starts_with(c)) else {
+            continue;
+        };
+        let parents = mount_point_parents(&path, root);
+        let kind = match std::fs::metadata(&path) {
+            Ok(meta) if meta.is_dir() => BindKind::Directory,
+            Ok(_) => BindKind::File,
+            // The path does not exist yet. The program makes it itself, so
+            // pent only makes the directories above it.
+            Err(_) => BindKind::ParentsOnly,
+        };
+        let Some(target) = to_cstring(&path) else {
+            continue;
+        };
+        if kind != BindKind::ParentsOnly {
+            plan.visible.push(path);
+        }
+        plan.binds.push(PrivateBind {
+            source: target.clone(),
+            source_fd: AtomicI32::new(-1),
+            target,
+            parents,
+            kind,
+            access: BindAccess::ReadWrite,
+            on_failure: OnFailure::Stop,
+        });
+    }
+
+    let mut empty: Vec<PathBuf> = vec![PathBuf::from(format!("/run/user/{uid}"))];
+    empty.extend(
+        ["XDG_RUNTIME_DIR", "TMPDIR"]
+            .iter()
+            .filter_map(|k| config.env.get(*k))
+            .map(PathBuf::from),
+    );
+    for path in empty {
+        let Some(root) = plan
+            .covered
+            .iter()
+            .find(|c| path.starts_with(c) && path.as_path() != c.as_path())
+        else {
+            continue;
+        };
+        // A path that a bind already restores needs no empty directory.
+        if !plan.hides(&path) {
+            continue;
+        }
+        if plan
+            .binds
+            .iter()
+            .any(|b| b.target.as_bytes() == path.as_os_str().as_encoded_bytes())
+        {
+            continue;
+        }
+        let Some(target) = to_cstring(&path) else {
+            continue;
+        };
+        plan.binds.push(PrivateBind {
+            source: target.clone(),
+            source_fd: AtomicI32::new(-1),
+            target,
+            parents: mount_point_parents(&path, root),
+            kind: BindKind::EmptyDirectory(0o700),
+            access: BindAccess::ReadWrite,
+            on_failure: OnFailure::Stop,
+        });
+    }
+    plan
+}
+
+/// Return the bind that puts the `resolv.conf` of the proxy at
+/// `/etc/resolv.conf`.
+///
+/// The target is the canonical path, because `/etc/resolv.conf` is often a
+/// symbolic link into `/run`, and a tmpfs covers `/run`. The bind then makes
+/// the file inside the tmpfs.
+fn resolv_bind(source: &Path, covered: &[PathBuf]) -> Option<PrivateBind> {
+    let link = Path::new("/etc/resolv.conf");
+    let target = std::fs::canonicalize(link).unwrap_or_else(|_| link.to_path_buf());
+    let parents = covered
+        .iter()
+        .find(|c| target.starts_with(c))
+        .map(|root| mount_point_parents(&target, root))
+        .unwrap_or_default();
+    Some(PrivateBind {
+        source: to_cstring(source)?,
+        source_fd: AtomicI32::new(-1),
+        target: to_cstring(&target)?,
+        parents,
+        kind: BindKind::File,
+        access: BindAccess::ReadOnly,
+        on_failure: OnFailure::Warn,
+    })
+}
+
 /// Compute the directories and socket files to hide.
 fn mask_targets(config: &SandboxConfig, uid: libc::uid_t) -> (Vec<PathBuf>, Vec<PathBuf>) {
     use std::os::unix::fs::FileTypeExt;
@@ -790,8 +1438,13 @@ fn mask_targets(config: &SandboxConfig, uid: libc::uid_t) -> (Vec<PathBuf>, Vec<
     } else {
         RESOLVER_SOCKETS
     };
-    for s in ESCAPE_SOCKETS.iter().chain(resolvers) {
-        let p = Path::new(s);
+    let candidates: Vec<PathBuf> = ESCAPE_SOCKETS
+        .iter()
+        .chain(resolvers)
+        .map(PathBuf::from)
+        .chain(home_agent_sockets(config))
+        .collect();
+    for p in &candidates {
         let Ok(real) = std::fs::canonicalize(p) else {
             continue;
         };
@@ -808,7 +1461,226 @@ fn mask_targets(config: &SandboxConfig, uid: libc::uid_t) -> (Vec<PathBuf>, Vec<
     (dirs, files)
 }
 
+/// Return the home directory of the child.
+fn child_home(config: &SandboxConfig) -> Option<PathBuf> {
+    config
+        .env
+        .get("HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+        .filter(|p| p.is_absolute())
+}
+
+/// Return the agent sockets of [`HOME_AGENT_SOCKETS`] that exist in the home
+/// directory of the child.
+fn home_agent_sockets(config: &SandboxConfig) -> Vec<PathBuf> {
+    let Some(home) = child_home(config) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for (dir, prefix) in HOME_AGENT_SOCKETS {
+        let Ok(entries) = std::fs::read_dir(home.join(dir)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with(prefix) {
+                found.push(entry.path());
+            }
+        }
+    }
+    found
+}
+
+/// The length of the longest `/proc/self/fd/<n>` path.
+const FD_PATH_LEN: usize = 32;
+
+/// Write `/proc/self/fd/<fd>` into `buf` and return it.
+///
+/// A bind mount of a source that a tmpfs now hides goes through this path.
+/// Async-signal-safe: the function makes no allocation.
+fn fd_path(fd: libc::c_int, buf: &mut [u8; FD_PATH_LEN]) -> Option<&CStr> {
+    const PREFIX: &[u8] = b"/proc/self/fd/";
+    let mut value = usize::try_from(fd).ok()?;
+    let mut digits = [0u8; 10];
+    let mut count = 0usize;
+    loop {
+        let digit = u8::try_from(value % 10).ok()?;
+        *digits.get_mut(count)? = b'0' + digit;
+        count = count.checked_add(1)?;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    let end = PREFIX.len().checked_add(count)?;
+    buf.get_mut(..PREFIX.len())?.copy_from_slice(PREFIX);
+    for (slot, digit) in buf
+        .get_mut(PREFIX.len()..end)?
+        .iter_mut()
+        .zip(digits.iter().take(count).rev())
+    {
+        *slot = *digit;
+    }
+    *buf.get_mut(end)? = 0;
+    CStr::from_bytes_with_nul(buf.get(..end.checked_add(1)?)?).ok()
+}
+
+/// Make the directory `path` with `mode`. A directory that exists already is
+/// not an error. Async-signal-safe.
+///
+/// # Errors
+/// Returns the OS error of `mkdir(2)`.
+fn mkdir_if_missing(path: &CStr, mode: libc::mode_t) -> std::io::Result<()> {
+    // SAFETY: mkdir(2) with a NUL-terminated string that the parent
+    // prepared.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    if unsafe { libc::mkdir(path.as_ptr(), mode) } == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::EEXIST) {
+        return Ok(());
+    }
+    write_stderr_static(b"pent: cannot make a directory for a private mount\n");
+    Err(err)
+}
+
+/// Make an empty file at `path`. A file that exists already is not an error.
+/// Async-signal-safe.
+///
+/// # Errors
+/// Returns the OS error of `open(2)`.
+fn create_if_missing(path: &CStr) -> std::io::Result<()> {
+    // SAFETY: open(2) with a NUL-terminated string that the parent
+    // prepared. O_EXCL keeps an existing file as it is.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
+            libc::c_int::from(0o600),
+        )
+    };
+    if fd >= 0 {
+        // SAFETY: `fd` is the descriptor that this function opened.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe { libc::close(fd) };
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::EEXIST) {
+        return Ok(());
+    }
+    write_stderr_static(b"pent: cannot make a file for a private mount\n");
+    Err(err)
+}
+
+impl PrivateBind {
+    /// Open an `O_PATH` descriptor of the source. The child calls this
+    /// before the tmpfs mounts hide the source. Async-signal-safe.
+    fn open_source(&self) {
+        if matches!(
+            self.kind,
+            BindKind::EmptyDirectory(_) | BindKind::ParentsOnly
+        ) {
+            return;
+        }
+        // SAFETY: open(2) with a NUL-terminated string that the parent
+        // prepared. O_PATH opens the inode only; it reads nothing.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let fd = unsafe { libc::open(self.source.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+        self.source_fd.store(fd, Ordering::Relaxed);
+    }
+
+    /// Make the mount point and the mount. Async-signal-safe.
+    ///
+    /// # Errors
+    /// Returns the OS error of the directory, the file or the mount.
+    fn apply(&self) -> std::io::Result<()> {
+        for parent in &self.parents {
+            mkdir_if_missing(parent, 0o755)?;
+        }
+        match self.kind {
+            BindKind::ParentsOnly => return Ok(()),
+            BindKind::EmptyDirectory(mode) => return mkdir_if_missing(&self.target, mode),
+            BindKind::Directory => mkdir_if_missing(&self.target, 0o755)?,
+            BindKind::File => create_if_missing(&self.target)?,
+        }
+        let mut buf = [0u8; FD_PATH_LEN];
+        let Some(source) = fd_path(self.source_fd.load(Ordering::Relaxed), &mut buf) else {
+            write_stderr_static(b"pent: a private mount source is not open\n");
+            return Err(std::io::Error::from_raw_os_error(libc::EBADF));
+        };
+        if self.access == BindAccess::ReadOnly {
+            return bind_readonly(source, &self.target, 0);
+        }
+        // SAFETY: mount(2) with NUL-terminated strings. The source is the
+        // descriptor that `open_source` opened.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let ret = unsafe {
+            libc::mount(
+                source.as_ptr(),
+                self.target.as_ptr(),
+                std::ptr::null(),
+                libc::MS_BIND | libc::MS_REC,
+                std::ptr::null(),
+            )
+        };
+        if ret != 0 {
+            return Err(last_err(b"pent: a private bind mount failed\n"));
+        }
+        Ok(())
+    }
+}
+
 impl MountPlan {
+    /// Open an `O_PATH` descriptor of each private bind source, before the
+    /// tmpfs mounts hide them. Async-signal-safe.
+    fn open_private_sources(&self) {
+        for bind in &self.private_binds {
+            bind.open_source();
+        }
+    }
+
+    /// Cover each private directory with an empty tmpfs, then make the
+    /// mounts that restore what the session needs. Async-signal-safe.
+    ///
+    /// # Errors
+    /// A failure of a tmpfs mount is fatal, and so is a failure of a bind
+    /// with [`OnFailure::Stop`].
+    fn apply_private_dirs(&self) -> std::io::Result<()> {
+        for mount in &self.private_dirs {
+            // SAFETY: mount(2) with NUL-terminated strings that the parent
+            // prepared.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            let ret = unsafe {
+                libc::mount(
+                    c"tmpfs".as_ptr(),
+                    mount.target.as_ptr(),
+                    c"tmpfs".as_ptr(),
+                    libc::MS_NOSUID | libc::MS_NODEV,
+                    mount.data.as_ptr().cast(),
+                )
+            };
+            if ret != 0 {
+                return Err(last_err(
+                    b"pent: cannot make a private temporary directory\n",
+                ));
+            }
+        }
+        for bind in &self.private_binds {
+            if let Err(err) = bind.apply() {
+                match bind.on_failure {
+                    OnFailure::Stop => return Err(err),
+                    OnFailure::Warn => {
+                        write_stderr_static(b"pent: an optional private mount failed\n");
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Make the private mounts. Async-signal-safe.
     ///
     /// # Errors
@@ -819,6 +1691,8 @@ impl MountPlan {
         if !self.make_private {
             return Ok(());
         }
+        // The sources must be open before a tmpfs hides them.
+        self.open_private_sources();
         // After unshare(CLONE_NEWNS) in a user namespace, inherited mounts
         // are slaves. Make the tree private before new mounts, so that no
         // mount propagates to the host. This must come after the overlayfs
@@ -839,16 +1713,31 @@ impl MountPlan {
             return Err(last_err(b"pent: mount --make-rprivate / failed\n"));
         }
 
-        if let Some(src) = &self.resolv {
-            // MS_BIND follows a symbolic link at the target, so this also
-            // covers a /etc/resolv.conf that points into /run. The mount is
-            // read-only: the file is shared with other pent processes.
-            if bind_readonly(src, c"/etc/resolv.conf", 0).is_err() {
-                write_stderr_static(
-                    b"pent: bind-mount /etc/resolv.conf failed; DNS may not work\n",
-                );
+        if self.private_proc {
+            // A new `proc` shows only the processes of the PID namespace of
+            // the process that mounts it. The mount comes before the
+            // private directories: their bind mounts go through
+            // `/proc/self/fd`.
+            // SAFETY: mount(2) with static NUL-terminated strings.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            let ret = unsafe {
+                libc::mount(
+                    c"proc".as_ptr(),
+                    c"/proc".as_ptr(),
+                    c"proc".as_ptr(),
+                    libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+                    std::ptr::null(),
+                )
+            };
+            if ret != 0 {
+                return Err(last_err(b"pent: cannot mount a private /proc\n"));
             }
         }
+
+        // The private temporary and runtime directories, and the mounts
+        // that restore what the session needs in them (the `resolv.conf` of
+        // the proxy among them).
+        self.apply_private_dirs()?;
 
         for path in &self.readonly {
             bind_readonly(path, path, libc::MS_REC)?;
@@ -1016,6 +1905,10 @@ impl ChildPlan {
             }
             if self.unshare_flags & libc::CLONE_NEWUSER != 0 {
                 setup_userns_mappings(&self.uid_map, &self.gid_map)?;
+            }
+            if self.unshare_flags & libc::CLONE_NEWPID != 0 {
+                // Only the command returns here; see `fork_pid_namespace`.
+                fork_pid_namespace()?;
             }
         }
 
@@ -1313,8 +2206,13 @@ pub(crate) fn spawn_linux(
         NetworkMode::Unrestricted => 0,
         _ => libc::CLONE_NEWNET,
     };
+    // A new PID namespace hides the processes of the host and ends the
+    // background processes of the session. Watch mode does not take it: it
+    // must not change how the program runs, and an orphan of the program
+    // must keep its events.
+    let pid_flag = if enforce { libc::CLONE_NEWPID } else { 0 };
     let unshare_flags = if enforce || watch {
-        libc::CLONE_NEWUSER | libc::CLONE_NEWNS | net_flag
+        libc::CLONE_NEWUSER | libc::CLONE_NEWNS | net_flag | pid_flag
     } else if net_flag != 0 {
         let ns = if is_proxy { libc::CLONE_NEWNS } else { 0 };
         libc::CLONE_NEWUSER | net_flag | ns
@@ -1329,37 +2227,76 @@ pub(crate) fn spawn_linux(
 
     let mut mounts = MountPlan {
         make_private: has_mntns,
-        resolv: resolv_src.as_deref().and_then(to_cstring),
+        private_proc: pid_flag != 0,
         ..MountPlan::default()
     };
-    // The masks also tell the recorder which sockets the policy hides.
-    let (mut mask_dirs, mask_files) = mask_targets(config, uid);
+    // The private temporary and runtime directories. The child keeps the
+    // overlay mount points and the write targets of the guard, because a
+    // mount needs a target that exists.
+    let mut keep_private: Vec<PathBuf> = overlay_mounts.iter().map(|m| m.real_dir.clone()).collect();
     if let Some(plan) = guard {
+        keep_private.extend(plan.ro_binds.iter().cloned());
+    }
+    let mut private = if enforce || watch {
+        plan_private_dirs(config, path_dirs, &keep_private, uid)
+    } else {
+        PrivatePlan::default()
+    };
+    mounts.private_dirs = std::mem::take(&mut private.mounts);
+    mounts.private_binds = std::mem::take(&mut private.binds);
+    if let Some(src) = &resolv_src {
+        // The mount is read-only: the file is shared with other pent
+        // processes.
         mounts
-            .readonly
-            .extend(plan.ro_binds.iter().filter_map(|p| to_cstring(p)));
-        mounts
-            .guard_dirs
-            .extend(plan.mask_dirs.iter().filter_map(|p| to_cstring(p)));
-        mounts
-            .guard_files
-            .extend(plan.mask_files.iter().filter_map(|p| to_cstring(p)));
+            .private_binds
+            .extend(resolv_bind(src, &private.covered));
+    }
+    // The masks also tell the recorder which sockets the policy hides. A
+    // path that a private tmpfs already hides needs no mask, and a mask on
+    // a path that the tmpfs removed would fail.
+    let (mut mask_dirs, mask_files) = mask_targets(config, uid);
+    // The overlay staging root holds the stub layers that hide the files
+    // which are not on the allowlist. If the child deletes a whiteout
+    // there, the hidden file appears. A private tmpfs over `/tmp` or over
+    // the runtime directory already covers the staging root; the mask is
+    // for a host that has neither.
+    for staging_root in overlay_mounts.iter().filter_map(|m| m.base_dir.parent()) {
+        if !mask_dirs.iter().any(|d| staging_root.starts_with(d)) {
+            mask_dirs.push(staging_root.to_path_buf());
+        }
+    }
+    let mask_dirs: Vec<PathBuf> = mask_dirs
+        .into_iter()
+        .filter(|p| !private.hides(p))
+        .collect();
+    let mask_files: Vec<PathBuf> = mask_files
+        .into_iter()
+        .filter(|p| !private.hides(p))
+        .collect();
+    if let Some(plan) = guard {
+        mounts.readonly.extend(
+            plan.ro_binds
+                .iter()
+                .filter(|p| !private.hides(p))
+                .filter_map(|p| to_cstring(p)),
+        );
+        mounts.guard_dirs.extend(
+            plan.mask_dirs
+                .iter()
+                .filter(|p| !private.hides(p))
+                .filter_map(|p| to_cstring(p)),
+        );
+        mounts.guard_files.extend(
+            plan.mask_files
+                .iter()
+                .filter(|p| !private.hides(p))
+                .filter_map(|p| to_cstring(p)),
+        );
     }
     if enforce {
         let dot_pent = config.workspace.join(".pent");
         if dot_pent.exists() {
             mounts.readonly.extend(to_cstring(&dot_pent));
-        }
-        // Hide the overlay staging root. The child can write to /tmp, and the
-        // staging root holds the stub layers that hide the files which are
-        // not on the allowlist. If the child deletes a whiteout there, the
-        // hidden file appears. The overlay mounts keep their references to
-        // the layers, so the tmpfs over the staging root does not change
-        // them. The tmpfs mounts after the overlay mounts.
-        for staging_root in overlay_mounts.iter().filter_map(|m| m.base_dir.parent()) {
-            if !mask_dirs.iter().any(|d| staging_root.starts_with(d)) {
-                mask_dirs.push(staging_root.to_path_buf());
-            }
         }
         mounts
             .mask_dirs
@@ -1381,7 +2318,13 @@ pub(crate) fn spawn_linux(
             None => {
                 let mut policy = AccessPolicy::default();
                 add_ruleset_rules(&mut policy, config, path_dirs, &write_set, &overlay_dirs);
-                policy.hidden = mask_dirs.iter().chain(&mask_files).cloned().collect();
+                policy.hidden = mask_dirs
+                    .iter()
+                    .chain(&mask_files)
+                    .chain(&private.covered)
+                    .cloned()
+                    .collect();
+                policy.visible.clone_from(&private.visible);
                 policy.abstract_denied = net_flag != 0
                     || (enforce && crate::linux_landlock::abi_version().is_ok_and(|abi| abi >= 6));
                 crate::linux_watch::Judge::Policy(policy)
@@ -3205,6 +4148,169 @@ mod tests {
     fn test_system_paths_include_nix_store() {
         assert!(SYSTEM_PATHS.contains(&"/nix/store"));
         assert!(!SYSTEM_PATHS.contains(&"/"));
+    }
+
+    // ========================================================================
+    // Private temporary and runtime directories
+    // ========================================================================
+
+    /// A configuration with the workspace under `/tmp`.
+    fn private_test_config(workspace: &Path) -> SandboxConfig {
+        SandboxConfig::new(
+            workspace.to_path_buf(),
+            SandboxPaths::default(),
+            workspace.to_path_buf(),
+        )
+        .with_data_dir(workspace.join("data"))
+    }
+
+    #[test]
+    fn test_private_dirs_cover_tmp_and_run() {
+        let plan = plan_private_dirs(&make_test_config(), &[], &[], 4242);
+        assert!(
+            plan.covered.contains(&PathBuf::from("/tmp")),
+            "/tmp must get a private tmpfs"
+        );
+        assert!(
+            plan.covered.contains(&PathBuf::from("/run")),
+            "/run must get a private tmpfs"
+        );
+        // `/var/run` points to `/run` on this host, so it needs no own mount.
+        assert_eq!(plan.covered.len(), plan.mounts.len());
+    }
+
+    #[test]
+    fn test_private_dirs_bind_a_workspace_under_tmp() -> TestResult {
+        let temp = tempfile::Builder::new()
+            .prefix("pent-private-")
+            .tempdir_in("/tmp")?;
+        let workspace = temp.path().join("ws");
+        std::fs::create_dir_all(&workspace)?;
+        let plan = plan_private_dirs(&private_test_config(&workspace), &[], &[], 4242);
+        assert!(
+            plan.visible.contains(&workspace),
+            "the workspace under /tmp must stay visible: {:?}",
+            plan.visible
+        );
+        assert!(!plan.hides(&workspace));
+        assert!(plan.hides(Path::new("/tmp/some-host-file")));
+        Ok(())
+    }
+
+    #[test]
+    fn test_private_dirs_keep_the_system_paths() {
+        let plan = plan_private_dirs(&make_test_config(), &[], &[], 4242);
+        for keep in ["/run/current-system", "/run/wrappers/bin"] {
+            if !Path::new(keep).exists() {
+                continue; // not a NixOS host
+            }
+            assert!(
+                plan.visible.contains(&PathBuf::from(keep)),
+                "{keep} must stay visible"
+            );
+        }
+        assert!(plan.hides(Path::new("/run/dbus/system_bus_socket")));
+        assert!(plan.hides(Path::new("/run/tailscale/tailscaled.sock")));
+    }
+
+    #[test]
+    fn test_private_dirs_make_an_empty_runtime_directory() {
+        let plan = plan_private_dirs(&make_test_config(), &[], &[], 4242);
+        let runtime = CString::new("/run/user/4242").unwrap_or_default();
+        let bind = plan.binds.iter().find(|b| b.target == runtime);
+        assert_eq!(
+            bind.map(|b| b.kind),
+            Some(BindKind::EmptyDirectory(0o700)),
+            "the plan must make an empty /run/user/4242"
+        );
+        assert!(
+            plan.hides(Path::new("/run/user/4242/bus")),
+            "the runtime directory stays empty"
+        );
+    }
+
+    #[test]
+    fn test_mount_point_parents() {
+        let parents = mount_point_parents(Path::new("/tmp/a/b/c"), Path::new("/tmp"));
+        let want: Vec<CString> = ["/tmp/a", "/tmp/a/b"]
+            .iter()
+            .filter_map(|p| CString::new(*p).ok())
+            .collect();
+        assert_eq!(parents, want);
+        assert!(mount_point_parents(Path::new("/tmp/a"), Path::new("/tmp")).is_empty());
+    }
+
+    #[test]
+    fn test_fd_path() {
+        let mut buf = [0u8; FD_PATH_LEN];
+        assert_eq!(fd_path(0, &mut buf), Some(c"/proc/self/fd/0"));
+        let mut buf = [0u8; FD_PATH_LEN];
+        assert_eq!(fd_path(1234, &mut buf), Some(c"/proc/self/fd/1234"));
+        let mut buf = [0u8; FD_PATH_LEN];
+        assert_eq!(fd_path(-1, &mut buf), None);
+    }
+
+    #[test]
+    fn test_escape_sockets_hold_the_system_bus() {
+        assert!(ESCAPE_SOCKETS.contains(&"/run/dbus/system_bus_socket"));
+        assert!(ESCAPE_SOCKETS.contains(&"/var/run/dbus/system_bus_socket"));
+        assert!(RESOLVER_SOCKETS.contains(&"/run/tailscale/tailscaled.sock"));
+    }
+
+    #[test]
+    fn test_home_agent_sockets_find_a_gpg_socket() -> TestResult {
+        use std::os::unix::net::UnixListener;
+        let temp = tempfile::tempdir()?;
+        let gnupg = temp.path().join(".gnupg");
+        std::fs::create_dir_all(&gnupg)?;
+        let socket = gnupg.join("S.gpg-agent.ssh");
+        let listener = UnixListener::bind(&socket)?;
+        let mut config = make_test_config();
+        config.env.insert(
+            "HOME".to_string(),
+            temp.path().to_string_lossy().into_owned(),
+        );
+        let found = home_agent_sockets(&config);
+        drop(listener);
+        assert!(found.contains(&socket), "{found:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn test_mask_targets_hide_a_home_agent_socket() -> TestResult {
+        use std::os::unix::net::UnixListener;
+        let temp = tempfile::tempdir()?;
+        let ssh = temp.path().join(".ssh");
+        std::fs::create_dir_all(&ssh)?;
+        let socket = ssh.join("agent.4242");
+        let listener = UnixListener::bind(&socket)?;
+        let mut config = make_test_config();
+        config.env.insert(
+            "HOME".to_string(),
+            temp.path().to_string_lossy().into_owned(),
+        );
+        let (_, files) = mask_targets(&config, 4242);
+        let real = std::fs::canonicalize(&socket)?;
+        drop(listener);
+        assert!(files.contains(&real), "{files:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn test_policy_predict_unix_with_a_visible_path() {
+        let policy = AccessPolicy {
+            hidden: vec![PathBuf::from("/tmp")],
+            visible: vec![PathBuf::from("/tmp/ws")],
+            ..AccessPolicy::default()
+        };
+        assert_eq!(
+            policy.predict_unix("/tmp/host.sock"),
+            pent_profile::Outcome::Denied
+        );
+        assert_eq!(
+            policy.predict_unix("/tmp/ws/app.sock"),
+            pent_profile::Outcome::Allowed
+        );
     }
 
     #[test]

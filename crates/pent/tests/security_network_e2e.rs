@@ -79,7 +79,6 @@ fn out_text(out: &Output) -> String {
 const TAILSCALE_SOCK: &str = "/run/tailscale/tailscaled.sock";
 
 #[test]
-#[ignore = "OPEN VULN NET-1: tailscaled LocalAPI socket is not masked; ts-dial gives full egress"]
 fn tailscale_localapi_socket_is_masked() -> TestResult {
     if !sandbox_ready() {
         eprintln!("skip: sandbox not available");
@@ -119,7 +118,6 @@ print("REACHED" if data.startswith(b"HTTP/1.1 200") else "NODATA", data[:16])
 const SYSTEM_BUS: &str = "/run/dbus/system_bus_socket";
 
 #[test]
-#[ignore = "OPEN VULN NET-2: system D-Bus socket is reachable; resolve1/NetworkManager escape the proxy"]
 fn system_dbus_socket_is_masked() -> TestResult {
     if !sandbox_ready() {
         eprintln!("skip: sandbox not available");

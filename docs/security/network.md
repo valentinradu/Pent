@@ -22,12 +22,17 @@ Test files:
 
 ## Findings
 
-| ID | Severity | One line | Test |
-|----|----------|----------|------|
-| NET-1 | Critical | The Tailscale daemon socket is not masked; its `ts-dial` call gives full network egress past the proxy. | `tailscale_localapi_socket_is_masked` |
-| NET-2 | High | The system D-Bus socket is reachable; it resolves names and reaches network services past the proxy. | `system_dbus_socket_is_masked` |
+| ID | Severity | One line | State | Test |
+|----|----------|----------|-------|------|
+| NET-1 | Critical | The Tailscale daemon socket is not masked; its `ts-dial` call gives full network egress past the proxy. | Fixed | `tailscale_localapi_socket_is_masked` |
+| NET-2 | High | The system D-Bus socket is reachable; it resolves names and reaches network services past the proxy. | Fixed | `system_dbus_socket_is_masked` |
 
 ### NET-1 — the Tailscale daemon socket gives full egress (Critical)
+
+**State: fixed.** An empty tmpfs covers `/run` in the mount namespace of the
+child, so the socket is not there. The socket is also in `RESOLVER_SOCKETS`,
+the mask list that pent applies when the network is not `Unrestricted`. See
+`docs/security/linux-sandbox.md` (LS-1 and LS-2).
 
 **Attack.** The child connects to the Unix socket
 `/run/tailscale/tailscaled.sock`. This socket is the Tailscale LocalAPI. The
@@ -66,6 +71,9 @@ pent must say this limit in the documentation and let the user name more
 sockets to mask.
 
 ### NET-2 — the system D-Bus socket is reachable (High)
+
+**State: fixed.** The same tmpfs over `/run` removes the socket, and the
+socket is in `ESCAPE_SOCKETS`. See `docs/security/linux-sandbox.md`.
 
 **Attack.** The child connects to `/run/dbus/system_bus_socket`. The system
 bus reaches host services. Two examples:
@@ -175,12 +183,11 @@ cannot fix them. pent must document them. Each has a test with the name prefix
 
 ## Recommended fixes, in priority order
 
-1. **NET-1.** Mask the Tailscale daemon socket when the network mode is not
-   `Unrestricted`. Add the socket to the masked set in
-   `crates/pent-sandbox/src/linux.rs`. Give the user a setting to name more
-   egress sockets to mask.
-2. **NET-2.** Mask the system D-Bus socket when the network mode is not
-   `Unrestricted`, or at least say in the documentation that it is a resolver
-   and an egress path. Let a profile name the socket to keep it.
-3. **Documentation.** Add the inherent limits above to the README, next to the
+1. **NET-1 and NET-2: done.** An empty tmpfs covers `/run` in the mount
+   namespace of the child, so no control socket of a host daemon is
+   reachable. A fixed list of sockets can never be complete, so pent hides
+   the directory, not the name. The mask lists in
+   `crates/pent-sandbox/src/linux.rs` stay as the second layer, and as the
+   data that a user setting can extend later.
+2. **Documentation.** Add the inherent limits above to the README, next to the
    limits that it already names.
