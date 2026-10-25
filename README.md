@@ -6,16 +6,16 @@
 Wrap any process in a lightweight containment layer that restricts filesystem and network access using native OS mechanisms. No containers, no VMs.
 
 ```bash
-# Setup: run once to write ~/.config/pent/pent.toml.
-# @claude, @npm, @gh, etc. are profiles: named sets of domains and filesystem paths.
-pent config add --global @claude @gh @npm @cargo @pip @gem @go @git
+# 1. Record: run the program one time without the sandbox. Pent records each
+#    file and each domain that it uses, groups them into rules, and asks you.
+pent watch -- claude
 
-# Run: every invocation. Pent enforces the config:
-# only listed domains resolve, only listed paths are accessible.
+# 2. Trust: read the draft profile, then trust it.
+pent trust claude
+
+# 3. Run: every time. Pent finds the "claude" profile from the command name.
+#    Only the domains and paths of the profile are accessible.
 pent run -- claude
-
-# Inspect what's allowed
-pent config show
 ```
 
 ## Why Pent?
@@ -28,7 +28,7 @@ Pent is for developers who need to run powerful but untrusted processes without 
 | **Platforms** | macOS & Linux | All (via VM) | Linux only | Linux only |
 | **Network control** | Domain allowlist | IP/port rules | IP/firewall | None |
 | **Filesystem control** | Path allowlist + overlayfs | Volume mounts | Path rules | Bind mounts |
-| **Setup** | Zero-config profiles | Dockerfile | Per-app profiles | Manual flags |
+| **Setup** | Recorded profiles | Dockerfile | Per-app profiles | Manual flags |
 | **Overhead** | Native (no VM) | High | Low | Low |
 
 ## What Pent does
@@ -69,9 +69,8 @@ Pent uses the same rule on all platforms to select the network mode. The first i
 
 1. An explicit `--network` flag.
 2. One or more `--allow` flags. These select proxy mode.
-3. The `[sandbox.network]` mode in the config.
-4. A `domain_allowlist` in the `[proxy]` section of the config. This selects proxy mode.
-5. The default: `blocked`.
+3. Domains in the profile. These select proxy mode.
+4. The default: `blocked`.
 
 `--trace` does not change the network mode.
 
@@ -127,125 +126,211 @@ sudo apt install pent
 
 ## Quick start
 
-### One-off runs
+### Record a profile
+
+Pent applies a profile to each program. A profile is a short list of the paths and the domains that the program needs. You do not write it by hand: `pent watch` records it.
+
 ```bash
-# Restricted network (domain allowlist)
-pent run --allow example.com -- curl https://example.com
-
-# No network access
-pent run --network blocked -- curl https://example.com
-
-# Read-only access to specific paths
-pent run --read /etc/ssl/certs -- my-app
+pent watch -- claude
 ```
 
-### Persistent configuration
-```bash
-# Add profiles for common tools
-pent config add --global @claude @gh @npm
+Watch mode does not sandbox the program. Pent shows a banner and asks before the start:
 
-# Run the tool (config is applied automatically)
+```
+pent watch: claude
+  Watch mode does not sandbox the program. It records what the program does.
+  The program can read and change your files and use the network.
+  Pent blocks only the most dangerous accesses (credentials, persistence).
+  If you do not trust this binary, run it in a VM or a container.
+Continue? [y/N]
+```
+
+Use the program as usual, then exit it. Pent groups the recorded accesses into rules and shows them one section at a time. For each section, accept all items, no items, or some items by number:
+
+```
+Read-write (3)
+  1  ~/.claude              creates and edits files (37 new)
+  2  ~/.claude.json         config file
+  3  ~/.cache/claude        cache
+Accept: [a]ll, [n]one, or the numbers (1,3-5)? [a]
+```
+
+Pent writes the selected rules to a draft and asks `Trust this profile now? [y/N]`.
+
+### Trust and run
+
+```bash
+# Show the draft, ask, then trust it
+pent trust claude
+
+# Run with the trusted profile
 pent run -- claude
 ```
 
-Pent reads two config files:
+Without a trusted profile, `pent run` does not start the program:
 
-- The global config, `~/.config/pent/pent.toml` (on macOS, `~/Library/Application Support/pent/pent.toml`). Pent always applies it, in every directory.
-- The project config, `<workspace>/.pent/pent.toml`. The workspace is the directory where you run pent. Pent applies the project config only after you trust it (see below).
-
-Project values replace global values for single settings, such as the network mode. Lists, such as paths and domains, are merged.
-
-### Project config and trust
-
-A project config comes with the repository, thus another person can write it. A project config can give access to your secrets, for example `read_write = ["~/.ssh"]`. For this reason pent does not apply a new or changed project config until you trust it, as `direnv allow` does.
-
-```bash
-# Show what the project config adds to the global config, then trust it
-pent config trust
-
-# Trust without a prompt (for scripts)
-pent config trust --yes
-
-# Remove the trust
-pent config untrust
-
-# Show the effective config and tell if the project config applies
-pent config show
+```
+✗ no trusted profile for "claude"
+  record one: pent watch -- claude
 ```
 
-Pent keeps the SHA-256 hash and the path of each trusted file in `trusted.toml` in the pent config directory. When the file changes, the hash changes, and pent stops to apply the file. `pent run` then prints a warning and continues with the global config only.
+### Flags for one run
 
-`pent config add`, `pent config rm`, `pent config init` and `pent config edit` (without `--global`) trust the file again after they write it. They do this only if the file was trusted before the change.
+The flags add to the profile for one run. They never replace it.
 
-### Config file format
+```bash
+# One more domain (this also selects proxy mode)
+pent run --allow example.com -- claude
+
+# One more read-only path, read-write path or executable path
+pent run --read /etc/ssl/certs --write ./out --execute ~/tools/bin -- claude
+
+# No network access
+pent run --network blocked -- claude
+```
+
+## Configuration
+
+### Files
+
+Pent uses the XDG directories on all platforms. When `$XDG_CONFIG_HOME` or `$XDG_STATE_HOME` is set, pent uses it.
+
+| Path | Content |
+|---|---|
+| `~/.config/pent/pent.toml` | The global settings (see below). |
+| `~/.config/pent/profiles/<name>.toml` | A trusted profile. |
+| `~/.config/pent/trusted.toml` | The trust store: the path and the SHA-256 hash of each trusted profile. |
+| `~/.local/state/pent/drafts/<name>.toml` | The draft that `pent watch` writes. |
+| `~/.local/state/pent/watch/<name>/<run>.jsonl` | The raw events of one watch run. |
+| `~/.local/state/pent/denied/<name>.jsonl` | The accesses that `pent run` denied. |
+
+Pent has no project or local settings file. A file in a repository cannot change the sandbox.
+
+### Global settings
+
+The global settings have only the proxy tunables and the mounts. They have no paths and no domains: these are in the profiles.
 
 ```toml
-# Written by `pent config add`. `pent config rm` uses this list.
-profiles = ["@node", "@base", "@npm"]
-
-[sandbox]
-network = { mode = "proxy_only" }   # unrestricted | localhost_only | proxy_only | blocked
-
-[sandbox.paths]
-traversal  = ["~"]
-read       = ["~/.gitconfig"]
-execute    = ["~/.local/bin"]
-read_write = ["~/.npm", "build-cache"]
+[proxy]
+upstream_dns = ["1.1.1.1:53"]       # default: the resolvers in /etc/resolv.conf
+dns_ttl_seconds = 300
+tcp_connect_timeout_secs = 30
+tcp_idle_timeout_secs = 300
+private_destinations = "deny"       # "allow" for an internal registry on 10.x
 
 # Linux only. A mount is read-only unless you set readonly = false.
 [[sandbox.mounts]]
 path = "/opt/tools"
-
-[proxy]
-domain_allowlist = ["registry.npmjs.org", "*.npmjs.org"]
 ```
 
-Pent rejects an unknown key, thus a typo causes an error that names the key.
+```bash
+pent config init     # write a starter file
+pent config show     # print the settings (--format json for JSON)
+pent config edit     # open the file in $EDITOR
+```
 
-Pent expands a leading `~` to your home directory. Pent does not expand environment variables such as `$HOME`. A relative path resolves against the workspace, not against the current directory of the process. Pent does not remove `..` from a path, thus `../other` gives access to a directory next to the workspace.
+Pent rejects an unknown key, thus a typo causes an error that names the key. A key of an older pent version causes an error that tells where the setting went, for example:
 
-### Profiles
+```
+✗ ~/.config/pent/pent.toml: `domain_allowlist` moved to profiles; record one with `pent watch`
+```
 
-A profile is a named set of domains and paths, for example `@npm` or `@claude`. `pent config add` adds a profile and the profiles that it needs. It also records them in the `profiles` list.
+## Profiles
 
-`pent config rm` removes only the entries that the removed profiles give and that no remaining profile gives. It never removes an entry that you added by hand. For a config file without a `profiles` list (an older pent wrote it), pent guesses the present profiles from the entries.
+### The profile name
 
-Profiles do not give access to secrets that you do not expect. `@keychain` gives access to the keyrings and the password store, and no other profile includes it. Add it explicitly if you need it. `@git` does not give access to `~/.config/gh` (the GitHub token): add `@gh` for that. `@ssh` gives access to `~/.ssh/known_hosts` and `~/.ssh/config`, but not to the private keys.
+The profile name is the file name of the command as you type it:
+
+| Command | Profile |
+|---|---|
+| `pent run -- claude` | `claude` |
+| `pent run -- ~/.local/bin/claude --resume` | `claude` |
+| `pent run -- python3 train.py` | `python3`, with a warning. Use `--profile train`. |
+| `pent run -- bash -c "npm test"` | `bash`, with a warning. Use `--profile npm-test`. |
+
+Use the same `--profile NAME` for `pent watch` and for `pent run`. A profile covers the full process tree: when `claude` starts `git`, `git` gets the rules of the `claude` profile.
+
+### The draft
+
+The draft has one comment for each rule. The comment tells why the rule exists. Remove a line to remove the rule.
+
+```toml
+# Profile for "claude". Pent made it from 3 watch runs.
+# Each comment tells why the rule exists. Remove a line to remove the rule.
+
+[filesystem]
+read_write = [
+  "~/.claude",          # creates and edits files (37 new)
+  "~/.claude.json",     # config file
+]
+read = [
+  "~/.gitconfig",       # read by git
+]
+execute = [
+  "~/.local/share/claude",
+]
+
+[network]
+domains = [
+  "api.anthropic.com",
+  "*.npmjs.org",        # registry, www, cdn
+]
+```
+
+Pent expands a leading `~` to your home directory. A relative path resolves against the workspace. The workspace (the current directory) is always read-write, and the system paths (`/usr`, `/etc`, `/tmp`, ...) are always available.
+
+To record more accesses into the same draft, run `pent watch --append -- claude`. Each run adds to the draft.
+
+### Trust
+
+Pent applies a profile only after you trust its exact content, as `direnv allow` does. Pent keeps the SHA-256 hash of each trusted profile. When the file changes, `pent run` stops and tells you to trust it again.
+
+| Command | Description |
+|---|---|
+| `pent trust NAME` | Show the draft (or the changed profile), ask, then trust it. `--yes` skips the question. |
+| `pent trust NAME --review` | Review the accesses that `pent run` denied, and add the selected rules. |
+| `pent untrust NAME` | Remove the trust. `pent run` then does not apply the profile. |
+| `pent profile list` | List the profiles, their trust status and the drafts. |
+| `pent profile show NAME` | Print the profile (or the draft). |
+| `pent profile rm NAME` | Remove the profile, its draft, its trust and its logs. |
 
 ## Debugging
 
-### `--trace`: record denials at runtime
+### Denied accesses and `pent trust --review`
 
-Use `--trace` to record denials in `.pent/trace.log`. The process continues after a denial. `--trace` does not change the network mode.
+`pent run` records each access that the sandbox denies. At exit, pent tells you:
+
+```
+▲ 3 accesses denied; review them: pent trust claude --review
+```
+
+`pent trust claude --review` groups the denied accesses into rules, with the same review as `pent watch`. Pent adds the selected rules to a new draft, asks you to trust it, and then deletes the list of denied accesses.
+
+Pent always records the domains that the proxy denies. Pent records the filesystem denials only with `--trace`.
+
+### `--trace`: write the denials to a log
+
+Use `--trace` to write the sandbox and proxy events to `.pent/trace.log`, and to record the filesystem denials. The process continues after a denial. `--trace` does not change the network mode.
 
 ```bash
 pent run --trace -- claude
 cat .pent/trace.log
 ```
 
-The events that Pent records are different on each platform.
-
-**macOS.** Pent reads the Seatbelt denials of the process and of its child processes from the unified log (`log stream`). Pent starts `log stream` before the process. For a denied file read, file write or `process-exec`, Pent adds a fix hint with the correct config key. Network denials and other denials have no fix hint. Example output:
+Each denial has a fix hint:
 
 ```
-pent: [denied] filesystem: "cat" (pid 4321) was denied file-read-data on "/Users/alice/.ssh/id_rsa"
-pent: fix: add "/Users/alice/.ssh/id_rsa" to read in the [sandbox.paths] section of your pent config
-```
-
-**Linux.** Pent records the DNS queries and connections that go through the proxy. This occurs only in proxy mode (`--allow`, `--network proxy`, or a `domain_allowlist` in the config). In other modes, Pent shows a note and records no network events. Pent does not record filesystem denials on Linux yet. Use `strace` (see below) to find the paths. Example output:
-
-```
-pent: [denied] network: DNS query for "evil.example" blocked — domain not in allowlist
-pent: fix: add "evil.example" to domain_allowlist in the [proxy] section of your pent config
+pent: [denied] network: DNS query for "evil.example" (A) blocked: the domain is not in the allowlist
+pent: fix: allow it for one run with --allow evil.example, or add it to the profile: pent trust claude --review
 
 pent: [allowed] network: connection to "example.com" allowed
 ```
 
-`--trace` records only the accesses that the sandbox or the proxy denies. It cannot show all the files that a program tries to open before you run it. For a complete list, use `strace`.
+The proxy events are in the log only in proxy mode (domains in the profile, `--allow`, or `--network proxy`). In other modes, pent shows a note. On macOS, pent also reads the Seatbelt denials of the process tree from the unified log (`log stream`).
 
-### `strace`: discover all filesystem access upfront
+### `strace`: see all filesystem accesses
 
-`strace` intercepts every system call the process makes, including all file opens. This lets you build a complete allowlist before running under Pent.
+`pent watch` is the usual way to find the paths that a program needs. To see every system call, use `strace` without pent:
 
 ```bash
 strace -e trace=openat,open,stat,statx,access,faccessat \
@@ -253,16 +338,7 @@ strace -e trace=openat,open,stat,statx,access,faccessat \
        your-command
 ```
 
-To extract the paths it tried to open, run `grep -oP '"\K[^"]+(?=", O_)' strace.log | sort -u` for successful opens and `grep 'EACCES\|ENOENT' strace.log | grep -oP '"\K[^"]+(?=")' | sort -u` for denials. Then add the relevant entries to your Pent config:
-```toml
-[sandbox.paths]
-read       = ["/path/to/thing"]
-read_write = ["/path/to/writable"]
-```
-
-## Contributing profiles
-
-Profiles are the heart of Pent's zero-config experience. If you use a tool that isn't covered, please contribute a profile by opening `crates/pent-settings/src/profiles.rs`, adding your tool to the `Profile` enum and `PROFILES` table, defining its domains and paths in `profile_config`, and submitting a PR.
+To get the paths that the program opened, run `grep -oP '"\K[^"]+(?=", O_)' strace.log | sort -u`. Give a path for one run with `--read` or `--write`, or record it with `pent watch --append`.
 
 ## License
 
