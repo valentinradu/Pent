@@ -293,8 +293,18 @@ impl ResolutionCache {
     /// * `resolved` - The resolved address to cache
     #[allow(clippy::needless_pass_by_value)] // owned for ergonomics at call sites
     pub fn insert(&self, resolved: ResolvedAddress) {
+        self.insert_at(resolved, std::time::Instant::now());
+    }
+
+    /// The same as [`ResolutionCache::insert`], with the time as a
+    /// parameter.
+    ///
+    /// A test cannot wait for an entry to expire, and it cannot make the
+    /// expiry of an entry equal to the time of the check. With the time as
+    /// a parameter it can do both.
+    #[allow(clippy::needless_pass_by_value)] // owned for ergonomics at call sites
+    pub fn insert_at(&self, resolved: ResolvedAddress, now: std::time::Instant) {
         let mut entries = write_lock(&self.entries);
-        let now = std::time::Instant::now();
 
         // 1. Evict expired entries
         entries.retain(|_, entry| {
@@ -360,8 +370,13 @@ impl ResolutionCache {
     /// # Arguments
     /// * `addr` - The IP address to look up
     pub fn lookup(&self, addr: &std::net::IpAddr) -> Option<String> {
+        self.lookup_at(addr, std::time::Instant::now())
+    }
+
+    /// The same as [`ResolutionCache::lookup`], with the time as a
+    /// parameter. See [`ResolutionCache::insert_at`].
+    pub fn lookup_at(&self, addr: &std::net::IpAddr, now: std::time::Instant) -> Option<String> {
         let entries = read_lock(&self.entries);
-        let now = std::time::Instant::now();
         entries.get(addr).and_then(|entry| {
             entry
                 .domains
@@ -378,8 +393,13 @@ impl ResolutionCache {
     /// # Arguments
     /// * `addr` - The IP address to look up
     pub fn lookup_all(&self, addr: &std::net::IpAddr) -> Vec<String> {
+        self.lookup_all_at(addr, std::time::Instant::now())
+    }
+
+    /// The same as [`ResolutionCache::lookup_all`], with the time as a
+    /// parameter. See [`ResolutionCache::insert_at`].
+    pub fn lookup_all_at(&self, addr: &std::net::IpAddr, now: std::time::Instant) -> Vec<String> {
         let entries = read_lock(&self.entries);
-        let now = std::time::Instant::now();
         entries.get(addr).map_or_else(Vec::new, |entry| {
             entry
                 .domains
@@ -923,24 +943,48 @@ mod tests {
     /// An entry whose expiry is exactly the time of the check has expired:
     /// `insert` must drop it, and `lookup` and `lookup_all` must not
     /// report it.
-    ///
-    /// With the seam the body reads:
-    ///
-    /// ```text
-    /// let now = std::time::Instant::now();
-    /// let cache = ResolutionCache::new();
-    /// cache.insert_at(ResolvedAddress { expires_at: now, .. }, now);
-    /// assert!(cache.lookup_at(&ip, now).is_none());
-    /// assert!(cache.lookup_all_at(&ip, now).is_empty());
-    /// ```
-    ///
-    /// Today `ResolutionCache` reads `Instant::now()` itself, so a test
-    /// cannot make the expiry of an entry equal to the time of the check.
     #[test]
-    #[ignore = "NEEDS SEAM: ResolutionCache must take the current time as a parameter \
-                (insert_at, lookup_at, lookup_all_at), with the public methods passing \
-                Instant::now()"]
-    fn test_resolution_cache_drops_an_entry_that_expires_at_the_time_of_the_check() {}
+    fn test_resolution_cache_drops_an_entry_that_expires_at_the_time_of_the_check() {
+        let now = std::time::Instant::now();
+        let ip: std::net::IpAddr = std::net::Ipv4Addr::new(10, 0, 0, 1).into();
+        let cache = ResolutionCache::new();
+        cache.insert_at(
+            ResolvedAddress {
+                domain: "a.example".to_string(),
+                addresses: vec![ip],
+                expires_at: now,
+            },
+            now,
+        );
+        assert!(
+            cache.lookup_at(&ip, now).is_none(),
+            "an entry that expires at the time of the check is not valid"
+        );
+        assert!(
+            cache.lookup_all_at(&ip, now).is_empty(),
+            "an entry that expires at the time of the check is not valid"
+        );
+
+        // One nanosecond earlier the same entry is still valid, so the
+        // test proves the boundary and not that the cache is always empty.
+        let before = now
+            .checked_sub(std::time::Duration::from_nanos(1))
+            .unwrap_or(now);
+        let cache = ResolutionCache::new();
+        cache.insert_at(
+            ResolvedAddress {
+                domain: "a.example".to_string(),
+                addresses: vec![ip],
+                expires_at: now,
+            },
+            before,
+        );
+        assert_eq!(
+            cache.lookup_at(&ip, before).as_deref(),
+            Some("a.example"),
+            "an entry that expires later is valid"
+        );
+    }
 
     /// A full cache removes the address with the oldest insertion time. An
     /// address that the cache saw again keeps its place.
