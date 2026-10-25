@@ -4,9 +4,53 @@
 //! directory or domain that the program needs, and one short reason for each
 //! rule. See `docs/design/watch.md` for the grouping rules.
 
-use std::path::PathBuf;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
+use std::net::IpAddr;
+use std::path::{Component, Path, PathBuf};
 
-use crate::{GuardClass, ProfileDoc, WatchEvent};
+use crate::psl;
+use crate::{FsOp, GuardClass, Outcome, ProfileDoc, WatchEvent};
+
+/// The number of entries in one directory that makes one rule on the
+/// directory.
+const DIR_THRESHOLD: usize = 4;
+
+/// The number of names below one registrable domain that makes one wildcard.
+const WILDCARD_THRESHOLD: usize = 3;
+
+/// The maximum number of names in a reason. The reason shows the rest as
+/// `+N`.
+const MAX_NAMES: usize = 3;
+
+/// Directories below the home directory that are too broad for a rule. The
+/// summary uses the child directory instead.
+const BROAD_HOME_DIRS: &[&str] = &[
+    ".config",
+    ".local",
+    ".local/share",
+    ".local/state",
+    ".cache",
+    "Library",
+    "Library/Application Support",
+    "Library/Caches",
+    "Library/Preferences",
+];
+
+/// Cache directories below the home directory.
+const CACHE_DIRS: &[&str] = &[".cache", "Library/Caches"];
+
+/// Directories with short-lived files. The summary omits all paths below
+/// them.
+const EPHEMERAL_DIRS: &[&str] = &[
+    "/tmp",
+    "/var/tmp",
+    "/dev",
+    "/private/tmp",
+    "/private/var/tmp",
+    "/var/folders",
+    "/private/var/folders",
+];
 
 /// The access that a filesystem rule gives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -96,12 +140,29 @@ impl Item {
 /// Counts for the header of the summary.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Stats {
-    /// The number of filesystem events.
+    /// The number of filesystem events. This count includes the `connect()`
+    /// calls to Unix sockets.
     pub fs_events: usize,
     /// The number of network events.
     pub net_events: usize,
     /// The distinct process names, in order of first appearance.
     pub processes: Vec<String>,
+    /// The distinct Unix sockets that the program connected to (`~/` for the
+    /// home directory, `@name` for an abstract socket). The sandbox cannot
+    /// allow a Unix socket by rule, so the summary makes no item for them.
+    pub unix_sockets: Vec<String>,
+    /// The distinct connections to an IP address without a name, as
+    /// `address:port`. The proxy cannot allow an IP address, so the summary
+    /// makes no item for them.
+    pub ip_hosts: Vec<String>,
+}
+
+impl Stats {
+    /// Return the number of all events.
+    #[must_use]
+    pub const fn total_events(&self) -> usize {
+        self.fs_events.saturating_add(self.net_events)
+    }
 }
 
 /// The input of the summary step that does not come from the events.
@@ -156,13 +217,1294 @@ impl Summary {
 
 /// Group raw events into a summary.
 ///
-/// CONTRACT STUB: the full grouping is not implemented yet. This version
-/// returns an empty summary.
+/// The grouping follows `docs/design/watch.md`:
+///
+/// - The summary replaces the home directory with `~`. It omits the
+///   workspace, the paths in [`SummaryContext::covered`] and the short-lived
+///   paths (`/proc/<pid>`, `/proc/self`, `/tmp`, `/var/tmp`, `/dev`).
+/// - A create or a delete in a directory gives read-write on the directory. A
+///   write to an existing file gives read-write on the file.
+/// - A directory with at least 4 entries that have rules of the same kind
+///   gets one rule. The count includes subdirectories, so the grouping goes
+///   up the tree. For read-write, only the directory rules count, not the
+///   single written files.
+/// - The summary never makes a rule on a top-level directory, on the home
+///   directory or its parents, or on a broad home directory (`~/.config`,
+///   `~/.local/share`, `~/.cache`, ...). It uses the child instead. Grouping
+///   never makes a rule on the workspace or on a parent of the workspace.
+/// - An exec gives execute on the directory of the binary. When the path has
+///   a version directory (`versions/2.1.3`), the rule goes above it, so an
+///   update of the program does not need a new rule.
+/// - A wider rule hides a narrower one. Read-write and execute include read.
+/// - The summary omits the rules that [`SummaryContext::existing`] has.
+/// - Events with [`Outcome::Blocked`] become blocked items. Events with
+///   [`Outcome::Denied`] become normal items.
+/// - Three or more names below one registrable domain become `*.domain`,
+///   except on a public suffix.
+/// - Connections to an IP address and to Unix sockets give no item. The
+///   summary lists them in [`Stats`].
 #[must_use]
 pub fn summarize<'a, I>(events: I, ctx: &SummaryContext) -> Summary
 where
     I: IntoIterator<Item = &'a WatchEvent>,
 {
-    let _ = (events.into_iter().count(), ctx);
-    Summary::default()
+    let env = Env::new(ctx);
+    let mut stats = Stats::default();
+    let mut fs = FsLog::default();
+    let mut blocked: BTreeMap<(FsAccess, PathBuf), BlockedEntry> = BTreeMap::new();
+    let mut net = NetLog::default();
+    let mut unix = Names::default();
+    let mut ips = Names::default();
+
+    for event in events {
+        match event {
+            WatchEvent::Fs {
+                op,
+                path,
+                process,
+                outcome,
+            } => {
+                stats.fs_events = stats.fs_events.saturating_add(1);
+                add_name(&mut stats.processes, &process.name);
+                let Some(path) = normalize(path) else {
+                    continue;
+                };
+                if let Outcome::Blocked(class) = outcome {
+                    add_blocked(&mut blocked, *op, path, *class, &process.name, &env);
+                } else if !env.is_omitted(&path) {
+                    fs.record(*op, path, &process.name);
+                }
+            }
+            WatchEvent::UnixConnect {
+                target, process, ..
+            } => {
+                stats.fs_events = stats.fs_events.saturating_add(1);
+                add_name(&mut stats.processes, &process.name);
+                let shown = if target.starts_with('@') {
+                    target.clone()
+                } else {
+                    normalize(Path::new(target))
+                        .and_then(|p| env.display(&p))
+                        .unwrap_or_else(|| target.clone())
+                };
+                unix.add(&shown);
+            }
+            WatchEvent::Dns { name, .. } => {
+                stats.net_events = stats.net_events.saturating_add(1);
+                net.add(name, None);
+            }
+            WatchEvent::Connect { host, port, .. } => {
+                stats.net_events = stats.net_events.saturating_add(1);
+                match parse_ip(host) {
+                    Some(IpAddr::V4(ip)) => ips.add(&format!("{ip}:{port}")),
+                    Some(IpAddr::V6(ip)) => ips.add(&format!("[{ip}]:{port}")),
+                    None => net.add(host, Some(*port)),
+                }
+            }
+        }
+    }
+    stats.unix_sockets = unix.0;
+    stats.ip_hosts = ips.0;
+
+    let mut items = fs_items(&fs, &env, &stats.processes);
+    items.extend(blocked_items(blocked, &env));
+    items.extend(net.items());
+    if let Some(existing) = &ctx.existing {
+        items.retain(|item| !doc_covers(existing, &item.grant, &env));
+    }
+    items.sort_by(|a, b| sort_key(a).cmp(&sort_key(b)));
+    Summary { items, stats }
+}
+
+// ── Helpers: names ───────────────────────────────────────────────────────────
+
+/// Distinct names in order of first appearance.
+#[derive(Debug, Default, Clone)]
+struct Names(Vec<String>);
+
+impl Names {
+    fn add(&mut self, name: &str) {
+        add_name(&mut self.0, name);
+    }
+
+    fn extend(&mut self, other: &Self) {
+        for name in &other.0 {
+            self.add(name);
+        }
+    }
+}
+
+/// Add `name` to `names` if it is not empty and not in the list.
+fn add_name(names: &mut Vec<String>, name: &str) {
+    if !name.is_empty() && !names.iter().any(|n| n == name) {
+        names.push(name.to_string());
+    }
+}
+
+/// Join at most [`MAX_NAMES`] names, then `+N` for the rest.
+fn list_names<S: AsRef<str>>(names: &[S]) -> String {
+    let mut text = names
+        .iter()
+        .take(MAX_NAMES)
+        .map(AsRef::as_ref)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let rest = names.len().saturating_sub(MAX_NAMES);
+    if rest > 0 {
+        text.push_str(&format!(" +{rest}"));
+    }
+    text
+}
+
+/// Sort process names by their first appearance in the session.
+fn in_session_order(names: Names, order: &[String]) -> Vec<String> {
+    let mut names = names.0;
+    names.sort_by_key(|n| order.iter().position(|o| o == n).unwrap_or(usize::MAX));
+    names
+}
+
+// ── Helpers: paths ───────────────────────────────────────────────────────────
+
+/// Make an absolute path without `.` and `..` components. Return `None` for
+/// a relative path, because a rule cannot use it.
+fn normalize(path: &Path) -> Option<PathBuf> {
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(p) => out.push(p.as_os_str()),
+            Component::RootDir => out.push(Component::RootDir.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // At the root, `pop` does nothing, like the kernel.
+                out.pop();
+            }
+            Component::Normal(n) => out.push(n),
+        }
+    }
+    Some(out)
+}
+
+/// Return true for a short-lived path.
+fn is_ephemeral(path: &Path) -> bool {
+    if EPHEMERAL_DIRS.iter().any(|d| path.starts_with(d)) {
+        return true;
+    }
+    let mut components = path.components();
+    components.next() == Some(Component::RootDir)
+        && components.next() == Some(Component::Normal(OsStr::new("proc")))
+        && match components.next() {
+            Some(Component::Normal(name)) => {
+                name == "self"
+                    || name == "thread-self"
+                    || name
+                        .to_str()
+                        .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+            }
+            _ => false,
+        }
+}
+
+/// Return true if a directory name looks like a version (`2.1.3`,
+/// `v22.1.0`, `1.80.0-x86_64-unknown-linux-gnu`).
+fn is_version(name: &str) -> bool {
+    let rest = name.strip_prefix('v').unwrap_or(name);
+    rest.starts_with(|c: char| c.is_ascii_digit())
+        && rest.contains('.')
+        && rest
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '+'))
+}
+
+/// Return the path of the first `.git` directory in `path`, without `.git`.
+fn repo_root(path: &Path) -> Option<PathBuf> {
+    path.ancestors()
+        .find(|a| a.file_name() == Some(OsStr::new(".git")))
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+}
+
+/// The paths of the context, checked once.
+struct Env {
+    home: Option<PathBuf>,
+    workspace: Option<PathBuf>,
+    covered: Vec<PathBuf>,
+}
+
+impl Env {
+    fn new(ctx: &SummaryContext) -> Self {
+        Self {
+            // An empty or relative path is a prefix of each path, so the
+            // summary ignores it.
+            home: normalize(&ctx.home),
+            workspace: normalize(&ctx.workspace),
+            covered: ctx.covered.iter().filter_map(|p| normalize(p)).collect(),
+        }
+    }
+
+    fn is_omitted(&self, path: &Path) -> bool {
+        self.workspace.as_ref().is_some_and(|w| path.starts_with(w))
+            || self.covered.iter().any(|c| path.starts_with(c))
+            || is_ephemeral(path)
+    }
+
+    /// Return true if a directory is too broad for a rule.
+    fn is_broad(&self, dir: &Path) -> bool {
+        dir.components().count() <= 2
+            || self.home.as_ref().is_some_and(|home| {
+                home.starts_with(dir) || BROAD_HOME_DIRS.iter().any(|r| dir == home.join(r))
+            })
+    }
+
+    /// Return true if grouping can make a rule on `dir`.
+    fn can_group(&self, dir: &Path) -> bool {
+        !self.is_broad(dir) && !self.workspace.as_ref().is_some_and(|w| w.starts_with(dir))
+    }
+
+    fn is_cache(&self, path: &Path) -> bool {
+        self.home
+            .as_ref()
+            .is_some_and(|home| CACHE_DIRS.iter().any(|r| path.starts_with(home.join(r))))
+    }
+
+    fn is_outside_home(&self, path: &Path) -> bool {
+        !self
+            .home
+            .as_ref()
+            .is_some_and(|home| path.starts_with(home))
+    }
+
+    /// Return the path as the profile writes it (`~/` for the home
+    /// directory). Return `None` for a path that is not valid UTF-8: a rule
+    /// cannot name it.
+    fn display(&self, path: &Path) -> Option<String> {
+        if let Some(rel) = self.home.as_ref().and_then(|h| path.strip_prefix(h).ok()) {
+            if rel.as_os_str().is_empty() {
+                return Some("~".to_string());
+            }
+            return rel.to_str().map(|r| format!("~/{r}"));
+        }
+        path.to_str().map(str::to_string)
+    }
+
+    /// Return a profile path in the form of [`Self::display`].
+    fn rule_form(&self, rule: &str) -> PathBuf {
+        normalize(Path::new(rule))
+            .and_then(|p| self.display(&p))
+            .map_or_else(|| PathBuf::from(rule), PathBuf::from)
+    }
+
+    /// Return the directory for the execute rule of `binary`.
+    fn exec_dir(&self, binary: &Path) -> PathBuf {
+        let Some(parent) = binary.parent() else {
+            return binary.to_path_buf();
+        };
+        let mut dir = parent;
+        let version = parent.ancestors().find(|a| {
+            a.file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(is_version)
+        });
+        if let Some(up) = version.and_then(Path::parent) {
+            dir = up;
+        }
+        if dir.file_name() == Some(OsStr::new("versions")) {
+            if let Some(up) = dir.parent() {
+                dir = up;
+            }
+        }
+        if !self.is_broad(dir) {
+            return dir.to_path_buf();
+        }
+        if !self.is_broad(parent) {
+            return parent.to_path_buf();
+        }
+        binary.to_path_buf()
+    }
+}
+
+// ── Filesystem ───────────────────────────────────────────────────────────────
+
+/// The filesystem events that the summary keeps, by path.
+#[derive(Default)]
+struct FsLog {
+    reads: BTreeMap<PathBuf, Names>,
+    writes: BTreeMap<PathBuf, Names>,
+    execs: BTreeMap<PathBuf, Names>,
+    created: BTreeSet<PathBuf>,
+    deleted: BTreeSet<PathBuf>,
+    /// True if the path exists after the last create or delete.
+    exists_at_end: BTreeMap<PathBuf, bool>,
+    /// The roots of the source repositories that the program touched.
+    repos: BTreeSet<PathBuf>,
+}
+
+impl FsLog {
+    fn record(&mut self, op: FsOp, path: PathBuf, process: &str) {
+        if let Some(root) = repo_root(&path) {
+            self.repos.insert(root);
+        }
+        match op {
+            FsOp::Read => self.reads.entry(path).or_default().add(process),
+            FsOp::Write => self.writes.entry(path).or_default().add(process),
+            FsOp::Exec => self.execs.entry(path).or_default().add(process),
+            FsOp::Create => {
+                self.created.insert(path.clone());
+                self.exists_at_end.insert(path, true);
+            }
+            FsOp::Delete => {
+                self.deleted.insert(path.clone());
+                self.exists_at_end.insert(path, false);
+            }
+        }
+    }
+
+    /// Return true if the program created `path` and deleted it again.
+    fn is_transient(&self, path: &Path) -> bool {
+        self.created.contains(path) && self.exists_at_end.get(path) == Some(&false)
+    }
+}
+
+/// Return true if a rule with access `wide` includes access `narrow`.
+fn includes(wide: FsAccess, narrow: FsAccess) -> bool {
+    wide == narrow || (narrow == FsAccess::Read && wide != FsAccess::Read)
+}
+
+/// Replace each group of at least [`DIR_THRESHOLD`] entries in one directory
+/// with one rule on the directory. Only the candidates for which `counts`
+/// returns true make a directory an entry of its parent.
+///
+/// When grouping makes a rule on a directory, the entries of its parent do
+/// not change: the new rule is below the same child. Thus one pass over the
+/// tree gives the same result as repeated passes.
+fn group(
+    candidates: &BTreeSet<PathBuf>,
+    counts: impl Fn(&Path) -> bool,
+    env: &Env,
+) -> BTreeSet<PathBuf> {
+    let mut entries: BTreeMap<&Path, BTreeSet<&Path>> = BTreeMap::new();
+    for candidate in candidates.iter().filter(|c| counts(c)) {
+        let mut child = candidate.as_path();
+        while let Some(parent) = child.parent() {
+            entries.entry(parent).or_default().insert(child);
+            child = parent;
+        }
+    }
+    let groups: BTreeSet<&Path> = entries
+        .iter()
+        .filter(|(dir, kids)| kids.len() >= DIR_THRESHOLD && env.can_group(dir))
+        .map(|(dir, _)| *dir)
+        .collect();
+    candidates
+        .iter()
+        .map(|c| {
+            c.ancestors()
+                .filter(|a| groups.contains(a))
+                .last()
+                .unwrap_or(c)
+                .to_path_buf()
+        })
+        .collect()
+}
+
+/// Make the filesystem items.
+fn fs_items(fs: &FsLog, env: &Env, order: &[String]) -> Vec<Item> {
+    // Read-write: a create or a delete gives the directory, a write to an
+    // existing file gives the file.
+    let mut rw_dirs = BTreeSet::new();
+    let mut rw = BTreeSet::new();
+    for path in fs.created.iter().chain(fs.deleted.iter()) {
+        let Some(dir) = path.parent() else {
+            continue;
+        };
+        if env.is_broad(dir) {
+            // A temporary file in a broad directory gets no rule: its next
+            // name is not known.
+            if !fs.is_transient(path) {
+                rw.insert(path.clone());
+            }
+        } else {
+            rw_dirs.insert(dir.to_path_buf());
+            rw.insert(dir.to_path_buf());
+        }
+    }
+    for path in fs.writes.keys() {
+        if !fs.created.contains(path) {
+            rw.insert(path.clone());
+        }
+    }
+    let rw = group(&rw, |p| rw_dirs.contains(p), env);
+
+    let exec: BTreeSet<PathBuf> = fs.execs.keys().map(|b| env.exec_dir(b)).collect();
+
+    let wider_exists = |path: &Path| path.ancestors().any(|a| rw.contains(a) || exec.contains(a));
+    let read: BTreeSet<PathBuf> = fs
+        .reads
+        .keys()
+        .filter(|p| !wider_exists(p))
+        .cloned()
+        .collect();
+    let read = group(&read, |_| true, env);
+
+    let mut rules: BTreeSet<(FsAccess, PathBuf)> = BTreeSet::new();
+    rules.extend(rw.into_iter().map(|p| (FsAccess::ReadWrite, p)));
+    rules.extend(exec.into_iter().map(|p| (FsAccess::Execute, p)));
+    rules.extend(read.into_iter().map(|p| (FsAccess::Read, p)));
+
+    let hidden = |access: FsAccess, path: &Path| {
+        path.ancestors().any(|a| {
+            [FsAccess::Read, FsAccess::ReadWrite, FsAccess::Execute]
+                .into_iter()
+                .filter(|&wide| includes(wide, access))
+                .filter(|&wide| a != path || wide != access)
+                .any(|wide| rules.contains(&(wide, a.to_path_buf())))
+        })
+    };
+
+    let mut items = Vec::new();
+    for (access, path) in &rules {
+        if hidden(*access, path) {
+            continue;
+        }
+        let Some(shown) = env.display(path) else {
+            continue;
+        };
+        let mut notes = Vec::new();
+        let reason = match access {
+            FsAccess::ReadWrite => rw_reason(fs, env, path),
+            FsAccess::Read => read_reason(fs, env, path, order),
+            FsAccess::Execute => {
+                let mut binaries = Names::default();
+                for binary in fs.execs.keys().filter(|b| b.starts_with(path)) {
+                    if let Some(name) = binary.file_name().and_then(OsStr::to_str) {
+                        binaries.add(name);
+                    }
+                    if fs.created.contains(binary)
+                        && !notes.contains(&ItemNote::CreatedThenExecuted)
+                    {
+                        notes.push(ItemNote::CreatedThenExecuted);
+                    }
+                }
+                format!("runs {}", list_names(&binaries.0))
+            }
+        };
+        if env.is_outside_home(path) {
+            notes.push(ItemNote::OutsideHome);
+        }
+        let other_repo = fs.repos.iter().any(|root| {
+            !env.workspace.as_ref().is_some_and(|w| w.starts_with(root))
+                && (path.starts_with(root) || root.starts_with(path))
+        });
+        if other_repo {
+            notes.push(ItemNote::OtherRepository);
+        }
+        items.push(Item {
+            grant: Grant::Fs {
+                access: *access,
+                path: shown,
+            },
+            reason,
+            blocked: None,
+            notes,
+        });
+    }
+    items
+}
+
+/// Return the reason of a read rule on `path`.
+fn read_reason(fs: &FsLog, env: &Env, path: &Path, order: &[String]) -> String {
+    if env.is_cache(path) {
+        return "cache".to_string();
+    }
+    let mut names = Names::default();
+    for (_, n) in fs.reads.iter().filter(|(p, _)| p.starts_with(path)) {
+        names.extend(n);
+    }
+    let names = in_session_order(names, order);
+    if names.is_empty() {
+        "read".to_string()
+    } else {
+        format!("read by {}", list_names(&names))
+    }
+}
+
+/// Return the reason of a read-write rule on `path`.
+fn rw_reason(fs: &FsLog, env: &Env, path: &Path) -> String {
+    if env.is_cache(path) {
+        return "cache".to_string();
+    }
+    let below = |set: &mut dyn Iterator<Item = &PathBuf>| {
+        set.filter(|p| p.starts_with(path) && p.as_path() != path)
+            .count()
+    };
+    let new = below(&mut fs.created.iter());
+    let deleted = below(&mut fs.deleted.iter());
+    let written = below(&mut fs.writes.keys());
+    if new > 0 {
+        return format!("creates and edits files ({} new)", format_count(new));
+    }
+    if deleted > 0 && written == 0 {
+        return "deletes files".to_string();
+    }
+    if written > 0 || deleted > 0 {
+        return "edits files".to_string();
+    }
+    let name = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if name.ends_with(".lock") || name.ends_with(".pid") {
+        "lock file".to_string()
+    } else if name.ends_with(".log") {
+        "log file".to_string()
+    } else if name.contains("history") {
+        "history file".to_string()
+    } else {
+        "config file".to_string()
+    }
+}
+
+/// Format a count with a comma between groups of three digits (`1,834`).
+#[must_use]
+pub fn format_count(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len().saturating_add(digits.len() / 3));
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && digits.len().saturating_sub(i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+// ── Blocked accesses ─────────────────────────────────────────────────────────
+
+/// One blocked access, merged by grant.
+struct BlockedEntry {
+    class: GuardClass,
+    processes: Names,
+    binaries: Names,
+}
+
+fn add_blocked(
+    blocked: &mut BTreeMap<(FsAccess, PathBuf), BlockedEntry>,
+    op: FsOp,
+    path: PathBuf,
+    class: GuardClass,
+    process: &str,
+    env: &Env,
+) {
+    let binary = (op == FsOp::Exec)
+        .then(|| path.file_name().and_then(OsStr::to_str).map(str::to_string))
+        .flatten();
+    let key = match op {
+        FsOp::Read => (FsAccess::Read, path),
+        FsOp::Exec => (FsAccess::Execute, env.exec_dir(&path)),
+        FsOp::Write | FsOp::Create | FsOp::Delete => (FsAccess::ReadWrite, path),
+    };
+    let entry = blocked.entry(key).or_insert_with(|| BlockedEntry {
+        class,
+        processes: Names::default(),
+        binaries: Names::default(),
+    });
+    entry.processes.add(process);
+    if let Some(binary) = binary {
+        entry.binaries.add(&binary);
+    }
+}
+
+fn blocked_items(blocked: BTreeMap<(FsAccess, PathBuf), BlockedEntry>, env: &Env) -> Vec<Item> {
+    blocked
+        .into_iter()
+        .filter_map(|((access, path), entry)| {
+            let shown = env.display(&path)?;
+            let reason = if access == FsAccess::Execute && !entry.binaries.0.is_empty() {
+                format!("runs {}", list_names(&entry.binaries.0))
+            } else if entry.processes.0.is_empty() {
+                match access {
+                    FsAccess::Read => "read",
+                    FsAccess::ReadWrite => "write",
+                    FsAccess::Execute => "exec",
+                }
+                .to_string()
+            } else {
+                list_names(&entry.processes.0)
+            };
+            Some(Item {
+                grant: Grant::Fs {
+                    access,
+                    path: shown,
+                },
+                reason,
+                blocked: Some(entry.class),
+                notes: Vec::new(),
+            })
+        })
+        .collect()
+}
+
+// ── Network ──────────────────────────────────────────────────────────────────
+
+/// Parse a host as an IP address (`1.2.3.4`, `::1` or `[::1]`).
+fn parse_ip(host: &str) -> Option<IpAddr> {
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    bare.parse().ok()
+}
+
+/// Normalize a domain name. Return `None` for a name that cannot be a rule:
+/// an IP address, a name with one label, a local name (`localhost`,
+/// `*.local`) or a reverse lookup (`*.arpa`).
+fn normalize_domain(raw: &str) -> Option<String> {
+    let name = raw.trim().trim_end_matches('.').to_ascii_lowercase();
+    let valid = !name.is_empty()
+        && name.contains('.')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        && !name.split('.').any(str::is_empty);
+    let local = name == "localhost"
+        || name.ends_with(".localhost")
+        || name.ends_with(".local")
+        || name.ends_with(".arpa");
+    (valid && !local && parse_ip(&name).is_none()).then_some(name)
+}
+
+/// One domain, with the ports of its connections.
+struct DomainEntry {
+    order: usize,
+    ports: BTreeSet<u16>,
+}
+
+#[derive(Default)]
+struct NetLog {
+    domains: BTreeMap<String, DomainEntry>,
+}
+
+impl NetLog {
+    fn add(&mut self, raw: &str, port: Option<u16>) {
+        let Some(name) = normalize_domain(raw) else {
+            return;
+        };
+        let order = self.domains.len();
+        let entry = self.domains.entry(name).or_insert_with(|| DomainEntry {
+            order,
+            ports: BTreeSet::new(),
+        });
+        if let Some(port) = port {
+            entry.ports.insert(port);
+        }
+    }
+
+    fn items(&self) -> Vec<Item> {
+        let mut below: BTreeMap<&str, Vec<(&str, usize)>> = BTreeMap::new();
+        for (name, entry) in &self.domains {
+            if let Some(registrable) = psl::registrable_domain(name) {
+                if registrable != name {
+                    below
+                        .entry(registrable)
+                        .or_default()
+                        .push((name.as_str(), entry.order));
+                }
+            }
+        }
+        let mut items = Vec::new();
+        let mut grouped = BTreeSet::new();
+        for (registrable, mut names) in below {
+            if names.len() < WILDCARD_THRESHOLD || !psl::wildcard_allowed(registrable) {
+                continue;
+            }
+            names.sort_by_key(|(_, order)| *order);
+            let labels: Vec<&str> = names
+                .iter()
+                .map(|(name, _)| {
+                    name.strip_suffix(registrable)
+                        .map_or(*name, |rest| rest.trim_end_matches('.'))
+                })
+                .collect();
+            items.push(Item {
+                grant: Grant::Domain(format!("*.{registrable}")),
+                reason: list_names(&labels),
+                blocked: None,
+                notes: Vec::new(),
+            });
+            grouped.extend(names.iter().map(|(name, _)| *name));
+        }
+        for (name, entry) in &self.domains {
+            if grouped.contains(name.as_str()) {
+                continue;
+            }
+            items.push(Item {
+                grant: Grant::Domain(name.clone()),
+                reason: port_reason(&entry.ports),
+                blocked: None,
+                notes: Vec::new(),
+            });
+        }
+        items
+    }
+}
+
+/// Return the reason of a domain from its ports.
+fn port_reason(ports: &BTreeSet<u16>) -> String {
+    if ports.is_empty() {
+        return "DNS lookup only".to_string();
+    }
+    // HTTPS and HTTP first, then the other ports in order.
+    let mut parts = Vec::new();
+    if ports.contains(&443) {
+        parts.push("HTTPS".to_string());
+    }
+    if ports.contains(&80) {
+        parts.push("HTTP".to_string());
+    }
+    parts.extend(
+        ports
+            .iter()
+            .filter(|p| !matches!(p, 80 | 443))
+            .map(|p| format!("port {p}")),
+    );
+    list_names(&parts)
+}
+
+// ── Existing profile and order ───────────────────────────────────────────────
+
+/// Return true if the domain rule `rule` matches the domain or wildcard
+/// `domain`.
+fn domain_covers(rule: &str, domain: &str) -> bool {
+    if rule == domain {
+        return true;
+    }
+    let Some(base) = rule.strip_prefix("*.") else {
+        return false;
+    };
+    let target = domain.strip_prefix("*.").unwrap_or(domain);
+    target
+        .strip_suffix(base)
+        .is_some_and(|rest| rest.ends_with('.'))
+        || (target == base && domain.starts_with("*."))
+}
+
+/// Return true if the profile `doc` already has a rule that includes
+/// `grant`.
+fn doc_covers(doc: &ProfileDoc, grant: &Grant, env: &Env) -> bool {
+    match grant {
+        Grant::Fs { access, path } => {
+            let fs = &doc.filesystem;
+            let lists: &[&Vec<String>] = match access {
+                FsAccess::Read => &[&fs.read, &fs.read_write, &fs.execute],
+                FsAccess::ReadWrite => &[&fs.read_write],
+                FsAccess::Execute => &[&fs.execute],
+            };
+            let path = Path::new(path);
+            lists
+                .iter()
+                .flat_map(|list| list.iter())
+                .any(|rule| path.starts_with(env.rule_form(rule)))
+        }
+        Grant::Domain(domain) => doc
+            .network
+            .domains
+            .iter()
+            .any(|rule| domain_covers(rule, domain)),
+    }
+}
+
+/// The sort key of an item: the section, then the path or the domain. A
+/// wildcard sorts next to its domain.
+fn sort_key(item: &Item) -> (Section, &str, bool) {
+    match &item.grant {
+        Grant::Fs { path, .. } => (item.section(), path.as_str(), false),
+        Grant::Domain(domain) => match domain.strip_prefix("*.") {
+            Some(base) => (item.section(), base, true),
+            None => (item.section(), domain.as_str(), false),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fixture::{blocked, claude_session, connect, ctx, dns, fs, fs_outcome};
+    use FsOp::{Create, Delete, Exec, Read, Write};
+
+    /// One line for each item: `<section> <rule> | <reason> [notes]`.
+    fn lines(summary: &Summary) -> Vec<String> {
+        summary
+            .items
+            .iter()
+            .map(|item| {
+                let section = match item.section() {
+                    Section::ReadWrite => "rw",
+                    Section::Read => "r",
+                    Section::Execute => "x",
+                    Section::Network => "net",
+                    Section::Blocked => "blocked",
+                };
+                let rule = match &item.grant {
+                    Grant::Fs { access, path } if item.blocked.is_some() => {
+                        format!("{access:?} {path}")
+                    }
+                    Grant::Fs { path, .. } => path.clone(),
+                    Grant::Domain(d) => d.clone(),
+                };
+                let mut line = format!("{section} {rule} | {}", item.reason);
+                if let Some(class) = item.blocked {
+                    line.push_str(&format!(" ({class:?})"));
+                }
+                if !item.notes.is_empty() {
+                    line.push_str(&format!(" {:?}", item.notes));
+                }
+                line
+            })
+            .collect()
+    }
+
+    fn run(events: &[WatchEvent]) -> Vec<String> {
+        lines(&summarize(events, &ctx()))
+    }
+
+    #[test]
+    fn claude_session_gives_a_short_list() {
+        let events = claude_session();
+        let summary = summarize(&events, &ctx());
+        assert_eq!(
+            lines(&summary),
+            vec![
+                "rw ~/.cache/claude | cache",
+                "rw ~/.claude | creates and edits files (37 new)",
+                "rw ~/.claude.json | config file",
+                "r ~/.config/git/ignore | read by git",
+                "r ~/.gitconfig | read by git",
+                "r ~/.ssh/config | read by ssh",
+                "r ~/.ssh/known_hosts | read by git, ssh",
+                "x ~/.local/share/claude | runs claude",
+                "x ~/.nvm/versions/node | runs node",
+                "net api.anthropic.com | HTTPS",
+                "net github.com | port 22",
+                "net *.npmjs.org | registry, www, cdn",
+                "net statsig.anthropic.com | HTTPS",
+                "blocked ReadWrite ~/.bashrc | node (Persistence)",
+                "blocked Read ~/.ssh/id_ed25519 | ssh (Credential)",
+            ]
+        );
+        let stats = &summary.stats;
+        assert_eq!(stats.processes, vec!["claude", "git", "ssh", "node"]);
+        assert_eq!(stats.unix_sockets, vec!["/run/user/1000/bus"]);
+        assert_eq!(stats.ip_hosts, vec!["140.82.112.3:443"]);
+        assert_eq!(stats.net_events, 508);
+        assert_eq!(stats.total_events(), events.len());
+    }
+
+    #[test]
+    fn omits_workspace_covered_and_ephemeral_paths() {
+        let events = [
+            fs(Read, "/home/u/work/app/README.md", "a"),
+            fs(Read, "/usr/lib/libz.so", "a"),
+            fs(Read, "/proc/self/status", "a"),
+            fs(Read, "/proc/77/cmdline", "a"),
+            fs(Create, "/tmp/x", "a"),
+            fs(Write, "/var/tmp/y", "a"),
+            fs(Read, "/dev/tty", "a"),
+            fs(Read, "relative/path", "a"),
+        ];
+        assert!(run(&events).is_empty());
+    }
+
+    #[test]
+    fn four_reads_in_a_directory_give_one_rule() {
+        let three: Vec<_> = (0..3)
+            .map(|i| fs(Read, &format!("/home/u/.tool/f{i}"), "tool"))
+            .collect();
+        assert_eq!(run(&three).len(), 3);
+        let four: Vec<_> = (0..4)
+            .map(|i| fs(Read, &format!("/home/u/.tool/f{i}"), "tool"))
+            .collect();
+        assert_eq!(run(&four), vec!["r ~/.tool | read by tool"]);
+    }
+
+    #[test]
+    fn grouping_goes_up_the_tree() {
+        let events: Vec<_> = (0..4)
+            .flat_map(|d| (0..2).map(move |f| (d, f)))
+            .map(|(d, f)| fs(Read, &format!("/home/u/.tool/d{d}/f{f}"), "tool"))
+            .collect();
+        assert_eq!(run(&events), vec!["r ~/.tool | read by tool"]);
+    }
+
+    #[test]
+    fn never_groups_on_broad_directories() {
+        let events: Vec<_> = ["a.toml", "b.toml", "c.toml", "d.toml"]
+            .iter()
+            .map(|f| fs(Read, &format!("/home/u/.config/{f}"), "tool"))
+            .chain((0..4).map(|i| fs(Read, &format!("/home/u/.f{i}"), "tool")))
+            .collect();
+        assert_eq!(
+            run(&events),
+            vec![
+                "r ~/.config/a.toml | read by tool",
+                "r ~/.config/b.toml | read by tool",
+                "r ~/.config/c.toml | read by tool",
+                "r ~/.config/d.toml | read by tool",
+                "r ~/.f0 | read by tool",
+                "r ~/.f1 | read by tool",
+                "r ~/.f2 | read by tool",
+                "r ~/.f3 | read by tool",
+            ]
+        );
+        // Creates directly in ~/.cache give a rule on the child.
+        let events = [
+            fs(Create, "/home/u/.cache/tool", "tool"),
+            fs(Create, "/home/u/.cache/tool/a", "tool"),
+        ];
+        assert_eq!(run(&events), vec!["rw ~/.cache/tool | cache"]);
+    }
+
+    #[test]
+    fn never_groups_on_the_workspace_parent() {
+        let events: Vec<_> = (0..4)
+            .map(|i| fs(Read, &format!("/home/u/work/other{i}/README.md"), "tool"))
+            .collect();
+        assert_eq!(run(&events).len(), 4);
+    }
+
+    #[test]
+    fn creates_give_the_directory_and_writes_give_the_file() {
+        let events = [
+            fs(Write, "/home/u/.tool/config.json", "tool"),
+            fs(Write, "/home/u/.other/state.json", "tool"),
+            fs(Create, "/home/u/.other/lock", "tool"),
+        ];
+        assert_eq!(
+            run(&events),
+            vec![
+                "rw ~/.other | creates and edits files (1 new)",
+                "rw ~/.tool/config.json | config file",
+            ]
+        );
+    }
+
+    #[test]
+    fn deletes_count_as_writes_to_the_directory() {
+        let events = [fs(Delete, "/home/u/.tool/old.log", "tool")];
+        assert_eq!(run(&events), vec!["rw ~/.tool | deletes files"]);
+    }
+
+    #[test]
+    fn temporary_files_in_home_give_no_rule() {
+        let events = [
+            fs(Create, "/home/u/.tool.json.tmp", "tool"),
+            fs(Delete, "/home/u/.tool.json.tmp", "tool"),
+            fs(Create, "/home/u/.tool.json", "tool"),
+            fs(Write, "/home/u/.bash_history", "bash"),
+        ];
+        assert_eq!(
+            run(&events),
+            vec![
+                "rw ~/.bash_history | history file",
+                "rw ~/.tool.json | config file",
+            ]
+        );
+    }
+
+    #[test]
+    fn wider_rules_hide_narrower_rules() {
+        let events = [
+            fs(Read, "/home/u/.tool/a", "tool"),
+            fs(Write, "/home/u/.tool/b", "tool"),
+            fs(Create, "/home/u/.tool/c", "tool"),
+            fs(Exec, "/opt/tool/bin/tool", "tool"),
+            fs(Read, "/opt/tool/lib/x.so", "tool"),
+        ];
+        assert_eq!(
+            run(&events),
+            vec![
+                "rw ~/.tool | creates and edits files (1 new)",
+                "r /opt/tool/lib/x.so | read by tool [OutsideHome]",
+                "x /opt/tool/bin | runs tool [OutsideHome]",
+            ]
+        );
+    }
+
+    #[test]
+    fn exec_rules_skip_version_directories() {
+        let events = [
+            fs(
+                Exec,
+                "/home/u/.rustup/toolchains/1.80.0-x86_64-unknown-linux-gnu/bin/cargo",
+                "sh",
+            ),
+            fs(Exec, "/home/u/.local/share/claude/versions/2.1.4", "sh"),
+            fs(Exec, "/home/u/.local/bin/tool", "sh"),
+            fs(Exec, "/home/u/run.sh", "sh"),
+        ];
+        assert_eq!(
+            run(&events),
+            vec![
+                "x ~/.local/bin | runs tool",
+                "x ~/.local/share/claude | runs 2.1.4",
+                "x ~/.rustup/toolchains | runs cargo",
+                "x ~/run.sh | runs run.sh",
+            ]
+        );
+    }
+
+    #[test]
+    fn created_then_executed_gets_a_note() {
+        let events = [
+            fs(Create, "/home/u/build/out/tool", "cc"),
+            fs(Exec, "/home/u/build/out/tool", "make"),
+        ];
+        assert_eq!(
+            run(&events),
+            vec![
+                "rw ~/build/out | creates and edits files (1 new)",
+                "x ~/build/out | runs tool [CreatedThenExecuted]",
+            ]
+        );
+    }
+
+    #[test]
+    fn other_repositories_get_a_note() {
+        let events = [
+            fs(Read, "/home/u/src/lib/.git/HEAD", "git"),
+            fs(Read, "/home/u/work/app/.git/HEAD", "git"),
+        ];
+        assert_eq!(
+            run(&events),
+            vec!["r ~/src/lib/.git/HEAD | read by git [OtherRepository]"]
+        );
+    }
+
+    #[test]
+    fn existing_rules_are_omitted() {
+        let mut ctx = ctx();
+        let mut doc = ProfileDoc::default();
+        doc.filesystem.read_write.push("~/.tool".to_string());
+        doc.filesystem
+            .execute
+            .push("/home/u/.local/bin".to_string());
+        doc.network.domains.push("*.npmjs.org".to_string());
+        ctx.existing = Some(doc);
+        let events = [
+            fs(Read, "/home/u/.tool/a", "tool"),
+            fs(Create, "/home/u/.tool/b/c", "tool"),
+            fs(Exec, "/home/u/.local/bin/tool", "sh"),
+            fs(Exec, "/home/u/.local/bin2/tool", "sh"),
+            connect("registry.npmjs.org", 443),
+            connect("npmjs.org", 443),
+        ];
+        assert_eq!(
+            lines(&summarize(&events, &ctx)),
+            vec!["x ~/.local/bin2 | runs tool", "net npmjs.org | HTTPS"]
+        );
+    }
+
+    #[test]
+    fn denied_events_are_normal_items() {
+        let events = [
+            fs_outcome(Read, "/home/u/.tool/a", "tool", Outcome::Denied),
+            fs_outcome(Read, "/home/u/.ssh/id_rsa", "ssh", Outcome::Denied),
+        ];
+        assert_eq!(
+            run(&events),
+            vec![
+                "r ~/.ssh/id_rsa | read by ssh",
+                "r ~/.tool/a | read by tool"
+            ]
+        );
+    }
+
+    #[test]
+    fn blocked_events_become_blocked_items() {
+        let events = [
+            blocked(
+                Read,
+                "/home/u/.aws/credentials",
+                "aws",
+                GuardClass::Credential,
+            ),
+            blocked(
+                Read,
+                "/home/u/.aws/credentials",
+                "python3",
+                GuardClass::Credential,
+            ),
+            blocked(
+                Exec,
+                "/run/wrappers/bin/sudo",
+                "bash",
+                GuardClass::PrivilegeEscalation,
+            ),
+            blocked(
+                Create,
+                "/home/u/.config/pent/profiles/x.toml",
+                "x",
+                GuardClass::PentFiles,
+            ),
+        ];
+        assert_eq!(
+            run(&events),
+            vec![
+                "blocked Execute /run/wrappers/bin | runs sudo (PrivilegeEscalation)",
+                "blocked Read ~/.aws/credentials | aws, python3 (Credential)",
+                "blocked ReadWrite ~/.config/pent/profiles/x.toml | x (PentFiles)",
+            ]
+        );
+    }
+
+    #[test]
+    fn wildcards_need_three_names_and_never_use_a_public_suffix() {
+        let events = [
+            connect("a.example.co.uk", 443),
+            connect("b.example.co.uk", 443),
+            connect("c.example.co.uk", 443),
+            connect("one.github.io", 443),
+            connect("two.github.io", 443),
+            connect("three.github.io", 443),
+            connect("x.foo.dev", 443),
+            connect("y.foo.dev", 80),
+            connect("b1.s3.amazonaws.com", 443),
+            connect("b2.s3.amazonaws.com", 443),
+            connect("b3.s3.amazonaws.com", 443),
+        ];
+        assert_eq!(
+            run(&events),
+            vec![
+                "net b1.s3.amazonaws.com | HTTPS",
+                "net b2.s3.amazonaws.com | HTTPS",
+                "net b3.s3.amazonaws.com | HTTPS",
+                "net *.example.co.uk | a, b, c",
+                "net one.github.io | HTTPS",
+                "net three.github.io | HTTPS",
+                "net two.github.io | HTTPS",
+                "net x.foo.dev | HTTPS",
+                "net y.foo.dev | HTTP",
+            ]
+        );
+    }
+
+    #[test]
+    fn wildcard_reasons_list_at_most_three_names() {
+        let events: Vec<_> = ["registry", "www", "cdn", "api", "a.b"]
+            .iter()
+            .map(|l| connect(&format!("{l}.npmjs.org"), 443))
+            .collect();
+        assert_eq!(
+            run(&events),
+            vec!["net *.npmjs.org | registry, www, cdn +2"]
+        );
+    }
+
+    #[test]
+    fn network_reasons_and_skipped_names() {
+        let events = [
+            dns("Example.COM."),
+            dns("localhost"),
+            dns("printer.local"),
+            dns("1.0.0.127.in-addr.arpa"),
+            dns("intranet"),
+            connect("ssh.example.org", 22),
+            connect("ssh.example.org", 443),
+            connect("ssh.example.org", 80),
+            connect("::1", 8080),
+            connect("[2001:db8::1]", 443),
+        ];
+        let summary = summarize(&events, &ctx());
+        assert_eq!(
+            lines(&summary),
+            vec![
+                "net example.com | DNS lookup only",
+                "net ssh.example.org | HTTPS, HTTP, port 22",
+            ]
+        );
+        assert_eq!(
+            summary.stats.ip_hosts,
+            vec!["[::1]:8080", "[2001:db8::1]:443"]
+        );
+    }
+
+    #[test]
+    fn process_names_show_at_most_three() {
+        let events: Vec<_> = ["a", "b", "c", "d", "e", "a"]
+            .iter()
+            .map(|p| fs(Read, "/home/u/.shared", p))
+            .collect();
+        assert_eq!(run(&events), vec!["r ~/.shared | read by a, b, c +2"]);
+    }
+
+    #[test]
+    fn unix_sockets_use_the_home_form() {
+        let events = [
+            WatchEvent::UnixConnect {
+                target: "/home/u/.gnupg/S.gpg-agent".to_string(),
+                process: crate::ProcessInfo {
+                    pid: 1,
+                    name: "gpg".to_string(),
+                },
+                outcome: Outcome::Allowed,
+            },
+            WatchEvent::UnixConnect {
+                target: "@/tmp/.X11-unix/X0".to_string(),
+                process: crate::ProcessInfo {
+                    pid: 1,
+                    name: "gpg".to_string(),
+                },
+                outcome: Outcome::Allowed,
+            },
+        ];
+        let summary = summarize(&events, &ctx());
+        assert!(summary.items.is_empty());
+        assert_eq!(
+            summary.stats.unix_sockets,
+            vec!["~/.gnupg/S.gpg-agent", "@/tmp/.X11-unix/X0"]
+        );
+    }
+
+    #[test]
+    fn to_doc_uses_the_selected_items() {
+        let events = claude_session();
+        let summary = summarize(&events, &ctx());
+        let all: Vec<usize> = (0..summary.items.len()).collect();
+        let doc = summary.to_doc(&all);
+        assert_eq!(
+            doc.filesystem.read_write,
+            vec![
+                "~/.cache/claude",
+                "~/.claude",
+                "~/.claude.json",
+                "~/.bashrc"
+            ]
+        );
+        assert_eq!(doc.network.domains.len(), 4);
+    }
+
+    #[test]
+    fn counts_have_group_separators() {
+        assert_eq!(format_count(0), "0");
+        assert_eq!(format_count(999), "999");
+        assert_eq!(format_count(1_834), "1,834");
+        assert_eq!(format_count(1_234_567), "1,234,567");
+    }
+
+    #[test]
+    fn empty_home_and_workspace_do_not_hide_everything() {
+        let ctx = SummaryContext {
+            home: PathBuf::new(),
+            workspace: PathBuf::new(),
+            covered: vec![PathBuf::new()],
+            existing: None,
+        };
+        let events = [fs(Read, "/opt/tool/a", "tool")];
+        assert_eq!(
+            lines(&summarize(&events, &ctx)),
+            vec!["r /opt/tool/a | read by tool [OutsideHome]"]
+        );
+    }
 }
