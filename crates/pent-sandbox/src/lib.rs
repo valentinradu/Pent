@@ -796,6 +796,9 @@ mod tests {
     // =========================================================================
 
     /// Find `name` in PATH (like `which`). Returns `None` if it is absent.
+    ///
+    /// Only the Linux tests use this helper.
+    #[cfg(target_os = "linux")]
     fn which(name: &str) -> Option<std::path::PathBuf> {
         std::env::var_os("PATH").and_then(|path| {
             std::env::split_paths(&path)

@@ -1495,6 +1495,269 @@ mod tests {
         );
     }
 
+    // ========================================================================
+    // The oracle: `sandbox-exec` compiles each profile that pent makes.
+    //
+    // These tests run only on macOS. They are the fastest way to find an
+    // escaping mistake: the Seatbelt reader rejects a profile that is not
+    // valid, and the test then prints the profile. A new path shape costs
+    // one line in `SHAPES`.
+    // ========================================================================
+    #[cfg(target_os = "macos")]
+    mod oracle {
+        use super::*;
+        use std::process::{Command, Stdio};
+
+        /// The Seatbelt front end.
+        const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
+
+        /// A program that does nothing and that every macOS has.
+        const TRUE_BIN: &str = "/usr/bin/true";
+
+        /// The path shapes that a profile must take. Each one is a name and
+        /// a path. The name is in the message of a failed assertion.
+        const SHAPES: &[(&str, &str)] = &[
+            ("plain", "/nonexistent/plain"),
+            ("space", "/nonexistent/a b/c d"),
+            ("single quote", "/nonexistent/it's"),
+            ("double quote", "/nonexistent/a\"b"),
+            ("parentheses", "/nonexistent/proj (copy)"),
+            ("backslash", "/nonexistent/a\\b"),
+            ("hash", "/nonexistent/a#b"),
+            ("semicolon", "/nonexistent/a;b"),
+            ("tab", "/nonexistent/a\tb"),
+            ("non-ASCII", "/nonexistent/ünïcøde/日本語/🙂"),
+            (
+                "regex metacharacters",
+                "/nonexistent/a.b*c?d[e]f{g}h^i$j|k+l",
+            ),
+            (
+                "injection",
+                "/nonexistent/x\") (allow file-write* (subpath \"/",
+            ),
+            ("comment start", "/nonexistent/; (allow default)"),
+        ];
+
+        /// Run `/usr/bin/true` under `profile` and return the exit code and
+        /// the standard error.
+        fn compile(profile: &str) -> (Option<i32>, String) {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("profile.sb");
+            std::fs::write(&path, profile).unwrap();
+            let out = Command::new(SANDBOX_EXEC)
+                .arg("-f")
+                .arg(&path)
+                .arg(TRUE_BIN)
+                .stdin(Stdio::null())
+                .output()
+                .unwrap();
+            (
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr).into_owned(),
+            )
+        }
+
+        /// Fail with the full profile when `sandbox-exec` does not accept
+        /// it.
+        fn assert_compiles(name: &str, profile: &str) {
+            let (code, stderr) = compile(profile);
+            assert_eq!(
+                code,
+                Some(0),
+                "sandbox-exec rejected the profile of the shape {name:?} \
+                 (exit {code:?})\n--- stderr ---\n{stderr}\n--- profile ---\n{profile}"
+            );
+        }
+
+        /// A workspace that exists, so that `canonicalize` works.
+        fn workspace() -> (tempfile::TempDir, std::path::PathBuf) {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().canonicalize().unwrap();
+            (dir, path)
+        }
+
+        /// The default paths of the platform, plus `path` in each list.
+        fn paths_with(path: &str) -> SandboxPaths {
+            let mut paths = crate::system_default_paths();
+            paths.traversal.push(path.to_string());
+            paths.read.push(path.to_string());
+            paths.execute.push(path.to_string());
+            paths.read_write.push(path.to_string());
+            paths
+        }
+
+        #[test]
+        fn every_path_shape_gives_a_profile_that_compiles() {
+            let (_dir, ws) = workspace();
+            for (name, path) in SHAPES {
+                let config = SandboxConfig::new(ws.clone(), paths_with(path), ws.clone());
+                let profile = generate_sbpl_profile(&config).unwrap();
+                assert_compiles(name, &profile);
+            }
+        }
+
+        #[test]
+        fn every_glob_shape_gives_a_profile_that_compiles() {
+            let (_dir, ws) = workspace();
+            for (name, path) in SHAPES {
+                let config =
+                    SandboxConfig::new(ws.clone(), paths_with(&format!("{path}*")), ws.clone());
+                let profile = generate_sbpl_profile(&config).unwrap();
+                assert_compiles(&format!("{name} (glob)"), &profile);
+            }
+        }
+
+        #[test]
+        fn a_workspace_with_an_odd_name_gives_a_profile_that_compiles() {
+            let (_dir, base) = workspace();
+            for (name, part) in [
+                ("space", "a b"),
+                ("single quote", "it's"),
+                ("parentheses", "proj (copy)"),
+                ("semicolon", "a;b"),
+                ("hash", "a#b"),
+                ("non-ASCII", "ünïcøde"),
+            ] {
+                let ws = base.join(part);
+                std::fs::create_dir_all(&ws).unwrap();
+                let config =
+                    SandboxConfig::new(ws.clone(), crate::system_default_paths(), ws.clone());
+                let profile = generate_sbpl_profile(&config).unwrap();
+                assert_compiles(&format!("workspace {name}"), &profile);
+            }
+        }
+
+        #[test]
+        fn a_very_long_path_gives_a_profile_that_compiles() {
+            let (_dir, ws) = workspace();
+            let long = format!("/nonexistent/{}", "x".repeat(3000));
+            let config = SandboxConfig::new(ws.clone(), paths_with(&long), ws);
+            let profile = generate_sbpl_profile(&config).unwrap();
+            assert_compiles("very long", &profile);
+        }
+
+        #[test]
+        fn an_empty_profile_compiles() {
+            let (_dir, ws) = workspace();
+            let paths = SandboxPaths {
+                traversal: vec![],
+                read: vec![],
+                execute: vec![],
+                read_write: vec![],
+            };
+            let config = SandboxConfig::new(ws.clone(), paths, ws);
+            let profile = generate_sbpl_profile(&config).unwrap();
+            // The profile denies each file content read, so `/usr/bin/true`
+            // cannot start. The check is the reader of the profile, not the
+            // run: a parse error has another message.
+            let (_code, stderr) = compile(&profile);
+            assert!(
+                !stderr.contains("sandbox-exec: ") || stderr.contains("Operation not permitted"),
+                "sandbox-exec rejected the empty profile\n--- stderr ---\n{stderr}\n\
+                 --- profile ---\n{profile}"
+            );
+        }
+
+        #[test]
+        fn every_network_mode_gives_a_profile_that_compiles() {
+            let (_dir, ws) = workspace();
+            let modes = [
+                ("unrestricted", NetworkMode::Unrestricted),
+                ("blocked", NetworkMode::Blocked),
+                ("localhost", NetworkMode::LocalhostOnly),
+                ("proxy", proxy_mode()),
+            ];
+            for (name, mode) in modes {
+                let config =
+                    SandboxConfig::new(ws.clone(), crate::system_default_paths(), ws.clone())
+                        .with_network(mode);
+                let profile = generate_sbpl_profile(&config).unwrap();
+                assert_compiles(&format!("network {name}"), &profile);
+            }
+        }
+
+        #[test]
+        fn the_watch_profile_with_the_guard_rules_compiles() {
+            let (_dir, ws) = workspace();
+            let home = dirs::home_dir().unwrap_or_else(|| ws.clone());
+            let guard = pent_profile::guard_rules(&home);
+            assert!(!guard.is_empty(), "the guard list must not be empty");
+            for mode in [
+                NetworkMode::Unrestricted,
+                NetworkMode::Blocked,
+                proxy_mode(),
+            ] {
+                let config =
+                    SandboxConfig::new(ws.clone(), crate::system_default_paths(), ws.clone())
+                        .with_network(mode);
+                let profile = generate_watch_profile(&config, &guard).unwrap();
+                assert_compiles("watch", &profile);
+            }
+        }
+
+        #[test]
+        fn a_newline_in_a_path_is_rejected_before_generation() {
+            let (_dir, ws) = workspace();
+            let config = SandboxConfig::new(ws.clone(), paths_with("/nonexistent/a\nb"), ws);
+            assert!(
+                generate_sbpl_profile(&config).is_err(),
+                "a newline in a path must not reach the profile"
+            );
+        }
+
+        /// Run `/bin/cat path` under `profile` and return true when the
+        /// read worked.
+        fn can_read(profile: &str, path: &Path) -> (bool, String) {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("profile.sb");
+            std::fs::write(&file, profile).unwrap();
+            let out = Command::new(SANDBOX_EXEC)
+                .arg("-f")
+                .arg(&file)
+                .arg("/bin/cat")
+                .arg(path)
+                .stdin(Stdio::null())
+                .output()
+                .unwrap();
+            (
+                out.status.success(),
+                String::from_utf8_lossy(&out.stderr).into_owned(),
+            )
+        }
+
+        #[test]
+        fn the_last_matching_rule_wins() {
+            let dir = tempfile::tempdir().unwrap();
+            let base = dir.path().canonicalize().unwrap();
+            let open = base.join("open.txt");
+            let secret = base.join("secret.txt");
+            std::fs::write(&open, "OPEN").unwrap();
+            std::fs::write(&secret, "SECRET").unwrap();
+            let allow = format!("(allow file-read-data (subpath \"{}\"))\n", base.display());
+            let deny = format!("(deny file-read-data (literal \"{}\"))\n", secret.display());
+
+            // The deny comes after the allow, so the deny wins.
+            let deny_last = format!("(version 1)\n(allow default)\n{allow}{deny}");
+            let (ok, stderr) = can_read(&deny_last, &secret);
+            assert!(
+                !ok,
+                "the deny after the allow must win\n--- stderr ---\n{stderr}\n\
+                 --- profile ---\n{deny_last}"
+            );
+            let (ok, stderr) = can_read(&deny_last, &open);
+            assert!(ok, "the other file stays readable: {stderr}");
+
+            // The allow comes after the deny, so the allow wins.
+            let allow_last = format!("(version 1)\n(allow default)\n{deny}{allow}");
+            let (ok, stderr) = can_read(&allow_last, &secret);
+            assert!(
+                ok,
+                "the allow after the deny must win\n--- stderr ---\n{stderr}\n\
+                 --- profile ---\n{allow_last}"
+            );
+        }
+    }
+
     #[test]
     fn test_sbpl_profile_denies_project_config_writes_last() {
         let config =
