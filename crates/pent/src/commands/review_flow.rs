@@ -7,7 +7,7 @@ use pent_profile::review::{review, Selection};
 use pent_profile::summary::{summarize, Summary, SummaryContext};
 use pent_profile::{
     render_draft_with, render_header, render_terminal, DraftSource, ProfileDoc, ProfileName,
-    Reasons, WatchEvent, WatchHeader,
+    Reasons, Warnings, WatchEvent, WatchHeader,
 };
 use pent_settings::ProfileStore;
 
@@ -104,17 +104,26 @@ pub(crate) fn summarize_review_and_draft(
 
     // With a terminal, the review shows the items itself, so pent prints only
     // the header first. Without a terminal, pent prints the full summary.
+    // The warning lines come after the header, so a user who presses Enter
+    // quickly still sees the important facts.
     let mut tty = Tty::open();
+    let facts = Warnings::of(&summary);
     let selection = match &tty {
         Some(t) => {
             eprint!("{}", render_header(&summary, &header));
+            for line in facts.lines() {
+                ui::warn(line);
+            }
             eprintln!();
             let (input, output) = t.split()?;
             review(&summary, input, output)?
         }
         None => {
             eprint!("{}", render_terminal(&summary, &header));
-            select_unblocked(&summary)
+            for line in facts.lines() {
+                ui::warn(line);
+            }
+            select_by_default(&summary)
         }
     };
     let added = summary.to_doc(&selection.indices);
@@ -142,7 +151,7 @@ pub(crate) fn summarize_review_and_draft(
             reasons.merge_missing(Reasons::from_draft(&text));
         }
     }
-    let text = render_draft_with(name, origin, &doc, &reasons);
+    let text = render_draft_with(name, origin, &doc, &reasons, facts);
     let path = store.write_draft(name, &text)?;
     ui::ok(format!("draft written: {}", path.display()));
 
@@ -161,15 +170,18 @@ pub(crate) fn summarize_review_and_draft(
     }
 }
 
-/// Select all items that the guard did not block (the review without a
-/// terminal).
-fn select_unblocked(summary: &Summary) -> Selection {
+/// Select the items of each section that the review selects by default
+/// (the review without a terminal).
+///
+/// The blocked accesses and the Unix sockets stay out: both are strong
+/// grants, and only the user can accept them.
+fn select_by_default(summary: &Summary) -> Selection {
     Selection {
         indices: summary
             .items
             .iter()
             .enumerate()
-            .filter(|(_, item)| item.blocked.is_none())
+            .filter(|(_, item)| item.section().selects_by_default())
             .map(|(i, _)| i)
             .collect(),
     }
@@ -182,18 +194,43 @@ mod tests {
     use pent_profile::GuardClass;
 
     #[test]
-    fn without_terminal_all_but_blocked() {
-        let item = |blocked| Item {
-            grant: Grant::Domain("a.com".to_string()),
+    fn without_terminal_all_but_the_strong_grants() {
+        let item = |grant, blocked| Item {
+            grant,
             reason: String::new(),
             blocked,
             notes: vec![],
         };
+        let domain = || Grant::Domain("a.com".to_string());
         let summary = Summary {
-            items: vec![item(None), item(Some(GuardClass::Credential)), item(None)],
+            items: vec![
+                item(domain(), None),
+                item(domain(), Some(GuardClass::Credential)),
+                item(Grant::UnixSocket("~/a.sock".to_string()), None),
+                item(domain(), None),
+            ],
             stats: pent_profile::summary::Stats::default(),
         };
-        assert_eq!(select_unblocked(&summary).indices, vec![0, 2]);
+        assert_eq!(select_by_default(&summary).indices, vec![0, 3]);
+    }
+
+    /// The warning lines show only the counts that are not zero.
+    #[test]
+    fn warning_lines_name_each_count() {
+        assert!(Warnings::default().lines().is_empty());
+        let facts = Warnings {
+            outside_home: 2,
+            other_repository: 1,
+            refused_unix_sockets: 3,
+        };
+        assert_eq!(
+            facts.lines(),
+            vec![
+                "2 rules read outside the home directory",
+                "1 rule reads in another repository",
+                "pent refused 3 connections to a Unix socket",
+            ]
+        );
     }
 
     #[test]

@@ -10,9 +10,13 @@ use pent_sandbox::{
 };
 use pent_settings::{ConfigLoader, ProfileStore, WatchRunMode};
 
-use crate::cli::WatchArgs;
+use crate::cli::{NetworkModeArg, WatchArgs};
 use crate::commands::review_flow::{
     home_dir, summarize_review_and_draft, ReviewInput, TrustAnswer,
+};
+use crate::commands::run::{
+    base_network_mode, network_status, network_warnings, resolve_network, NetworkChoice,
+    NetworkDecision, NetworkSource,
 };
 use crate::commands::select::{generic_warning, select_profile};
 use crate::commands::session::{
@@ -27,16 +31,65 @@ use pent_profile::DraftSource;
 /// The longest time to wait for the last events after the child exits.
 const FINAL_DRAIN: Duration = Duration::from_secs(5);
 
-/// The banner text after the first line. See `docs/design/watch.md`.
-const BANNER: &str =
+/// The first lines of the banner. See `docs/design/watch.md`.
+const BANNER_HEAD: &str =
     "  Watch mode does not sandbox the program. It records what the program does.\n  \
-     The program can read and change your files and use the network.\n  \
-     Pent blocks only the most dangerous accesses (credentials, persistence).\n  \
+     The program can read and change your files and use the network.\n";
+
+/// The line that the banner adds when the proxy allows each domain.
+const BANNER_OPEN_NETWORK: &str =
+    "  The network is open in this run. Use --allow DOMAIN or --network blocked \
+     to close it.\n";
+
+/// The last lines of the banner.
+const BANNER_TAIL: &str =
+    "  Pent blocks only the most dangerous accesses (credentials, persistence).\n  \
      If you do not trust this binary, run it in a VM or a container.\n";
 
-/// The banner for the profile `name`.
-fn banner(name: &str) -> String {
-    format!("pent watch: {name}\n{BANNER}")
+/// The banner for the profile `name`. The banner names an open network, so
+/// the user knows that the program can send out what it reads.
+fn banner(name: &str, policy: ProxyPolicy) -> String {
+    let network = if policy == ProxyPolicy::Observe {
+        BANNER_OPEN_NETWORK
+    } else {
+        ""
+    };
+    format!("pent watch: {name}\n{BANNER_HEAD}{network}{BANNER_TAIL}")
+}
+
+/// The network of one watch run.
+struct WatchNetwork {
+    /// The mode and the input that decided it.
+    decision: NetworkDecision,
+    /// The policy of the proxy.
+    policy: ProxyPolicy,
+    /// The domains of the allowlist.
+    domains: Vec<String>,
+}
+
+/// Decide the network of a watch run.
+///
+/// Without `--network` and without `--allow`, the proxy observes and allows
+/// each domain: a watch run must learn what the program needs. With one of
+/// the two flags, the rule of `pent run` applies, and the proxy enforces the
+/// allowlist. A watch run applies no profile, so the profile domains are
+/// empty.
+fn watch_network(flag: Option<NetworkModeArg>, allow: &[String]) -> WatchNetwork {
+    if flag.is_none() && allow.is_empty() {
+        return WatchNetwork {
+            decision: NetworkDecision {
+                choice: NetworkChoice::Proxy,
+                source: NetworkSource::Default,
+            },
+            policy: ProxyPolicy::Observe,
+            domains: Vec::new(),
+        };
+    }
+    WatchNetwork {
+        decision: resolve_network(flag, allow, &[]),
+        policy: ProxyPolicy::Enforce,
+        domains: allow.to_vec(),
+    }
 }
 
 // The function is long because it lists the steps of one watch run in
@@ -48,10 +101,11 @@ pub(crate) async fn watch(args: WatchArgs, cwd: PathBuf) -> Result<(), CliError>
         ui::warn(warning);
     }
     let name = selected.name;
+    let net = watch_network(args.network, &args.allow);
 
     // ── Banner ───────────────────────────────────────────────────────────────
     if args.yes {
-        eprint!("{}", banner(name.as_str()));
+        eprint!("{}", banner(name.as_str(), net.policy));
     } else {
         let Some(mut tty) = Tty::open() else {
             return Err(CliError::Other(
@@ -60,11 +114,15 @@ pub(crate) async fn watch(args: WatchArgs, cwd: PathBuf) -> Result<(), CliError>
                     .to_string(),
             ));
         };
-        tty.write(&banner(name.as_str()))?;
+        tty.write(&banner(name.as_str(), net.policy))?;
         if !tty.confirm("Continue?")? {
             ui::warn("pent watch did not start");
             return Ok(());
         }
+    }
+    // `--trace` is a flag of `pent run`, so a watch run never traces.
+    for warning in network_warnings(net.decision, &args.allow, false) {
+        ui::warn(warning);
     }
 
     let store = ProfileStore::open_default()?;
@@ -81,18 +139,34 @@ pub(crate) async fn watch(args: WatchArgs, cwd: PathBuf) -> Result<(), CliError>
         .split_first()
         .ok_or_else(|| CliError::Other("command list is empty".to_string()))?;
 
-    // ── Proxy in observe mode ────────────────────────────────────────────────
+    // ── Proxy ────────────────────────────────────────────────────────────────
+    // The proxy observes by default. With `--allow` or `--network`, it
+    // enforces the allowlist, and each refused request becomes an item of
+    // the summary.
     let (net_tx, net_rx) = tokio::sync::mpsc::unbounded_channel::<WatchEvent>();
-    let proxy = start_proxy(
-        &settings.proxy,
-        Vec::new(),
-        ProxyPolicy::Observe,
-        ProxyChannels {
-            trace: None,
-            events: Some(net_tx),
-        },
-    )
-    .await?;
+    let proxy = if net.decision.choice == NetworkChoice::Proxy {
+        Some(
+            start_proxy(
+                &settings.proxy,
+                net.domains,
+                net.policy,
+                ProxyChannels {
+                    trace: None,
+                    events: Some(net_tx),
+                },
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let network = proxy.as_ref().map_or_else(
+        || base_network_mode(net.decision.choice),
+        |p| p.network.clone(),
+    );
+    if let Some(line) = network_status(&network, net.decision.source) {
+        ui::status("network", line);
+    }
 
     let sandbox_cfg = SandboxConfig::from_sandbox_settings(
         settings.sandbox,
@@ -100,7 +174,7 @@ pub(crate) async fn watch(args: WatchArgs, cwd: PathBuf) -> Result<(), CliError>
         cwd.clone(),
         cwd.clone(),
     )
-    .with_network(proxy.network.clone())
+    .with_network(network)
     .with_env(build_env(&[]));
     // The guard protects the files of pent at their real place, also when
     // $XDG_CONFIG_HOME or $XDG_STATE_HOME points outside of the defaults.
@@ -119,7 +193,9 @@ pub(crate) async fn watch(args: WatchArgs, cwd: PathBuf) -> Result<(), CliError>
     let watched = match spawn_watched(&sandbox_cfg, &options, cmd, cmd_args) {
         Ok(watched) => watched,
         Err(e) => {
-            proxy.shutdown().await;
+            if let Some(proxy) = proxy {
+                proxy.shutdown().await;
+            }
             // The run did not start; remove its empty log. A failure here
             // leaves an empty file, which adds no events.
             let _ = std::fs::remove_file(log.path());
@@ -139,7 +215,9 @@ pub(crate) async fn watch(args: WatchArgs, cwd: PathBuf) -> Result<(), CliError>
     // proxy cannot use them, the error drops `cleanup`, which stops the
     // child.
     #[cfg(target_os = "linux")]
-    proxy.attach(watched.child.proxy_listeners)?;
+    if let Some(proxy) = &proxy {
+        proxy.attach(watched.child.proxy_listeners)?;
+    }
     #[cfg(not(target_os = "linux"))]
     let cleanup = SessionCleanup::new(watched.child.child.id(), ());
 
@@ -165,7 +243,9 @@ pub(crate) async fn watch(args: WatchArgs, cwd: PathBuf) -> Result<(), CliError>
         wait_child(watched.child.child, &mut signals, Some(event_rx), &mut sink).await;
     cleanup.finish();
     stop.stop();
-    proxy.shutdown().await;
+    if let Some(proxy) = proxy {
+        proxy.shutdown().await;
+    }
     if drain(rest, FINAL_DRAIN, &mut sink).await.is_some() {
         ui::warn("the recorder did not finish in time; a process of the command can still run");
     }
@@ -219,10 +299,53 @@ mod tests {
 
     #[test]
     fn banner_matches_the_design() {
-        let b = banner("claude");
+        let b = banner("claude", ProxyPolicy::Observe);
         assert!(b.starts_with("pent watch: claude\n  Watch mode does not sandbox the program."));
         assert!(b.ends_with("run it in a VM or a container.\n"));
-        assert_eq!(b.lines().count(), 5);
+        assert_eq!(b.lines().count(), 6);
+    }
+
+    /// The default run has an open network, and the banner says so. With a
+    /// flag the proxy enforces the allowlist, and the line goes away.
+    #[test]
+    fn the_banner_names_an_open_network() {
+        let open = banner("claude", ProxyPolicy::Observe);
+        assert!(open.contains("The network is open in this run."), "{open}");
+        assert!(open.contains("--network blocked"), "{open}");
+        let closed = banner("claude", ProxyPolicy::Enforce);
+        assert!(!closed.contains("The network is open"), "{closed}");
+        assert_eq!(closed.lines().count(), 5);
+    }
+
+    #[test]
+    fn without_a_flag_the_proxy_observes_and_allows_each_domain() {
+        let net = watch_network(None, &[]);
+        assert_eq!(net.policy, ProxyPolicy::Observe);
+        assert_eq!(net.decision.choice, NetworkChoice::Proxy);
+        assert_eq!(net.decision.source, NetworkSource::Default);
+        assert!(net.domains.is_empty());
+    }
+
+    #[test]
+    fn allow_makes_the_proxy_enforce_the_allowlist() {
+        let net = watch_network(None, &["a.example".to_string()]);
+        assert_eq!(net.policy, ProxyPolicy::Enforce);
+        assert_eq!(net.decision.choice, NetworkChoice::Proxy);
+        assert_eq!(net.decision.source, NetworkSource::AllowFlag);
+        assert_eq!(net.domains, vec!["a.example"]);
+    }
+
+    /// `--network` has precedence over `--allow`, as in `pent run`.
+    #[test]
+    fn the_network_flag_has_precedence() {
+        let net = watch_network(Some(NetworkModeArg::Blocked), &["a.example".to_string()]);
+        assert_eq!(net.decision.choice, NetworkChoice::Blocked);
+        assert_eq!(net.decision.source, NetworkSource::NetworkFlag);
+        let warnings = network_warnings(net.decision, &["a.example".to_string()], false);
+        assert!(
+            warnings.iter().any(|w| w.contains("--allow has no effect")),
+            "{warnings:?}"
+        );
     }
 
     #[test]
