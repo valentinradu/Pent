@@ -39,8 +39,8 @@ mod macos {
         TestEnv, TestResult,
     };
     use super::common::macos::{
-        deny_reads_profile, have_files, log_write, sandbox_exec_spawn, wait_for_log_line, LOGGER,
-        SANDBOX_EXEC,
+        deny_exec_profile, deny_reads_profile, have_files, log_write, sandbox_exec,
+        sandbox_exec_spawn, wait_for_log_line, LOGGER, SANDBOX_EXEC,
     };
 
     /// The time limit for one pent command.
@@ -196,10 +196,24 @@ mod macos {
         );
 
         let out = env.pent(&["run", "--profile", "p", "--", script])?;
+        // When the binary runs, the next question is whether the kernel
+        // denies this path at all. The probe is a profile of the same
+        // shape as the one that pent writes: `(allow default)`, then
+        // `(deny process-exec)`, then the allow rules of the system
+        // directories (MAC-4).
+        let probe = deny_exec_profile();
+        let probe_out = sandbox_exec(&env.root, &probe, &[script])?;
         assert!(
             !stdout(&out).contains("HELLO_FROM_TOOL"),
-            "without --execute the binary must not run\nstderr: {}",
-            stderr(&out)
+            "without --execute the binary must not run\n\
+             pent exited {:?}\nstderr: {}\n\
+             --- the kernel answer to the same shape of profile ---\n\
+             exit {:?}\nstdout: {}\nstderr: {}\n--- the probe profile ---\n{probe}",
+            out.status.code(),
+            stderr(&out),
+            probe_out.status.code(),
+            stdout(&probe_out),
+            stderr(&probe_out)
         );
         Ok(())
     }

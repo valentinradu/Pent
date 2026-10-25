@@ -317,7 +317,17 @@ pub fn generate_sbpl_profile(config: &SandboxConfig) -> Result<String, SandboxEr
     // =========================================================================
     // SYSTEM EXECUTE PATHS - the programs that every command needs
     // =========================================================================
-    add_system_exec_allows(&mut profile)?;
+    // With `--trace`, the kernel logs each of these execs. The reader needs
+    // them: it checks the name of each report against the program that the
+    // process runs, and only an exec report tells it that a process runs a
+    // new file (MAC-8). `/bin/sh` runs `/bin/bash` on macOS, so without
+    // this report the reader drops each denial of the shell.
+    let exec_report = if config.record_events {
+        Report::Yes
+    } else {
+        Report::No
+    };
+    add_system_exec_allows(&mut profile, exec_report)?;
 
     // =========================================================================
     // READ-WRITE PATHS - subpath content and write access
@@ -419,9 +429,16 @@ const SYSTEM_EXEC_PATHS: &[&str] = &[
 /// Returns `SandboxError::InvalidConfig` if a path contains NUL or a
 /// newline. Each path of [`SYSTEM_EXEC_PATHS`] is a literal, so the error
 /// cannot occur.
-fn add_system_exec_allows(profile: &mut String) -> Result<(), SandboxError> {
+fn add_system_exec_allows(profile: &mut String, report: Report) -> Result<(), SandboxError> {
     for dir in SYSTEM_EXEC_PATHS {
-        push_rule(profile, RuleAction::Allow, "process-exec", "subpath", dir)?;
+        push_rule_with(
+            profile,
+            RuleAction::Allow,
+            "process-exec",
+            "subpath",
+            dir,
+            report,
+        )?;
     }
     Ok(())
 }
@@ -2112,6 +2129,38 @@ mod tests {
             root_process_names("npm"),
             vec!["sandbox-exec".to_string(), "npm".to_string()]
         );
+    }
+
+    /// MAC-4. The run profile denies `process-exec`, and no rule after the
+    /// deny gives exec access to a path of the workspace. A program in the
+    /// workspace runs only with `--execute`, as on Linux.
+    #[test]
+    fn the_run_profile_denies_the_execution_of_a_program_in_the_workspace() {
+        let ws = std::path::PathBuf::from("/nonexistent/ws");
+        let paths = SandboxPaths {
+            traversal: vec!["/".to_string()],
+            read: vec!["/usr/lib".to_string()],
+            execute: vec!["/bin".to_string()],
+            read_write: vec!["/tmp".to_string()],
+        };
+        let config = SandboxConfig::new(ws.clone(), paths, ws.clone());
+        let generated = generate_sbpl_profile(&config);
+        assert!(generated.is_ok(), "the generator gave no profile");
+        let profile = generated.unwrap_or_default();
+        assert!(profile.contains("(deny process-exec)\n"), "{profile}");
+        let exec_rules: Vec<&str> = profile
+            .lines()
+            .filter(|l| l.contains("(allow process-exec"))
+            .collect();
+        assert!(
+            !exec_rules.iter().any(|l| l.contains("/nonexistent/ws")),
+            "a rule gives exec access to the workspace:\n{exec_rules:#?}"
+        );
+        // The deny comes before each allow, and the last matching rule
+        // wins, so the order is the whole property.
+        let deny = profile.find("(deny process-exec)");
+        let first_allow = profile.find("(allow process-exec");
+        assert!(deny < first_allow, "{profile}");
     }
 
     // ========================================================================
