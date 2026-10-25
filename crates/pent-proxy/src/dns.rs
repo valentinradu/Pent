@@ -3495,7 +3495,7 @@ mod wire_properties {
         (query, answer)
     }
 
-    /// OPEN FUZZ-2. The server must keep the truncation bit of the
+    /// The server must keep the truncation bit of the
     /// upstream answer. Without the bit the client takes a short answer as
     /// the whole answer and never asks again over TCP. The server does
     /// serve DNS over TCP (`DnsServer::run_tcp_on`), so the retry works.

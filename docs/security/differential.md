@@ -1,8 +1,8 @@
 # Differential tests: the profile, the summary and the kernel
 
-Status: review of commit `69cdc99` (2026-10-25). DIFF-1, DIFF-2, DIFF-4,
-DIFF-5, DIFF-6, DIFF-7 and DIFF-8 have a fix; each section names its
-commit. DIFF-3 and DIFF-9 stay open.
+Status: review of commit `69cdc99` (2026-10-25). DIFF-1 to DIFF-8 have a
+fix; each section names its commit. DIFF-9 stays open: it is a macOS
+rule, and no machine here runs macOS. The pipeline runs its row.
 
 Pent describes one policy three times:
 
@@ -75,7 +75,7 @@ proof of the finding.
 |---|---|---|---|
 | DIFF-1 | Medium | The summary | **Fixed.** A read that the overlay hid was not a recorded denial. |
 | DIFF-2 | Medium | The kernel | **Fixed.** A profile entry that named a symbolic link gave access to nothing. |
-| DIFF-3 | Low | The kernel | A write to a read-only rule succeeds inside the run. |
+| DIFF-3 | Low | The kernel | **Fixed.** A write to a read-only rule worked inside the run. |
 | DIFF-4 | Medium | The kernel | **Fixed.** A `read` rule also gave execute. |
 | DIFF-5 | High | The kernel | **Fixed.** The guard missed a private key behind a symbolic link, and the summary said "blocked". |
 | DIFF-6 | High | The kernel | **Fixed.** The guard missed a private key that the program makes during the run, and the summary said "blocked". |
