@@ -62,6 +62,48 @@ pub use pent_settings::{Mount, NetworkMode, SandboxPaths, SandboxSettings};
 use std::process::Child;
 use thiserror::Error;
 
+/// The options of watch mode.
+///
+/// Watch mode does not apply the sandbox policy. It records each access of
+/// the process tree and blocks only the accesses that `guard` names. The
+/// kernel enforces the guard (mount masks on Linux, Seatbelt deny rules on
+/// macOS).
+#[derive(Debug, Clone)]
+pub struct WatchOptions {
+    /// The dangerous accesses to block (see [`pent_profile::guard_rules`]).
+    pub guard: Vec<pent_profile::GuardRule>,
+}
+
+/// A process that runs in watch mode.
+pub struct WatchedChild {
+    /// The child and the platform resources (network namespace on Linux).
+    pub child: SandboxChild,
+    /// The recorded events. The channel closes when the last process of the
+    /// tree exits and the recorder has sent all events.
+    pub events: std::sync::mpsc::Receiver<pent_profile::WatchEvent>,
+}
+
+/// Spawn `cmd` in watch mode.
+///
+/// `config.network` selects the network path as for [`spawn_sandboxed`].
+/// Watch mode uses [`NetworkMode::ProxyOnly`] with the proxy in observe mode,
+/// so that network events have domain names.
+///
+/// CONTRACT STUB: the platform recorders are not implemented yet.
+///
+/// # Errors
+/// Returns [`SandboxError::UnsupportedPlatform`] until a recorder exists for
+/// the platform, or a spawn error.
+pub fn spawn_watched(
+    config: &SandboxConfig,
+    options: &WatchOptions,
+    cmd: &str,
+    args: &[String],
+) -> Result<WatchedChild, SandboxError> {
+    let _ = (config, options, cmd, args);
+    Err(SandboxError::UnsupportedPlatform)
+}
+
 /// A sandboxed child process, optionally with an overlayfs handle.
 pub struct SandboxChild {
     /// The child process handle.

@@ -1,0 +1,26 @@
+//! Recorded access events, profile files, grouping and review for pent.
+//!
+//! This crate holds the parts of watch mode that do not depend on the
+//! platform:
+//!
+//! - [`event`]: the event type that each recorder emits (Linux seccomp
+//!   recorder, macOS Seatbelt recorder, the proxy).
+//! - [`name`]: the name of a profile.
+//! - [`doc`]: the profile file (`~/.config/pent/profiles/<name>.toml`).
+//! - [`guard`]: the dangerous paths that watch mode blocks on all platforms.
+//! - [`summary`]: the step that groups raw events into a short list of rules.
+//! - [`review`]: the interactive review at the end of watch mode.
+//!
+//! See `docs/design/watch.md` for the full design.
+
+pub mod doc;
+pub mod event;
+pub mod guard;
+pub mod name;
+pub mod review;
+pub mod summary;
+
+pub use doc::{DocError, FilesystemRules, NetworkRules, ProfileDoc};
+pub use event::{FsOp, GuardClass, NetProtocol, Outcome, ProcessInfo, WatchEvent};
+pub use guard::{classify, guard_rules, GuardAccess, GuardRule, GuardTarget};
+pub use name::{ProfileName, ProfileNameError};

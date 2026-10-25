@@ -8,6 +8,7 @@ description = "OS-level process sandboxing (filesystem + network containment)"
 
 [dependencies]
 pent-settings = { path = "../pent-settings" }
+pent-profile = { path = "../pent-profile" }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 dirs = "5"

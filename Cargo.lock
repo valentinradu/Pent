@@ -514,6 +514,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pent-profile"
+version = "0.0.5"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "toml",
+]
+
+[[package]]
 name = "pent-proxy"
 version = "0.0.5"
 dependencies = [
@@ -529,6 +540,7 @@ version = "0.0.5"
 dependencies = [
  "dirs",
  "libc",
+ "pent-profile",
  "pent-settings",
  "serial_test",
  "tempfile",
