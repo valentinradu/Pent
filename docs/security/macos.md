@@ -83,7 +83,8 @@ summary of pent can never drift apart again (MAC-2 and MAC-3).
 |---|---|
 | A path in the profile is readable; a sibling that the profile does not name is not. | `profile_path_is_readable_and_a_sibling_is_not` |
 | A write to a path with only a read rule fails; a write to a `read_write` path reaches the real file. | `read_rule_denies_a_write_and_read_write_reaches_the_file` |
-| `--execute` lets the named binary run; without the flag it does not. The profile denies `process-exec` and allows the `execute` paths and the system program directories (MAC-4). | `execute_flag_runs_the_named_binary` |
+| `--execute` lets the child run a program of the named directory; without the flag it does not. The profile denies `process-exec` and allows the `execute` paths and the system program directories (MAC-4). | `execute_flag_lets_the_child_run_a_tool` |
+| The command that the user names always runs, also when no `execute` rule names its directory. | `the_named_command_runs_without_an_execute_rule` |
 | The README claim that only the content read is limited: `stat` works outside the profile, `cat` does not. | `metadata_read_is_not_limited_but_content_read_is` |
 | `pent watch --yes` writes a draft, `pent trust` makes it a profile, and `pent run` then does the recorded accesses and nothing more. | `watch_trust_run_gives_the_recorded_accesses` |
 
@@ -163,7 +164,7 @@ items: MAC-7, MAC-8, MAC-9 and MAC-10.
 | MAC-1 | High | The watched program writes its own Seatbelt reports into the unified log and chooses the rules of its own draft. | Fixed; the fix ran on a Mac | `a_program_cannot_forge_its_own_events` |
 | MAC-2 | High | The watch guard does not translate the suffix key patterns, so `~/.ssh/github_rsa` stays readable. | Fixed; the fix ran on a Mac | `watch_guard_blocks_a_key_with_a_suffix_name` |
 | MAC-3 | High | The watch guard covers only the direct children of a guarded directory. | Fixed; the fix ran on a Mac | `watch_guard_blocks_a_key_in_a_subdirectory` |
-| MAC-4 | Critical | The profile starts from `(allow default)`. The `process-exec` half is fixed; `launchd` still runs a program for the child, outside the sandbox. | Half fixed | `execute_flag_runs_the_named_binary`, `the_child_cannot_start_a_program_through_launchd` (ignored) |
+| MAC-4 | Critical | The profile starts from `(allow default)`. The `process-exec` half is fixed; `launchd` still runs a program for the child, outside the sandbox. | Half fixed | `execute_flag_lets_the_child_run_a_tool`, `the_child_cannot_start_a_program_through_launchd` (ignored) |
 | MAC-5 | Low | The log reader trusts the lines that it reads. | Fixed with MAC-1 | The unit tests of `parse_line` |
 | MAC-6 | Medium | `pent run --trace` had a second log reader with the old predicate and the old parser. | Fixed | The tests of `macos_log.rs` |
 | MAC-7 | Medium | The probe of the macOS tests asked whether `sandbox-exec` can run `/bin/true`, which macOS does not have, so thirteen tests skipped on a good machine. | Fixed | Each macOS test of `integration_test.rs` |
@@ -376,6 +377,26 @@ gets `READ_EXECUTE` there. The workspace is in neither list, so a program in
 the workspace runs only with `--execute`. Linux works the same way: the
 workspace gets `ALL_NO_EXECUTE`.
 
+**What the test of the `execute` flag really holds.** The first form of
+`execute_flag_runs_the_named_binary` asked for the wrong thing: it ran the
+tool as the command of the run and asked that the command not start.
+`spawn_sandboxed` adds the directory of the command to the `execute` paths
+(`binary_grant_dirs` in `crates/pent-sandbox/src/lib.rs`), because the user
+names that command. Both platforms work this way, and a run that cannot
+start its own command has no value. The debug log of the profile shows the
+rule:
+
+```text
+(allow file-read-data (subpath ".../t-ZO6Fia/tools"))
+(allow process-exec (subpath ".../t-ZO6Fia/tools"))
+```
+
+`--execute` is for the programs that the **child** runs. The test is now
+`execute_flag_lets_the_child_run_a_tool`: the command is the shell, and the
+shell runs the tool. `the_named_command_runs_without_an_execute_rule` holds
+the other half. `pent run -v` logs the whole profile, which is how this came
+out.
+
 **The open half.** `mach-lookup` stays allowed, so the child still reaches
 `launchd` and asks it to start a program. A deny of `mach-lookup` needs an
 allow list of the services that a normal program needs (the name resolver,
@@ -586,4 +607,8 @@ could not give.
 The prediction that was right: `(deny process-exec)` after `(allow default)`
 works, so the `execute` list of a profile can mean something on macOS
 (MAC-4).
+
+The test that was wrong: `execute_flag_runs_the_named_binary` asked that the
+command of the run not start. Pent gives exec access to the directory of
+that command by design, on both platforms.
 

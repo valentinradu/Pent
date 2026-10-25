@@ -168,10 +168,22 @@ mod macos {
         Ok(())
     }
 
-    /// `--execute` lets the named binary run. Without the flag, the same
-    /// binary does not run.
+    /// `--execute` lets the child run a program of the named directory.
+    /// Without the flag, the same program does not run (MAC-4).
+    ///
+    /// The program under test is one that the **child** runs, not the
+    /// command of the run. `spawn_sandboxed` always gives exec access to
+    /// the directory of the command, because the user names that command
+    /// (`binary_grant_dirs` in `crates/pent-sandbox/src/lib.rs`). The
+    /// command of this test is therefore the shell, and the shell runs the
+    /// tool.
+    ///
+    /// The run profile denies `process-exec` and allows the `execute`
+    /// paths and the system program directories. Before that deny, the
+    /// `execute` list of a profile meant nothing on macOS: `(allow
+    /// default)` let the child run every program on the machine.
     #[test]
-    fn execute_flag_runs_the_named_binary() -> TestResult {
+    fn execute_flag_lets_the_child_run_a_tool() -> TestResult {
         if !ready("execute_flag", &[SH]) {
             return Ok(());
         }
@@ -186,36 +198,81 @@ mod macos {
         let script = script.to_str().ok_or("the path is not UTF-8")?;
         let tools = tools.to_str().ok_or("the path is not UTF-8")?;
         env.install_profile("p", "")?;
+        let run_tool = format!("'{script}' || echo TOOL_DENIED");
 
-        let out = env.pent(&["run", "--profile", "p", "--execute", tools, "--", script])?;
+        let out = env.pent(&[
+            "run",
+            "--profile",
+            "p",
+            "--execute",
+            tools,
+            "--",
+            SH,
+            "-c",
+            &run_tool,
+        ])?;
         assert!(
             stdout(&out).contains("HELLO_FROM_TOOL"),
-            "--execute must let the binary run\nstdout: {}\nstderr: {}",
+            "--execute must let the child run the tool\nstdout: {}\nstderr: {}",
             stdout(&out),
             stderr(&out)
         );
 
         // `-v` makes pent log the profile that it gives to the kernel, so
-        // a failure shows the rule that lets the program run (MAC-4).
-        let out = env.pent(&["-v", "run", "--profile", "p", "--", script])?;
-        // When the binary runs, the next question is whether the kernel
+        // a failure shows the rule that lets the program run.
+        let out = env.pent(&["-v", "run", "--profile", "p", "--", SH, "-c", &run_tool])?;
+        // When the tool runs, the next question is whether the kernel
         // denies this path at all. The probe is a profile of the same
         // shape as the one that pent writes: `(allow default)`, then
         // `(deny process-exec)`, then the allow rules of the system
-        // directories (MAC-4).
+        // directories.
         let probe = deny_exec_profile();
-        let probe_out = sandbox_exec(&env.root, &probe, &[script])?;
+        let probe_out = sandbox_exec(&env.root, &probe, &[SH, "-c", &run_tool])?;
         assert!(
             !stdout(&out).contains("HELLO_FROM_TOOL"),
-            "without --execute the binary must not run\n\
-             pent exited {:?}\nstderr: {}\n\
+            "without --execute the child must not run the tool\n\
+             pent exited {:?}\nstdout: {}\nstderr: {}\n\
              --- the kernel answer to the same shape of profile ---\n\
              exit {:?}\nstdout: {}\nstderr: {}\n--- the probe profile ---\n{probe}",
             out.status.code(),
+            stdout(&out),
             stderr(&out),
             probe_out.status.code(),
             stdout(&probe_out),
             stderr(&probe_out)
+        );
+        Ok(())
+    }
+
+    /// The command that the user names always runs, also when no
+    /// `execute` rule names its directory.
+    ///
+    /// `spawn_sandboxed` adds the directory of the command to the
+    /// `execute` paths (`binary_grant_dirs`). The user names the command,
+    /// so pent lets it run; `--execute` is for the programs that the child
+    /// runs itself. Both platforms work this way.
+    #[test]
+    fn the_named_command_runs_without_an_execute_rule() -> TestResult {
+        if !ready("named_command_runs", &[SH]) {
+            return Ok(());
+        }
+        let env = TestEnv::new()?;
+        let tools = env.root.join("tools");
+        fs::create_dir_all(&tools)?;
+        let script = tools.join("hello");
+        fs::write(&script, "#!/bin/sh\necho HELLO_FROM_TOOL\n")?;
+        let mut perms = fs::metadata(&script)?.permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        fs::set_permissions(&script, perms)?;
+        let script = script.to_str().ok_or("the path is not UTF-8")?;
+        env.install_profile("p", "")?;
+
+        let out = env.pent(&["run", "--profile", "p", "--", script])?;
+        assert!(
+            stdout(&out).contains("HELLO_FROM_TOOL"),
+            "the command of the run must start\nstdout: {}\nstderr: {}",
+            stdout(&out),
+            stderr(&out)
         );
         Ok(())
     }
