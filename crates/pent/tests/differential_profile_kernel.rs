@@ -362,13 +362,13 @@ printf 'rc=%s\n' "$?"
         Ok(())
     }
 
-    /// The kernel must tell pent about every access that it blocks.
+    /// DIFF-1. The kernel must tell pent about every access that it
+    /// blocks.
     ///
-    /// `pent run --trace` records a Landlock denial. It records nothing
-    /// when the overlay hides the path: the program gets `ENOENT`, and the
-    /// review never sees the access.
+    /// `pent run --trace` records a Landlock denial. Before the fix it
+    /// recorded nothing when the overlay hid the path: the program got
+    /// `ENOENT`, and the review never saw the access.
     #[test]
-    #[ignore = "OPEN DIFF-1: a read that the overlay hides is not recorded as a denial"]
     fn diff_1_a_hidden_path_is_not_a_recorded_denial() -> TestResult {
         let test = "fs_diff_1_hidden_denial";
         if !ready(test) {
