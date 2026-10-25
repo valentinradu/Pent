@@ -643,8 +643,10 @@ fn fs_items(fs: &FsLog, env: &Env, order: &[String]) -> Vec<Item> {
         };
         if env.is_broad(dir) {
             // A temporary file in a broad directory gets no rule: its next
-            // name is not known.
-            if !fs.is_transient(path) {
+            // name is not known. A broad directory that the program makes
+            // (for example `~/.local/share` in a new home) gets no rule: the
+            // rule goes on the child.
+            if !fs.is_transient(path) && !env.is_broad(path) {
                 rw.insert(path.clone());
             }
         } else {
@@ -1202,6 +1204,16 @@ mod tests {
             fs(Create, "/home/u/.cache/tool/a", "tool"),
         ];
         assert_eq!(run(&events), vec!["rw ~/.cache/tool | cache"]);
+        // A new broad directory gives a rule on the child, not on itself.
+        let events = [
+            fs(Create, "/home/u/.local/share", "tool"),
+            fs(Create, "/home/u/.local/share/tool", "tool"),
+            fs(Create, "/home/u/.local/share/tool/a", "tool"),
+        ];
+        assert_eq!(
+            run(&events),
+            vec!["rw ~/.local/share/tool | creates and edits files (1 new)"]
+        );
     }
 
     #[test]
