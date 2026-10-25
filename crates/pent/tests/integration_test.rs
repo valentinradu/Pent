@@ -69,22 +69,14 @@ fn expect_failure(out: &Output) {
     );
 }
 
-/// True when we are on macOS and sandbox-exec can actually apply a profile.
-///
-/// Merely checking that the binary exists is insufficient: macOS does not
-/// allow nested Seatbelt sandboxes, so `sandbox_apply` returns EPERM when
-/// `pent` is itself running under `sandbox-exec` (e.g. during development).
-#[cfg(target_os = "macos")]
-fn sandbox_available() -> bool {
-    if !cfg!(target_os = "macos") || !Path::new("/usr/bin/sandbox-exec").exists() {
-        return false;
-    }
-    Command::new("/usr/bin/sandbox-exec")
-        .args(["-p", "(version 1) (allow default)", "/bin/true"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
+// The guard of each macOS test is `common::e2e::sandbox_ready`. It asks the
+// question that matters: can pent apply a profile on this machine. The
+// earlier guard ran `sandbox-exec -p '(version 1) (allow default)'
+// /bin/true`, which answered a different question and gave the wrong
+// answer: it asked whether `sandbox-exec` can run `/bin/true`. The probe
+// read each failure of that program as "no sandbox", so thirteen tests
+// skipped on a machine that runs the sandbox well. See MAC-7 in
+// `docs/security/macos.md`.
 
 /// Extra --read flags that must be added to give the sandboxed shell
 /// access to system executables (/bin/sh, /bin/cat, /usr/bin/nc, etc.)
@@ -312,11 +304,7 @@ fn test_check_reports_platform() -> TestResult {
 #[cfg(target_os = "macos")] // the Linux behaviour is in e2e_linux.rs
 #[test]
 fn test_run_reads_file_in_workspace() -> TestResult {
-    if !sandbox_available() {
-        common::e2e::skip(
-            "test_run_reads_file_in_workspace",
-            "sandbox-exec cannot apply a profile on this machine",
-        );
+    if !common::e2e::sandbox_ready("test_run_reads_file_in_workspace") {
         return Ok(());
     }
 
@@ -335,11 +323,7 @@ fn test_run_reads_file_in_workspace() -> TestResult {
 #[cfg(target_os = "macos")] // the Linux behaviour is in e2e_linux.rs
 #[test]
 fn test_run_writes_file_in_workspace() -> TestResult {
-    if !sandbox_available() {
-        common::e2e::skip(
-            "test_run_writes_file_in_workspace",
-            "sandbox-exec cannot apply a profile on this machine",
-        );
+    if !common::e2e::sandbox_ready("test_run_writes_file_in_workspace") {
         return Ok(());
     }
 
@@ -365,11 +349,7 @@ fn test_run_writes_file_in_workspace() -> TestResult {
 fn test_run_cannot_read_file_in_home_dir() -> TestResult {
     // $HOME (/Users/<user>) is NOT in sandbox defaults, so the sandboxed
     // process should not be able to read files placed there.
-    if !sandbox_available() {
-        common::e2e::skip(
-            "test_run_cannot_read_file_in_home_dir",
-            "sandbox-exec cannot apply a profile on this machine",
-        );
+    if !common::e2e::sandbox_ready("test_run_cannot_read_file_in_home_dir") {
         return Ok(());
     }
 
@@ -415,11 +395,7 @@ fn test_run_cannot_read_file_in_home_dir() -> TestResult {
 fn test_run_extra_read_gives_access_to_home_dir_file() -> TestResult {
     // Verify that --read <dir> grants read access to that directory from
     // inside the sandbox, even if it would otherwise be inaccessible.
-    if !sandbox_available() {
-        common::e2e::skip(
-            "test_run_extra_read_gives_access_to_home_dir_file",
-            "sandbox-exec cannot apply a profile on this machine",
-        );
+    if !common::e2e::sandbox_ready("test_run_extra_read_gives_access_to_home_dir_file") {
         return Ok(());
     }
 
@@ -485,11 +461,7 @@ fn test_run_extra_read_gives_access_to_home_dir_file() -> TestResult {
 fn test_run_extra_write_gives_write_access() -> TestResult {
     // --write <dir> should grant write access to a directory that is
     // otherwise inaccessible.
-    if !sandbox_available() {
-        common::e2e::skip(
-            "test_run_extra_write_gives_write_access",
-            "sandbox-exec cannot apply a profile on this machine",
-        );
+    if !common::e2e::sandbox_ready("test_run_extra_write_gives_write_access") {
         return Ok(());
     }
 
@@ -539,8 +511,7 @@ fn test_run_extra_write_gives_write_access() -> TestResult {
 /// status of `nc`, so a child that never ran cannot pass.
 #[cfg(target_os = "macos")]
 fn assert_connect_denied(test: &str, net_args: &[&str], host: &str, port: &str) -> TestResult {
-    if !sandbox_available() {
-        common::e2e::skip(test, "sandbox-exec cannot apply a profile on this machine");
+    if !common::e2e::sandbox_ready(test) {
         return Ok(());
     }
     if !host_can_reach(test, host, port) {
@@ -596,11 +567,7 @@ fn test_run_blocked_network_by_direct_ip() -> TestResult {
 #[cfg(target_os = "macos")] // the Linux behaviour is in e2e_linux.rs
 #[test]
 fn test_run_localhost_network_allows_loopback() -> TestResult {
-    if !sandbox_available() {
-        common::e2e::skip(
-            "test_run_localhost_network_allows_loopback",
-            "sandbox-exec cannot apply a profile on this machine",
-        );
+    if !common::e2e::sandbox_ready("test_run_localhost_network_allows_loopback") {
         return Ok(());
     }
 
@@ -635,11 +602,7 @@ fn test_run_localhost_network_allows_loopback() -> TestResult {
 #[cfg(target_os = "macos")] // the Linux behaviour is in e2e_linux.rs
 #[test]
 fn test_run_allow_flag_starts_proxy_without_crash() -> TestResult {
-    if !sandbox_available() {
-        common::e2e::skip(
-            "test_run_allow_flag_starts_proxy_without_crash",
-            "sandbox-exec cannot apply a profile on this machine",
-        );
+    if !common::e2e::sandbox_ready("test_run_allow_flag_starts_proxy_without_crash") {
         return Ok(());
     }
 
@@ -661,11 +624,7 @@ fn test_run_allow_flag_starts_proxy_without_crash() -> TestResult {
 #[cfg(target_os = "macos")] // the Linux behaviour is in e2e_linux.rs
 #[test]
 fn test_run_env_flag_passes_named_variable() -> TestResult {
-    if !sandbox_available() {
-        common::e2e::skip(
-            "test_run_env_flag_passes_named_variable",
-            "sandbox-exec cannot apply a profile on this machine",
-        );
+    if !common::e2e::sandbox_ready("test_run_env_flag_passes_named_variable") {
         return Ok(());
     }
 
@@ -684,11 +643,7 @@ fn test_run_env_flag_passes_named_variable() -> TestResult {
 #[cfg(target_os = "macos")] // the Linux behaviour is in e2e_linux.rs
 #[test]
 fn test_run_env_explicit_kv_sets_variable() -> TestResult {
-    if !sandbox_available() {
-        common::e2e::skip(
-            "test_run_env_explicit_kv_sets_variable",
-            "sandbox-exec cannot apply a profile on this machine",
-        );
+    if !common::e2e::sandbox_ready("test_run_env_explicit_kv_sets_variable") {
         return Ok(());
     }
 
@@ -717,11 +672,7 @@ fn test_run_env_explicit_kv_sets_variable() -> TestResult {
 fn test_proxy_mode_allows_localhost_mcp_connection() -> TestResult {
     // MCP servers typically run on localhost (stdio or SSE). Verify that a
     // sandboxed process in proxy_only mode can reach a TCP server on 127.0.0.1.
-    if !sandbox_available() {
-        common::e2e::skip(
-            "test_proxy_mode_allows_localhost_mcp_connection",
-            "sandbox-exec cannot apply a profile on this machine",
-        );
+    if !common::e2e::sandbox_ready("test_proxy_mode_allows_localhost_mcp_connection") {
         return Ok(());
     }
 

@@ -183,4 +183,4 @@ The differences from Linux:
 - DNS does not go through the pent DNS server. The system resolver answers each query, so the child can resolve names that the allowlist does not have. It cannot connect to them. The proxy resolves the names for proxy-aware clients.
 - The child cannot connect to the other loopback ports of the host.
 
-Watch mode uses a Seatbelt profile that allows each operation with `(with report)` and denies the guard accesses. `macos_log.rs` reads the reports from `log stream`. Nobody tested the SBPL forms of `macos.rs` on a Mac yet; the code comments give the source and the uncertain points of each form.
+Watch mode uses a Seatbelt profile that allows each operation with `(with report)` and denies the guard accesses. `macos_log.rs` reads the reports from `log stream`. The suite ran on a Mac on 2026-10-25, and each SBPL form of `macos.rs` holds. The reader builds the process tree from a poll of `ps`, so it loses the accesses of a child process that lives less than one poll (MAC-10 in `docs/security/macos.md`). The run profile also denies `process-exec` and allows the `execute` paths and `SYSTEM_EXEC_PATHS`.

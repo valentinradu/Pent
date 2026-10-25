@@ -174,3 +174,38 @@ pub fn deny_reads_profile(dir: &Path) -> String {
         dir.display()
     )
 }
+
+/// The directories whose programs the profile of [`deny_exec_profile`]
+/// allows. The list is the one of `SYSTEM_EXEC_PATHS` in
+/// `crates/pent-sandbox/src/macos.rs`.
+const SYSTEM_EXEC_DIRS: &[&str] = &[
+    "/bin",
+    "/sbin",
+    "/usr/bin",
+    "/usr/sbin",
+    "/usr/libexec",
+    "/usr/local/bin",
+    "/usr/local/sbin",
+    "/usr/local/libexec",
+    "/opt/homebrew",
+    "/opt/local",
+    "/System",
+    "/Library/Apple",
+    "/Library/Developer",
+    "/Applications/Xcode.app",
+];
+
+/// A profile of the shape that `pent run` writes: `(allow default)`, the
+/// deny of each program execution, then the allow rules of the system
+/// program directories.
+///
+/// A test runs a program under this profile to get the answer of the
+/// kernel beside the answer of pent (MAC-4).
+#[must_use]
+pub fn deny_exec_profile() -> String {
+    let mut profile = String::from("(version 1)\n(allow default)\n(deny process-exec)\n");
+    for dir in SYSTEM_EXEC_DIRS {
+        profile.push_str(&format!("(allow process-exec (subpath \"{dir}\"))\n"));
+    }
+    profile
+}

@@ -228,6 +228,14 @@ pub fn generate_sbpl_profile(config: &SandboxConfig) -> Result<String, SandboxEr
     profile.push_str("(allow default)\n");
     profile.push_str("(deny file-read-data)\n");
     profile.push_str("(deny file-write*)\n");
+    // The child runs only a program in a system directory or in an
+    // `execute` path (MAC-4). Without this deny, `(allow default)` lets the
+    // child run every program on the machine, and the `execute` list of a
+    // profile means nothing. The run of 2026-10-25 on a Mac proved both
+    // halves: `(deny process-exec)` after `(allow default)` stops a
+    // program, and an `(allow process-exec (subpath ...))` after it lets
+    // the programs of that directory run.
+    profile.push_str("(deny process-exec)\n");
 
     // Expand paths from config
     let (traversal, read, execute, read_write) = config.paths.expand_paths();
@@ -307,6 +315,21 @@ pub fn generate_sbpl_profile(config: &SandboxConfig) -> Result<String, SandboxEr
     }
 
     // =========================================================================
+    // SYSTEM EXECUTE PATHS - the programs that every command needs
+    // =========================================================================
+    // With `--trace`, the kernel logs each of these execs. The reader needs
+    // them: it checks the name of each report against the program that the
+    // process runs, and only an exec report tells it that a process runs a
+    // new file (MAC-8). `/bin/sh` runs `/bin/bash` on macOS, so without
+    // this report the reader drops each denial of the shell.
+    let exec_report = if config.record_events {
+        Report::Yes
+    } else {
+        Report::No
+    };
+    add_system_exec_allows(&mut profile, exec_report)?;
+
+    // =========================================================================
     // READ-WRITE PATHS - subpath content and write access
     // =========================================================================
     for (path, is_glob) in &read_write {
@@ -365,6 +388,59 @@ pub fn generate_sbpl_profile(config: &SandboxConfig) -> Result<String, SandboxEr
     }
 
     Ok(profile)
+}
+
+/// The directories of the programs that a command needs, beside the
+/// `execute` paths of the profile.
+///
+/// `(deny process-exec)` stops each program that no rule allows, so the
+/// profile must name the directories of the system. The list holds the
+/// system program directories, the two Homebrew prefixes, the helper
+/// programs of Apple (`/usr/libexec`, among them Rosetta), the programs
+/// inside the system frameworks and the developer tools. It is the macOS
+/// form of `SYSTEM_PATHS` of the Linux backend, which gets
+/// `READ_EXECUTE` there.
+///
+/// The workspace is not in the list, as on Linux: a program in the
+/// workspace runs only with `--execute`.
+const SYSTEM_EXEC_PATHS: &[&str] = &[
+    "/bin",
+    "/sbin",
+    "/usr/bin",
+    "/usr/sbin",
+    "/usr/libexec",
+    "/usr/local/bin",
+    "/usr/local/sbin",
+    "/usr/local/libexec",
+    "/opt/homebrew",
+    "/opt/local",
+    "/System",
+    "/Library/Apple",
+    "/Library/Developer",
+    "/Applications/Xcode.app",
+];
+
+/// Allow the child to run the programs of the system directories.
+///
+/// The rules come after `(deny process-exec)`, and the last matching rule
+/// wins.
+///
+/// # Errors
+/// Returns `SandboxError::InvalidConfig` if a path contains NUL or a
+/// newline. Each path of [`SYSTEM_EXEC_PATHS`] is a literal, so the error
+/// cannot occur.
+fn add_system_exec_allows(profile: &mut String, report: Report) -> Result<(), SandboxError> {
+    for dir in SYSTEM_EXEC_PATHS {
+        push_rule_with(
+            profile,
+            RuleAction::Allow,
+            "process-exec",
+            "subpath",
+            dir,
+            report,
+        )?;
+    }
+    Ok(())
 }
 
 /// Allow connections to the Unix sockets in the paths that the process can
@@ -688,13 +764,13 @@ const WATCH_REPORTED_OPERATIONS: &[&str] = &[
 /// (deny process-exec (regex "/sudo$"))
 /// ```
 ///
-/// Uncertain points (from memory; nobody tested them on a Mac yet):
+/// The run of 2026-10-25 on a Mac confirmed each of these points:
 ///
-/// - `(with report)` is a valid modifier on an `allow` rule. The author is
-///   not sure that `(allow default (with report))` is valid, so the profile
-///   keeps a plain `(allow default)` and adds one reported `allow` rule for
-///   each operation of interest. This also keeps the volume of reports
-///   small.
+/// - `(with report)` is a valid modifier on an `allow` rule, and the
+///   kernel writes one line of the unified log for each operation that
+///   such a rule allows. The profile keeps a plain `(allow default)` and
+///   adds one reported `allow` rule for each operation of interest, which
+///   keeps the volume of reports small.
 /// - The modifier comes after the filter. Apple profiles put `(with ...)`
 ///   before or after the filters.
 /// - When more than one rule matches an operation, the last rule wins. The
@@ -1028,6 +1104,23 @@ pub(crate) fn child_env(config: &SandboxConfig) -> std::collections::HashMap<Str
     e
 }
 
+/// The names of the programs that the root process of a sandboxed run
+/// runs.
+///
+/// Pent starts `/usr/bin/sandbox-exec`, which applies the profile and then
+/// runs `cmd` in the same process. The reader of the log checks the name of
+/// each report against the program that the PID runs, and the process table
+/// misses a process that lives less than one poll interval. These two names
+/// come from pent itself, so the reports of a short-lived root process also
+/// reach the recorder. See MAC-8 in `docs/security/macos.md`.
+fn root_process_names(cmd: &str) -> Vec<String> {
+    let command = Path::new(cmd)
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or(cmd);
+    vec!["sandbox-exec".to_string(), command.to_string()]
+}
+
 /// Spawn `cmd` under the run-mode profile of `config`.
 ///
 /// When [`SandboxConfig::record_events`] is set, start the log reader before
@@ -1057,7 +1150,13 @@ pub(crate) fn spawn_run(
         None
     };
     let child = spawn_with_sandbox(&profile, cmd, args, &env, &config.cwd)?;
-    let events = reader.map(|r| r.attach(child.id(), crate::macos_log::RecordMode::Run));
+    let events = reader.map(|r| {
+        r.attach(
+            child.id(),
+            &root_process_names(cmd),
+            crate::macos_log::RecordMode::Run,
+        )
+    });
     Ok(crate::SandboxChild { child, events })
 }
 
@@ -1083,6 +1182,7 @@ pub(crate) fn spawn_watched(
     let child = spawn_with_sandbox(&profile, cmd, args, &env, &config.cwd)?;
     let events = reader.attach(
         child.id(),
+        &root_process_names(cmd),
         crate::macos_log::RecordMode::Watch(options.guard.clone()),
     );
     Ok(crate::WatchedChild {
@@ -1117,6 +1217,10 @@ pub fn spawn_with_sandbox(
     cwd: &Path,
 ) -> Result<std::process::Child, SandboxError> {
     use std::process::{Command, Stdio};
+
+    // The profile is the whole policy of the run. With `-v` the user, and
+    // a test, can read the text that the kernel gets.
+    tracing::debug!(%profile, "the Seatbelt profile of the run");
 
     let mut command = Command::new("/usr/bin/sandbox-exec");
     command.arg("-p");
@@ -2016,6 +2120,53 @@ mod tests {
         assert!(rules.contains("(deny network*)"));
     }
 
+    /// The root process of a run has two names: the front end and the
+    /// command. The reader needs both, because `sandbox-exec` runs the
+    /// command in the same process (MAC-8).
+    #[test]
+    fn the_root_process_has_the_name_of_the_front_end_and_of_the_command() {
+        assert_eq!(
+            root_process_names("/bin/cat"),
+            vec!["sandbox-exec".to_string(), "cat".to_string()]
+        );
+        assert_eq!(
+            root_process_names("npm"),
+            vec!["sandbox-exec".to_string(), "npm".to_string()]
+        );
+    }
+
+    /// MAC-4. The run profile denies `process-exec`, and no rule after the
+    /// deny gives exec access to a path of the workspace. A program in the
+    /// workspace runs only with `--execute`, as on Linux.
+    #[test]
+    fn the_run_profile_denies_the_execution_of_a_program_in_the_workspace() {
+        let ws = std::path::PathBuf::from("/nonexistent/ws");
+        let paths = SandboxPaths {
+            traversal: vec!["/".to_string()],
+            read: vec!["/usr/lib".to_string()],
+            execute: vec!["/bin".to_string()],
+            read_write: vec!["/tmp".to_string()],
+        };
+        let config = SandboxConfig::new(ws.clone(), paths, ws.clone());
+        let generated = generate_sbpl_profile(&config);
+        assert!(generated.is_ok(), "the generator gave no profile");
+        let profile = generated.unwrap_or_default();
+        assert!(profile.contains("(deny process-exec)\n"), "{profile}");
+        let exec_rules: Vec<&str> = profile
+            .lines()
+            .filter(|l| l.contains("(allow process-exec"))
+            .collect();
+        assert!(
+            !exec_rules.iter().any(|l| l.contains("/nonexistent/ws")),
+            "a rule gives exec access to the workspace:\n{exec_rules:#?}"
+        );
+        // The deny comes before each allow, and the last matching rule
+        // wins, so the order is the whole property.
+        let deny = profile.find("(deny process-exec)");
+        let first_allow = profile.find("(allow process-exec");
+        assert!(deny < first_allow, "{profile}");
+    }
+
     // ========================================================================
     // check_available tests
     // ========================================================================
@@ -2313,10 +2464,35 @@ mod tests {
         #[test]
         fn a_very_long_path_gives_a_profile_that_compiles() {
             let (_dir, ws) = workspace();
-            let long = format!("/nonexistent/{}", "x".repeat(3000));
+            // MAC-9. The reader of `sandbox-exec` has a length limit: the
+            // run of 2026-10-25 on a Mac accepted a string of 512 bytes
+            // and refused one of 1023 bytes with "Error reading string".
+            // `PATH_MAX` is 1024 on macOS, so a path of the system never
+            // reaches the limit. The test uses the longest path that the
+            // kernel can give.
+            let long = format!("/nonexistent/{}", "x".repeat(500));
             let config = SandboxConfig::new(ws.clone(), paths_with(&long), ws);
             let profile = generate_sbpl_profile(&config).unwrap();
             assert_compiles("very long", &profile);
+        }
+
+        /// MAC-9. A string over the limit of the reader gives a profile
+        /// that `sandbox-exec` refuses. Such a path cannot come from the
+        /// kernel, because `PATH_MAX` is 1024 on macOS, but the test holds
+        /// the limit, so a later change of it is visible.
+        #[test]
+        fn a_path_over_the_limit_of_the_reader_gives_a_profile_that_it_refuses() {
+            let (_dir, ws) = workspace();
+            let long = format!("/nonexistent/{}", "x".repeat(3000));
+            let config = SandboxConfig::new(ws.clone(), paths_with(&long), ws);
+            let profile = generate_sbpl_profile(&config).unwrap();
+            let (code, stderr) = compile(&profile);
+            assert_ne!(
+                code,
+                Some(0),
+                "sandbox-exec accepts a string of 3000 bytes now; MAC-9 is \
+                 closed and this test must go\n--- stderr ---\n{stderr}"
+            );
         }
 
         #[test]
