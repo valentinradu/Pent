@@ -5,18 +5,24 @@
 // when those items are accessed crate-internally.
 #![allow(unreachable_pub)]
 //!
-//! Uses Landlock for filesystem access control. Requires kernel 5.19+ (ABI v4).
+//! Uses Landlock for filesystem access control. Pent requires Landlock ABI v3
+//! (Linux 6.2) and uses the highest ABI up to v6 (see `linux_landlock.rs`).
 //!
-//! Network isolation is implemented via `unshare(CLONE_NEWNET)` in the child
-//! process after fork but before exec:
-//! - `LocalhostOnly` / `ProxyOnly`: new network namespace + loopback brought up
-//! - `Blocked`: new network namespace with no interfaces
-//! - `Unrestricted`: no network changes
+//! # Namespaces
 //!
-//! # Landlock Architecture
+//! With enforcement, the child always creates a user namespace and a mount
+//! namespace (and a network namespace unless the network is `Unrestricted`):
+//! - `LocalhostOnly`: new network namespace, the child brings up loopback.
+//! - `ProxyOnly`: new network namespace; the parent moves a veth into it and
+//!   configures it.
+//! - `Blocked`: new network namespace with no interfaces.
+//! - `Unrestricted`: no network namespace.
 //!
-//! Landlock creates a deny-all baseline for filesystem operations,
-//! then explicitly allows access to specific paths:
+//! The private mount namespace hides the Unix sockets that Landlock cannot
+//! control (`/run/user/<uid>`, the Docker and Podman sockets) and makes
+//! `<workspace>/.pent` read-only.
+//!
+//! # Landlock architecture
 //!
 //! ```text
 //! Ruleset (deny-all baseline)
@@ -25,29 +31,51 @@
 //!   +-- Allow data_dir (rw)
 //!   +-- Allow mounts (per config)
 //!   +-- Allow PATH dirs (read+exec)
-//!   +-- Allow execute paths (read+exec) — binary dirs, installed tools
-//!   +-- Allow read paths (read only) — config files, libraries, data
-//!   +-- Allow system libs (ro)
-//!   +-- Allow /tmp (rw)
-//!   +-- Allow /dev (ro)
+//!   +-- Allow execute paths (exec, no read)
+//!   +-- Allow read paths (read only)
+//!   +-- Allow system libs and /nix/store (read+exec)
+//!   +-- Allow /tmp, /var/tmp (rw)
+//!   +-- Allow /dev/null, /dev/tty, /dev/pts, ... (rw); /dev/urandom, ... (ro)
 //!   +-- Allow /proc (ro)
 //! ```
 //!
-//! # `pre_exec` for `spawn_sandboxed`
+//! # `pre_exec` and async-signal safety
 //!
-//! Landlock restricts the current process. For `spawn_sandboxed`,
-//! we use `Command::pre_exec()` to apply Landlock in the child
-//! process after fork but before exec.
+//! The parent is multithreaded. Between `fork` and `exec` the child may only
+//! use async-signal-safe functions. Thus the parent prepares all data before
+//! `fork`: the Landlock ruleset file descriptor and its rules as C strings,
+//! the UID and GID maps, the mount targets and the working directory. The
+//! `pre_exec` hook uses only raw system calls on this data. The parent
+//! configures the `ProxyOnly` network of the child from a helper thread.
+//!
+//! The overlayfs helpers (`linux_overlayfs::setup_overlay_dirs` and
+//! `mount_overlays`) still allocate in the child. They run only when write
+//! listed files need an overlay.
+//!
+//! # Limits
+//!
+//! Landlock (ABI v6 and earlier) does not control `connect(2)` on Unix
+//! sockets that have a path. A sandboxed process can connect to a socket file
+//! that it finds, if the socket is not hidden by a mount. Pent hides only the
+//! well-known sockets.
 
+use crate::linux_landlock::{access, PreparedRuleset};
+use crate::linux_netns::write_stderr_static;
 use crate::{NetworkMode, SandboxConfig, SandboxError};
+use std::collections::HashSet;
+use std::ffi::CString;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 
 #[cfg(test)]
 /// Minimum required Landlock ABI version.
-/// ABI v4 requires kernel 5.19+.
-pub const MIN_LANDLOCK_ABI: i32 = 4;
+pub const MIN_LANDLOCK_ABI: u32 = crate::linux_landlock::MIN_ABI;
 
-/// System paths to allow read access (libraries, config, etc.)
+/// System paths to allow read and execute access (libraries, config, etc.).
+///
+/// On NixOS, all binaries and libraries live in the immutable, world-readable
+/// `/nix/store`. `/run/current-system` points into it. A missing path is
+/// skipped.
 const SYSTEM_PATHS: &[&str] = &[
     "/usr/lib",
     "/usr/lib64",
@@ -55,26 +83,50 @@ const SYSTEM_PATHS: &[&str] = &[
     "/lib64",
     "/usr/share",
     "/etc",
+    "/nix/store",
+    "/run/current-system",
 ];
 
 /// Temp paths to allow read/write access.
 const TEMP_PATHS: &[&str] = &["/tmp", "/var/tmp"];
 
-/// Device and proc paths to allow read access.
-const DEVICE_PATHS: &[&str] = &["/dev", "/proc"];
+/// Device nodes with read/write access. `/dev/shm` and `/dev/mqueue` are not
+/// in the list: add them to the configuration if a tool needs them.
+pub(crate) const DEV_RW_PATHS: &[&str] = &[
+    "/dev/null",
+    "/dev/zero",
+    "/dev/full",
+    "/dev/tty",
+    "/dev/pts",
+    "/dev/ptmx",
+];
+
+/// Device nodes with read-only access.
+///
+/// `/dev/fd` and `/dev/std*` are not in the list: they are symbolic links
+/// into `/proc/self/fd`. The `/proc` rule covers the link, and Landlock does
+/// not control pipes and sockets that a process opens through it.
+pub(crate) const DEV_READ_PATHS: &[&str] = &["/dev/random", "/dev/urandom"];
+
+/// Proc paths to allow read access.
+const PROC_PATHS: &[&str] = &["/proc"];
+
+/// Unix sockets that give a way out of the sandbox. The child hides each one
+/// that exists with a bind mount of `/dev/null`, unless the configuration
+/// names it.
+const ESCAPE_SOCKETS: &[&str] = &[
+    "/run/docker.sock",
+    "/var/run/docker.sock",
+    "/run/podman/podman.sock",
+];
 
 /// Compute the set of paths the sandboxed process is allowed to read/execute.
 ///
 /// This mirrors the accessible set built inside `spawn_with_landlock` and is used
 /// by the filesystem trace watcher (`--no-sandbox --trace`) to determine which
 /// file opens would have been denied by the sandbox policy.
-#[cfg(target_os = "linux")]
 #[must_use]
-pub fn compute_accessible_set(
-    config: &SandboxConfig,
-    path_dirs: &[PathBuf],
-) -> std::collections::HashSet<PathBuf> {
-    use std::collections::HashSet;
+pub fn compute_accessible_set(config: &SandboxConfig, path_dirs: &[PathBuf]) -> HashSet<PathBuf> {
     let (_, read_expanded, execute_expanded, rw_expanded) = config.paths.expand_paths();
     let mut accessible: HashSet<PathBuf> = HashSet::new();
     for (p, _) in read_expanded
@@ -89,14 +141,14 @@ pub fn compute_accessible_set(
     for mount in &config.mounts {
         accessible.insert(mount.path.clone());
     }
-    for sys_path in SYSTEM_PATHS {
-        accessible.insert(PathBuf::from(sys_path));
-    }
-    for tmp_path in TEMP_PATHS {
-        accessible.insert(PathBuf::from(tmp_path));
-    }
-    for dev_path in DEVICE_PATHS {
-        accessible.insert(PathBuf::from(dev_path));
+    for p in SYSTEM_PATHS
+        .iter()
+        .chain(TEMP_PATHS)
+        .chain(DEV_RW_PATHS)
+        .chain(DEV_READ_PATHS)
+        .chain(PROC_PATHS)
+    {
+        accessible.insert(PathBuf::from(p));
     }
     for path_dir in path_dirs {
         accessible.insert(path_dir.clone());
@@ -104,121 +156,36 @@ pub fn compute_accessible_set(
     accessible
 }
 
-/// Check if Landlock ABI v4 is available.
+/// Check that Landlock is enabled and supports the minimum ABI.
 ///
 /// # Errors
-/// Returns `SandboxUnavailable` with kernel upgrade suggestion if not available.
-#[cfg(target_os = "linux")]
+/// Returns `SandboxUnavailable` with a remediation if Landlock is absent,
+/// disabled at boot, or too old.
 pub fn check_available() -> Result<(), SandboxError> {
-    use landlock::{Access, AccessFs, Ruleset, RulesetAttr, ABI};
-
-    // Try to create a minimal ruleset — succeeds only if the kernel supports ABI v4.
-    let all_access = AccessFs::from_all(ABI::V4);
-    Ruleset::default()
-        .handle_access(all_access)
-        .and_then(Ruleset::create)
-        .map(|_| ())
-        .map_err(|_| SandboxError::SandboxUnavailable {
-            reason: "Landlock ABI v4 not available".to_string(),
-            remediation: "Upgrade to Linux kernel 5.19+ for Landlock ABI v4 support".to_string(),
-        })
+    crate::linux_landlock::abi_version().map(|_| ())
 }
 
-#[cfg(not(target_os = "linux"))]
-pub fn check_available() -> Result<(), SandboxError> {
-    Err(SandboxError::UnsupportedPlatform)
-}
-
-/// Build Landlock ruleset for the given config.
+/// Add all filesystem rules for `config` to `ruleset`.
 ///
-/// Creates deny-all baseline with explicit allows for:
-/// - Workspace directory (rw)
-/// - `data_dir` directory (rw)
-/// - Mount paths (ro or rw per config)
-/// - PATH directories (ro+exec)
-/// - System libraries /usr/lib, /lib, /lib64 (ro)
-/// - Temp directories /tmp, /var/tmp (rw)
-/// - Device nodes /dev (ro)
-/// - Proc filesystem /proc (ro)
-///
-/// # Arguments
-/// * `config` - Sandbox configuration
-/// * `path_dirs` - PATH directories to allow
-///
-/// # Returns
-/// Landlock `RulesetCreated` ready to be applied
-///
-/// # Errors
-/// * `InvalidConfig` - If a required path cannot be opened
-#[cfg(all(target_os = "linux", test))]
-pub fn build_landlock_ruleset(
+/// * `write_set` - write-listed files that an overlay covers (skipped here;
+///   the overlay parent directory rule covers them).
+/// * `overlay_dirs` - directories with an overlay mount (read/write).
+fn add_ruleset_rules(
+    ruleset: &mut PreparedRuleset,
     config: &SandboxConfig,
     path_dirs: &[PathBuf],
-) -> Result<landlock::RulesetCreated, SandboxError> {
-    use landlock::{
-        Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr, ABI,
-    };
-
-    // All filesystem access rights for deny-all baseline
-    let all_access = AccessFs::from_all(ABI::V4);
-
-    // Read-only: no Execute (config files, libraries, data).
-    let read_access = AccessFs::ReadFile | AccessFs::ReadDir;
-
-    // Execute: runnable but not readable (binary directories, installed tools).
-    // ReadFile is intentionally omitted — execute paths should not be readable
-    // by the sandboxed process; Landlock enforces this at the syscall level.
-    let execute_access = AccessFs::ReadDir | AccessFs::Execute;
-
-    // System library paths need ReadFile in addition to Execute so that the
-    // dynamic linker can open() shared libraries. This is separate from
-    // execute_access (user-configured execute paths) which is intentionally
-    // execute-only without ReadFile.
-    let syslib_access = AccessFs::ReadFile | AccessFs::ReadDir | AccessFs::Execute;
-
-    // Write: all rights (workspace, temp dirs, cache dirs); unchanged.
-    let write_access = all_access;
-
-    // Create ruleset with deny-all baseline
-    let mut ruleset = Ruleset::default()
-        .handle_access(all_access)
-        .map_err(|e| SandboxError::InvalidConfig(format!("Failed to create ruleset: {e}")))?
-        .create()
-        .map_err(|e| SandboxError::InvalidConfig(format!("Failed to create ruleset: {e}")))?;
-
-    // Helper to add path rule, skipping non-existent paths
-    let add_path =
-        |ruleset: &mut landlock::RulesetCreated, path: &Path, access| -> Result<(), SandboxError> {
-            if !path.exists() {
-                return Ok(()); // Skip non-existent paths
-            }
-            let fd = PathFd::new(path).map_err(|e| {
-                SandboxError::InvalidConfig(format!("Failed to open path {}: {e}", path.display()))
-            })?;
-            ruleset
-                .add_rule(PathBeneath::new(fd, access))
-                .map_err(|e| {
-                    SandboxError::InvalidConfig(format!(
-                        "Failed to add rule for {}: {e}",
-                        path.display()
-                    ))
-                })?;
-            Ok(())
-        };
-
-    // Workspace - read/write
-    add_path(&mut ruleset, &config.workspace, write_access)?;
-
-    // data_dir - read/write
-    add_path(&mut ruleset, &config.data_dir, write_access)?;
-
-    // Mounts
+    write_set: &HashSet<PathBuf>,
+    overlay_dirs: &HashSet<PathBuf>,
+) {
+    ruleset.add(&config.workspace, access::ALL);
+    ruleset.add(&config.data_dir, access::ALL);
     for mount in &config.mounts {
-        if mount.readonly {
-            add_path(&mut ruleset, &mount.path, read_access)?;
+        let a = if mount.readonly {
+            access::READ
         } else {
-            add_path(&mut ruleset, &mount.path, write_access)?;
-        }
+            access::ALL
+        };
+        ruleset.add(&mount.path, a);
     }
 
     // Configured SandboxPaths (from profiles and TOML config).
@@ -226,71 +193,142 @@ pub fn build_landlock_ruleset(
     // read = ReadFile | ReadDir (config files, libraries, data; no exec).
     // execute = ReadDir | Execute (binary directories, installed tools; no ReadFile).
     // read_write = all access rights.
-    let traversal_access = AccessFs::ReadDir;
-    let (traversal_paths, read_paths, execute_paths, rw_paths) = config.paths.expand_paths();
-    for (path, _) in &traversal_paths {
-        add_path(&mut ruleset, path, traversal_access.into())?;
+    let (traversal, read, execute, rw) = config.paths.expand_paths();
+    for (path, _) in &traversal {
+        ruleset.add(path, access::TRAVERSAL);
     }
-    for (path, _) in &read_paths {
-        add_path(&mut ruleset, path, read_access)?;
+    for (path, _) in &read {
+        ruleset.add(path, access::READ);
     }
-    for (path, _) in &execute_paths {
-        add_path(&mut ruleset, path, execute_access)?;
+    for (path, _) in &execute {
+        ruleset.add(path, access::EXECUTE_ONLY);
     }
-    for (path, _) in &rw_paths {
-        add_path(&mut ruleset, path, write_access)?;
+    for (path, _) in &rw {
+        if !write_set.contains(path) {
+            ruleset.add(path, access::ALL);
+        }
     }
-
-    // PATH directories - read + execute (these are binary dirs; the dynamic
-    // linker reads binaries in $PATH so ReadFile is needed here via syslib_access)
+    // Overlay parent directories: inside the namespace, writes go to the
+    // upper layer; the watcher of the parent flushes write-listed files.
+    for dir in overlay_dirs {
+        ruleset.add(dir, access::ALL);
+    }
+    // PATH directories and system libraries: the dynamic linker must open()
+    // binaries and shared libraries, so these get ReadFile too.
     for path_dir in path_dirs {
-        add_path(&mut ruleset, path_dir, syslib_access)?;
+        ruleset.add(path_dir, access::READ_EXECUTE);
     }
-
-    // System libraries - read + execute (dynamic linker in /usr/lib, /lib64 needs
-    // ReadFile to open() shared libraries; use syslib_access not execute_access)
-    for sys_path in SYSTEM_PATHS {
-        add_path(&mut ruleset, Path::new(sys_path), syslib_access)?;
+    for p in SYSTEM_PATHS {
+        ruleset.add(Path::new(p), access::READ_EXECUTE);
     }
-
-    // Temp directories - read/write
-    for tmp_path in TEMP_PATHS {
-        add_path(&mut ruleset, Path::new(tmp_path), write_access)?;
+    for p in TEMP_PATHS.iter().chain(DEV_RW_PATHS) {
+        ruleset.add(Path::new(p), access::ALL);
     }
-
-    // Device and proc - read only
-    for dev_path in DEVICE_PATHS {
-        add_path(&mut ruleset, Path::new(dev_path), read_access)?;
+    for p in DEV_READ_PATHS.iter().chain(PROC_PATHS) {
+        ruleset.add(Path::new(p), access::READ);
     }
+}
 
+/// Build the Landlock ruleset for `config` (test helper).
+///
+/// # Errors
+/// Returns `SandboxUnavailable` if Landlock is not usable.
+#[cfg(test)]
+pub fn build_landlock_ruleset(
+    config: &SandboxConfig,
+    path_dirs: &[PathBuf],
+) -> Result<PreparedRuleset, SandboxError> {
+    let mut ruleset = PreparedRuleset::create()?;
+    add_ruleset_rules(
+        &mut ruleset,
+        config,
+        path_dirs,
+        &HashSet::new(),
+        &HashSet::new(),
+    );
     Ok(ruleset)
 }
 
-/// Stub for non-Linux platforms.
-#[cfg(not(target_os = "linux"))]
-pub fn build_landlock_ruleset(
-    _config: &SandboxConfig,
-    _path_dirs: &[PathBuf],
-) -> Result<(), SandboxError> {
-    Err(SandboxError::UnsupportedPlatform)
+// ── Raw helpers for the pre_exec hook ──────────────────────────────────────
+
+/// Return the last OS error. `std::io::Error::last_os_error` does not
+/// allocate, so this is async-signal-safe.
+fn last_err(msg: &'static [u8]) -> std::io::Error {
+    let err = std::io::Error::last_os_error();
+    write_stderr_static(msg);
+    err
 }
 
-/// Stub for non-Linux platforms.
-#[cfg(not(target_os = "linux"))]
-pub fn apply_landlock(_ruleset: ()) -> Result<(), SandboxError> {
-    Err(SandboxError::UnsupportedPlatform)
+/// Write all of `buf` to `fd`. Retries on EINTR and on a short write.
+/// Async-signal-safe.
+fn write_all_fd(fd: libc::c_int, mut buf: &[u8]) -> std::io::Result<()> {
+    while !buf.is_empty() {
+        // SAFETY: `buf` is a valid slice for `buf.len()` bytes.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let n = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        if n == 0 {
+            return Err(std::io::Error::from_raw_os_error(libc::EIO));
+        }
+        buf = buf.get(n.unsigned_abs()..).unwrap_or_default();
+    }
+    Ok(())
+}
+
+/// Fill `buf` from `fd`. Retries on EINTR. Returns `Ok(false)` on EOF before
+/// any byte. Async-signal-safe.
+fn read_exact_fd(fd: libc::c_int, buf: &mut [u8]) -> std::io::Result<bool> {
+    let mut done = 0usize;
+    while done < buf.len() {
+        let Some(rest) = buf.get_mut(done..) else {
+            break;
+        };
+        // SAFETY: `rest` is a valid, writable slice for `rest.len()` bytes.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let n = unsafe { libc::read(fd, rest.as_mut_ptr().cast(), rest.len()) };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        if n == 0 {
+            if done == 0 {
+                return Ok(false);
+            }
+            return Err(std::io::Error::from_raw_os_error(libc::EPIPE));
+        }
+        done = done.saturating_add(n.unsigned_abs());
+    }
+    Ok(true)
+}
+
+/// Open `path` for writing and write all of `buf` to it. Async-signal-safe.
+fn write_proc_file(path: &std::ffi::CStr, buf: &[u8]) -> std::io::Result<()> {
+    // SAFETY: `path` is a valid NUL-terminated string.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let fd = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let result = write_all_fd(fd, buf);
+    // SAFETY: `fd` is a file descriptor that this function opened.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    unsafe { libc::close(fd) };
+    result
 }
 
 /// Bring up the loopback interface in the current network namespace.
 ///
-/// Called after `unshare(CLONE_NEWNET)` to make localhost connectivity
-/// available for `LocalhostOnly` and `ProxyOnly` modes.
-///
-/// # Safety
-/// Caller must be in a post-fork, pre-exec context (`pre_exec` hook) or
-/// equivalent single-threaded environment. Uses raw ioctl syscalls.
-#[cfg(target_os = "linux")]
-unsafe fn bring_up_loopback() {
+/// Called after `unshare(CLONE_NEWNET)` for `LocalhostOnly`. Async-signal-safe.
+fn bring_up_loopback() -> std::io::Result<()> {
     const IFNAMSIZ: usize = 16;
     const IFF_UP: i16 = 0x1;
 
@@ -312,142 +350,572 @@ unsafe fn bring_up_loopback() {
     req.ifr_name[0] = b'l';
     req.ifr_name[1] = b'o';
 
-    let sock = libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0);
+    // SAFETY: socket(2) with constant arguments.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
     if sock < 0 {
-        return;
+        return Err(last_err(b"pent: socket for loopback setup failed\n"));
     }
-    libc::ioctl(
-        sock,
-        libc::SIOCGIFFLAGS as _,
-        std::ptr::addr_of_mut!(req).cast::<libc::c_void>(),
-    );
-    req.ifr_flags |= IFF_UP;
-    libc::ioctl(
-        sock,
-        libc::SIOCSIFFLAGS as _,
-        std::ptr::addr_of_mut!(req).cast::<libc::c_void>(),
-    );
-    libc::close(sock);
+    // SAFETY: `req` is a valid `struct ifreq` for SIOCGIFFLAGS, and `sock`
+    // is a socket that this function owns.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let got = unsafe {
+        libc::ioctl(
+            sock,
+            libc::SIOCGIFFLAGS as _,
+            std::ptr::addr_of_mut!(req).cast::<libc::c_void>(),
+        )
+    };
+    let result = if got == 0 {
+        req.ifr_flags |= IFF_UP;
+        // SAFETY: as above, for SIOCSIFFLAGS.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let set = unsafe {
+            libc::ioctl(
+                sock,
+                libc::SIOCSIFFLAGS as _,
+                std::ptr::addr_of_mut!(req).cast::<libc::c_void>(),
+            )
+        };
+        if set == 0 {
+            Ok(())
+        } else {
+            Err(last_err(b"pent: SIOCSIFFLAGS on lo failed\n"))
+        }
+    } else {
+        Err(last_err(b"pent: SIOCGIFFLAGS on lo failed\n"))
+    };
+    // SAFETY: `sock` is a file descriptor that this function opened.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    unsafe { libc::close(sock) };
+    result
 }
 
-/// Set up UID/GID mappings for a newly created user namespace.
+/// Write the UID and GID maps for a new user namespace.
 ///
-/// Uses an identity mapping: the caller's real UID/GID maps to itself inside
-/// the user namespace. The sandboxed process therefore appears as the real user
-/// (not root) after execve, which is the correct principle-of-least-privilege
-/// behaviour.
-///
-/// All privileged pre-exec operations (veth config, overlayfs mount, etc.)
-/// run after `unshare(CLONE_NEWUSER)` grants a full capability set in the new
-/// namespace and before execve — so they are unaffected by this mapping.
-/// After execve the sandboxed binary has no capabilities, which is intentional.
-///
-/// Must be called after `unshare(CLONE_NEWUSER | CLONE_NEWNET)`, in a
-/// post-fork, single-threaded child before exec.
-///
-/// # Safety
-/// Uses raw libc open/write/close, which are safe in a post-fork child.
-#[cfg(target_os = "linux")]
-unsafe fn setup_userns_mappings(uid: u32, gid: u32) {
-    // Kernels >= 3.19 require "deny" in setgroups before writing gid_map
-    // when the caller is unprivileged.
-    let fd = libc::open(
-        c"/proc/self/setgroups".as_ptr(),
-        libc::O_WRONLY | libc::O_CLOEXEC,
-    );
-    if fd >= 0 {
-        let deny = b"deny";
-        libc::write(fd, deny.as_ptr().cast::<libc::c_void>(), deny.len());
-        libc::close(fd);
-    }
-
-    // Identity mapping: host GID → same GID inside namespace.
-    let gid_map = format!("{gid} {gid} 1\n");
-    let fd = libc::open(
-        c"/proc/self/gid_map".as_ptr(),
-        libc::O_WRONLY | libc::O_CLOEXEC,
-    );
-    if fd >= 0 {
-        let b = gid_map.as_bytes();
-        libc::write(fd, b.as_ptr().cast::<libc::c_void>(), b.len());
-        libc::close(fd);
-    }
-
-    // Identity mapping: host UID → same UID inside namespace.
-    let uid_map = format!("{uid} {uid} 1\n");
-    let fd = libc::open(
-        c"/proc/self/uid_map".as_ptr(),
-        libc::O_WRONLY | libc::O_CLOEXEC,
-    );
-    if fd >= 0 {
-        let b = uid_map.as_bytes();
-        libc::write(fd, b.as_ptr().cast::<libc::c_void>(), b.len());
-        libc::close(fd);
-    }
-}
-
-/// Apply network isolation to the current process for the given mode.
-///
-/// Uses `unshare(CLONE_NEWUSER | CLONE_NEWNET)` — no root required on any
-/// kernel that allows unprivileged user namespaces (Ubuntu 22.04+, Fedora,
-/// Arch, etc.). The user namespace maps the caller's UID/GID to 0 inside,
-/// which grants `CAP_NET_ADMIN` within the namespace for loopback setup.
-///
-/// Note: `ProxyOnly` mode uses a veth pair set up by the parent
-/// (`spawn_with_landlock`) and is handled via `setns` there, not here.
-/// When `apply_network_isolation` is called for `ProxyOnly`, it falls back
-/// to loopback-only isolation.
+/// The maps are identity maps that the parent prepared: the real UID and GID
+/// map to themselves. The sandboxed process thus has the real UID of the
+/// user (not root, not 65534). Async-signal-safe.
 ///
 /// # Errors
-/// Returns `io::Error` if unshare fails.  On systems with unprivileged user
-/// namespaces disabled (`/proc/sys/kernel/unprivileged_userns_clone = 0`)
-/// this will fail with EPERM.
-#[cfg(target_os = "linux")]
-fn apply_network_isolation(network: &NetworkMode) -> std::io::Result<()> {
-    match network {
-        NetworkMode::LocalhostOnly | NetworkMode::ProxyOnly { .. } => {
-            // SAFETY: getuid/getgid are always safe.
-            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-            let uid = unsafe { libc::getuid() };
-            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-            let gid = unsafe { libc::getgid() };
-            // CLONE_NEWUSER | CLONE_NEWNET: create both namespaces atomically.
-            // Does not require root when unprivileged user namespaces are enabled.
-            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-            let ret = unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) };
-            if ret != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-            unsafe {
-                // Map real UID/GID to root inside namespace (gives CAP_NET_ADMIN).
-                setup_userns_mappings(uid, gid);
-                // Bring up loopback (requires CAP_NET_ADMIN, now available).
-                bring_up_loopback();
-            }
-        }
-        NetworkMode::Blocked => {
-            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-            let uid = unsafe { libc::getuid() };
-            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-            let gid = unsafe { libc::getgid() };
-            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-            let ret = unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) };
-            if ret != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-            unsafe { setup_userns_mappings(uid, gid) };
-        }
-        NetworkMode::Unrestricted => {}
+/// Returns the OS error of the first write that fails. A failure is fatal:
+/// without the maps the child runs as the overflow UID 65534.
+fn setup_userns_mappings(uid_map: &[u8], gid_map: &[u8]) -> std::io::Result<()> {
+    // An unprivileged process must write "deny" to setgroups before gid_map.
+    write_proc_file(c"/proc/self/setgroups", b"deny")
+        .map_err(|_| last_err(b"pent: write /proc/self/setgroups failed\n"))?;
+    write_proc_file(c"/proc/self/gid_map", gid_map)
+        .map_err(|_| last_err(b"pent: write /proc/self/gid_map failed\n"))?;
+    write_proc_file(c"/proc/self/uid_map", uid_map)
+        .map_err(|_| last_err(b"pent: write /proc/self/uid_map failed\n"))?;
+    Ok(())
+}
+
+/// Clear the inheritable capability set and make the process dumpable.
+///
+/// The pent binary can carry `cap_net_admin=eip` file capabilities. These
+/// have two effects that break the user namespace setup:
+///
+/// 1. The process is not dumpable. Its `/proc/self` files belong to root,
+///    so the writes to `uid_map` fail with EACCES. `PR_SET_DUMPABLE` fixes
+///    this.
+/// 2. Linux 5.11 and later refuse `unshare(CLONE_NEWUSER)` with a non-empty
+///    inheritable set. `capset` clears it.
+///
+/// Async-signal-safe.
+fn prepare_caps_for_userns() -> std::io::Result<()> {
+    #[repr(C)]
+    struct CapHeader {
+        version: u32,
+        pid: i32,
+    }
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct CapData {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+    const CAP_V3: u32 = 0x2008_0522;
+
+    // SAFETY: prctl with integer arguments only.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) } != 0 {
+        return Err(last_err(b"pent: prctl(PR_SET_DUMPABLE) failed\n"));
+    }
+    let mut hdr = CapHeader {
+        version: CAP_V3,
+        pid: 0,
+    };
+    let mut data = [CapData {
+        effective: 0,
+        permitted: 0,
+        inheritable: 0,
+    }; 2];
+    // SAFETY: `hdr` and `data` have the layout that capget(2) expects for
+    // version 3 (two data words) and are writable.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    if unsafe { libc::syscall(libc::SYS_capget, &raw mut hdr, data.as_mut_ptr()) } != 0 {
+        return Err(last_err(b"pent: capget failed\n"));
+    }
+    if data.iter().all(|d| d.inheritable == 0) {
+        return Ok(());
+    }
+    for d in &mut data {
+        d.inheritable = 0;
+    }
+    // SAFETY: the same valid buffers, now read by capset(2).
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    if unsafe { libc::syscall(libc::SYS_capset, &raw mut hdr, data.as_ptr()) } != 0 {
+        return Err(last_err(b"pent: capset failed\n"));
     }
     Ok(())
 }
 
-/// Spawn command with Landlock sandbox using `pre_exec`.
+/// Mark all file descriptors from 3 up as close-on-exec, so that file
+/// descriptors of the embedding program that are not `O_CLOEXEC` do not leak
+/// into the child. The sync pipes and the ruleset stay usable until `exec`.
+/// Async-signal-safe.
+fn cloexec_inherited_fds() {
+    const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
+    // SAFETY: close_range(2) with integer arguments only.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let ret = unsafe { libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, CLOSE_RANGE_CLOEXEC) };
+    if ret == 0 {
+        return;
+    }
+    // Fallback for kernels before 5.11 (only possible with `no_enforcement`,
+    // because Landlock ABI v3 needs Linux 6.2).
+    for fd in 3..4096 {
+        // SAFETY: fcntl(2) on a number; EBADF for a closed number is harmless.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    }
+}
+
+/// Mount flags that a bind mount inherits and must keep on a remount.
 ///
-/// Uses `Command::pre_exec()` to apply Landlock and network isolation in the
-/// child process after fork but before exec. This restricts only the child.
+/// A remount that drops a flag of a mount from a less privileged mount
+/// namespace fails with EPERM. Async-signal-safe.
+fn locked_mount_flags(path: &std::ffi::CStr) -> std::io::Result<libc::c_ulong> {
+    let mut st = std::mem::MaybeUninit::<libc::statvfs>::zeroed();
+    // SAFETY: `path` is NUL-terminated and `st` is writable. glibc
+    // implements statvfs with the statfs system call and the ST_* flags
+    // that the kernel returns; it does not allocate.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    if unsafe { libc::statvfs(path.as_ptr(), st.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: statvfs succeeded, so the struct is initialized.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let st = unsafe { st.assume_init() };
+    let f = st.f_flag;
+    let pairs: [(libc::c_ulong, libc::c_ulong); 6] = [
+        (libc::ST_NOSUID, libc::MS_NOSUID),
+        (libc::ST_NODEV, libc::MS_NODEV),
+        (libc::ST_NOEXEC, libc::MS_NOEXEC),
+        (libc::ST_NOATIME, libc::MS_NOATIME),
+        (libc::ST_NODIRATIME, libc::MS_NODIRATIME),
+        (libc::ST_RELATIME, libc::MS_RELATIME),
+    ];
+    Ok(pairs
+        .iter()
+        .filter(|(st_flag, _)| f & st_flag != 0)
+        .fold(0, |acc, (_, ms)| acc | ms))
+}
+
+// ── Mount plan ─────────────────────────────────────────────────────────────
+
+/// The private mounts that the child makes before Landlock applies.
+#[derive(Debug, Default)]
+struct MountPlan {
+    /// Make the mount tree private (only in a new mount namespace).
+    make_private: bool,
+    /// `resolv.conf` source to bind-mount over `/etc/resolv.conf`.
+    resolv: Option<CString>,
+    /// Paths to bind-mount read-only onto themselves (`<workspace>/.pent`).
+    readonly: Vec<CString>,
+    /// Directories to hide with an empty tmpfs (`/run/user/<uid>`).
+    mask_dirs: Vec<CString>,
+    /// Socket files to hide with a bind mount of `/dev/null`.
+    mask_files: Vec<CString>,
+}
+
+fn to_cstring(path: &Path) -> Option<CString> {
+    use std::os::unix::ffi::OsStrExt;
+    CString::new(path.as_os_str().as_bytes()).ok()
+}
+
+/// Return true if the configuration names `mask` or a path inside it.
+///
+/// A grant on an ancestor (for example the traversal grant on `/`) does not
+/// count: the user must name the hidden path itself.
+#[must_use]
+pub(crate) fn is_explicitly_allowed(mask: &Path, configured: &[PathBuf]) -> bool {
+    configured.iter().any(|p| p.starts_with(mask))
+}
+
+/// Return all paths that the configuration names explicitly.
+fn configured_paths(config: &SandboxConfig) -> Vec<PathBuf> {
+    let (traversal, read, execute, rw) = config.paths.expand_paths();
+    let mut v: Vec<PathBuf> = traversal
+        .into_iter()
+        .chain(read)
+        .chain(execute)
+        .chain(rw)
+        .map(|(p, _)| p)
+        .collect();
+    v.extend(config.mounts.iter().map(|m| m.path.clone()));
+    v.push(config.workspace.clone());
+    v.push(config.data_dir.clone());
+    v.push(config.cwd.clone());
+    v
+}
+
+/// Compute the directories and socket files to hide.
+fn mask_targets(config: &SandboxConfig, uid: libc::uid_t) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    use std::os::unix::fs::FileTypeExt;
+    let configured = configured_paths(config);
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut runtime_dirs = vec![PathBuf::from(format!("/run/user/{uid}"))];
+    if let Some(xdg) = config.env.get("XDG_RUNTIME_DIR") {
+        runtime_dirs.push(PathBuf::from(xdg));
+    }
+    for d in runtime_dirs {
+        let Ok(real) = std::fs::canonicalize(&d) else {
+            continue;
+        };
+        if real != Path::new("/")
+            && real.is_dir()
+            && !is_explicitly_allowed(&d, &configured)
+            && !is_explicitly_allowed(&real, &configured)
+            && !dirs.contains(&real)
+        {
+            dirs.push(real);
+        }
+    }
+    let mut files: Vec<PathBuf> = Vec::new();
+    for s in ESCAPE_SOCKETS {
+        let p = Path::new(s);
+        let Ok(real) = std::fs::canonicalize(p) else {
+            continue;
+        };
+        let is_socket = std::fs::symlink_metadata(&real).is_ok_and(|m| m.file_type().is_socket());
+        if is_socket
+            && !is_explicitly_allowed(p, &configured)
+            && !is_explicitly_allowed(&real, &configured)
+            && !dirs.iter().any(|d| real.starts_with(d))
+            && !files.contains(&real)
+        {
+            files.push(real);
+        }
+    }
+    (dirs, files)
+}
+
+impl MountPlan {
+    /// Make the private mounts. Async-signal-safe.
+    ///
+    /// # Errors
+    /// A failure to make the tree private, to make a path read-only or to
+    /// hide a path is fatal. A failure of the `resolv.conf` mount is only
+    /// reported.
+    fn apply(&self) -> std::io::Result<()> {
+        if !self.make_private {
+            return Ok(());
+        }
+        // After unshare(CLONE_NEWNS) in a user namespace, inherited mounts
+        // are slaves. Make the tree private before new mounts, so that no
+        // mount propagates to the host. This must come after the overlayfs
+        // mounts: a private tree before overlayfs gives EACCES on some
+        // kernels.
+        // SAFETY: mount(2) with static NUL-terminated strings.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let ret = unsafe {
+            libc::mount(
+                c"none".as_ptr(),
+                c"/".as_ptr(),
+                std::ptr::null(),
+                libc::MS_REC | libc::MS_PRIVATE,
+                std::ptr::null(),
+            )
+        };
+        if ret != 0 {
+            return Err(last_err(b"pent: mount --make-rprivate / failed\n"));
+        }
+
+        if let Some(src) = &self.resolv {
+            // MS_BIND follows a symbolic link at the target, so this also
+            // covers a /etc/resolv.conf that points into /run.
+            // SAFETY: mount(2) with NUL-terminated strings that the parent
+            // prepared.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            let ret = unsafe {
+                libc::mount(
+                    src.as_ptr(),
+                    c"/etc/resolv.conf".as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_BIND,
+                    std::ptr::null(),
+                )
+            };
+            if ret != 0 {
+                write_stderr_static(
+                    b"pent: bind-mount /etc/resolv.conf failed; DNS may not work\n",
+                );
+            }
+        }
+
+        for path in &self.readonly {
+            // SAFETY: mount(2) with NUL-terminated strings that the parent
+            // prepared.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            let ret = unsafe {
+                libc::mount(
+                    path.as_ptr(),
+                    path.as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_BIND | libc::MS_REC,
+                    std::ptr::null(),
+                )
+            };
+            if ret != 0 {
+                return Err(last_err(b"pent: bind-mount of .pent failed\n"));
+            }
+            let locked = locked_mount_flags(path)
+                .map_err(|_| last_err(b"pent: statfs of .pent failed\n"))?;
+            // SAFETY: as above.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            let ret = unsafe {
+                libc::mount(
+                    std::ptr::null(),
+                    path.as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY | locked,
+                    std::ptr::null(),
+                )
+            };
+            if ret != 0 {
+                return Err(last_err(b"pent: read-only remount of .pent failed\n"));
+            }
+        }
+
+        for dir in &self.mask_dirs {
+            // SAFETY: mount(2) with NUL-terminated strings.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            let ret = unsafe {
+                libc::mount(
+                    c"tmpfs".as_ptr(),
+                    dir.as_ptr(),
+                    c"tmpfs".as_ptr(),
+                    libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+                    c"size=16k,mode=0700".as_ptr().cast(),
+                )
+            };
+            if ret != 0 {
+                return Err(last_err(b"pent: cannot hide the user runtime directory\n"));
+            }
+        }
+
+        for file in &self.mask_files {
+            // SAFETY: mount(2) with NUL-terminated strings.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            let ret = unsafe {
+                libc::mount(
+                    c"/dev/null".as_ptr(),
+                    file.as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_BIND,
+                    std::ptr::null(),
+                )
+            };
+            if ret != 0 {
+                return Err(last_err(b"pent: cannot hide a container socket\n"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Everything that the `pre_exec` hook needs, prepared before `fork`.
+struct ChildPlan {
+    parent_pid: libc::pid_t,
+    unshare_flags: libc::c_int,
+    uid_map: Vec<u8>,
+    gid_map: Vec<u8>,
+    /// ProxyOnly sync pipes: (ready write end, go read end).
+    proxy_sync: Option<(libc::c_int, libc::c_int)>,
+    overlays: Vec<super::linux_overlayfs::OverlayMount>,
+    accessible: HashSet<PathBuf>,
+    mounts: MountPlan,
+    cwd: Option<CString>,
+    bring_up_lo: bool,
+    /// `None` when enforcement is off (`--no-sandbox`).
+    ruleset: Option<PreparedRuleset>,
+}
+
+impl ChildPlan {
+    /// The body of the `pre_exec` hook.
+    ///
+    /// Order matters:
+    /// 1. Parent-death signal and close-on-exec for inherited fds.
+    /// 2. All namespace work while `/proc/self` is still writable: unshare,
+    ///    UID/GID maps, the ProxyOnly handshake, overlay and private mounts,
+    ///    loopback.
+    /// 3. `PR_SET_NO_NEW_PRIVS`, the seccomp filter and Landlock last.
+    fn run(&self) -> std::io::Result<()> {
+        // SAFETY: prctl with integer arguments only. PDEATHSIG fires when the
+        // *thread* that forked exits, so `spawn_sandboxed` must run on a
+        // thread that lives as long as the child (see its documentation).
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) } != 0 {
+            return Err(last_err(b"pent: prctl(PR_SET_PDEATHSIG) failed\n"));
+        }
+        // The parent can exit before the prctl call; then no signal comes.
+        // SAFETY: getppid has no preconditions.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        if unsafe { libc::getppid() } != self.parent_pid {
+            return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+        }
+        cloexec_inherited_fds();
+
+        if self.unshare_flags != 0 {
+            if self.unshare_flags & libc::CLONE_NEWUSER != 0 {
+                prepare_caps_for_userns()?;
+            }
+            // SAFETY: unshare(2) with integer flags.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            if unsafe { libc::unshare(self.unshare_flags) } != 0 {
+                return Err(last_err(b"pent: unshare failed\n"));
+            }
+            if self.unshare_flags & libc::CLONE_NEWUSER != 0 {
+                setup_userns_mappings(&self.uid_map, &self.gid_map)?;
+            }
+        }
+
+        if let Some((ready_w, go_r)) = self.proxy_sync {
+            // Send our PID to the helper thread of the parent. The thread
+            // moves the inner veth into our network namespace, configures
+            // it, and then sends one byte.
+            // SAFETY: getpid has no preconditions.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            let pid = unsafe { libc::getpid() };
+            let sent = write_all_fd(ready_w, &pid.to_ne_bytes());
+            // SAFETY: close our copy of the pipe end; exec closes it anyway.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            unsafe { libc::close(ready_w) };
+            sent.map_err(|_| last_err(b"pent: cannot send the PID to the parent\n"))?;
+            let mut go = [0u8; 1];
+            let got = read_exact_fd(go_r, &mut go);
+            // SAFETY: as above.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            unsafe { libc::close(go_r) };
+            match got {
+                Ok(true) if go == *b"1" => {}
+                _ => {
+                    write_stderr_static(b"pent: the parent did not configure the network\n");
+                    return Err(std::io::Error::from_raw_os_error(libc::ENETDOWN));
+                }
+            }
+        }
+
+        if !self.overlays.is_empty() {
+            // These helpers live in linux_overlayfs.rs. They create the
+            // upper/work directories inside the user namespace (doing so in
+            // the parent gives EACCES on the overlay mount with a btrfs
+            // lower layer) and mount the overlays.
+            super::linux_overlayfs::setup_overlay_dirs(&self.overlays, &self.accessible)?;
+            // SAFETY: we are in the post-fork child, after
+            // unshare(CLONE_NEWUSER | CLONE_NEWNS) and the UID/GID maps.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            unsafe { super::linux_overlayfs::mount_overlays(&self.overlays) }?;
+        }
+
+        self.mounts.apply()?;
+
+        // Re-chdir after the mounts: std calls chdir() before pre_exec hooks,
+        // so the CWD can point to an inode under a new mount. Landlock rules
+        // bind to the inodes that the new mounts show.
+        if let Some(cwd) = &self.cwd {
+            // SAFETY: `cwd` is a NUL-terminated string that the parent prepared.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            if unsafe { libc::chdir(cwd.as_ptr()) } != 0 {
+                return Err(last_err(b"pent: chdir to the working directory failed\n"));
+            }
+        }
+
+        if self.bring_up_lo {
+            bring_up_loopback()?;
+        }
+
+        if let Some(ruleset) = &self.ruleset {
+            // SAFETY: prctl with integer arguments only.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+                return Err(last_err(b"pent: prctl(PR_SET_NO_NEW_PRIVS) failed\n"));
+            }
+            // SAFETY: we are in the pre_exec hook and NO_NEW_PRIVS is set.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            unsafe { crate::linux_landlock::install_tiocsti_filter() }
+                .map_err(|_| last_err(b"pent: seccomp filter failed\n"))?;
+            // SAFETY: we are in the pre_exec hook and NO_NEW_PRIVS is set;
+            // the function uses only raw system calls on prepared data.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            unsafe { ruleset.apply_in_child() }
+                .map_err(|_| last_err(b"pent: Landlock restriction failed\n"))?;
+        }
+        Ok(())
+    }
+}
+
+/// Create a pipe with `O_CLOEXEC` and return (read end, write end).
+fn cloexec_pipe() -> Result<(OwnedFd, OwnedFd), SandboxError> {
+    let mut fds = [0i32; 2];
+    // SAFETY: pipe2 writes two file descriptors into `fds`.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(SandboxError::SpawnFailed(std::io::Error::last_os_error()));
+    }
+    // SAFETY: pipe2 succeeded, so both numbers are new file descriptors
+    // that this process owns.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
+}
+
+/// Add the proxy variables to the environment of the child.
+fn proxy_env(
+    env: &std::collections::HashMap<String, String>,
+    outer_ip: std::net::Ipv4Addr,
+    port: u16,
+) -> std::collections::HashMap<String, String> {
+    let http_url = format!("http://{outer_ip}:{port}");
+    // socks5h = hostname resolved by the proxy, so the sandboxed process
+    // never calls getaddrinfo for external hosts — DNS stays on the proxy side.
+    let socks_url = format!("socks5h://{outer_ip}:{port}");
+    let no_proxy = "localhost,127.0.0.1,::1";
+    let mut e = env.clone();
+    e.insert("HTTP_PROXY".to_string(), http_url.clone());
+    e.insert("HTTPS_PROXY".to_string(), http_url.clone());
+    e.insert("http_proxy".to_string(), http_url.clone());
+    e.insert("https_proxy".to_string(), http_url);
+    e.insert("ALL_PROXY".to_string(), socks_url.clone());
+    e.insert("all_proxy".to_string(), socks_url.clone());
+    e.insert("GRPC_PROXY".to_string(), socks_url.clone());
+    e.insert("grpc_proxy".to_string(), socks_url);
+    e.insert("NO_PROXY".to_string(), no_proxy.to_string());
+    e.insert("no_proxy".to_string(), no_proxy.to_string());
+    // Route git-over-SSH through the SOCKS5 proxy (nc -X 5 = SOCKS5).
+    e.insert(
+        "GIT_SSH_COMMAND".to_string(),
+        format!("ssh -o ProxyCommand='nc -X 5 -x {outer_ip}:{port} %h %p'"),
+    );
+    // Signal to the sandboxed process that it is running inside a proxy sandbox.
+    // Claude Code checks this flag to activate its own proxy-aware networking.
+    e.insert("SANDBOX_RUNTIME".to_string(), "1".to_string());
+    e
+}
+
+/// Spawn command with Landlock sandbox using `pre_exec`.
 ///
 /// For write-listed file paths, overlayfs is mounted over their parent directories
 /// inside the child's mount namespace so that atomic writes (rename-based) go to
@@ -455,21 +923,19 @@ fn apply_network_isolation(network: &NetworkMode) -> std::io::Result<()> {
 /// writes back to the real file inodes in-place, preserving the inodes that
 /// Landlock rules are bound to.
 ///
-/// # Arguments
-/// * `config` - Sandbox configuration
-/// * `cmd` - Command to execute
-/// * `args` - Command arguments
-/// * `env` - Environment variables
-/// * `path_dirs` - PATH directories for ruleset
+/// The child gets `PR_SET_PDEATHSIG(SIGKILL)`. Call this function on a thread
+/// that lives as long as the child: the signal fires when the forking thread
+/// exits.
 ///
 /// # Returns
-/// `(child_handle, overlay_handle)` — `overlay_handle` is `Some` when overlayfs
-/// is in use; pass it to [`super::linux_overlayfs::teardown`] after the child exits.
+/// `(child_handle, overlay_handle, netns_handle)` — `overlay_handle` is `Some`
+/// when overlayfs is in use; pass it to [`super::linux_overlayfs::teardown`]
+/// after the child exits.
 ///
 /// # Errors
 /// * `SandboxUnavailable` - If Landlock unavailable
+/// * `NetworkSetupFailed` / `PrivilegeRequired` - If the proxy network fails
 /// * `SpawnFailed` - If spawn fails
-#[cfg(target_os = "linux")]
 #[allow(clippy::too_many_lines)]
 pub fn spawn_with_landlock(
     config: &SandboxConfig,
@@ -485,22 +951,10 @@ pub fn spawn_with_landlock(
     ),
     SandboxError,
 > {
-    use landlock::{
-        Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr, ABI,
-    };
-    use std::collections::HashSet;
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
-    // Clone config data for use in pre_exec closure
-    let workspace = config.workspace.clone();
-    let cwd_path = config.cwd.clone();
-    let data_dir = config.data_dir.clone();
-    let mounts = config.mounts.clone();
-    let paths = config.paths.clone();
-    let path_dirs = path_dirs.to_vec();
-    let network = config.network.clone();
-    let no_enforcement = config.no_enforcement;
+    let enforce = !config.no_enforcement;
 
     // Identify write-listed file paths (as opposed to directories) and prepare
     // overlayfs staging directories for them. Directories use regular Landlock
@@ -511,9 +965,7 @@ pub fn spawn_with_landlock(
         .filter_map(|(path, _)| {
             // Include paths that are files, or don't exist yet but whose parent
             // directory exists (will be created as a file on first write).
-            if path.is_file()
-                || (!path.exists() && path.parent().is_some_and(std::path::Path::is_dir))
-            {
+            if path.is_file() || (!path.exists() && path.parent().is_some_and(Path::is_dir)) {
                 Some(path.clone())
             } else {
                 None
@@ -524,35 +976,22 @@ pub fn spawn_with_landlock(
 
     // Directory-type read_write entries: all files created or modified inside
     // these directories during the session should be flushed back to the real FS.
-    //
-    // Include paths that are currently directories AND paths that don't exist
-    // yet but whose parent does — those might be created as directories by the
-    // sandboxed process (e.g. ~/.cache/claude that doesn't exist at spawn time).
-    // Paths that are already files are excluded (they're handled by write_set).
+    // Include paths that are directories AND paths that don't exist yet but
+    // whose parent does (they may be created as directories in the sandbox).
     let mut rw_dirs: HashSet<PathBuf> = rw_expanded
         .iter()
         .filter_map(|(path, _)| {
-            if path.is_dir() {
-                Some(path.clone())
-            } else if !path.is_file()
-                && !path.exists()
-                && path.parent().is_some_and(std::path::Path::is_dir)
+            if path.is_dir()
+                || (!path.is_file() && !path.exists() && path.parent().is_some_and(Path::is_dir))
             {
-                // Non-existent entry with an existing parent: include so that
-                // if the sandbox creates it as a directory, its contents are flushed.
                 Some(path.clone())
             } else {
                 None
             }
         })
         .collect();
-
-    // The workspace and data_dir receive write access via Landlock and are
-    // always flushed back to the real filesystem.  They may fall inside an
-    // overlayfs mount (e.g. the home-dir overlay triggered by ~/.claude.json
-    // being in read_write); without this, every file the sandboxed agent
-    // writes in the workspace goes to the upper layer and is silently
-    // discarded on session exit.
+    // The workspace and data_dir are always flushed back: they may fall inside
+    // an overlayfs mount (e.g. the home-dir overlay).
     rw_dirs.insert(config.workspace.clone());
     rw_dirs.insert(config.data_dir.clone());
 
@@ -567,35 +1006,17 @@ pub fn spawn_with_landlock(
         accessible.insert(p.clone());
     }
     accessible.extend(write_set.iter().cloned());
-    accessible.insert(config.workspace.clone());
-    accessible.insert(config.data_dir.clone());
-    for mount in &config.mounts {
-        accessible.insert(mount.path.clone());
-    }
-    for sys_path in SYSTEM_PATHS {
-        accessible.insert(PathBuf::from(sys_path));
-    }
-    for tmp_path in TEMP_PATHS {
-        accessible.insert(PathBuf::from(tmp_path));
-    }
-    for dev_path in DEVICE_PATHS {
-        accessible.insert(PathBuf::from(dev_path));
-    }
-    for path_dir in &path_dirs {
-        accessible.insert(path_dir.clone());
-    }
+    accessible.extend(compute_accessible_set(config, path_dirs));
 
-    // Compute home_dir for overlay root calculation.
     let home_dir: PathBuf = std::env::var("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| config.workspace.clone());
 
-    // In no_enforcement mode, skip overlayfs entirely.
     let pid = std::process::id();
-    let overlay_mounts = if no_enforcement {
-        Vec::new()
-    } else {
+    let overlay_mounts = if enforce {
         super::linux_overlayfs::prepare_overlay_dirs(&accessible, &home_dir, pid)?
+    } else {
+        Vec::new()
     };
     // Teardown must wait for orphaned session processes before the final
     // flush. As a child subreaper, pent gets them instead of init.
@@ -605,536 +1026,193 @@ pub fn spawn_with_landlock(
         }
     }
 
-    // Compute the set of parent directories covered by overlayfs (for Landlock rules).
     let overlay_dirs: HashSet<PathBuf> =
         overlay_mounts.iter().map(|m| m.real_dir.clone()).collect();
 
-    // Clone overlay data for capture into the pre_exec closure.
-    let overlay_mounts_pre = overlay_mounts.clone();
-    let write_set_pre = write_set.clone();
-    let overlay_dirs_pre = overlay_dirs;
-    // accessible is passed to setup_overlay_dirs (runs in pre_exec after unshare).
-    let accessible_pre = accessible;
-
-    // For ProxyOnly, create the host-side veth pair. The child will create its own
-    // user+net namespace via unshare in pre_exec; the background thread moves the
-    // inner veth into it once the child signals readiness via pipe.
-    let mut proxy_netns: Option<super::linux_netns::NetnsHandle> =
-        if let NetworkMode::ProxyOnly { dns_port, .. } = &config.network {
-            let ns_config = super::linux_netns::NetnsConfig::from_pid();
-            Some(super::linux_netns::create_netns(&ns_config, *dns_port)?)
-        } else {
-            None
-        };
-
-    // Proxy data for the pre_exec closure and background thread.
-    let is_proxy = proxy_netns.is_some();
-    let proxy_inner_veth: String = proxy_netns
-        .as_ref()
-        .map_or(String::new(), |h| h.inner_veth.clone());
-    let proxy_inner_cidr: String = proxy_netns
-        .as_ref()
-        .map_or(String::new(), |h| h.inner_cidr.clone());
-    let proxy_gateway: String = proxy_netns
-        .as_ref()
-        .map_or(String::new(), |h| h.outer_ip.to_string());
-
-    // Pipe fds for pre_exec ↔ background-thread sync.  -1 when not ProxyOnly.
-    // ready_pipe: child writes its PID → parent reads it
-    // go_pipe:    parent writes go signal → child reads it
-    // Both ends are O_CLOEXEC so they're closed automatically when the child
-    // calls exec; the pre_exec hook closes them explicitly in the child.
-    let (proxy_ready_r, proxy_ready_w): (libc::c_int, libc::c_int);
-    let (proxy_go_r, proxy_go_w): (libc::c_int, libc::c_int);
-    if is_proxy {
-        let mut rp = [0i32; 2];
-        let mut gp = [0i32; 2];
-        // SAFETY: pipe2 is always safe to call.
-        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-        unsafe {
-            if libc::pipe2(rp.as_mut_ptr(), libc::O_CLOEXEC) != 0 {
-                return Err(SandboxError::SpawnFailed(std::io::Error::last_os_error()));
-            }
-            if libc::pipe2(gp.as_mut_ptr(), libc::O_CLOEXEC) != 0 {
-                libc::close(rp[0]);
-                libc::close(rp[1]);
-                return Err(SandboxError::SpawnFailed(std::io::Error::last_os_error()));
-            }
-        }
-        proxy_ready_r = rp[0];
-        proxy_ready_w = rp[1];
-        proxy_go_r = gp[0];
-        proxy_go_w = gp[1];
+    // Landlock ruleset: created in the parent, rules applied in the child.
+    let ruleset = if enforce {
+        let mut rs = PreparedRuleset::create()?;
+        add_ruleset_rules(&mut rs, config, path_dirs, &write_set, &overlay_dirs);
+        Some(rs)
     } else {
-        (proxy_ready_r, proxy_ready_w) = (-1, -1);
-        (proxy_go_r, proxy_go_w) = (-1, -1);
+        None
+    };
+
+    // ProxyOnly: use the network that `prepare_proxy_network` created for the
+    // proxy address, or create one now.
+    let mut proxy_netns: Option<super::linux_netns::NetnsHandle> = if let NetworkMode::ProxyOnly {
+        proxy_addr,
+        dns_port,
+    } = &config.network
+    {
+        let mut handle = match super::linux_netns::take_prepared(proxy_addr.ip()) {
+            Some(h) => h,
+            None => super::linux_netns::create_netns()?,
+        };
+        handle.install_firewall(proxy_addr.port(), *dns_port)?;
+        Some(handle)
+    } else {
+        None
+    };
+    let resolv_src: Option<PathBuf> = match (&mut proxy_netns, &config.network) {
+        (Some(h), NetworkMode::ProxyOnly { dns_port, .. }) if *dns_port != 0 => {
+            Some(h.write_resolv_conf()?)
+        }
+        _ => None,
+    };
+
+    // Namespaces.
+    let net_flag = match config.network {
+        NetworkMode::Unrestricted => 0,
+        _ => libc::CLONE_NEWNET,
+    };
+    let unshare_flags = if enforce {
+        libc::CLONE_NEWUSER | libc::CLONE_NEWNS | net_flag
+    } else if net_flag != 0 {
+        let ns = if proxy_netns.is_some() {
+            libc::CLONE_NEWNS
+        } else {
+            0
+        };
+        libc::CLONE_NEWUSER | net_flag | ns
+    } else {
+        0
+    };
+    let has_mntns = unshare_flags & libc::CLONE_NEWNS != 0;
+
+    // SAFETY: getuid/getgid have no preconditions.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+
+    let mut mounts = MountPlan {
+        make_private: has_mntns,
+        resolv: resolv_src.as_deref().and_then(to_cstring),
+        ..MountPlan::default()
+    };
+    if enforce {
+        let dot_pent = config.workspace.join(".pent");
+        if dot_pent.exists() {
+            mounts.readonly.extend(to_cstring(&dot_pent));
+        }
+        let (mask_dirs, mask_files) = mask_targets(config, uid);
+        mounts
+            .mask_dirs
+            .extend(mask_dirs.iter().filter_map(|p| to_cstring(p)));
+        mounts
+            .mask_files
+            .extend(mask_files.iter().filter_map(|p| to_cstring(p)));
     }
 
-    // For ProxyOnly, inject proxy env vars pointing to the veth host-side IP so
-    // the child can reach the proxy from inside the isolated namespace.
-    let effective_env: std::collections::HashMap<String, String> =
-        if let (NetworkMode::ProxyOnly { proxy_addr, .. }, Some(handle)) =
-            (&config.network, &proxy_netns)
-        {
-            let outer_ip = handle.outer_ip;
-            let port = proxy_addr.port();
-            let http_url = format!("http://{outer_ip}:{port}");
-            // socks5h = hostname resolved by the proxy, so the sandboxed process
-            // never calls getaddrinfo for external hosts — DNS stays on the proxy side.
-            let socks_url = format!("socks5h://{outer_ip}:{port}");
-            let no_proxy = "localhost,127.0.0.1,::1";
-            let mut e = env.clone();
-            e.insert("HTTP_PROXY".to_string(), http_url.clone());
-            e.insert("HTTPS_PROXY".to_string(), http_url.clone());
-            e.insert("http_proxy".to_string(), http_url.clone());
-            e.insert("https_proxy".to_string(), http_url);
-            e.insert("ALL_PROXY".to_string(), socks_url.clone());
-            e.insert("all_proxy".to_string(), socks_url.clone());
-            e.insert("GRPC_PROXY".to_string(), socks_url.clone());
-            e.insert("grpc_proxy".to_string(), socks_url);
-            e.insert("NO_PROXY".to_string(), no_proxy.to_string());
-            e.insert("no_proxy".to_string(), no_proxy.to_string());
-            // Route git-over-SSH through the SOCKS5 proxy (nc -X 5 = SOCKS5).
-            e.insert(
-                "GIT_SSH_COMMAND".to_string(),
-                format!("ssh -o ProxyCommand='nc -X 5 -x {outer_ip}:{port} %h %p'"),
-            );
-            // Signal to the sandboxed process that it is running inside a proxy sandbox.
-            // Claude Code checks this flag to activate its own proxy-aware networking.
-            e.insert("SANDBOX_RUNTIME".to_string(), "1".to_string());
-            e
+    // Sync pipes for ProxyOnly.
+    // ready: child writes its PID → helper thread reads it.
+    // go:    helper thread writes one byte → child reads it.
+    let pipes = if proxy_netns.is_some() {
+        let (ready_r, ready_w) = cloexec_pipe()?;
+        let (go_r, go_w) = cloexec_pipe()?;
+        Some((ready_r, ready_w, go_r, go_w))
+    } else {
+        None
+    };
+
+    let plan = ChildPlan {
+        // The PID fits in pid_t: the kernel limit is 2^22.
+        #[allow(clippy::cast_possible_wrap)]
+        parent_pid: pid as libc::pid_t,
+        unshare_flags,
+        uid_map: format!("{uid} {uid} 1\n").into_bytes(),
+        gid_map: format!("{gid} {gid} 1\n").into_bytes(),
+        proxy_sync: pipes
+            .as_ref()
+            .map(|(_, ready_w, go_r, _)| (ready_w.as_raw_fd(), go_r.as_raw_fd())),
+        overlays: overlay_mounts.clone(),
+        accessible,
+        mounts,
+        cwd: if has_mntns {
+            to_cstring(&config.cwd)
         } else {
-            env.clone()
-        };
+            None
+        },
+        bring_up_lo: config.network == NetworkMode::LocalhostOnly,
+        ruleset,
+    };
+
+    let effective_env = match (&config.network, &proxy_netns) {
+        (NetworkMode::ProxyOnly { proxy_addr, .. }, Some(handle)) => {
+            proxy_env(env, handle.outer_ip, proxy_addr.port())
+        }
+        _ => env.clone(),
+    };
 
     let mut command = Command::new(cmd);
     command.args(args);
     command.current_dir(&config.cwd);
     command.env_clear();
-    for (key, value) in &effective_env {
-        command.env(key, value);
-    }
+    command.envs(&effective_env);
     command.stdin(Stdio::inherit());
     command.stdout(Stdio::inherit());
     command.stderr(Stdio::inherit());
-
-    // Clone strings that are used in BOTH the pre_exec closure and the
-    // background thread (the closure moves them; the thread needs its own copy).
-    let proxy_inner_veth_bg = proxy_inner_veth.clone();
-
+    // SAFETY: `ChildPlan::run` uses only async-signal-safe raw system calls
+    // on data prepared before fork (except the overlayfs helpers, see the
+    // module documentation).
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
-        command.pre_exec(move || {
-            // ── Phase 0: Fix dumpable bit and drop inheritable capabilities ──
-            //
-            // The pent binary carries cap_net_admin=eip on disk (file caps).
-            // Executing a binary with file capabilities has two side-effects
-            // that break user-namespace setup:
-            //
-            // Problem 1 — non-dumpable process (EACCES on /proc/self/uid_map):
-            //   The kernel marks any process with elevated file capabilities as
-            //   "not dumpable" (PR_GET_DUMPABLE → 0).  Non-dumpable processes
-            //   have their /proc/[pid]/ files owned by root:root in the initial
-            //   user namespace.  After unshare(CLONE_NEWUSER) but before uid_map
-            //   is written, the process appears as uid 65534 (overflowuid) inside
-            //   the new namespace.  Opening /proc/self/{uid_map,gid_map,setgroups}
-            //   for writing then fails with EACCES (owned by root, we're nobody).
-            //   Fix: prctl(PR_SET_DUMPABLE, 1) restores /proc ownership to our
-            //   real uid, making those files writable again after unshare.
-            //
-            // Problem 2 — non-empty inheritable set (EACCES from unshare):
-            //   Linux ≥ 5.11 rejects unshare(CLONE_NEWUSER) when the calling
-            //   process has a non-empty inheritable capability set.
-            //   Fix: capset to zero the inheritable words before unshare.
-            //   (effective and permitted are fine; they don't trigger this check,
-            //   and we need them cleared only to the extent the dumpable fix above
-            //   handles uid_map — which it does independently.)
-            {
-                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-                libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0);
-            }
-            {
-                #[repr(C)]
-                struct CapHeader {
-                    version: u32,
-                    pid: i32,
-                }
-                #[repr(C)]
-                #[derive(Copy, Clone)]
-                struct CapData {
-                    effective: u32,
-                    permitted: u32,
-                    inheritable: u32,
-                }
-                const CAP_V3: u32 = 0x2008_0522;
-                let mut hdr = CapHeader {
-                    version: CAP_V3,
-                    pid: 0,
-                };
-                let mut data = [CapData {
-                    effective: 0,
-                    permitted: 0,
-                    inheritable: 0,
-                }; 2];
-                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-                libc::syscall(libc::SYS_capget, &raw mut hdr, data.as_mut_ptr());
-                data[0].inheritable = 0;
-                data[1].inheritable = 0;
-                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-                libc::syscall(libc::SYS_capset, &raw mut hdr, data.as_ptr());
-            }
-
-            // ── Phase 1: Namespace and overlay setup ─────────────────────────
-            //
-            // When overlayfs is in use we need CLONE_NEWUSER + CLONE_NEWNS (and
-            // CLONE_NEWNET for network-isolating modes) in a single unshare call.
-            // ProxyOnly now creates its own user+net namespace here too.
-            // In no_enforcement mode, skip overlay entirely.
-            let has_overlays = !no_enforcement && !overlay_mounts_pre.is_empty();
-
-            if has_overlays {
-                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-                let uid = libc::getuid();
-                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-                let gid = libc::getgid();
-
-                let mut flags = libc::CLONE_NEWUSER | libc::CLONE_NEWNS;
-                match &network {
-                    NetworkMode::LocalhostOnly
-                    | NetworkMode::Blocked
-                    | NetworkMode::ProxyOnly { .. } => {
-                        flags |= libc::CLONE_NEWNET;
-                    }
-                    NetworkMode::Unrestricted => {}
-                }
-                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-                let ret = libc::unshare(flags);
-                if ret != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-                setup_userns_mappings(uid, gid);
-
-                // Create upper/work dirs and populate stubs from inside the
-                // user namespace.  This must happen after unshare + userns
-                // mappings so the kernel sees the directories as created in
-                // the same security context as the overlay mount.  Doing this
-                // in the parent process (before fork) causes EACCES on the
-                // overlay mount on kernel 6.18 with btrfs lower.
-                super::linux_overlayfs::setup_overlay_dirs(&overlay_mounts_pre, &accessible_pre)?;
-
-                // Mount overlayfs inside the new mount namespace.
-                // SAFETY: we are in a single-threaded post-fork child that has
-                // just called unshare(CLONE_NEWUSER | CLONE_NEWNS).
-                //
-                // NOTE: do NOT make the mount tree private (MS_REC|MS_PRIVATE)
-                // before this call.  On this system overlayfs works fine on
-                // inherited slave mounts (confirmed by testing), but making
-                // the tree private first causes EACCES on the overlay mount
-                // itself.  rprivate is applied later in setup_child_dns, where
-                // it is needed before mounting tmpfs on /run.
-                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-                super::linux_overlayfs::mount_overlays(&overlay_mounts_pre)?;
-
-                // Re-chdir after overlay mount: Rust's Command::current_dir() calls
-                // chdir() BEFORE pre_exec hooks run, so the CWD dentry points to the
-                // lower-layer (real-fs) inode at the time the overlay is mounted.
-                // After mounting, Landlock rules are registered against the overlay's
-                // merged inodes.  Without this re-chdir, relative paths resolved via
-                // the stale CWD dentry reference lower-layer inodes not covered by any
-                // Landlock rule, causing EACCES on relative-path writes even when the
-                // same absolute path succeeds.
-                {
-                    use std::os::unix::ffi::OsStrExt;
-                    if let Ok(cwd_c) = std::ffi::CString::new(cwd_path.as_os_str().as_bytes()) {
-                        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-                        libc::chdir(cwd_c.as_ptr());
-                    }
-                }
-            } else if proxy_ready_w >= 0 {
-                // ProxyOnly without overlays: unshare user+net+mount namespace.
-                // CLONE_NEWNS is required so that:
-                //   1. We can mount a tmpfs on /run for the iptables lock file.
-                //   2. We can bind-mount a custom /etc/resolv.conf.
-                // Both are scoped to this mount namespace and invisible to the host.
-                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-                let uid = libc::getuid();
-                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-                let gid = libc::getgid();
-                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-                let ret =
-                    libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET | libc::CLONE_NEWNS);
-                if ret != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-                setup_userns_mappings(uid, gid);
-                // rprivate is applied inside setup_child_dns before the
-                // tmpfs-on-/run and resolv.conf bind-mounts.
-            }
-
-            // ── Phase 1.5: ProxyOnly pipe-sync and inner veth config ─────────
-            //
-            // The child has a fresh CLONE_NEWNET namespace (Phase 1 or the else-if
-            // above). Signal readiness to the parent background thread by writing
-            // our PID; the thread moves the inner veth here, then sends a go byte.
-            // We then configure the inner veth before Landlock is applied — after
-            // Landlock the ip binary would be inaccessible.
-            if proxy_ready_w >= 0 {
-                // Restore dumpability so the parent can open /proc/self if needed.
-                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-                libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0);
-
-                // Send our PID (4 bytes, native endian) to the background thread.
-                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-                let pid = libc::getpid();
-                let pid_bytes = pid.to_ne_bytes();
-                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-                libc::write(proxy_ready_w, pid_bytes.as_ptr().cast(), 4);
-                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-                libc::close(proxy_ready_w);
-
-                // Block until the background thread moves the inner veth in.
-                let mut buf = [0u8; 1];
-                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-                libc::read(proxy_go_r, buf.as_mut_ptr().cast(), 1);
-                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-                libc::close(proxy_go_r);
-
-                // Configure the inner veth inside our new network namespace.
-                // ip is still accessible here — Landlock hasn't been applied yet.
-                super::linux_netns::run_ip_local(&[
-                    "addr",
-                    "add",
-                    &proxy_inner_cidr,
-                    "dev",
-                    &proxy_inner_veth,
-                ])
-                .map_err(|e| std::io::Error::other(e.to_string()))?;
-                super::linux_netns::run_ip_local(&["link", "set", &proxy_inner_veth, "up"])
-                    .map_err(|e| std::io::Error::other(e.to_string()))?;
-                super::linux_netns::run_ip_local(&["link", "set", "lo", "up"])
-                    .map_err(|e| std::io::Error::other(e.to_string()))?;
-                super::linux_netns::run_ip_local(&[
-                    "route",
-                    "add",
-                    "default",
-                    "via",
-                    &proxy_gateway,
-                ])
-                .map_err(|e| std::io::Error::other(e.to_string()))?;
-
-                // ── resolv.conf inside child namespace ────────────────────────
-                // Point /etc/resolv.conf at the host-side veth IP (outer_ip).
-                // DNS queries to port 53 on that IP are intercepted by the
-                // host-side nft PREROUTING rule (created in create_netns) and
-                // redirected to the proxy's DNS server port.
-                if let NetworkMode::ProxyOnly { dns_port, .. } = &network {
-                    if *dns_port != 0 {
-                        super::linux_netns::setup_child_dns(&proxy_gateway, *dns_port);
-                    }
-                }
-            }
-
-            // ── Phase 2: Landlock ─────────────────────────────────────────────
-            // Skip entire Landlock setup when no_enforcement is active.
-            if !no_enforcement {
-                let all_access = AccessFs::from_all(ABI::V4);
-                let read_access = AccessFs::ReadFile | AccessFs::ReadDir;
-                // Execute: runnable but not readable (binary directories, installed tools).
-                // ReadFile is intentionally omitted — execute paths should not be readable
-                // by the sandboxed process; Landlock enforces this at the syscall level.
-                let execute_access = AccessFs::ReadDir | AccessFs::Execute;
-                // System library paths need ReadFile in addition to Execute so that the
-                // dynamic linker can open() shared libraries. This is separate from
-                // execute_access (user-configured execute paths) which is intentionally
-                // execute-only without ReadFile.
-                let syslib_access = AccessFs::ReadFile | AccessFs::ReadDir | AccessFs::Execute;
-                let write_access = all_access;
-
-                let mut ruleset = Ruleset::default()
-                    .handle_access(all_access)
-                    .map_err(|e| std::io::Error::other(e.to_string()))?
-                    .create()
-                    .map_err(|e| std::io::Error::other(e.to_string()))?;
-
-                // Helper: pass ruleset by &mut so it isn't moved into the closure.
-                let add_path = |ruleset: &mut landlock::RulesetCreated,
-                                path: &Path,
-                                access|
-                 -> std::io::Result<()> {
-                    if !path.exists() {
-                        return Ok(());
-                    }
-                    let fd = PathFd::new(path).map_err(|e| std::io::Error::other(e.to_string()))?;
-                    ruleset
-                        .add_rule(PathBeneath::new(fd, access))
-                        .map_err(|e| std::io::Error::other(e.to_string()))?;
-                    Ok(())
-                };
-
-                // Add workspace and data_dir
-                add_path(&mut ruleset, &workspace, write_access)?;
-                add_path(&mut ruleset, &data_dir, write_access)?;
-
-                // Add mounts
-                for mount in &mounts {
-                    if mount.readonly {
-                        add_path(&mut ruleset, &mount.path, read_access)?;
-                    } else {
-                        add_path(&mut ruleset, &mount.path, write_access)?;
-                    }
-                }
-
-                // Add configured SandboxPaths (from profiles and TOML config).
-                let traversal_access = AccessFs::ReadDir;
-                let (traversal_paths, read_paths, execute_paths, rw_paths) = paths.expand_paths();
-                for (path, _) in &traversal_paths {
-                    add_path(&mut ruleset, path, traversal_access.into())?;
-                }
-                for (path, _) in &read_paths {
-                    add_path(&mut ruleset, path, read_access)?;
-                }
-                for (path, _) in &execute_paths {
-                    add_path(&mut ruleset, path, execute_access)?;
-                }
-                // For rw_paths:
-                // - Paths covered by overlayfs (files in write_set_pre): skip; access
-                //   is granted at the parent directory level via the overlay_dirs rule.
-                // - Paths not covered (directories, non-overlay files): add directly.
-                for (path, _) in &rw_paths {
-                    if write_set_pre.contains(path) {
-                        continue; // covered by overlay parent-dir rule below
-                    }
-                    add_path(&mut ruleset, path, write_access)?;
-                }
-                // Overlay parent directories — grant full write access so the child
-                // can read/write through the overlayfs mount point. Inside the
-                // namespace, writes go to upper (tmpfs); the real filesystem only
-                // sees changes when the parent's watcher flushes write_set files.
-                // The overlay's opaque/whiteout stubs protect non-manifest content;
-                // if the mount failed, pre_exec already returned an error above.
-                for dir in &overlay_dirs_pre {
-                    add_path(&mut ruleset, dir, write_access)?;
-                }
-
-                // Add PATH directories (binary dirs — need ReadFile for the dynamic
-                // linker to load shared libraries when executing binaries in $PATH)
-                for path_dir in &path_dirs {
-                    add_path(&mut ruleset, path_dir, syslib_access)?;
-                }
-
-                // Add system paths (dynamic linker in /usr/lib, /lib64 needs ReadFile
-                // to open() shared libraries; use syslib_access not execute_access)
-                for sys_path in SYSTEM_PATHS {
-                    add_path(&mut ruleset, Path::new(sys_path), syslib_access)?;
-                }
-
-                // Add temp paths
-                for tmp_path in TEMP_PATHS {
-                    add_path(&mut ruleset, Path::new(tmp_path), write_access)?;
-                }
-
-                // Add device and proc paths
-                for dev_path in DEVICE_PATHS {
-                    add_path(&mut ruleset, Path::new(dev_path), read_access)?;
-                }
-
-                // Apply the ruleset.
-                ruleset
-                    .restrict_self()
-                    .map_err(|e| std::io::Error::other(e.to_string()))?;
-            } // end if !no_enforcement (Phase 2)
-
-            // ── Phase 3: Network isolation ────────────────────────────────────
-            if has_overlays || proxy_ready_w >= 0 {
-                // Namespace was already created in Phase 1 / Phase 1.5.
-                // ProxyOnly: veth + loopback already configured in Phase 1.5.
-                // LocalhostOnly / Blocked: just bring up loopback if needed.
-                if network == NetworkMode::LocalhostOnly {
-                    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-                    bring_up_loopback();
-                }
-            } else {
-                // No overlays and not ProxyOnly: apply_network_isolation handles
-                // unshare + loopback internally.
-                apply_network_isolation(&network)?;
-            }
-
-            Ok(())
-        });
+        command.pre_exec(move || plan.run());
     }
 
-    // Spawn the background thread that moves the inner veth into the child's
-    // namespace. Must be launched BEFORE command.spawn() because the child's
-    // pre_exec will block on the go_pipe until the thread responds.
-    let bg_thread: Option<std::thread::JoinHandle<Result<(), SandboxError>>> = if is_proxy {
-        let inner_veth = proxy_inner_veth_bg;
-        let ready_r = proxy_ready_r;
-        let go_w = proxy_go_w;
-        Some(std::thread::spawn(move || {
-            // Read child PID (4 bytes, native endian) from ready pipe.
-            let mut pid_bytes = [0u8; 4];
-            // SAFETY: read on a valid pipe fd.
-            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-            let n = unsafe { libc::read(ready_r, pid_bytes.as_mut_ptr().cast(), 4) };
-            // SAFETY: close is always safe.
-            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-            unsafe { libc::close(ready_r) };
-            if n != 4 {
-                // SAFETY: close is always safe.
-                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-                unsafe { libc::close(go_w) };
-                return Err(SandboxError::NetworkSetupFailed(
-                    "child ready signal truncated".to_string(),
-                ));
-            }
-            let pid = i32::from_ne_bytes(pid_bytes);
-
-            // Move inner veth into the child's network namespace.
-            if let Err(e) = super::linux_netns::move_inner_veth_to_pid(&inner_veth, pid) {
-                // SAFETY: close is always safe.
-                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-                unsafe { libc::close(go_w) };
-                return Err(e);
-            }
-
-            // Signal child to proceed with inner veth configuration.
-            // SAFETY: write/close on valid pipe fds.
-            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-            unsafe {
-                libc::write(go_w, b"1".as_ptr().cast(), 1);
-                libc::close(go_w);
-            }
-            Ok(())
-        }))
-    } else {
-        None
+    // The helper thread configures the child network. It must start before
+    // `spawn`, because the child blocks on the go pipe inside `spawn`.
+    let (parent_ends, helper) = match pipes {
+        Some((ready_r, ready_w, go_r, go_w)) => {
+            let net = proxy_netns
+                .as_ref()
+                .map(super::linux_netns::NetnsHandle::child_config);
+            let helper = std::thread::spawn(move || -> Result<bool, SandboxError> {
+                let mut pid_bytes = [0u8; 4];
+                match read_exact_fd(ready_r.as_raw_fd(), &mut pid_bytes) {
+                    Ok(true) => {}
+                    // EOF: the child failed before the handshake.
+                    Ok(false) => return Ok(false),
+                    Err(e) => {
+                        return Err(SandboxError::NetworkSetupFailed(format!(
+                            "cannot read the child PID: {e}"
+                        )))
+                    }
+                }
+                let child_pid = libc::pid_t::from_ne_bytes(pid_bytes);
+                if let Some(net) = &net {
+                    net.configure(child_pid)?;
+                }
+                write_all_fd(go_w.as_raw_fd(), b"1").map_err(|e| {
+                    SandboxError::NetworkSetupFailed(format!("cannot signal the child: {e}"))
+                })?;
+                Ok(true)
+            });
+            (Some((ready_w, go_r)), Some(helper))
+        }
+        None => (None, None),
     };
 
-    let result = command.spawn().map_err(SandboxError::SpawnFailed);
+    let spawn_result = command.spawn();
+    // Drop the closure (and with it the ruleset fd) and the parent copies of
+    // the child-side pipe ends. The helper then sees EOF if the child died
+    // before the handshake.
+    drop(command);
+    drop(parent_ends);
 
-    // Close the parent's copies of the child-side pipe ends.  The child's
-    // copies were already closed by O_CLOEXEC on exec.
-    if is_proxy {
-        // SAFETY: close is always safe.
-        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-        unsafe {
-            libc::close(proxy_ready_w);
-            libc::close(proxy_go_r);
-        }
-    }
+    let helper_result = match helper {
+        Some(h) => h.join().map_err(|_| {
+            SandboxError::NetworkSetupFailed("the network helper thread panicked".to_string())
+        })?,
+        None => Ok(true),
+    };
 
-    // Join background thread; propagate any error it encountered.
-    if let Some(thread) = bg_thread {
-        let _ = thread.join();
-    }
-
-    if result.is_err() {
-        proxy_netns = None; // triggers Drop → cleans up firewall/routing rules
-    }
-
-    let child = result?;
+    // On error, `proxy_netns` drops here and removes the network.
+    let child = match (spawn_result, helper_result) {
+        (Ok(child), Ok(_)) => child,
+        // The helper failure is the root cause of the spawn failure.
+        (_, Err(e)) => return Err(e),
+        (Err(e), Ok(_)) => return Err(SandboxError::SpawnFailed(e)),
+    };
 
     // Start the inotify watcher now that the child is running.
     let overlay_handle = if overlay_mounts.is_empty() {
@@ -1149,17 +1227,6 @@ pub fn spawn_with_landlock(
     };
 
     Ok((child, overlay_handle, proxy_netns))
-}
-
-#[cfg(not(target_os = "linux"))]
-pub fn spawn_with_landlock(
-    _config: &SandboxConfig,
-    _cmd: &str,
-    _args: &[String],
-    _env: &std::collections::HashMap<String, String>,
-    _path_dirs: &[PathBuf],
-) -> Result<(std::process::Child, Option<()>), SandboxError> {
-    Err(SandboxError::UnsupportedPlatform)
 }
 
 #[cfg(test)]
@@ -1197,7 +1264,7 @@ mod tests {
 
     #[test]
     fn test_min_landlock_abi() {
-        assert_eq!(MIN_LANDLOCK_ABI, 4);
+        assert_eq!(MIN_LANDLOCK_ABI, 3);
     }
 
     // ========================================================================
@@ -1205,7 +1272,6 @@ mod tests {
     // ========================================================================
 
     #[test]
-    #[cfg(target_os = "linux")]
     fn test_check_available_returns_result() {
         // Should return Ok if Landlock ABI v4 available, Err otherwise
         // Either result is valid depending on kernel version
@@ -1214,18 +1280,10 @@ mod tests {
         let _ = result;
     }
 
-    #[test]
-    #[cfg(not(target_os = "linux"))]
-    fn test_check_available_non_linux() {
-        let result = check_available();
-        assert!(matches!(result, Err(SandboxError::UnsupportedPlatform)));
-    }
-
     // ========================================================================
     // build_landlock_ruleset tests
     // ========================================================================
 
-    #[cfg(target_os = "linux")]
     fn make_test_config() -> SandboxConfig {
         SandboxConfig::new(
             PathBuf::from("/tmp/test-workspace"),
@@ -1236,7 +1294,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
     fn test_build_landlock_ruleset_basic() {
         let config = make_test_config();
         let result = build_landlock_ruleset(&config, &[]);
@@ -1250,7 +1307,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
     fn test_build_landlock_ruleset_with_path_dirs() {
         let config = make_test_config();
         let path_dirs = vec![PathBuf::from("/usr/bin"), PathBuf::from("/bin")];
@@ -1261,7 +1317,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
     fn test_build_landlock_ruleset_with_mounts() {
         use crate::Mount;
         let config = make_test_config()
@@ -1280,7 +1335,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
     fn test_build_landlock_ruleset_skips_nonexistent_paths() {
         let config = SandboxConfig::new(
             PathBuf::from("/nonexistent/workspace/12345"),
@@ -1295,40 +1349,12 @@ mod tests {
         }
     }
 
-    #[test]
-    #[cfg(not(target_os = "linux"))]
-    fn test_build_landlock_ruleset_non_linux() {
-        let config = SandboxConfig::new(
-            PathBuf::from("/workspace"),
-            SandboxPaths::default(),
-            PathBuf::from("/workspace"),
-        )
-        .with_data_dir(PathBuf::from("/home/.data"));
-        let result = build_landlock_ruleset(&config, &[]);
-        assert!(matches!(result, Err(SandboxError::UnsupportedPlatform)));
-    }
-
-    // ========================================================================
-    // apply_landlock tests
-    // ========================================================================
-
-    // Note: apply_landlock is irreversible for the process, so we can't
-    // test it directly in unit tests. Integration tests would fork a child.
-
-    #[test]
-    #[cfg(not(target_os = "linux"))]
-    fn test_apply_landlock_non_linux() {
-        let result = apply_landlock(());
-        assert!(matches!(result, Err(SandboxError::UnsupportedPlatform)));
-    }
-
     // ========================================================================
     // spawn_with_landlock tests
     // ========================================================================
 
     #[test]
     #[serial]
-    #[cfg(target_os = "linux")]
     fn test_spawn_with_landlock_true_command() -> TestResult {
         use std::collections::HashMap;
 
@@ -1339,10 +1365,14 @@ mod tests {
             dirs.workspace.clone(),
         )
         .with_data_dir(dirs.data_dir);
-        let path_dirs = vec![PathBuf::from("/usr/bin"), PathBuf::from("/bin")];
+        let Some(true_bin) = which("true") else {
+            return Ok(()); // skip: no `true` in PATH
+        };
+        let path_dirs = test_path_dirs(&true_bin);
         let env = HashMap::new();
 
-        let result = spawn_with_landlock(&config, "/bin/true", &[], &env, &path_dirs);
+        let result =
+            spawn_with_landlock(&config, &true_bin.to_string_lossy(), &[], &env, &path_dirs);
 
         if check_available().is_ok() {
             match result {
@@ -1366,7 +1396,6 @@ mod tests {
 
     #[test]
     #[serial]
-    #[cfg(target_os = "linux")]
     fn test_spawn_with_landlock_echo_command() -> TestResult {
         use std::collections::HashMap;
 
@@ -1377,12 +1406,15 @@ mod tests {
             dirs.workspace.clone(),
         )
         .with_data_dir(dirs.data_dir);
-        let path_dirs = vec![PathBuf::from("/usr/bin"), PathBuf::from("/bin")];
+        let Some(echo_bin) = which("echo") else {
+            return Ok(()); // skip: no `echo` in PATH
+        };
+        let path_dirs = test_path_dirs(&echo_bin);
         let env = HashMap::new();
 
         let result = spawn_with_landlock(
             &config,
-            "/bin/echo",
+            &echo_bin.to_string_lossy(),
             &["hello".to_string()],
             &env,
             &path_dirs,
@@ -1410,7 +1442,6 @@ mod tests {
 
     #[test]
     #[serial]
-    #[cfg(target_os = "linux")]
     fn test_spawn_with_landlock_nonexistent_command() {
         use std::collections::HashMap;
 
@@ -1449,7 +1480,6 @@ mod tests {
     /// be missing here if the live path is broken.
     #[test]
     #[serial]
-    #[cfg(target_os = "linux")]
     fn test_overlay_live_flush_during_long_running_session() -> TestResult {
         let temp = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
         let rw_dir = temp.path().join("data");
@@ -1566,7 +1596,6 @@ mod tests {
     /// itself — which is also the root of every `rw_paths` directory used in
     /// these tests.  All rw directories therefore fall inside the overlay and
     /// are covered by the `rw_dirs` flush path.
-    #[cfg(target_os = "linux")]
     fn spawn_rw(
         workspace: &std::path::Path,
         rw_paths: &[&str],
@@ -1599,13 +1628,13 @@ mod tests {
             .with_data_dir(workspace.to_path_buf())
             .with_env(HashMap::new());
 
-        let path_dirs = vec![PathBuf::from("/bin"), PathBuf::from("/usr/bin")];
+        let (test_env, path_dirs) = host_path_env();
 
         match spawn_with_landlock(
             &config,
             "/bin/sh",
             &["-c".to_string(), cmd.to_string()],
-            &HashMap::new(),
+            &test_env,
             &path_dirs,
         ) {
             Ok((child, handle, _netns)) => Some((child, handle)),
@@ -1621,7 +1650,6 @@ mod tests {
 
     /// Run `spawn_rw`, wait for the child, call teardown, then return whether
     /// the overlay was active (`Some` handle → true, `None` → false).
-    #[cfg(target_os = "linux")]
     fn run_sandboxed_rw(workspace: &std::path::Path, rw_paths: &[&str], cmd: &str) -> bool {
         let Some((mut child, overlay_handle)) = spawn_rw(workspace, rw_paths, cmd) else {
             return false;
@@ -1647,7 +1675,6 @@ mod tests {
     /// after it.
     #[test]
     #[serial]
-    #[cfg(target_os = "linux")]
     fn test_overlay_flush_workspace_under_home_overlay() -> TestResult {
         use std::collections::HashMap;
 
@@ -1681,7 +1708,7 @@ mod tests {
             .with_data_dir(workspace)
             .with_env(HashMap::new());
 
-        let path_dirs = vec![PathBuf::from("/bin"), PathBuf::from("/usr/bin")];
+        let (test_env, path_dirs) = host_path_env();
         let cmd = format!(
             "printf 'fn main() {{ println!(\"hi\"); }}' > '{}'",
             target.display()
@@ -1691,7 +1718,7 @@ mod tests {
             &config,
             "/bin/sh",
             &["-c".to_string(), cmd],
-            &HashMap::new(),
+            &test_env,
             &path_dirs,
         );
 
@@ -1727,7 +1754,6 @@ mod tests {
     /// entry).  This is the original `write_set` path.
     #[test]
     #[serial]
-    #[cfg(target_os = "linux")]
     fn test_overlay_flush_direct_file_entry() -> TestResult {
         let temp = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
         let target = temp.path().join("config.json");
@@ -1754,7 +1780,6 @@ mod tests {
     /// entry — the `rw_dirs` path that was broken before this fix).
     #[test]
     #[serial]
-    #[cfg(target_os = "linux")]
     fn test_overlay_flush_file_inside_rw_dir() -> TestResult {
         let temp = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
         let dir = temp.path().join("mydir");
@@ -1779,7 +1804,6 @@ mod tests {
     /// Modify multiple files inside the same rw directory in one session.
     #[test]
     #[serial]
-    #[cfg(target_os = "linux")]
     fn test_overlay_flush_multiple_files_in_rw_dir() -> TestResult {
         let temp = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
         let dir = temp.path().join("store");
@@ -1815,7 +1839,6 @@ mod tests {
     /// Create a new file inside an rw directory (file did not exist at spawn time).
     #[test]
     #[serial]
-    #[cfg(target_os = "linux")]
     fn test_overlay_flush_newly_created_file_in_rw_dir() -> TestResult {
         let temp = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
         let dir = temp.path().join("newdir");
@@ -1847,7 +1870,6 @@ mod tests {
     /// All parent directories exist at spawn time.
     #[test]
     #[serial]
-    #[cfg(target_os = "linux")]
     fn test_overlay_flush_deeply_nested_existing_file() -> TestResult {
         let temp = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
         let rw_dir = temp.path().join("store");
@@ -1878,7 +1900,6 @@ mod tests {
     /// The subdirectory did not exist at spawn time.
     #[test]
     #[serial]
-    #[cfg(target_os = "linux")]
     fn test_overlay_flush_file_in_new_subdir() -> TestResult {
         let temp = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
         let rw_dir = temp.path().join("data");
@@ -1915,7 +1936,6 @@ mod tests {
     /// Atomic write (write-to-tmp then rename) inside an rw directory.
     #[test]
     #[serial]
-    #[cfg(target_os = "linux")]
     fn test_overlay_flush_atomic_write_in_rw_dir() -> TestResult {
         let temp = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
         let dir = temp.path().join("cfg");
@@ -1946,7 +1966,6 @@ mod tests {
     /// Mix of a direct file entry and a directory entry in the same session.
     #[test]
     #[serial]
-    #[cfg(target_os = "linux")]
     fn test_overlay_flush_mixed_file_and_dir_entries() -> TestResult {
         let temp = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
         let file_entry = temp.path().join("config.json");
@@ -1989,7 +2008,6 @@ mod tests {
     /// Append to an existing file inside an rw directory.
     #[test]
     #[serial]
-    #[cfg(target_os = "linux")]
     fn test_overlay_flush_append_to_file_in_rw_dir() -> TestResult {
         let temp = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
         let dir = temp.path().join("logs");
@@ -2018,7 +2036,6 @@ mod tests {
     /// directory by the sandbox process.  Its contents must be flushed.
     #[test]
     #[serial]
-    #[cfg(target_os = "linux")]
     fn test_overlay_flush_nonexistent_rw_path_created_as_dir() -> TestResult {
         let temp = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
         // rw_dir does NOT exist at spawn time — it will be created by the sandbox.
@@ -2061,7 +2078,6 @@ mod tests {
     /// reached the upper layer, the flush condition would not match.
     #[test]
     #[serial]
-    #[cfg(target_os = "linux")]
     fn test_overlay_no_flush_for_non_rw_dir() -> TestResult {
         use std::collections::HashMap;
 
@@ -2073,7 +2089,11 @@ mod tests {
         // workspace/ is the workspace — its contents ARE flushed.
         // sibling/ is a sibling directory outside the workspace — writes are
         // blocked by Landlock and must not be flushed.
-        let base = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
+        // The default temp dir is under /tmp, which the sandbox can always
+        // write. This test needs a directory outside of it.
+        let Some(base) = non_tmp_tempdir() else {
+            return Ok(());
+        };
         let workspace = base.path().join("workspace");
         let sibling = base.path().join("sibling");
         std::fs::create_dir_all(&workspace).map_err(|e| format!("create workspace: {e}"))?;
@@ -2100,7 +2120,7 @@ mod tests {
         let config = SandboxConfig::new(workspace.clone(), paths, workspace.clone())
             .with_data_dir(workspace)
             .with_env(HashMap::new());
-        let path_dirs = vec![PathBuf::from("/bin"), PathBuf::from("/usr/bin")];
+        let (test_env, path_dirs) = host_path_env();
 
         // The sandbox can write to workspace (Landlock allows it) but not to
         // sibling (Landlock denies it — the write fails silently).
@@ -2114,7 +2134,7 @@ mod tests {
             &config,
             "/bin/sh",
             &["-c".to_string(), cmd],
-            &HashMap::new(),
+            &test_env,
             &path_dirs,
         );
         let (mut child, overlay_handle, _netns) = match result {
@@ -2150,7 +2170,6 @@ mod tests {
 
     #[test]
     #[serial]
-    #[cfg(target_os = "linux")]
     fn test_overlay_atomic_write_preserves_inode() -> TestResult {
         // Verify that the overlayfs + inotify pipeline correctly:
         //   1. lets the child atomically replace a write-listed file
@@ -2168,7 +2187,11 @@ mod tests {
             return Ok(());
         }
 
-        let temp = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
+        // The default temp dir is under /tmp, which the sandbox can always
+        // write. This test needs a directory outside of it.
+        let Some(temp) = non_tmp_tempdir() else {
+            return Ok(());
+        };
         let target = temp.path().join("target.json");
         std::fs::write(&target, r#"{"version":1}"#).map_err(|e| format!("write: {e}"))?;
         let inode_before = std::fs::metadata(&target)
@@ -2186,7 +2209,7 @@ mod tests {
             .with_data_dir(temp.path().to_path_buf())
             .with_env(HashMap::new());
 
-        let path_dirs = vec![PathBuf::from("/bin"), PathBuf::from("/usr/bin")];
+        let (test_env, path_dirs) = host_path_env();
 
         let new_content = r#"{"version":2}"#;
         // Atomic write: write to a sibling tmp file then rename into place.
@@ -2203,7 +2226,7 @@ mod tests {
             &config,
             "/bin/sh",
             &["-c".to_string(), cmd],
-            &HashMap::new(),
+            &test_env,
             &path_dirs,
         );
 
@@ -2264,10 +2287,8 @@ mod tests {
     ///
     /// Used by tests that temporarily redirect HOME to a temp directory so that
     /// `spawn_with_landlock` computes overlay roots relative to a fake home.
-    #[cfg(target_os = "linux")]
     struct HomeGuard(String);
 
-    #[cfg(target_os = "linux")]
     impl HomeGuard {
         fn set(new_home: &std::path::Path) -> Self {
             let old = std::env::var("HOME").unwrap_or_default();
@@ -2278,7 +2299,6 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
     impl Drop for HomeGuard {
         fn drop(&mut self) {
             #[allow(deprecated)]
@@ -2292,7 +2312,6 @@ mod tests {
     /// overlay mounts via the MCA algorithm).  `rw_dirs` are added as directory
     /// entries so their writes are flushed back.  The command's working
     /// directory and data_dir are both `work_dir`.
-    #[cfg(target_os = "linux")]
     #[allow(clippy::too_many_arguments)]
     fn spawn_with_fake_home(
         fake_home: &std::path::Path,
@@ -2326,7 +2345,7 @@ mod tests {
             .with_data_dir(work_dir.to_path_buf())
             .with_env(HashMap::new());
 
-        let path_dirs = vec![PathBuf::from("/bin"), PathBuf::from("/usr/bin")];
+        let (test_env, path_dirs) = host_path_env();
 
         // HOME must be set to fake_home before this call so that
         // spawn_with_landlock computes overlay roots relative to it.
@@ -2336,7 +2355,7 @@ mod tests {
             &config,
             "/bin/sh",
             &["-c".to_string(), cmd.to_string()],
-            &HashMap::new(),
+            &test_env,
             &path_dirs,
         ) {
             Ok((child, handle, _netns)) => Some((child, handle)),
@@ -2362,9 +2381,12 @@ mod tests {
     /// layer.  The sandboxed `ls` on that directory must return non-zero.
     #[test]
     #[serial]
-    #[cfg(target_os = "linux")]
     fn test_overlay_non_accessible_sibling_is_eacces() -> TestResult {
-        let fake_home = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
+        // The default temp dir is under /tmp, which the sandbox can always
+        // write. This test needs a directory outside of it.
+        let Some(fake_home) = non_tmp_tempdir() else {
+            return Ok(());
+        };
         let config_dir = fake_home.path().join(".config");
         let allowed_file = config_dir.join("allowed.txt");
         let secret_dir = config_dir.join("secret");
@@ -2427,7 +2449,6 @@ mod tests {
     /// the sandbox ran.
     #[test]
     #[serial]
-    #[cfg(target_os = "linux")]
     fn test_overlay_real_permissions_not_leaked() -> TestResult {
         use std::os::unix::fs::PermissionsExt;
 
@@ -2482,7 +2503,6 @@ mod tests {
     /// After teardown the file must be gone from the real filesystem.
     #[test]
     #[serial]
-    #[cfg(target_os = "linux")]
     fn test_overlay_flush_delete_file_in_rw_dir() -> TestResult {
         let temp = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
         let dir = temp.path().join("data");
@@ -2515,7 +2535,6 @@ mod tests {
     /// gone from the real filesystem.
     #[test]
     #[serial]
-    #[cfg(target_os = "linux")]
     fn test_overlay_flush_delete_direct_write_set_entry() -> TestResult {
         let temp = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
         let target = temp.path().join("config.json");
@@ -2561,7 +2580,6 @@ mod tests {
     /// root, triggering the full overlayfs whiteout path.
     #[test]
     #[serial]
-    #[cfg(target_os = "linux")]
     fn test_overlay_flush_delete_under_overlay_root() -> TestResult {
         let fake_home = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
         let work_dir = fake_home.path().join("work");
@@ -2621,7 +2639,6 @@ mod tests {
     /// and the real directory was left behind.
     #[test]
     #[serial]
-    #[cfg(target_os = "linux")]
     fn test_overlay_delete_session_created_dir() -> TestResult {
         let fake_home = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
         let work_dir = fake_home.path().join("work");
@@ -2680,7 +2697,6 @@ mod tests {
     /// during `IN_CLOSE_WRITE` would stay on the real FS forever.
     #[test]
     #[serial]
-    #[cfg(target_os = "linux")]
     fn test_overlay_atomic_write_no_tmp_residue() -> TestResult {
         let fake_home = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
         let work_dir = fake_home.path().join("work");
@@ -2734,7 +2750,6 @@ mod tests {
     /// must use `remove_dir_all`, not `remove_file`, to propagate this.
     #[test]
     #[serial]
-    #[cfg(target_os = "linux")]
     fn test_overlay_flush_delete_dir_under_overlay_root() -> TestResult {
         let fake_home = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
         let work_dir = fake_home.path().join("work");
@@ -2787,7 +2802,6 @@ mod tests {
     /// permissions set inside the sandbox.
     #[test]
     #[serial]
-    #[cfg(target_os = "linux")]
     fn test_overlay_flush_permissions_under_overlay_root() -> TestResult {
         use std::os::unix::fs::PermissionsExt;
 
@@ -2841,7 +2855,6 @@ mod tests {
     /// survive the sandbox session intact.
     #[test]
     #[serial]
-    #[cfg(target_os = "linux")]
     fn test_overlay_delete_readonly_not_flushed() -> TestResult {
         let fake_home = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
         let work_dir = fake_home.path().join("work");
@@ -2901,39 +2914,179 @@ mod tests {
         Ok(())
     }
 
-    /// `execute_access` must NOT include `ReadFile`.
+    /// Execute-only access must NOT include `ReadFile`.
     ///
     /// Paths in `paths.execute` should be execute-only: the sandboxed process
     /// can `execve` binaries there but cannot `open(O_RDONLY)` them (which
     /// would let an attacker exfiltrate binary content).
     ///
-    /// System library paths (`syslib_access`) intentionally DO include
+    /// System library paths (`READ_EXECUTE`) intentionally DO include
     /// `ReadFile` because the dynamic linker uses `open()` to load `.so` files.
     #[test]
-    #[cfg(target_os = "linux")]
     fn test_execute_access_excludes_read_file() {
-        use landlock::{Access, AccessFs, ABI};
-        // Reproduce the execute_access and syslib_access constants from the
-        // production Landlock ruleset builder.
-        let execute_access = AccessFs::ReadDir | AccessFs::Execute;
-        let syslib_access = AccessFs::ReadFile | AccessFs::ReadDir | AccessFs::Execute;
-        let all_access = AccessFs::from_all(ABI::V4);
+        assert_eq!(access::EXECUTE_ONLY & access::READ_FILE, 0);
+        assert_ne!(access::READ_EXECUTE & access::READ_FILE, 0);
+        assert_eq!(access::ALL & access::EXECUTE_ONLY, access::EXECUTE_ONLY);
+    }
 
-        // Sanity: both are subsets of all_access.
-        assert!(all_access.contains(execute_access));
-        assert!(all_access.contains(syslib_access));
+    // ========================================================================
+    // Device set, masks and ordering
+    // ========================================================================
 
-        // Core invariant: execute-only paths must not grant ReadFile.
+    #[test]
+    fn test_dev_paths_are_minimal() {
+        assert!(!DEV_RW_PATHS.contains(&"/dev"));
+        assert!(!DEV_READ_PATHS.contains(&"/dev"));
+        for p in ["/dev/shm", "/dev/mqueue"] {
+            assert!(
+                !DEV_RW_PATHS.contains(&p),
+                "{p} must not be writable by default"
+            );
+            assert!(!DEV_READ_PATHS.contains(&p));
+        }
+        for p in ["/dev/null", "/dev/tty", "/dev/pts", "/dev/ptmx"] {
+            assert!(DEV_RW_PATHS.contains(&p), "{p} must be writable");
+        }
+        assert!(DEV_READ_PATHS.contains(&"/dev/urandom"));
+        let set = compute_accessible_set(&make_test_config(), &[]);
+        assert!(!set.contains(Path::new("/dev")));
+        assert!(set.contains(Path::new("/dev/null")));
+    }
+
+    #[test]
+    fn test_system_paths_include_nix_store() {
+        assert!(SYSTEM_PATHS.contains(&"/nix/store"));
+        assert!(!SYSTEM_PATHS.contains(&"/"));
+    }
+
+    #[test]
+    fn test_is_explicitly_allowed() {
+        let mask = Path::new("/run/user/1000");
+        let ancestor_only = vec![PathBuf::from("/"), PathBuf::from("/run")];
+        assert!(!is_explicitly_allowed(mask, &ancestor_only));
+        let inside = vec![PathBuf::from("/run/user/1000/bus")];
+        assert!(is_explicitly_allowed(mask, &inside));
+        let exact = vec![PathBuf::from("/run/user/1000")];
+        assert!(is_explicitly_allowed(mask, &exact));
+        let sibling = vec![PathBuf::from("/run/user/10000")];
+        assert!(!is_explicitly_allowed(mask, &sibling));
+    }
+
+    #[test]
+    fn test_mask_targets_skip_configured_runtime_dir() {
+        let mut paths = SandboxPaths::default();
+        paths.read_write.push("/run/user/4242/app".to_string());
+        let config = SandboxConfig::new(PathBuf::from("/tmp"), paths, PathBuf::from("/tmp"));
+        let (dirs, _) = mask_targets(&config, 4242);
+        assert!(!dirs.contains(&PathBuf::from("/run/user/4242")));
+    }
+
+    #[test]
+    fn test_read_write_helpers_handle_pipes() -> TestResult {
+        let (r, w) = cloexec_pipe().map_err(|e| format!("pipe: {e}"))?;
+        write_all_fd(w.as_raw_fd(), b"abcd")?;
+        drop(w);
+        let mut buf = [0u8; 4];
+        assert!(read_exact_fd(r.as_raw_fd(), &mut buf)?);
+        assert_eq!(&buf, b"abcd");
+        // EOF before any byte.
+        assert!(!read_exact_fd(r.as_raw_fd(), &mut buf)?);
+        Ok(())
+    }
+
+    /// With no overlays and `LocalhostOnly`, the child must write its UID map
+    /// before Landlock applies. A wrong order runs the child as UID 65534.
+    #[test]
+    #[serial]
+    fn test_spawn_keeps_real_uid() -> TestResult {
+        use std::collections::HashMap;
+        if check_available().is_err() {
+            return Ok(());
+        }
+        let (Some(sh), Some(id_bin)) = (which("sh"), which("id")) else {
+            return Ok(()); // skip: no sh or id in PATH
+        };
+        let dirs = make_test_dirs();
+        let config = SandboxConfig::new(
+            dirs.workspace.clone(),
+            SandboxPaths::default(),
+            dirs.workspace.clone(),
+        )
+        .with_data_dir(dirs.data_dir)
+        .with_network(NetworkMode::LocalhostOnly);
+        let mut path_dirs = test_path_dirs(&sh);
+        path_dirs.extend(test_path_dirs(&id_bin));
+        // SAFETY: getuid has no preconditions.
+        let uid = unsafe { libc::getuid() };
+        let script = format!("[ \"$({} -u)\" = {uid} ]", id_bin.display());
+        let (mut child, _overlay, _netns) = spawn_with_landlock(
+            &config,
+            &sh.to_string_lossy(),
+            &["-c".to_string(), script],
+            &HashMap::new(),
+            &path_dirs,
+        )
+        .map_err(|e| format!("spawn failed: {e:?}"))?;
         assert!(
-            !execute_access.contains(AccessFs::ReadFile),
-            "execute_access must not grant ReadFile — \
-             execute paths should be execute-only so cat(1) cannot read installed binaries"
+            child.wait()?.success(),
+            "the child must run with the real UID, not 65534"
         );
+        Ok(())
+    }
 
-        // System lib paths must grant ReadFile (dynamic linker needs it).
-        assert!(
-            syslib_access.contains(AccessFs::ReadFile),
-            "syslib_access must grant ReadFile so the dynamic linker can open shared libraries"
-        );
+    // ========================================================================
+    // Test helpers
+    // ========================================================================
+
+    /// A temp dir outside /tmp and /var/tmp (which the sandbox can always
+    /// write), in the crate directory. Returns `None` if the crate directory
+    /// is itself under a temp path.
+    fn non_tmp_tempdir() -> Option<TempDir> {
+        let base = Path::new(env!("CARGO_MANIFEST_DIR"));
+        if TEMP_PATHS.iter().any(|t| base.starts_with(t)) {
+            return None;
+        }
+        tempfile::tempdir_in(base).ok()
+    }
+
+    /// The PATH of the test process as a child environment, and the PATH
+    /// directories with their canonical targets (for the Landlock rules).
+    fn host_path_env() -> (std::collections::HashMap<String, String>, Vec<PathBuf>) {
+        let path = std::env::var("PATH").unwrap_or_default();
+        let mut dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
+        for d in dirs.clone() {
+            if let Ok(real) = std::fs::canonicalize(&d) {
+                dirs.push(real);
+            }
+        }
+        dirs.push(PathBuf::from("/bin"));
+        dirs.push(PathBuf::from("/usr/bin"));
+        let mut env = std::collections::HashMap::new();
+        env.insert("PATH".to_string(), path);
+        (env, dirs)
+    }
+
+    /// Find `name` in PATH (like `which`). Returns `None` if it is absent.
+    fn which(name: &str) -> Option<PathBuf> {
+        std::env::var_os("PATH").and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|d| d.join(name))
+                .find(|p| p.is_file())
+        })
+    }
+
+    /// PATH-like directories for a test binary: its directory and the
+    /// directory of its canonical target.
+    fn test_path_dirs(bin: &Path) -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = bin.parent().map(Path::to_path_buf).into_iter().collect();
+        if let Some(real) = std::fs::canonicalize(bin)
+            .ok()
+            .and_then(|r| r.parent().map(Path::to_path_buf))
+        {
+            v.push(real);
+        }
+        v.push(PathBuf::from("/usr/bin"));
+        v.push(PathBuf::from("/bin"));
+        v
     }
 }

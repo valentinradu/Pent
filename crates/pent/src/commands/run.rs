@@ -1277,25 +1277,18 @@ async fn setup_proxy(
             ProxyConfig::try_from(&config.proxy).map_err(|e| CliError::Other(e.to_string()))?;
         proxy_config.violation_tx = violation_tx;
         // On Linux, ProxyOnly routes child traffic from a separate network
-        // namespace through a veth pair. Both the TCP proxy and DNS server must
-        // listen on all interfaces (0.0.0.0) because:
-        //   1. The child's loopback is isolated from the parent's loopback.
-        //   2. The veth outer interface (10.200.x.1) is created inside
-        //      spawn_sandboxed *after* the proxy binds.
-        //   3. A socket bound to 0.0.0.0 accepts connections on interfaces
-        //      added after bind, so veth traffic arrives correctly.
-        //   4. The DNS server must also be reachable from the veth so that
-        //      DNS queries from the child namespace (redirected from port 53
-        //      via a PREROUTING rule) reach the proxy's resolver.
+        // namespace through a veth pair. The child's loopback is isolated, so
+        // the TCP proxy and the DNS server listen on the host side of the
+        // veth. Create the veth first, then bind to its outer address only.
+        // Other hosts on the LAN cannot reach this address (the host firewall
+        // drops packets to it from other interfaces). spawn_sandboxed uses the
+        // prepared veth because proxy_addr is on its outer address.
         #[cfg(target_os = "linux")]
         {
-            // Both the TCP proxy and DNS server must listen on all interfaces
-            // (0.0.0.0) so they are reachable from the veth outer IP (10.200.x.1).
-            // The child's loopback is isolated; only the veth reaches the host.
-            const BIND_ALL_ANY: std::net::SocketAddr =
-                std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
-            proxy_config.proxy_bind_addr = BIND_ALL_ANY;
-            proxy_config.dns_bind_addr = BIND_ALL_ANY;
+            let outer_ip = pent_sandbox::prepare_proxy_network()?;
+            let bind_addr = std::net::SocketAddr::new(std::net::IpAddr::V4(outer_ip), 0);
+            proxy_config.proxy_bind_addr = bind_addr;
+            proxy_config.dns_bind_addr = bind_addr;
         }
         let handle = ProxyServer::new(proxy_config)?.start().await?;
         let proxy_addr = handle.proxy_addr();
