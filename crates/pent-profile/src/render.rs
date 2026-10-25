@@ -1085,3 +1085,169 @@ Network
         Ok(())
     }
 }
+
+/// Property tests of the draft writer and of the profile reader.
+///
+/// A rule holds a path or a domain that the watched program chose, so a
+/// rule can hold any text. The same properties run as the `cargo fuzz`
+/// targets in `crates/pent-profile/fuzz`; this module repeats them with a
+/// fixed seed, so that the stable toolchain also checks them. See
+/// `docs/testing/fuzzing-and-coverage.md`.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)] // the generator uses only literals
+mod render_properties {
+    use super::*;
+    use crate::fixture::{rounds, Rng};
+
+    /// The number of documents that each property test reads by default.
+    const ROUNDS: usize = 20_000;
+
+    /// The characters that a generated rule can hold. They cover the three
+    /// groups that the writer must escape: the TOML syntax, the control
+    /// characters and the Unicode format characters.
+    const PIECES: [&str; 16] = [
+        "a",
+        "/home/u/work",
+        "~/.ssh",
+        "\"",
+        "\\",
+        "\n",
+        "\r",
+        "\t",
+        "\u{0}",
+        "\u{1b}",
+        "\u{7f}",
+        "\u{202e}",
+        "\u{feff}",
+        "\u{e0020}",
+        "#",
+        " ",
+    ];
+
+    /// Build one rule out of the pieces.
+    fn gen_rule(rng: &mut Rng) -> String {
+        let parts = rng.below(6);
+        (0..parts)
+            .map(|_| PIECES.get(rng.below(PIECES.len())).copied().unwrap_or("a"))
+            .collect()
+    }
+
+    /// Build a list of rules.
+    fn gen_rules(rng: &mut Rng) -> Vec<String> {
+        let count = rng.below(4);
+        (0..count).map(|_| gen_rule(rng)).collect()
+    }
+
+    /// Build a document.
+    fn gen_doc(rng: &mut Rng) -> ProfileDoc {
+        ProfileDoc {
+            filesystem: crate::FilesystemRules {
+                read: gen_rules(rng),
+                read_write: gen_rules(rng),
+                execute: gen_rules(rng),
+                unix_sockets: gen_rules(rng),
+            },
+            network: crate::NetworkRules {
+                domains: gen_rules(rng),
+            },
+        }
+    }
+
+    /// A draft parses back to the document that it holds, and it holds no
+    /// control character except the newline.
+    #[test]
+    fn a_draft_round_trips_and_is_safe_for_the_terminal() {
+        let mut rng = Rng::new(0x5EED_0601);
+        let total = rounds(ROUNDS);
+        let Ok(name) = "fuzz".parse::<ProfileName>() else {
+            panic!("the name \"fuzz\" must be valid");
+        };
+        let mut checked = 0usize;
+        for _ in 0..total {
+            let doc = gen_doc(&mut rng);
+            let source = if rng.one_in(2) {
+                DraftSource::WatchRuns(rng.below(5))
+            } else {
+                DraftSource::DeniedReview
+            };
+            let mut reasons = Reasons::default();
+            reasons.merge_missing(Reasons::from_summary(&Summary::default()));
+            let text = render_draft_with(&name, source, &doc, &reasons, Warnings::default());
+            if let Some(c) = text.chars().find(|c| c.is_control() && *c != '\n') {
+                panic!("the draft holds the control character {c:?}: {text:?}");
+            }
+            match ProfileDoc::parse(&text) {
+                Ok(parsed) => assert_eq!(parsed, doc, "the draft does not round trip: {text:?}"),
+                Err(e) => panic!("the draft does not parse: {e}: {text:?}"),
+            }
+            checked = checked.saturating_add(1);
+        }
+        assert!(
+            checked == total,
+            "the test read {checked} of {total} inputs"
+        );
+    }
+
+    /// The plain profile text and the terminal summary hold no control
+    /// character either. `pent trust` prints them to the terminal of the
+    /// user, so an escape sequence in a path must never reach it.
+    #[test]
+    fn the_profile_text_is_safe_for_the_terminal() {
+        let mut rng = Rng::new(0x5EED_0602);
+        let total = rounds(ROUNDS);
+        for _ in 0..total {
+            let doc = gen_doc(&mut rng);
+            let text = render_profile(&doc, &Reasons::default());
+            if let Some(c) = text.chars().find(|c| c.is_control() && *c != '\n') {
+                panic!("the profile text holds the control character {c:?}: {text:?}");
+            }
+            // `safe_lines` is the guard for a file that a person edited.
+            let safe = safe_lines(&text);
+            assert_eq!(safe, text, "safe_lines changed a text that pent wrote");
+        }
+    }
+
+    /// `safe_lines` escapes every control character except the newline, and
+    /// it changes nothing else.
+    #[test]
+    fn safe_lines_escapes_every_control_character() {
+        let mut rng = Rng::new(0x5EED_0603);
+        let total = rounds(ROUNDS);
+        for _ in 0..total {
+            let text = gen_rule(&mut rng);
+            let safe = safe_lines(&text);
+            if let Some(c) = safe.chars().find(|c| c.is_control() && *c != '\n') {
+                panic!("safe_lines kept the control character {c:?} of {text:?}");
+            }
+            if !text.chars().any(|c| c.is_control() && c != '\n') {
+                // The function must not change a text that is already safe,
+                // apart from the format characters that it also escapes.
+                assert!(safe.len() >= text.len(), "safe_lines made the text shorter");
+            }
+        }
+    }
+
+    /// A rule that `toml_string` writes parses back to the same rule.
+    #[test]
+    fn a_toml_string_parses_back_to_the_rule() {
+        let mut rng = Rng::new(0x5EED_0604);
+        let total = rounds(ROUNDS);
+        for _ in 0..total {
+            let rule = gen_rule(&mut rng);
+            let literal = toml_string(&rule);
+            assert!(
+                !literal.chars().any(char::is_control),
+                "the literal of {rule:?} holds a control character"
+            );
+            let document = format!("[filesystem]\nread = [{literal}]\n");
+            match ProfileDoc::parse(&document) {
+                Ok(doc) => assert_eq!(
+                    doc.filesystem.read,
+                    vec![rule.clone()],
+                    "the literal {literal} does not parse back to {rule:?}"
+                ),
+                Err(e) => panic!("the literal {literal} does not parse: {e}"),
+            }
+        }
+    }
+}

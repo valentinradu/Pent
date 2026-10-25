@@ -420,3 +420,229 @@ pub(crate) mod tests {
         drop(a);
     }
 }
+
+/// Property tests of the readers of the first client bytes.
+///
+/// The client chooses every byte of the TLS ClientHello and of the HTTP
+/// request head. The proxy makes a policy decision from the name that it
+/// reads there. See `docs/testing/fuzzing-and-coverage.md`.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)] // the generator uses only literals
+mod inspect_properties {
+    use super::*;
+    use crate::test_support::{rounds, Rng};
+
+    /// The number of inputs that each property test reads by default.
+    const ROUNDS: usize = 100_000;
+
+    /// A host name that the generator puts in the server name extension.
+    fn gen_host(rng: &mut Rng) -> String {
+        const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789-.";
+        let len = 1usize.saturating_add(rng.below(30));
+        (0..len)
+            .map(|_| {
+                let at = rng.below(ALPHABET.len());
+                char::from(*ALPHABET.get(at).unwrap_or(&b'a'))
+            })
+            .collect()
+    }
+
+    /// Build a TLS record that holds a ClientHello with the server name
+    /// `host`, and with `extra` other extensions before it.
+    fn gen_client_hello(rng: &mut Rng, host: &str, extra: usize) -> Vec<u8> {
+        let mut extensions: Vec<u8> = Vec::new();
+        for _ in 0..extra {
+            let len = rng.below(20);
+            // An extension type that is not server_name.
+            let kind = 0x0010u16.wrapping_add(u16::try_from(len).unwrap_or(0));
+            extensions.extend(kind.to_be_bytes());
+            extensions.extend(u16::try_from(len).unwrap_or(0).to_be_bytes());
+            extensions.extend(rng.bytes(len));
+        }
+        let name = host.as_bytes();
+        let name_len = u16::try_from(name.len()).unwrap_or(0);
+        let mut server_name: Vec<u8> = Vec::new();
+        server_name.push(0); // name type: host_name
+        server_name.extend(name_len.to_be_bytes());
+        server_name.extend_from_slice(name);
+        let list_len = u16::try_from(server_name.len()).unwrap_or(0);
+        extensions.extend(TLS_EXT_SERVER_NAME.to_be_bytes());
+        extensions.extend(
+            u16::try_from(server_name.len().saturating_add(2))
+                .unwrap_or(0)
+                .to_be_bytes(),
+        );
+        extensions.extend(list_len.to_be_bytes());
+        extensions.extend(server_name);
+
+        let mut hello: Vec<u8> = Vec::new();
+        hello.extend([0x03, 0x03]); // client_version
+        hello.extend(rng.bytes(32)); // random
+        let session = rng.below(32);
+        #[allow(clippy::cast_possible_truncation, reason = "session is below 32")]
+        hello.push(session as u8);
+        hello.extend(rng.bytes(session));
+        let suites = 2usize.saturating_mul(1usize.saturating_add(rng.below(8)));
+        hello.extend(u16::try_from(suites).unwrap_or(2).to_be_bytes());
+        hello.extend(rng.bytes(suites));
+        hello.push(1); // compression methods
+        hello.push(0);
+        hello.extend(u16::try_from(extensions.len()).unwrap_or(0).to_be_bytes());
+        hello.extend(extensions);
+
+        let mut body: Vec<u8> = vec![TLS_CLIENT_HELLO];
+        let hello_len = hello.len();
+        #[allow(clippy::cast_possible_truncation, reason = "the length is 24 bits")]
+        body.extend([
+            ((hello_len >> 16) & 0xFF) as u8,
+            ((hello_len >> 8) & 0xFF) as u8,
+            (hello_len & 0xFF) as u8,
+        ]);
+        body.extend(hello);
+
+        let mut record: Vec<u8> = vec![TLS_HANDSHAKE, 0x03, 0x01];
+        record.extend(u16::try_from(body.len()).unwrap_or(0).to_be_bytes());
+        record.extend(body);
+        record
+    }
+
+    /// The inspector must find the server name of a well-formed
+    /// ClientHello. A miss lets a client ask a shared address for another
+    /// host, and the proxy never sees the name.
+    #[test]
+    fn the_inspector_finds_the_server_name() {
+        let mut rng = Rng::new(0x5EED_0201);
+        let total = rounds(ROUNDS) / 10;
+        for _ in 0..total {
+            let host = gen_host(&mut rng);
+            let extra = rng.below(6);
+            let record = gen_client_hello(&mut rng, &host, extra);
+            assert!(
+                Inspect::Tls.is_complete(&record),
+                "the reader waits for more data for a complete record"
+            );
+            assert_eq!(
+                Inspect::Tls.host_name(&record),
+                Some(host.clone()),
+                "the inspector lost the server name {host:?}"
+            );
+        }
+        assert!(total > 0, "the test read no input");
+    }
+
+    /// A name that the inspector reports must be in the bytes that the
+    /// client sent, and the inspector must never panic.
+    #[test]
+    fn the_inspector_invents_no_name() {
+        let mut rng = Rng::new(0x5EED_0202);
+        let total = rounds(ROUNDS);
+        let mut checked = 0usize;
+        for _ in 0..total {
+            let host = gen_host(&mut rng);
+            let extra = rng.below(4);
+            let mut record = gen_client_hello(&mut rng, &host, extra);
+            // Break the record in one place, as a hostile client does.
+            for _ in 0..rng.below(4) {
+                let at = rng.below(record.len().max(1));
+                if let Some(byte) = record.get_mut(at) {
+                    *byte = rng.byte();
+                }
+            }
+            if rng.one_in(4) {
+                let keep = rng.below(record.len().max(1));
+                record.truncate(keep);
+            }
+            if let Some(found) = extract_sni(&record) {
+                checked = checked.saturating_add(1);
+                // An empty name is a name of zero bytes in the extension.
+                // `normalize_hostname` rejects it, so the proxy blocks it.
+                assert!(
+                    found.is_empty() || record.windows(found.len()).any(|w| w == found.as_bytes()),
+                    "the inspector reported the name {found:?}, which is not in the record"
+                );
+            }
+        }
+        assert!(
+            checked > total / 10,
+            "only {checked} of {total} records gave a name; the test proves little"
+        );
+    }
+
+    /// `read_initial` must stop. The loop ends when `is_complete` is true,
+    /// so a full record must always be complete.
+    #[test]
+    fn a_full_record_is_complete() {
+        let mut rng = Rng::new(0x5EED_0203);
+        let full = TLS_RECORD_HEADER_LEN.saturating_add(TLS_MAX_RECORD_LEN);
+        for _ in 0..1000 {
+            let mut buf = rng.bytes(full);
+            if let Some(first) = buf.first_mut() {
+                *first = TLS_HANDSHAKE;
+            }
+            assert!(
+                Inspect::Tls.is_complete(&buf),
+                "a record of {full} bytes is not complete"
+            );
+            let head = vec![b'A'; MAX_HTTP_HEAD_LEN];
+            assert!(
+                Inspect::Http.is_complete(&head),
+                "a head of {MAX_HTTP_HEAD_LEN} bytes is not complete"
+            );
+        }
+    }
+
+    /// The `Host` header reader must never report an IP address and never
+    /// report text that is not in the head.
+    #[test]
+    fn the_host_reader_invents_no_name() {
+        let mut rng = Rng::new(0x5EED_0204);
+        const VALUES: [&str; 10] = [
+            "example.com",
+            "example.com:80",
+            "127.0.0.1",
+            "127.0.0.1:80",
+            "[::1]:80",
+            "::1",
+            "",
+            " example.com ",
+            "example.com:80:90",
+            "EXAMPLE.com",
+        ];
+        let total = rounds(ROUNDS);
+        let mut checked = 0usize;
+        for _ in 0..total {
+            let value = VALUES.get(rng.below(VALUES.len())).copied().unwrap_or("");
+            let mut head = format!("GET /{} HTTP/1.1\r\n", rng.below(100));
+            if rng.one_in(8) {
+                head.push_str("X-Before: 1\r\n");
+            }
+            head.push_str(&format!("Host: {value}\r\n"));
+            if rng.one_in(4) {
+                head.push_str("Host: other.example\r\n");
+            }
+            head.push_str("\r\n");
+            let mut bytes = head.into_bytes();
+            if rng.one_in(6) {
+                let at = rng.below(bytes.len().max(1));
+                if let Some(byte) = bytes.get_mut(at) {
+                    *byte = rng.byte();
+                }
+            }
+            if let Some(found) = extract_http_host(&bytes) {
+                checked = checked.saturating_add(1);
+                assert!(
+                    found.parse::<IpAddr>().is_err(),
+                    "the reader reported the address {found:?} as a host name"
+                );
+                assert!(
+                    found.is_empty() || bytes.windows(found.len()).any(|w| w == found.as_bytes()),
+                    "the reader reported {found:?}, which is not in the head"
+                );
+            }
+        }
+        assert!(
+            checked > total / 10,
+            "only {checked} of {total} heads gave a host; the test proves little"
+        );
+    }
+}

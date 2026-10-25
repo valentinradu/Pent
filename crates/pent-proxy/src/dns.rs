@@ -2206,3 +2206,384 @@ mod tests {
         );
     }
 }
+
+/// Property tests of the DNS wire parser and the DNS builder.
+///
+/// A hostile program chooses every byte of a query, and a hostile upstream
+/// server chooses every byte of a response. The properties here hold for
+/// each of those byte strings. See `docs/testing/fuzzing-and-coverage.md`.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)] // the generator uses only literals
+mod wire_properties {
+    use super::*;
+    use crate::test_support::{rounds, Rng};
+
+    /// The number of messages that each property test reads by default.
+    const ROUNDS: usize = 200_000;
+
+    /// Append a domain name to `out`.
+    ///
+    /// The generator writes normal labels, labels that are too long, labels
+    /// with the reserved length bits, and compression pointers, so that the
+    /// parser sees every label type.
+    fn push_name(rng: &mut Rng, out: &mut Vec<u8>) {
+        let labels = rng.below(6);
+        for _ in 0..labels {
+            match rng.below(16) {
+                0 => {
+                    // A compression pointer to a random place.
+                    let target = rng.below(out.len().max(1));
+                    #[allow(clippy::cast_possible_truncation, reason = "the pointer is 14 bits")]
+                    let hi = 0xC0 | ((target >> 8) & 0x3F) as u8;
+                    #[allow(clippy::cast_possible_truncation, reason = "the low byte")]
+                    let lo = (target & 0xFF) as u8;
+                    out.push(hi);
+                    out.push(lo);
+                    return;
+                }
+                1 => {
+                    // A length byte with a reserved bit pattern.
+                    out.push(0x40 | rng.byte() & 0x3F);
+                }
+                2 => {
+                    // A label that says more bytes than the message holds.
+                    out.push(0x3F);
+                    let len = rng.below(10);
+                    out.extend(rng.bytes(len));
+                    return;
+                }
+                3 => {
+                    // A label at the limit of 63 bytes, to reach the length
+                    // check of a name of 253 characters.
+                    out.push(63);
+                    out.extend(std::iter::repeat_n(b'a', 63));
+                }
+                _ => {
+                    let len = rng.below(20);
+                    #[allow(clippy::cast_possible_truncation, reason = "len is below 20")]
+                    out.push(len as u8);
+                    if rng.one_in(2) {
+                        // A label that a host name can hold, so that the
+                        // test reaches the normalization and the builder.
+                        const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789-_";
+                        for _ in 0..len {
+                            let at = rng.below(ALPHABET.len());
+                            out.push(*ALPHABET.get(at).unwrap_or(&b'a'));
+                        }
+                    } else {
+                        out.extend(rng.bytes(len));
+                    }
+                }
+            }
+        }
+        out.push(0);
+    }
+
+    /// The shape of a generated message.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Shape {
+        /// A message as a client sends it.
+        Query,
+        /// A message as an upstream server sends it: the QR bit is set, the
+        /// question count is 1, and the class is IN. Without this shape
+        /// `process_upstream_response` rejects nearly every input before it
+        /// reads one record.
+        Response,
+    }
+
+    /// Build a message that looks like a DNS query or a DNS response.
+    fn gen_message(rng: &mut Rng, shape: Shape) -> Vec<u8> {
+        if rng.one_in(8) {
+            // Pure noise, of a length that can be shorter than the header.
+            let len = rng.below(40);
+            return rng.bytes(len);
+        }
+        let mut msg = rng.bytes(HEADER_LEN);
+        // A plausible question count, and plausible record counts.
+        let questions = if shape == Shape::Response {
+            1
+        } else {
+            rng.below(3)
+        };
+        let counts = [questions, rng.below(3), rng.below(3), rng.below(3)];
+        for (index, count) in counts.iter().enumerate() {
+            #[allow(clippy::cast_possible_truncation, reason = "the count is below 3")]
+            let bytes = (*count as u16).to_be_bytes();
+            let at = 4usize.saturating_add(index.saturating_mul(2));
+            if let Some(field) = msg.get_mut(at..at.saturating_add(2)) {
+                field.copy_from_slice(&bytes);
+            }
+        }
+        if shape == Shape::Response {
+            if let Some(flags) = msg.get_mut(2) {
+                *flags |= FLAG_QR;
+            }
+        }
+        push_name(rng, &mut msg);
+        msg.extend(rng.bytes(2)); // QTYPE
+        if shape == Shape::Response {
+            msg.extend(CLASS_IN.to_be_bytes());
+        } else {
+            msg.extend(rng.bytes(2)); // QCLASS
+        }
+        let records = counts[1]
+            .saturating_add(counts[2])
+            .saturating_add(counts[3]);
+        for _ in 0..records {
+            push_name(rng, &mut msg);
+            msg.extend(rng.bytes(2)); // TYPE
+            msg.extend(rng.bytes(2)); // CLASS
+            msg.extend(rng.bytes(4)); // TTL
+            let rdlen = rng.below(20);
+            #[allow(clippy::cast_possible_truncation, reason = "rdlen is below 20")]
+            msg.extend((rdlen as u16).to_be_bytes());
+            msg.extend(rng.bytes(rdlen));
+        }
+        // Flip a few bytes, so that the structure breaks in every place.
+        // A response keeps its header, so that the test reaches the records.
+        let flips = if shape == Shape::Response {
+            rng.below(2)
+        } else {
+            rng.below(4)
+        };
+        for _ in 0..flips {
+            let first = if shape == Shape::Response {
+                HEADER_LEN
+            } else {
+                0
+            };
+            let at = first.saturating_add(rng.below(msg.len().saturating_sub(first).max(1)));
+            if let Some(byte) = msg.get_mut(at) {
+                *byte = rng.byte();
+            }
+        }
+        msg
+    }
+
+    /// `read_name` must return a name that follows its own rules, and it
+    /// must always stop.
+    #[test]
+    fn read_name_holds_its_rules() {
+        let mut rng = Rng::new(0x5EED_0001);
+        let total = rounds(ROUNDS);
+        let mut checked = 0usize;
+        for _ in 0..total {
+            let msg = gen_message(&mut rng, Shape::Query);
+            let start = rng.below(msg.len().max(1));
+            for pointers in [Pointers::Forbidden, Pointers::Allowed] {
+                if let Ok((name, after)) = read_name(&msg, start, pointers, LabelBytes::Strict) {
+                    checked = checked.saturating_add(1);
+                    assert!(
+                        after <= msg.len(),
+                        "the end {after} is after the message {}",
+                        msg.len()
+                    );
+                    assert!(
+                        name.len() <= MAX_WIRE_NAME_LEN,
+                        "the name {name:?} is too long"
+                    );
+                    assert!(
+                        name.bytes().all(|b| b.is_ascii_graphic()),
+                        "the strict name {name:?} holds a byte that is not printable"
+                    );
+                }
+                // The lenient mode takes every byte, but the length limit
+                // and the end of the message still hold.
+                if let Ok((name, after)) = read_name(&msg, start, pointers, LabelBytes::Any) {
+                    assert!(after <= msg.len(), "the end {after} is after the message");
+                    // A byte that is not valid UTF-8 becomes one replacement
+                    // character, so the test counts characters, not bytes.
+                    assert!(
+                        name.chars().count() <= MAX_WIRE_NAME_LEN,
+                        "the lenient name {name:?} is too long"
+                    );
+                }
+            }
+        }
+        assert!(
+            checked > total / 10,
+            "only {checked} of {total} starts held a name; the test proves little"
+        );
+    }
+
+    /// `read_question` must never return an end after the message.
+    #[test]
+    fn read_question_stays_in_the_message() {
+        let mut rng = Rng::new(0x5EED_0002);
+        let total = rounds(ROUNDS);
+        let mut checked = 0usize;
+        for _ in 0..total {
+            let msg = gen_message(&mut rng, Shape::Query);
+            for pointers in [Pointers::Forbidden, Pointers::Allowed] {
+                if let Ok(question) = read_question(&msg, pointers) {
+                    checked = checked.saturating_add(1);
+                    assert!(
+                        question.end <= msg.len(),
+                        "the question ends at {} after the message {}",
+                        question.end,
+                        msg.len()
+                    );
+                    assert!(
+                        question.end >= HEADER_LEN,
+                        "the question ends inside the header"
+                    );
+                }
+            }
+        }
+        assert!(
+            checked > total / 10,
+            "only {checked} of {total} messages held a question; the test proves little"
+        );
+    }
+
+    /// An error response is always a response: the QR bit is set, the header
+    /// is complete, and the question count matches the question that the
+    /// response holds. Without the QR bit the server would answer its own
+    /// answer and make a loop.
+    #[test]
+    fn error_response_is_a_response() {
+        let mut rng = Rng::new(0x5EED_0003);
+        for _ in 0..rounds(ROUNDS) {
+            let query = gen_message(&mut rng, Shape::Query);
+            let end = read_question(&query, Pointers::Forbidden)
+                .ok()
+                .map(|q| q.end);
+            for code in [
+                rcode::FORMERR,
+                rcode::SERVFAIL,
+                rcode::NXDOMAIN,
+                rcode::NOTIMP,
+            ] {
+                for question_end in [None, end] {
+                    let response = build_error_response(&query, question_end, code);
+                    assert!(
+                        response.len() >= HEADER_LEN,
+                        "the response is shorter than the header"
+                    );
+                    let flags = *response.get(2).unwrap();
+                    assert!(flags & FLAG_QR != 0, "the response has no QR bit");
+                    assert_eq!(
+                        *response.get(3).unwrap() & 0x0F,
+                        code,
+                        "the response has the wrong code"
+                    );
+                    let qdcount = read_u16(&response, 4).unwrap();
+                    let body = response.get(HEADER_LEN..).unwrap_or_default();
+                    if qdcount == 0 {
+                        assert!(body.is_empty(), "a response with no question has a body");
+                    } else {
+                        assert_eq!(qdcount, 1, "the question count is not 0 or 1");
+                        let expected = question_end
+                            .and_then(|e| query.get(HEADER_LEN..e))
+                            .unwrap_or_default();
+                        assert_eq!(body, expected, "the question is not the one of the query");
+                    }
+                }
+            }
+        }
+    }
+
+    /// `process_upstream_response` must never panic, and every TTL that it
+    /// reports must be inside the bounds of the configuration.
+    #[test]
+    fn upstream_response_clamps_every_ttl() {
+        let mut rng = Rng::new(0x5EED_0004);
+        let bounds = (30u32, 300u32);
+        let total = rounds(ROUNDS);
+        let mut checked = 0usize;
+        for _ in 0..total {
+            let msg = gen_message(&mut rng, Shape::Response);
+            let id = read_u16(&msg, 0).unwrap_or(0);
+            let name = read_question(&msg, Pointers::Allowed)
+                .map(|q| q.name)
+                .unwrap_or_default();
+            let qtype = read_question(&msg, Pointers::Allowed)
+                .map(|q| q.qtype)
+                .unwrap_or(rtype::A);
+            let len = msg.len();
+            if let Ok(reply) = process_upstream_response(msg, id, &name, qtype, bounds) {
+                checked = checked.saturating_add(1);
+                assert!(
+                    reply.message.len() <= len,
+                    "the reply grew from {len} to {}",
+                    reply.message.len()
+                );
+                if let Some(ttl) = reply.address_ttl {
+                    assert!(
+                        (bounds.0..=bounds.1).contains(&ttl),
+                        "the TTL {ttl} is outside the bounds {bounds:?}"
+                    );
+                }
+                assert!(reply.rcode <= 0x0F, "the rcode has more than four bits");
+            }
+        }
+        assert!(
+            checked > total / 100,
+            "only {checked} of {total} messages were a usable response; the test proves little"
+        );
+    }
+
+    /// The name that the server checks is the name that it sends upstream.
+    ///
+    /// The server reads the question, normalizes the name, checks the
+    /// allowlist with it, and then builds a new query from the same text. If
+    /// the build changed the name, the allowlist decision would apply to
+    /// another name.
+    #[test]
+    fn the_checked_name_is_the_forwarded_name() {
+        let mut rng = Rng::new(0x5EED_0005);
+        let total = rounds(ROUNDS);
+        let mut checked = 0usize;
+        for _ in 0..total {
+            let msg = gen_message(&mut rng, Shape::Query);
+            let Ok(question) = read_question(&msg, Pointers::Forbidden) else {
+                continue;
+            };
+            let Ok(name) = crate::normalize_hostname(&question.name) else {
+                continue;
+            };
+            checked = checked.saturating_add(1);
+            let query = build_dns_query(0x1234, &name, question.qtype);
+            match read_question(&query, Pointers::Forbidden) {
+                Ok(built) => {
+                    assert_eq!(
+                        built.name, name,
+                        "the forwarded name is not the checked one"
+                    );
+                    assert_eq!(built.qtype, question.qtype, "the query type changed");
+                    assert_eq!(built.qclass, CLASS_IN, "the query class is not IN");
+                    assert_eq!(built.end, query.len(), "the built query has extra bytes");
+                }
+                Err(e) => panic!("the built query for {name:?} does not parse: {e}"),
+            }
+        }
+        assert!(
+            checked > total / 100,
+            "only {checked} of {total} questions held a valid host name; the test proves little"
+        );
+    }
+
+    /// A clamped TTL is always inside the bounds, for every pair of bounds.
+    #[test]
+    fn clamp_ttl_stays_in_the_bounds() {
+        let mut rng = Rng::new(0x5EED_0006);
+        for _ in 0..rounds(ROUNDS) {
+            #[allow(clippy::cast_possible_truncation, reason = "the test wants 32 bits")]
+            let ttl = rng.next_u64() as u32;
+            #[allow(clippy::cast_possible_truncation, reason = "the test wants 32 bits")]
+            let min = rng.next_u64() as u32;
+            #[allow(clippy::cast_possible_truncation, reason = "the test wants 32 bits")]
+            let max = rng.next_u64() as u32;
+            let clamped = clamp_ttl(ttl, (min, max));
+            if min <= max {
+                assert!(
+                    (min..=max).contains(&clamped),
+                    "clamp_ttl({ttl}, ({min}, {max})) gave {clamped}"
+                );
+            } else {
+                // The maximum has priority, as the doc comment says.
+                assert_eq!(clamped, max, "the maximum must win over the minimum");
+            }
+        }
+    }
+}

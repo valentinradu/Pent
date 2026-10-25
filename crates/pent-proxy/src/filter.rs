@@ -866,3 +866,185 @@ mod tests {
         ));
     }
 }
+
+/// Property tests of the host normalization and of the domain filter.
+///
+/// The name comes from the hostile program, and the pattern comes from the
+/// profile. The same properties run as a `cargo fuzz` target in
+/// `crates/pent-proxy/fuzz`; this module repeats them with a fixed seed, so
+/// that the stable toolchain also checks them. See
+/// `docs/testing/fuzzing-and-coverage.md`.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)] // the generator uses only literals
+mod filter_properties {
+    use super::*;
+    use crate::test_support::{rounds, Rng};
+
+    /// The number of names that each property test reads by default.
+    const ROUNDS: usize = 200_000;
+
+    /// The characters that the generator puts in a name.
+    const ALPHABET: &[u8] = b"ab.-_*0\x00 \x7fA\xc3\xa9";
+
+    /// Build a name or a pattern.
+    fn gen_name(rng: &mut Rng) -> String {
+        let len = rng.below(20);
+        let bytes: Vec<u8> = (0..len)
+            .map(|_| {
+                let at = rng.below(ALPHABET.len());
+                *ALPHABET.get(at).unwrap_or(&b'a')
+            })
+            .collect();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// A normalized name follows the rules of the documentation, and the
+    /// normalization is idempotent. The proxy normalizes a name more than
+    /// one time (the request, then the server name of the TLS session), and
+    /// the second run must not change the decision.
+    #[test]
+    fn a_normalized_name_follows_the_rules() {
+        let mut rng = Rng::new(0x5EED_0501);
+        let total = rounds(ROUNDS);
+        let mut checked = 0usize;
+        for _ in 0..total {
+            let text = gen_name(&mut rng);
+            let Ok(name) = normalize_hostname(&text) else {
+                continue;
+            };
+            checked = checked.saturating_add(1);
+            assert!(name.is_ascii(), "the name {name:?} is not ASCII");
+            assert!(!name.is_empty(), "the name is empty");
+            assert!(name.len() <= MAX_NAME_LEN, "the name {name:?} is too long");
+            assert_eq!(name, name.to_ascii_lowercase(), "the name is not lowercase");
+            for label in name.split('.') {
+                assert!(!label.is_empty(), "the name {name:?} has an empty label");
+                assert!(label.len() <= MAX_LABEL_LEN, "a label is too long");
+            }
+            assert_eq!(
+                normalize_hostname(&name).ok().as_deref(),
+                Some(name.as_str()),
+                "the normalization is not idempotent for {name:?}"
+            );
+        }
+        assert!(
+            checked > total / 100,
+            "only {checked} of {total} inputs were a name; the test proves little"
+        );
+    }
+
+    /// Build a pattern and a name that are often related, so that the
+    /// filter really matches them. A pair of two names that have nothing in
+    /// common proves nothing about the wildcard rules.
+    fn gen_pair(rng: &mut Rng) -> (String, String) {
+        const LABELS: [&str; 5] = ["a", "b", "example", "com", "x-y"];
+        let label = |rng: &mut Rng| LABELS.get(rng.below(LABELS.len())).copied().unwrap_or("a");
+        let depth = 1usize.saturating_add(rng.below(3));
+        let base: Vec<&str> = (0..depth).map(|_| label(rng)).collect();
+        let base = base.join(".");
+        let pattern = match rng.below(4) {
+            0 => format!("*.{base}"),
+            1 => format!("**.{base}"),
+            2 => base.clone(),
+            _ => {
+                // A pattern that is not valid, or a catch-all.
+                let odd = ["*", "**", "*.*", "a..b", &base];
+                odd.get(rng.below(odd.len()))
+                    .copied()
+                    .unwrap_or("*")
+                    .to_string()
+            }
+        };
+        let extra = rng.below(3);
+        let mut name = String::new();
+        for _ in 0..extra {
+            name.push_str(label(rng));
+            name.push('.');
+        }
+        name.push_str(&base);
+        if rng.one_in(6) {
+            name.push_str(".other");
+        }
+        if rng.one_in(8) {
+            name = name.to_ascii_uppercase();
+        }
+        if rng.one_in(8) {
+            name = gen_name(rng);
+        }
+        (pattern, name)
+    }
+
+    /// A wildcard pattern matches only a name below its suffix.
+    #[test]
+    fn a_wildcard_matches_only_below_its_suffix() {
+        let mut rng = Rng::new(0x5EED_0502);
+        let total = rounds(ROUNDS);
+        let mut matched = 0usize;
+        for _ in 0..total {
+            let (pattern_text, name) = gen_pair(&mut rng);
+            let Ok(pattern) = DomainPattern::parse(&pattern_text) else {
+                continue;
+            };
+            let Ok(normalized) = normalize_hostname(&name) else {
+                continue;
+            };
+            if !pattern.matches_normalized(&normalized) {
+                continue;
+            }
+            matched = matched.saturating_add(1);
+            let text = pattern.pattern();
+            if pattern.is_exact() {
+                assert_eq!(normalized, text, "an exact pattern matched another name");
+                continue;
+            }
+            let suffix = text.trim_start_matches('*');
+            if suffix.is_empty() {
+                // "*" matches a name of one label; "**" matches every name.
+                if !text.starts_with("**") {
+                    assert!(
+                        !normalized.contains('.'),
+                        "the pattern \"*\" matched {normalized:?}"
+                    );
+                }
+                continue;
+            }
+            let head = normalized.strip_suffix(suffix).unwrap_or_else(|| {
+                panic!("{text:?} matched {normalized:?}, which is not below it")
+            });
+            assert!(!head.is_empty(), "the wildcard matched the bare domain");
+            if !text.starts_with("**") {
+                assert!(
+                    !head.contains('.'),
+                    "the single wildcard {text:?} matched more than one label"
+                );
+            }
+        }
+        assert!(
+            matched > total / 1000,
+            "only {matched} of {total} pairs matched; the test proves little"
+        );
+    }
+
+    /// The catch-all patterns. The table of the module documentation does
+    /// not name them, so this test writes the behaviour down: `*` allows
+    /// every name of one label, and `**` allows every name.
+    #[test]
+    fn the_catch_all_patterns_allow_everything_below_them() {
+        let star = DomainFilter::new(&["*".to_string()]);
+        assert!(star.is_allowed("localhost"), "\"*\" must allow one label");
+        assert!(
+            !star.is_allowed("example.com"),
+            "\"*\" must not allow two labels"
+        );
+        let double = DomainFilter::new(&["**".to_string()]);
+        assert!(
+            double.is_allowed("evil.example.com"),
+            "\"**\" allows every name"
+        );
+        assert!(double.is_allowed("localhost"), "\"**\" allows every name");
+        assert!(
+            !double.is_allowed("not a name"),
+            "a name that is not valid stays blocked"
+        );
+    }
+}

@@ -188,3 +188,175 @@ mod tests {
         assert_eq!(class("2001:db8::1"), None);
     }
 }
+
+/// Property tests of the address classification.
+///
+/// The destination of a connection comes from the request of the program or
+/// from a DNS answer that an attacker controls. A gap here lets the program
+/// reach the host or the local network.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)] // the generator uses only literals
+mod netaddr_properties {
+    use super::*;
+    use crate::test_support::{rounds, Rng};
+
+    /// The number of addresses that each property test reads by default.
+    const ROUNDS: usize = 200_000;
+
+    /// The IPv4 ranges that the module documents, as (first octet pattern,
+    /// prefix length). The table is a second statement of the rule: it uses
+    /// plain arithmetic, not the methods of `Ipv4Addr`, so a wrong boundary
+    /// in either place shows up as a difference.
+    const V4_RANGES: [([u8; 4], u32); 9] = [
+        ([0, 0, 0, 0], 8),      // unspecified
+        ([10, 0, 0, 0], 8),     // private
+        ([100, 64, 0, 0], 10),  // shared CGNAT
+        ([127, 0, 0, 0], 8),    // loopback
+        ([169, 254, 0, 0], 16), // link-local
+        ([172, 16, 0, 0], 12),  // private
+        ([192, 168, 0, 0], 16), // private
+        ([224, 0, 0, 0], 4),    // multicast
+        ([240, 0, 0, 0], 4),    // reserved
+    ];
+
+    /// Return true if `ip` is in one of the documented ranges.
+    fn in_a_documented_range(ip: Ipv4Addr) -> bool {
+        let value = u32::from_be_bytes(ip.octets());
+        V4_RANGES.iter().any(|(base, bits)| {
+            let mask = if *bits == 0 {
+                0
+            } else {
+                u32::MAX.wrapping_shl(32u32.saturating_sub(*bits))
+            };
+            (value & mask) == (u32::from_be_bytes(*base) & mask)
+        })
+    }
+
+    /// `classify` must say "not public" for exactly the documented ranges.
+    #[test]
+    fn the_v4_ranges_are_the_documented_ones() {
+        let mut rng = Rng::new(0x5EED_0301);
+        let total = rounds(ROUNDS);
+        let mut private = 0usize;
+        for _ in 0..total {
+            #[allow(clippy::cast_possible_truncation, reason = "the test wants 32 bits")]
+            let ip = Ipv4Addr::from((rng.next_u64() as u32).to_be_bytes());
+            let expected = in_a_documented_range(ip);
+            let got = classify_v4(ip).is_some();
+            assert_eq!(got, expected, "the class of {ip} does not match the table");
+            if expected {
+                private = private.saturating_add(1);
+            }
+        }
+        assert!(
+            private > total / 100,
+            "only {private} of {total} addresses were private; the test proves little"
+        );
+    }
+
+    /// Every boundary of every documented range: the first address, the last
+    /// address, the one before the first and the one after the last.
+    #[test]
+    fn the_v4_boundaries_hold() {
+        for (base, bits) in V4_RANGES {
+            let first = u32::from_be_bytes(base);
+            let size = 1u32.wrapping_shl(32u32.saturating_sub(bits));
+            let last = first.saturating_add(size.saturating_sub(1));
+            assert!(
+                classify_v4(Ipv4Addr::from(first.to_be_bytes())).is_some(),
+                "the first address of {base:?}/{bits} is public"
+            );
+            assert!(
+                classify_v4(Ipv4Addr::from(last.to_be_bytes())).is_some(),
+                "the last address of {base:?}/{bits} is public"
+            );
+            if let Some(before) = first.checked_sub(1) {
+                let ip = Ipv4Addr::from(before.to_be_bytes());
+                assert_eq!(
+                    classify_v4(ip).is_some(),
+                    in_a_documented_range(ip),
+                    "the address before {base:?}/{bits} does not match the table"
+                );
+            }
+            if let Some(after) = last.checked_add(1) {
+                let ip = Ipv4Addr::from(after.to_be_bytes());
+                assert_eq!(
+                    classify_v4(ip).is_some(),
+                    in_a_documented_range(ip),
+                    "the address after {base:?}/{bits} does not match the table"
+                );
+            }
+        }
+    }
+
+    /// An IPv6 form that carries an IPv4 address must get the class of that
+    /// IPv4 address. A program that asks for `::ffff:127.0.0.1` reaches the
+    /// host if this does not hold.
+    #[test]
+    fn the_v4_forms_in_v6_keep_their_class() {
+        let mut rng = Rng::new(0x5EED_0302);
+        let total = rounds(ROUNDS);
+        let mut private = 0usize;
+        for _ in 0..total {
+            #[allow(clippy::cast_possible_truncation, reason = "the test wants 32 bits")]
+            let v4 = Ipv4Addr::from((rng.next_u64() as u32).to_be_bytes());
+            let expected = classify_v4(v4);
+            let [a, b, c, d] = v4.octets();
+            let mapped = Ipv6Addr::new(
+                0,
+                0,
+                0,
+                0,
+                0,
+                0xffff,
+                u16::from_be_bytes([a, b]),
+                u16::from_be_bytes([c, d]),
+            );
+            assert_eq!(
+                classify_v6(mapped),
+                expected,
+                "the mapped form of {v4} has another class"
+            );
+            let nat64 = Ipv6Addr::new(
+                0x0064,
+                0xff9b,
+                0,
+                0,
+                0,
+                0,
+                u16::from_be_bytes([a, b]),
+                u16::from_be_bytes([c, d]),
+            );
+            assert_eq!(
+                classify_v6(nat64),
+                expected,
+                "the NAT64 form of {v4} has another class"
+            );
+            if expected.is_some() {
+                private = private.saturating_add(1);
+            }
+        }
+        assert!(
+            private > total / 100,
+            "only {private} of {total} addresses were private; the test proves little"
+        );
+    }
+
+    /// `classify` must agree with `classify_v4` and `classify_v6`, and it
+    /// must never panic for any address.
+    #[test]
+    fn classify_agrees_with_the_two_families() {
+        let mut rng = Rng::new(0x5EED_0303);
+        for _ in 0..rounds(ROUNDS) {
+            #[allow(clippy::cast_possible_truncation, reason = "the test wants 32 bits")]
+            let v4 = Ipv4Addr::from((rng.next_u64() as u32).to_be_bytes());
+            assert_eq!(classify(IpAddr::V4(v4)), classify_v4(v4));
+            let mut octets = [0u8; 16];
+            for byte in &mut octets {
+                *byte = rng.byte();
+            }
+            let v6 = Ipv6Addr::from(octets);
+            assert_eq!(classify(IpAddr::V6(v6)), classify_v6(v6));
+        }
+    }
+}

@@ -1,0 +1,46 @@
+[package]
+name = "pent-profile-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+license = "MIT"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+pent-profile = { path = ".." }
+
+[[bin]]
+name = "draft_roundtrip"
+path = "fuzz_targets/draft_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "event_line"
+path = "fuzz_targets/event_line.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "doc_parse"
+path = "fuzz_targets/doc_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "draft_reasons"
+path = "fuzz_targets/draft_reasons.rs"
+test = false
+doc = false
+bench = false
+
+# The fuzz crate is its own workspace: the root workspace of pent must not
+# build it with `cargo build --workspace`.
+[workspace]

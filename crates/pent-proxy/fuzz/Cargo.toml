@@ -1,0 +1,32 @@
+[package]
+name = "pent-proxy-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+license = "MIT"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+pent-proxy = { path = ".." }
+
+[[bin]]
+name = "hostname"
+path = "fuzz_targets/hostname.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "domain_filter"
+path = "fuzz_targets/domain_filter.rs"
+test = false
+doc = false
+bench = false
+
+# The fuzz crate is its own workspace: the root workspace of pent must not
+# build it with `cargo build --workspace`.
+[workspace]

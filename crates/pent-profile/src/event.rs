@@ -323,3 +323,170 @@ mod tests {
         Ok(())
     }
 }
+
+/// Property tests of the event line.
+///
+/// Pent writes one event as one JSON line, and it reads the file back from
+/// its own state directory. A program with write access to that directory
+/// can change a line, and the path of an event holds bytes that the
+/// program chose. See `docs/testing/fuzzing-and-coverage.md`.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)] // the generator uses only literals
+mod event_properties {
+    use super::*;
+    use crate::fixture::{rounds, Rng};
+
+    /// The number of events that each property test reads by default.
+    const ROUNDS: usize = 50_000;
+
+    /// The byte strings that the generator puts in a path or a name.
+    const PIECES: [&[u8]; 10] = [
+        b"/home/u",
+        b"/a b",
+        b"\xff\xfe",
+        b"\n",
+        b"\r",
+        b"\"",
+        b"\\",
+        b"\x00",
+        b"\x1b[31m",
+        "\u{202e}".as_bytes(),
+    ];
+
+    /// Build a byte string out of the pieces.
+    fn gen_bytes(rng: &mut Rng) -> Vec<u8> {
+        let parts = rng.below(5);
+        let mut out = Vec::new();
+        for _ in 0..parts {
+            out.extend_from_slice(PIECES.get(rng.below(PIECES.len())).copied().unwrap_or(b"a"));
+        }
+        out
+    }
+
+    /// Build an event of each kind.
+    fn gen_event(rng: &mut Rng) -> WatchEvent {
+        let outcome = match rng.below(6) {
+            0 => Outcome::Blocked(GuardClass::Credential),
+            1 => Outcome::Blocked(GuardClass::Persistence),
+            2 => Outcome::Blocked(GuardClass::PentFiles),
+            3 => Outcome::Blocked(GuardClass::PrivilegeEscalation),
+            4 => Outcome::Denied,
+            _ => Outcome::Allowed,
+        };
+        let name = String::from_utf8_lossy(&gen_bytes(rng)).into_owned();
+        #[allow(clippy::cast_possible_truncation, reason = "a PID fits in 32 bits")]
+        let process = ProcessInfo {
+            pid: rng.next_u64() as u32,
+            name: name.clone(),
+        };
+        match rng.below(4) {
+            0 => {
+                use std::os::unix::ffi::OsStringExt as _;
+                let op = match rng.below(5) {
+                    0 => FsOp::Read,
+                    1 => FsOp::Write,
+                    2 => FsOp::Create,
+                    3 => FsOp::Delete,
+                    _ => FsOp::Exec,
+                };
+                WatchEvent::Fs {
+                    op,
+                    path: PathBuf::from(std::ffi::OsString::from_vec(gen_bytes(rng))),
+                    process,
+                    outcome,
+                }
+            }
+            1 => WatchEvent::UnixConnect {
+                target: name,
+                process,
+                outcome,
+            },
+            2 => WatchEvent::Dns {
+                name,
+                qtype: "A".to_string(),
+                outcome,
+            },
+            _ => {
+                #[allow(clippy::cast_possible_truncation, reason = "a port fits in 16 bits")]
+                let port = rng.next_u64() as u16;
+                WatchEvent::Connect {
+                    host: name,
+                    port,
+                    protocol: if rng.one_in(2) {
+                        NetProtocol::Socks5
+                    } else {
+                        NetProtocol::HttpConnect
+                    },
+                    outcome,
+                }
+            }
+        }
+    }
+
+    /// One event is one line, and the line reads back as the same event.
+    ///
+    /// A newline inside the line would let a program with a crafted path
+    /// write a second, false event into the watch log.
+    #[test]
+    fn one_event_is_one_line_and_reads_back() {
+        let mut rng = Rng::new(0x5EED_0701);
+        let total = rounds(ROUNDS);
+        for _ in 0..total {
+            let event = gen_event(&mut rng);
+            let Ok(line) = event.to_json_line() else {
+                panic!("the event {event:?} does not encode");
+            };
+            assert!(
+                !line.contains('\n') && !line.contains('\r'),
+                "the line of {event:?} holds a line break: {line:?}"
+            );
+            match WatchEvent::from_json_line(&line) {
+                Ok(again) => assert_eq!(again, event, "the event does not round trip: {line}"),
+                Err(e) => panic!("the line {line} does not parse: {e}"),
+            }
+        }
+    }
+
+    /// The reader must not panic for a line that a program changed, and it
+    /// must give back the same event for a line that it accepts.
+    #[test]
+    fn a_changed_line_gives_an_error_or_the_same_event() {
+        let mut rng = Rng::new(0x5EED_0702);
+        let total = rounds(ROUNDS);
+        let mut accepted = 0usize;
+        for _ in 0..total {
+            let event = gen_event(&mut rng);
+            let Ok(line) = event.to_json_line() else {
+                panic!("the event {event:?} does not encode");
+            };
+            let mut bytes = line.into_bytes();
+            for _ in 0..rng.below(4) {
+                let at = rng.below(bytes.len().max(1));
+                if let Some(byte) = bytes.get_mut(at) {
+                    #[allow(clippy::cast_possible_truncation, reason = "one byte is the goal")]
+                    {
+                        *byte = rng.next_u64() as u8;
+                    }
+                }
+            }
+            let Ok(text) = String::from_utf8(bytes) else {
+                continue;
+            };
+            let Ok(parsed) = WatchEvent::from_json_line(&text) else {
+                continue;
+            };
+            accepted = accepted.saturating_add(1);
+            let Ok(again) = parsed.to_json_line() else {
+                panic!("the event {parsed:?} does not encode");
+            };
+            match WatchEvent::from_json_line(&again) {
+                Ok(twice) => assert_eq!(twice, parsed, "the event does not round trip: {again}"),
+                Err(e) => panic!("the line {again} does not parse: {e}"),
+            }
+        }
+        assert!(
+            accepted > total / 100,
+            "only {accepted} of {total} changed lines parsed; the test proves little"
+        );
+    }
+}
