@@ -78,24 +78,45 @@ jobs:
       - name: Build
         run: cargo build --workspace --tests
 
-      # TEMPORARY. The step runs the three tests of MAC-4, MAC-10 and
-      # DIFF-9 alone and prints the result of each one. The step never
-      # fails, so the log holds the answer also when the suite is red.
-      # Remove this step when the three findings have a verdict.
+      # TEMPORARY. MAC-10 still records nothing for a run whose root is a
+      # shell, also with the `kqueue` watcher. The step runs four watch
+      # commands by hand and prints the draft, the raw events and the
+      # reports that the kernel wrote, so that the cause is visible. The
+      # step never fails. Remove it when MAC-10 has a verdict.
       - name: Probe the open macOS findings
         if: runner.os == 'macOS'
         run: |
           set +e
-          probe() {
-            echo "=== PROBE $2 ==="
-            cargo test -p pent --test "$1" -- --include-ignored --exact "$2" --nocapture
-            echo "=== PROBE RESULT $2: exit=$? ==="
+          PENTBIN=$(cargo build -p pent --message-format=json 2>/dev/null \
+            | /usr/bin/sed -n 's/.*"executable":"\([^"]*\/pent\)".*/\1/p' | tail -1)
+          echo "pent is [$PENTBIN]"
+          printf 'KNOWN\n' > /tmp/pent-probe-known.txt
+          probe_run() {
+            name=$1
+            shift
+            H=$(mktemp -d)
+            mkdir -p "$H/home" "$H/ws"
+            printf 'foo\n' > "$H/home/.foorc"
+            echo "=== RUN $name: $* ==="
+            start=$(date -u +%Y-%m-%d\ %H:%M:%S)
+            ( cd "$H/ws" && HOME="$H/home" XDG_CONFIG_HOME="$H/cfg" \
+              XDG_STATE_HOME="$H/state" "$PENTBIN" -v watch --yes \
+              --profile "$name" -- "$@" 2>&1 | cut -c1-200 | tail -30 )
+            echo "--- draft $name ---"
+            cat "$H/state/pent/drafts/$name.toml" 2>&1
+            echo "--- raw events $name ---"
+            cat "$H/state/pent/watch/$name/"* 2>&1 | cut -c1-200 | head -25
+            sleep 3
+            echo "--- the reports that the kernel wrote ---"
+            /usr/bin/log show --style syslog --start "$start" \
+              --predicate 'processImagePath == "/kernel"' 2>/dev/null \
+              | grep -a 'Sandbox: ' | cut -c1-200 | tail -25
+            echo "=== END $name ==="
           }
-          probe e2e_macos macos::watch_records_a_read_of_a_short_lived_child
-          probe e2e_macos macos::the_child_cannot_start_a_program_through_launchd
-          probe e2e_macos macos::watch_records_a_read_of_a_known_file
-          probe e2e_macos macos::execute_flag_lets_the_child_run_a_tool
-          probe differential_guard guard_table::diff_9_a_suffix_pattern_on_macos
+          probe_run r1 /bin/cat /tmp/pent-probe-known.txt
+          probe_run r2 /bin/sh -c 'cat ~/.foorc'
+          probe_run r3 /bin/sh -c 'cat ~/.foorc; sleep 3'
+          probe_run r4 /bin/sh -c 'read -r l < ~/.foorc; echo "$l"; sleep 3'
           exit 0
 
       # The whole workspace, in debug. The macOS suites (e2e_macos,
