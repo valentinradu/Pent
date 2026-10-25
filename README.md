@@ -65,6 +65,8 @@ Pent includes a DNS and TCP proxy. The DNS side returns `NXDOMAIN` for disallowe
 
 `--allow` and `--network proxy` are accepted on macOS but do not yet enforce network policy. Pent runs with unrestricted network access until a macOS-compatible isolation mechanism is implemented. On Linux, network policy is enforced at the kernel level via network namespaces.
 
+The macOS backend also ignores `[[sandbox.mounts]]`. Use `[sandbox.paths]` to give access to a path on macOS.
+
 ## Installation
 
 ### Homebrew (macOS / Linux)
@@ -112,6 +114,70 @@ pent config add --global @claude @gh @npm
 pent run -- claude
 ```
 
+Pent reads two config files:
+
+- The global config, `~/.config/pent/pent.toml` (on macOS, `~/Library/Application Support/pent/pent.toml`). Pent always applies it, in every directory.
+- The project config, `<workspace>/.pent/pent.toml`. The workspace is the directory where you run pent. Pent applies the project config only after you trust it (see below).
+
+Project values replace global values for single settings, such as the network mode. Lists, such as paths and domains, are merged.
+
+### Project config and trust
+
+A project config comes with the repository, thus another person can write it. A project config can give access to your secrets, for example `read_write = ["~/.ssh"]`. For this reason pent does not apply a new or changed project config until you trust it, as `direnv allow` does.
+
+```bash
+# Show what the project config adds to the global config, then trust it
+pent config trust
+
+# Trust without a prompt (for scripts)
+pent config trust --yes
+
+# Remove the trust
+pent config untrust
+
+# Show the effective config and tell if the project config applies
+pent config show
+```
+
+Pent keeps the SHA-256 hash and the path of each trusted file in `trusted.toml` in the pent config directory. When the file changes, the hash changes, and pent stops to apply the file. `pent run` then prints a warning and continues with the global config only.
+
+`pent config add`, `pent config rm`, `pent config init` and `pent config edit` (without `--global`) trust the file again after they write it. They do this only if the file was trusted before the change.
+
+### Config file format
+
+```toml
+# Written by `pent config add`. `pent config rm` uses this list.
+profiles = ["@node", "@base", "@npm"]
+
+[sandbox]
+network = { mode = "proxy_only" }   # unrestricted | localhost_only | proxy_only | blocked
+
+[sandbox.paths]
+traversal  = ["~"]
+read       = ["~/.gitconfig"]
+execute    = ["~/.local/bin"]
+read_write = ["~/.npm", "build-cache"]
+
+# Linux only. A mount is read-only unless you set readonly = false.
+[[sandbox.mounts]]
+path = "/opt/tools"
+
+[proxy]
+domain_allowlist = ["registry.npmjs.org", "*.npmjs.org"]
+```
+
+Pent rejects an unknown key, thus a typo causes an error that names the key.
+
+Pent expands a leading `~` to your home directory. Pent does not expand environment variables such as `$HOME`. A relative path resolves against the workspace, not against the current directory of the process. Pent does not remove `..` from a path, thus `../other` gives access to a directory next to the workspace.
+
+### Profiles
+
+A profile is a named set of domains and paths, for example `@npm` or `@claude`. `pent config add` adds a profile and the profiles that it needs. It also records them in the `profiles` list.
+
+`pent config rm` removes only the entries that the removed profiles give and that no remaining profile gives. It never removes an entry that you added by hand. For a config file without a `profiles` list (an older pent wrote it), pent guesses the present profiles from the entries.
+
+Profiles do not give access to secrets that you do not expect. `@keychain` gives access to the keyrings and the password store, and no other profile includes it. Add it explicitly if you need it. `@git` does not give access to `~/.config/gh` (the GitHub token): add `@gh` for that. `@ssh` gives access to `~/.ssh/known_hosts` and `~/.ssh/config`, but not to the private keys.
+
 ## Debugging
 
 ### `--trace`: log policy violations at runtime
@@ -144,8 +210,8 @@ strace -e trace=openat,open,stat,statx,access,faccessat \
 To extract the paths it tried to open, run `grep -oP '"\K[^"]+(?=", O_)' strace.log | sort -u` for successful opens and `grep 'EACCES\|ENOENT' strace.log | grep -oP '"\K[^"]+(?=")' | sort -u` for denials. Then add the relevant entries to your Pent config:
 ```toml
 [sandbox.paths]
-read  = ["/path/to/thing"]
-write = ["/path/to/writable"]
+read       = ["/path/to/thing"]
+read_write = ["/path/to/writable"]
 ```
 
 ## Contributing profiles
