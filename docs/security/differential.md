@@ -1,8 +1,10 @@
 # Differential tests: the profile, the summary and the kernel
 
-Status: review of commit `69cdc99` (2026-10-25). DIFF-1 to DIFF-8 have a
-fix; each section names its commit. DIFF-9 stays open: it is a macOS
-rule, and no machine here runs macOS. The pipeline runs its row.
+Status: review of commit `69cdc99` (2026-10-25). DIFF-1 to DIFF-9 have a
+fix; each section names its commit. DIFF-9 was a macOS rule that no
+machine here could run. The pipeline ran its seven rows on
+`macos-latest` on 2026-10-25 and each one agreed, so the finding is
+closed.
 
 Pent describes one policy three times:
 
@@ -81,7 +83,7 @@ proof of the finding.
 | DIFF-6 | High | The kernel | **Fixed.** The guard missed a private key that the program makes during the run, and the summary said "blocked". |
 | DIFF-7 | High | The summary | **Fixed.** The draft granted a path that the same summary showed as a blocked credential. |
 | DIFF-8 | Medium | The summary | **Fixed.** The proxy refused a destination that is not public, and recorded nothing. |
-| DIFF-9 | Medium | The kernel | On macOS a guard pattern with a leading `*` has no effect. |
+| DIFF-9 | Medium | The kernel | **Closed.** The prediction was wrong: the macOS backend already translates a guard pattern with a leading `*`. |
 
 ### DIFF-1 — a read that the overlay hides is not a recorded denial
 
@@ -359,7 +361,9 @@ fix it answered 400.
 
 ### DIFF-9 — on macOS a guard pattern with a leading `*` has no effect
 
-**Severity:** Medium. **Wrong description:** the kernel.
+**Severity:** Medium. **Wrong description:** the kernel. **Closed on
+2026-10-25** by `test(macos): close DIFF-9; measure the three open
+findings on a Mac`.
 
 **Test:** `differential_guard.rs`, `diff_9_a_suffix_pattern_on_macos`.
 Rows `key-suffix-rsa`, `key-suffix-pem`, `key-suffix-key`,
@@ -367,18 +371,17 @@ Rows `key-suffix-rsa`, `key-suffix-pem`, `key-suffix-key`,
 `key-name-with-a-star`.
 
 `GuardTarget::FilesInDir` takes a file name prefix, or a file name suffix
-with a leading `*`. The macOS backend builds one regular expression from
-the prefix form. A pattern with a leading `*` matches no file there.
-`classify` uses the full rule, so the summary shows the read in the blocked
-section while the kernel allows it.
+with a leading `*`. The row said that the macOS backend builds one
+regular expression from the prefix form, so a pattern with a leading `*`
+matches no file there.
 
-This row is a prediction, not a measurement. Nobody has run the macOS
-backend on a Mac yet. `docs/security/watch-and-profiles.md` names the same
-limit as H-13. The pipeline runs the macOS half and gives the answer.
-
-**The fix.** Give the macOS backend the pattern form. Build the regular
-expression from the suffix for a pattern with a leading `*`, and escape
-each character that a regular expression gives a meaning to.
+That was a prediction. The fix of MAC-2 (`name_pattern_regex` in
+`crates/pent-sandbox/src/macos.rs`) gave the backend the suffix form
+before anybody ran the row. The run of 2026-10-25 on `macos-latest`
+(run 40235794827) ran the seven rows and each one agreed: the kernel
+hides each key, and `classify` says the same. The test lost its `ignore`
+mark, and the seven rows lost their `open_macos` field, so
+`classify_and_the_kernel_agree` runs them too.
 
 ## Where the three descriptions agree
 
@@ -458,5 +461,4 @@ are stable:
 
 Each of the eight tests of a disagreement failed in all three runs of
 the review, with the same message. No finding of this document comes from
-one run. After the fixes, the test of each closed finding passes and the
-two tests of DIFF-3 and DIFF-9 still hold the open assertion.
+one run. After the fixes, the test of each closed finding passes.
