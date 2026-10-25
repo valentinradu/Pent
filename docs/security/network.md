@@ -28,6 +28,7 @@ Test files:
 | NET-2 | High | The system D-Bus socket is reachable; it resolves names and reaches network services past the proxy. | Fixed | `system_dbus_socket_is_masked` |
 | NET-3 | High | One profile path below a private directory restores the whole subtree above it, so the sibling sockets of the host come back. | Fixed by `dedaf2e` | `a_profile_path_below_a_private_dir_keeps_its_siblings_hidden` |
 | NET-4 | Medium | Pent refuses each address of the Unix family, so a program cannot use its own abstract socket. | Fixed by `bfac3e0` | `child_cannot_reach_a_host_abstract_unix_socket`, `the_default_profile_refuses_a_path_but_keeps_the_unix_family` |
+| NET-5 | Medium | On a host where `/etc/resolv.conf` is a symbolic link into `/run`, the child reads no resolver at all, so no name resolves in the sandbox. | Fixed | `child_sees_proxy_resolv_conf`, `test_proxy_only_passes_the_listeners`, `test_resolv_bind_makes_the_chain_inside_the_tmpfs` |
 
 ### NET-1 — the Tailscale daemon socket gives full egress (Critical)
 
@@ -208,6 +209,73 @@ listener. The child sends a pidfd of itself first and the supervisor
 takes the listener with `pidfd_getfd(2)`. Each `sendmsg(2)` on a
 datagram socket of the Unix family now costs one notification.
 
+### NET-5 — the `resolv.conf` of the child behind a symbolic link (Medium)
+
+**State: fixed.**
+
+**What pent gives the child.** In proxy mode pent writes one file with the
+single line `nameserver 127.0.0.1` in its runtime directory
+(`linux_proxynet::resolv_conf`), and the child binds that file read-only at
+the place where the C library reads the resolver. The file holds that line
+and nothing else, so the child reaches only the DNS server of pent on
+`127.0.0.1:53`. A program with a fixed resolver (for example `8.8.8.8`)
+has no route out of the network namespace and resolves no name.
+
+**The bug.** The bind used the canonical path of `/etc/resolv.conf`, and the
+Landlock rules did not name it. On a host where `/etc/resolv.conf` is a
+plain file (NixOS, and the Debian image of the Docker suite) the file sits
+in `/etc`, which `SYSTEM_PATHS` grants, and the child reads it. On a host
+with `systemd-resolved` — Ubuntu, Fedora and most other distributions —
+`/etc/resolv.conf` is a symbolic link into `/run`, for example to
+`/run/systemd/resolve/stub-resolv.conf`. The child gets an empty tmpfs over
+`/run`, and no rule of the ruleset covers a path below it. The child then
+got `EACCES` for `/etc/resolv.conf` and resolved no name at all. Every host
+of the test matrix hid the bug: the host of the author is NixOS, and the
+Docker image of the e2e suite is Debian with a plain file. The first run of
+the pipeline on `ubuntu-latest` found it.
+
+**The fix.** Three parts, in `crates/pent-sandbox/src/linux.rs`:
+
+1. The parent reads the symbolic link chain of `/etc/resolv.conf` before the
+   tmpfs hides the target (`resolv_link_target`). It follows up to
+   `RESOLV_LINK_LIMIT` (eight) links and keeps the last path.
+2. The child makes the directory chain of that path inside the tmpfs, makes
+   an empty file at the end of it, and binds the file of pent onto it
+   (`resolv_bind`). The directories get the mode `0755` and the mount point
+   the mode `0644`, whatever the umask of the parent is, so that every
+   program of the child can read the file.
+3. `add_ruleset_rules` adds a Landlock read rule for that path. The child
+   adds its rules after the mounts, so the rule binds to the inode of the
+   file of pent, and the path below the tmpfs becomes readable.
+
+A target outside a private directory needs no chain: the bind goes straight
+onto the existing file, as before.
+
+**Two states give the child no resolver.** Pent writes a warning in each,
+because the state must be a decision and not an accident:
+
+- A link inside `/run` or `/tmp` that points out of every private
+  directory, or a chain of more than eight links. Pent owns only its own
+  tmpfs; it must not put the resolver of the sandbox at a path of the host
+  that it does not control.
+- A host with no `/etc/resolv.conf`. Pent does not write in the `/etc` of
+  the host, so the path stays absent.
+
+In both states each name lookup of the child fails. This is the closed
+state and it is correct, and a program that needs a name reports an error.
+
+**The tests.** `test_resolv_target_follows_a_link_into_run`,
+`test_resolv_bind_makes_the_chain_inside_the_tmpfs`,
+`test_resolv_bind_of_a_plain_file_needs_no_chain`,
+`test_resolv_target_follows_two_links_and_keeps_a_limit` and
+`test_resolv_target_refuses_a_link_out_of_a_private_dir` in
+`crates/pent-sandbox/src/linux.rs` give the layout of the host as data, so
+they reproduce the layout of Ubuntu on a host of any layout.
+`test_proxy_only_passes_the_listeners` in the same file and
+`child_sees_proxy_resolv_conf` in
+`crates/pent/tests/security_network_e2e.rs` read the real file in a real
+sandbox, and they pass on a host of either layout.
+
 ## Verified defenses
 
 Each item below has a test that passes. The test stays as a regression test.
@@ -263,7 +331,9 @@ End to end (`crates/pent/tests/security_network_e2e.rs`):
 - The child cannot bind the proxy port again, with `SO_REUSEPORT` or not, to
   steal the connections of other processes in the sandbox.
   (`child_cannot_steal_the_proxy_port_with_reuseport`)
-- The child's `/etc/resolv.conf` names only the loopback proxy.
+- The child's `/etc/resolv.conf` names only the loopback proxy. The test
+  passes on a host where that path is a plain file and on a host where it
+  is a symbolic link into `/run` (NET-5).
   (`child_sees_proxy_resolv_conf`)
 
 The audit also confirmed, by hand, that the child cannot make an ICMP socket,

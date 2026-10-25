@@ -511,6 +511,7 @@ fn add_ruleset_rules(
     path_dirs: &[PathBuf],
     write_set: &HashSet<PathBuf>,
     overlay_dirs: &HashSet<PathBuf>,
+    resolv_target: Option<&Path>,
 ) {
     ruleset.add_rule(&config.workspace, access::ALL);
     ruleset.add_rule(&config.data_dir, access::ALL);
@@ -587,6 +588,15 @@ fn add_ruleset_rules(
     for p in DEV_READ_PATHS.iter().chain(PROC_PATHS) {
         ruleset.add_rule(Path::new(p), access::READ);
     }
+    // The `resolv.conf` of the proxy. On a host with `systemd-resolved`,
+    // `/etc/resolv.conf` is a symbolic link into `/run`, and the target is
+    // inside the private tmpfs of `/run`. No rule above covers that path,
+    // and Landlock then refuses the read with `EACCES`. The child adds the
+    // rule after the mounts, so the rule binds to the inode of the file of
+    // pent (see `resolv_bind` and `PreparedRuleset::apply_in_child`).
+    if let Some(path) = resolv_target {
+        ruleset.add_rule(path, access::READ);
+    }
 }
 
 /// Return the paths that the Landlock backend always allows, in addition to
@@ -620,6 +630,7 @@ pub fn build_landlock_ruleset(
         path_dirs,
         &HashSet::new(),
         &HashSet::new(),
+        None,
     );
     Ok(ruleset)
 }
@@ -1249,6 +1260,16 @@ struct PrivateMount {
     data: &'static CStr,
 }
 
+/// The modes that the child sets on a mount point and on the directories
+/// above it, whatever the umask of the parent is.
+#[derive(Debug, Clone, Copy)]
+struct ForcedMode {
+    /// The mode of each directory of [`PrivateBind::parents`].
+    dir: libc::mode_t,
+    /// The mode of the mount point itself.
+    file: libc::mode_t,
+}
+
 /// One mount that the child makes after the private tmpfs mounts.
 ///
 /// The child opens an `O_PATH` descriptor of the source **before** the tmpfs
@@ -1271,6 +1292,11 @@ struct PrivateBind {
     access: BindAccess,
     /// What the child does when the mount fails.
     on_failure: OnFailure,
+    /// The modes that the child sets on the mount point and on the
+    /// directories above it. `None` keeps the mode of `mkdir(2)` and of
+    /// `open(2)`, which the umask can make narrower. Only the `resolv.conf`
+    /// of the proxy sets this field.
+    forced_mode: Option<ForcedMode>,
 }
 
 /// The private mounts that the child makes before Landlock applies.
@@ -1499,6 +1525,7 @@ fn plan_private_dirs(
             kind,
             access: BindAccess::ReadWrite,
             on_failure: OnFailure::Stop,
+            forced_mode: None,
         });
     }
 
@@ -1539,33 +1566,159 @@ fn plan_private_dirs(
             kind: BindKind::EmptyDirectory(0o700),
             access: BindAccess::ReadWrite,
             on_failure: OnFailure::Stop,
+            forced_mode: None,
         });
     }
     plan
 }
 
-/// Return the bind that puts the `resolv.conf` of the proxy at
-/// `/etc/resolv.conf`.
+/// The path that the C library reads to find the resolver.
+const RESOLV_CONF_PATH: &str = "/etc/resolv.conf";
+
+/// The limit on the length of the symbolic link chain of [`RESOLV_CONF_PATH`].
 ///
-/// The target is the canonical path, because `/etc/resolv.conf` is often a
-/// symbolic link into `/run`, and a tmpfs covers `/run`. The bind then makes
-/// the file inside the tmpfs.
-fn resolv_bind(source: &Path, covered: &[PathBuf]) -> Option<PrivateBind> {
-    let link = Path::new("/etc/resolv.conf");
-    let target = std::fs::canonicalize(link).unwrap_or_else(|_| link.to_path_buf());
+/// A real host has one link (`/etc/resolv.conf` to
+/// `/run/systemd/resolve/stub-resolv.conf`) or two. The limit stops a loop.
+const RESOLV_LINK_LIMIT: usize = 8;
+
+/// The mode of each directory that pent makes above the `resolv.conf` of the
+/// child. Every program of the child must be able to walk through it.
+const RESOLV_DIR_MODE: libc::mode_t = 0o755;
+
+/// The mode of the mount point of the `resolv.conf` of the child. Every
+/// program of the child must be able to read the file.
+const RESOLV_FILE_MODE: libc::mode_t = 0o644;
+
+/// Join the target of a symbolic link to the directory of the link and
+/// remove each `.` and `..` component.
+///
+/// The function reads nothing from the file system. A `..` after the root
+/// stays at the root, as the kernel also does.
+fn join_link_target(link: &Path, target: &Path) -> PathBuf {
+    use std::path::Component;
+    let joined = match link.parent() {
+        Some(dir) if target.is_relative() => dir.join(target),
+        _ => target.to_path_buf(),
+    };
+    let mut out = PathBuf::new();
+    for part in joined.components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Return true when a private tmpfs of [`PRIVATE_DIRS`] covers `path`.
+fn in_private_dir(path: &Path) -> bool {
+    PRIVATE_DIRS
+        .iter()
+        .any(|dir| path.starts_with(Path::new(dir.path)))
+}
+
+/// Follow the symbolic link chain of `link` and return the path at which the
+/// child must find its `resolv.conf`.
+///
+/// `read_link` gives the target of a symbolic link, or `None` when the path
+/// is not a link. The parameter keeps the function free of the layout of the
+/// host, so a test gives the layout of Ubuntu as data.
+///
+/// The function returns `None` in two cases:
+///
+/// - The chain is longer than [`RESOLV_LINK_LIMIT`] steps. A loop ends here.
+/// - A link inside a private directory points out of every private
+///   directory. Pent owns only the tmpfs of [`PRIVATE_DIRS`]; it must not
+///   put the file of the proxy at a path of the host that it does not
+///   control.
+///
+/// The caller then leaves `/etc/resolv.conf` as it is. The child has no
+/// resolver and each name lookup fails, which is the closed state.
+fn resolv_link_target(
+    link: &Path,
+    read_link: impl Fn(&Path) -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    let mut current = link.to_path_buf();
+    let mut inside = in_private_dir(&current);
+    for _ in 0..RESOLV_LINK_LIMIT {
+        let Some(target) = read_link(&current) else {
+            // The path is not a symbolic link: it is the end of the chain.
+            return Some(current);
+        };
+        let next = join_link_target(&current, &target);
+        let next_inside = in_private_dir(&next);
+        if inside && !next_inside {
+            return None;
+        }
+        inside = next_inside;
+        current = next;
+    }
+    None
+}
+
+/// Return the path at which the child must find its `resolv.conf` on this
+/// host, and `None` when pent cannot give the child a resolver.
+///
+/// Pent makes a mount point only inside a directory that it covers with a
+/// tmpfs of its own. Outside such a directory the file must exist already:
+/// pent does not write in the `/etc` of the host. A host with no
+/// `/etc/resolv.conf` therefore keeps no resolver in the sandbox, and each
+/// name lookup of the child fails. The function writes a warning in that
+/// case, because the state must be a decision and not a surprise.
+fn resolv_mount_point() -> Option<PathBuf> {
+    let Some(target) = resolv_link_target(Path::new(RESOLV_CONF_PATH), |path| {
+        std::fs::read_link(path).ok()
+    }) else {
+        tracing::warn!(
+            "the symbolic link chain of {RESOLV_CONF_PATH} is too long or leaves the private \
+             directories of pent: the child gets no resolver, and each name lookup fails"
+        );
+        return None;
+    };
+    if in_private_dir(&target) || target.exists() {
+        return Some(target);
+    }
+    tracing::warn!(
+        "{} does not exist, and pent does not write in the /etc of the host: the child gets \
+         no resolver, and each name lookup fails",
+        target.display()
+    );
+    None
+}
+
+/// Return the bind that puts the `resolv.conf` of the proxy at `target`.
+///
+/// `target` comes from [`resolv_mount_point`]: it is `/etc/resolv.conf` itself on
+/// a host where that path is a plain file, and the target of the link on a
+/// host with `systemd-resolved`, where `/etc/resolv.conf` points into
+/// `/run`. A tmpfs of `covered` then hides the target, so the child first
+/// makes the directory chain and an empty file inside the tmpfs, and binds
+/// the file of pent onto it. A directory and a mount point that the child
+/// makes itself get the mode [`RESOLV_DIR_MODE`] and the mode
+/// [`RESOLV_FILE_MODE`], whatever the umask of the parent is, so that every
+/// program of the child can read the file. A path that is there already
+/// belongs to the host and keeps its mode.
+fn resolv_bind(source: &Path, target: &Path, covered: &[PathBuf]) -> Option<PrivateBind> {
     let parents = covered
         .iter()
         .find(|c| target.starts_with(c))
-        .map(|root| mount_point_parents(&target, root))
+        .map(|root| mount_point_parents(target, root))
         .unwrap_or_default();
     Some(PrivateBind {
         source: to_cstring(source)?,
         source_fd: AtomicI32::new(-1),
-        target: to_cstring(&target)?,
+        target: to_cstring(target)?,
         parents,
         kind: BindKind::File,
         access: BindAccess::ReadOnly,
         on_failure: OnFailure::Warn,
+        forced_mode: Some(ForcedMode {
+            dir: RESOLV_DIR_MODE,
+            file: RESOLV_FILE_MODE,
+        }),
     })
 }
 
@@ -1684,24 +1837,55 @@ fn fd_path(fd: libc::c_int, buf: &mut [u8; FD_PATH_LEN]) -> Option<&CStr> {
     CStr::from_bytes_with_nul(buf.get(..end.checked_add(1)?)?).ok()
 }
 
+/// Where a mount point comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MountPoint {
+    /// The child made the path itself, inside a private tmpfs.
+    Made,
+    /// The path was there already. It belongs to the host, so the child
+    /// does not change its mode.
+    Found,
+}
+
 /// Make the directory `path` with `mode`. A directory that exists already is
 /// not an error. Async-signal-safe.
 ///
 /// # Errors
 /// Returns the OS error of `mkdir(2)`.
-fn mkdir_if_missing(path: &CStr, mode: libc::mode_t) -> std::io::Result<()> {
+fn mkdir_if_missing(path: &CStr, mode: libc::mode_t) -> std::io::Result<MountPoint> {
     // SAFETY: mkdir(2) with a NUL-terminated string that the parent
     // prepared.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     if unsafe { libc::mkdir(path.as_ptr(), mode) } == 0 {
-        return Ok(());
+        return Ok(MountPoint::Made);
     }
     let err = std::io::Error::last_os_error();
     if err.raw_os_error() == Some(libc::EEXIST) {
-        return Ok(());
+        return Ok(MountPoint::Found);
     }
     write_stderr_static(b"pent: cannot make a directory for a private mount\n");
     Err(err)
+}
+
+/// Set the mode of `path`. Async-signal-safe.
+///
+/// `mkdir(2)` and `open(2)` take the umask of the process away from the mode
+/// of a new file, so a mount point that every program of the child must
+/// reach needs this call too. The caller uses it only on a path that the
+/// child made itself: the mode of a path of the host stays as it is.
+///
+/// # Errors
+/// Returns the OS error of `chmod(2)`.
+fn chmod_path(path: &CStr, mode: libc::mode_t) -> std::io::Result<()> {
+    // SAFETY: chmod(2) with a NUL-terminated string that the parent
+    // prepared.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    if unsafe { libc::chmod(path.as_ptr(), mode) } == 0 {
+        return Ok(());
+    }
+    Err(last_err(
+        b"pent: cannot set the mode of a private mount point\n",
+    ))
 }
 
 /// Make an empty file at `path`. A file that exists already is not an error.
@@ -1709,7 +1893,7 @@ fn mkdir_if_missing(path: &CStr, mode: libc::mode_t) -> std::io::Result<()> {
 ///
 /// # Errors
 /// Returns the OS error of `open(2)`.
-fn create_if_missing(path: &CStr) -> std::io::Result<()> {
+fn create_if_missing(path: &CStr) -> std::io::Result<MountPoint> {
     // SAFETY: open(2) with a NUL-terminated string that the parent
     // prepared. O_EXCL keeps an existing file as it is.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
@@ -1724,11 +1908,11 @@ fn create_if_missing(path: &CStr) -> std::io::Result<()> {
         // SAFETY: `fd` is the descriptor that this function opened.
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { libc::close(fd) };
-        return Ok(());
+        return Ok(MountPoint::Made);
     }
     let err = std::io::Error::last_os_error();
     if err.raw_os_error() == Some(libc::EEXIST) {
-        return Ok(());
+        return Ok(MountPoint::Found);
     }
     write_stderr_static(b"pent: cannot make a file for a private mount\n");
     Err(err)
@@ -1757,13 +1941,25 @@ impl PrivateBind {
     /// Returns the OS error of the directory, the file or the mount.
     fn apply(&self) -> std::io::Result<()> {
         for parent in &self.parents {
-            mkdir_if_missing(parent, 0o755)?;
+            let point = mkdir_if_missing(parent, 0o755)?;
+            // The child sets the mode only on a directory that it made in
+            // its own tmpfs. A directory of the host keeps its mode, and
+            // the child often cannot change it anyway.
+            if let (Some(mode), MountPoint::Made) = (self.forced_mode, point) {
+                chmod_path(parent, mode.dir)?;
+            }
         }
-        match self.kind {
+        let point = match self.kind {
             BindKind::ParentsOnly => return Ok(()),
-            BindKind::EmptyDirectory(mode) => return mkdir_if_missing(&self.target, mode),
+            BindKind::EmptyDirectory(mode) => {
+                mkdir_if_missing(&self.target, mode)?;
+                return Ok(());
+            }
             BindKind::Directory => mkdir_if_missing(&self.target, 0o755)?,
             BindKind::File => create_if_missing(&self.target)?,
+        };
+        if let (Some(mode), MountPoint::Made) = (self.forced_mode, point) {
+            chmod_path(&self.target, mode.file)?;
         }
         let mut buf = [0u8; FD_PATH_LEN];
         let Some(source) = fd_path(self.source_fd.load(Ordering::Relaxed), &mut buf) else {
@@ -2358,15 +2554,6 @@ pub(crate) fn spawn_linux(
     let overlay_dirs: HashSet<PathBuf> =
         overlay_mounts.iter().map(|m| m.real_dir.clone()).collect();
 
-    // Landlock ruleset: created in the parent, rules applied in the child.
-    let ruleset = if enforce {
-        let mut rs = PreparedRuleset::create()?;
-        add_ruleset_rules(&mut rs, config, path_dirs, &write_set, &overlay_dirs);
-        Some(rs)
-    } else {
-        None
-    };
-
     // ProxyOnly: the child makes the proxy listeners in its network namespace
     // and sends them over a socket pair. It resolves names through the proxy
     // DNS on 127.0.0.1:53.
@@ -2376,8 +2563,30 @@ pub(crate) fn spawn_linux(
     } else {
         None
     };
+    // The `resolv.conf` of the proxy, and the path at which the child must
+    // find it. The parent reads the symbolic link chain of
+    // `/etc/resolv.conf` here, before the tmpfs of the child hides the
+    // target of the link. The Landlock rules need the path too, so this
+    // comes before the ruleset.
     let resolv_src: Option<PathBuf> = if is_proxy {
         Some(super::linux_proxynet::resolv_conf()?)
+    } else {
+        None
+    };
+    let resolv_dst: Option<PathBuf> = if is_proxy { resolv_mount_point() } else { None };
+
+    // Landlock ruleset: created in the parent, rules applied in the child.
+    let ruleset = if enforce {
+        let mut rs = PreparedRuleset::create()?;
+        add_ruleset_rules(
+            &mut rs,
+            config,
+            path_dirs,
+            &write_set,
+            &overlay_dirs,
+            resolv_dst.as_deref(),
+        );
+        Some(rs)
     } else {
         None
     };
@@ -2433,12 +2642,12 @@ pub(crate) fn spawn_linux(
     };
     mounts.private_dirs = std::mem::take(&mut private.mounts);
     mounts.private_binds = std::mem::take(&mut private.binds);
-    if let Some(src) = &resolv_src {
+    if let (Some(src), Some(dst)) = (&resolv_src, &resolv_dst) {
         // The mount is read-only: the file is shared with other pent
         // processes.
         mounts
             .private_binds
-            .extend(resolv_bind(src, &private.covered));
+            .extend(resolv_bind(src, dst, &private.covered));
     }
     // The masks also tell the recorder which sockets the policy hides. A
     // path that a private tmpfs already hides needs no mask, and a mask on
@@ -2526,7 +2735,14 @@ pub(crate) fn spawn_linux(
                 },
                 None => {
                     let mut policy = AccessPolicy::default();
-                    add_ruleset_rules(&mut policy, config, path_dirs, &write_set, &overlay_dirs);
+                    add_ruleset_rules(
+                        &mut policy,
+                        config,
+                        path_dirs,
+                        &write_set,
+                        &overlay_dirs,
+                        resolv_dst.as_deref(),
+                    );
                     policy.set_overlay(&overlay_dirs, &accessible);
                     crate::linux_watch::Judge::Policy(policy)
                 }
@@ -4579,6 +4795,120 @@ mod tests {
         Ok(())
     }
 
+    /// The layout of Ubuntu, of Fedora and of every host with
+    /// `systemd-resolved`: `/etc/resolv.conf` is a relative symbolic link
+    /// into `/run`. The test gives the link as data, so it runs on a host
+    /// of any layout.
+    #[test]
+    fn test_resolv_target_follows_a_link_into_run() {
+        let target = resolv_link_target(Path::new(RESOLV_CONF_PATH), |path| {
+            if path == Path::new("/etc/resolv.conf") {
+                Some(PathBuf::from("../run/systemd/resolve/stub-resolv.conf"))
+            } else {
+                None
+            }
+        });
+        assert_eq!(
+            target,
+            Some(PathBuf::from("/run/systemd/resolve/stub-resolv.conf"))
+        );
+    }
+
+    /// The plan of the child must hold the directory chain inside the tmpfs
+    /// of `/run` and the bind at the target of the link. Without the chain
+    /// the bind has no mount point, and the child reads no resolver.
+    #[test]
+    fn test_resolv_bind_makes_the_chain_inside_the_tmpfs() -> TestResult {
+        let target = resolv_link_target(Path::new(RESOLV_CONF_PATH), |path| {
+            if path == Path::new("/etc/resolv.conf") {
+                Some(PathBuf::from("../run/systemd/resolve/stub-resolv.conf"))
+            } else {
+                None
+            }
+        })
+        .ok_or("the link chain must have a target")?;
+        let covered = vec![PathBuf::from("/tmp"), PathBuf::from("/run")];
+        let source = Path::new("/run/user/1000/pent/resolv.conf");
+        let bind = resolv_bind(source, &target, &covered).ok_or("the bind must exist")?;
+        assert_eq!(
+            bind.target.to_bytes(),
+            b"/run/systemd/resolve/stub-resolv.conf"
+        );
+        let parents: Vec<&[u8]> = bind.parents.iter().map(|p| p.to_bytes()).collect();
+        assert_eq!(parents, vec![&b"/run/systemd"[..], b"/run/systemd/resolve"]);
+        assert_eq!(bind.kind, BindKind::File);
+        assert_eq!(bind.access, BindAccess::ReadOnly);
+        let mode = bind.forced_mode.ok_or("the bind must force the modes")?;
+        assert_eq!((mode.dir, mode.file), (0o755, 0o644));
+        Ok(())
+    }
+
+    /// A host where `/etc/resolv.conf` is a plain file (NixOS): the chain
+    /// has no step, and the bind needs no directory above it.
+    #[test]
+    fn test_resolv_bind_of_a_plain_file_needs_no_chain() -> TestResult {
+        let target = resolv_link_target(Path::new(RESOLV_CONF_PATH), |_| None)
+            .ok_or("a plain file is its own target")?;
+        assert_eq!(target, PathBuf::from("/etc/resolv.conf"));
+        let covered = vec![PathBuf::from("/tmp"), PathBuf::from("/run")];
+        let bind = resolv_bind(Path::new("/tmp/pent-1000/resolv.conf"), &target, &covered)
+            .ok_or("the bind must exist")?;
+        assert!(bind.parents.is_empty(), "{:?}", bind.parents);
+        assert_eq!(bind.target.to_bytes(), b"/etc/resolv.conf");
+        Ok(())
+    }
+
+    /// A chain of two links ends at the last path, and the chain stops at
+    /// [`RESOLV_LINK_LIMIT`] steps, so a loop gives no target.
+    #[test]
+    fn test_resolv_target_follows_two_links_and_keeps_a_limit() {
+        let two = |path: &Path| match path.to_str() {
+            Some("/etc/resolv.conf") => Some(PathBuf::from("/run/resolvconf/resolv.conf")),
+            Some("/run/resolvconf/resolv.conf") => {
+                Some(PathBuf::from("../systemd/resolve/resolv.conf"))
+            }
+            _ => None,
+        };
+        assert_eq!(
+            resolv_link_target(Path::new(RESOLV_CONF_PATH), two),
+            Some(PathBuf::from("/run/systemd/resolve/resolv.conf"))
+        );
+        // A loop of two links. The limit ends the walk.
+        let loop_links = |path: &Path| match path.to_str() {
+            Some("/etc/resolv.conf") => Some(PathBuf::from("/run/a")),
+            Some("/run/a") => Some(PathBuf::from("/run/b")),
+            Some("/run/b") => Some(PathBuf::from("/run/a")),
+            _ => None,
+        };
+        assert_eq!(
+            resolv_link_target(Path::new(RESOLV_CONF_PATH), loop_links),
+            None
+        );
+        // A chain of exactly the limit of links still has no end.
+        let long = |path: &Path| {
+            let name = path.to_str()?;
+            let step: usize = name.strip_prefix("/run/step")?.parse().ok()?;
+            Some(PathBuf::from(format!(
+                "/run/step{}",
+                step.saturating_add(1)
+            )))
+        };
+        assert_eq!(resolv_link_target(Path::new("/run/step0"), long), None);
+    }
+
+    /// A link inside a private directory that points out of every private
+    /// directory gives no target: pent does not control that path, so the
+    /// child keeps no resolver and each name lookup fails.
+    #[test]
+    fn test_resolv_target_refuses_a_link_out_of_a_private_dir() {
+        let out = |path: &Path| match path.to_str() {
+            Some("/etc/resolv.conf") => Some(PathBuf::from("/run/resolvconf/resolv.conf")),
+            Some("/run/resolvconf/resolv.conf") => Some(PathBuf::from("/etc/resolv.conf.host")),
+            _ => None,
+        };
+        assert_eq!(resolv_link_target(Path::new(RESOLV_CONF_PATH), out), None);
+    }
+
     #[test]
     fn test_is_explicitly_allowed() {
         let mask = Path::new("/run/user/1000");
@@ -4810,7 +5140,14 @@ mod tests {
         );
         config.data_dir = dirs.data_dir.clone();
         let mut policy = AccessPolicy::default();
-        add_ruleset_rules(&mut policy, &config, &[], &HashSet::new(), &HashSet::new());
+        add_ruleset_rules(
+            &mut policy,
+            &config,
+            &[],
+            &HashSet::new(),
+            &HashSet::new(),
+            None,
+        );
         let ws = std::fs::canonicalize(&dirs.workspace)?;
         let allowed = Outcome::Allowed;
         let denied = Outcome::Denied;

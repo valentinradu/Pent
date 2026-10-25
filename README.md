@@ -135,7 +135,11 @@ Pent needs no root and no capability on Linux. It needs unprivileged user namesp
 
 In proxy mode, the child gets a new network namespace with only the loopback interface. Before the program starts, the child makes three sockets in this namespace: the proxy port `127.0.0.1:3128` (SOCKS5 and HTTP CONNECT) and the DNS port `127.0.0.1:53` (UDP and TCP). It gives them to Pent. Pent serves the proxy on these sockets and connects to the allowed hosts from the host network. The child has no route out of its namespace, so it cannot reach a host past the proxy. When IPv6 is available in the namespace, the proxy port also listens on `[::1]:3128`. The DNS port is IPv4 only.
 
-Inside the sandbox, `/etc/resolv.conf` contains `nameserver 127.0.0.1`. A program that uses a fixed resolver (for example `8.8.8.8`) cannot resolve names: the query fails, and the sandbox stays closed.
+Inside the sandbox, `/etc/resolv.conf` contains `nameserver 127.0.0.1` and nothing else. Pent writes this file itself and binds it read-only into the sandbox, so the child reaches only the Pent resolver. A program that uses a fixed resolver (for example `8.8.8.8`) cannot resolve names: the query fails, and the sandbox stays closed.
+
+On a host with `systemd-resolved` (Ubuntu, Fedora and most other distributions), `/etc/resolv.conf` is a symbolic link into `/run`, for example to `/run/systemd/resolve/stub-resolv.conf`. The sandbox replaces `/run` with an empty directory, so the target of the link is not there. Pent reads the link before the sandbox starts, makes the directories of the target inside the private `/run`, and puts its own file at that path. The child follows the link and reads the Pent resolver. Pent follows a chain of up to eight links.
+
+Two cases give the child no resolver at all. The first: a link inside `/run` or `/tmp` that points out of these directories, or a chain of more than eight links. The second: a host with no `/etc/resolv.conf` at all. Pent does not write in `/etc` of your host, so it leaves the path absent. In both cases every name lookup of the child fails, and Pent writes a warning. The sandbox stays closed, and a program that needs a name reports an error.
 
 ## Installation
 
