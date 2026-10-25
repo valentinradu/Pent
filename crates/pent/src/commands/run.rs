@@ -64,7 +64,7 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
     let decision = resolve_network(args.network, &args.allow, &profile.network.domains);
     let domains = merge_domains(&profile.network.domains, &args.allow);
     let env_map = build_run_env(&args.env);
-    let trace_log_path = open_trace_log(args.trace, &cwd);
+    let trace_log_path = open_trace_log(args.trace, &store, &name);
 
     for warning in network_warnings(decision, &args.allow, args.trace) {
         ui::warn(warning);
@@ -271,28 +271,23 @@ fn build_run_env(args_env: &[String]) -> HashMap<String, String> {
     env_map
 }
 
-/// Create `.pent/trace.log` when `trace` is true; emit warnings on failure.
-fn open_trace_log(trace: bool, cwd: &Path) -> Option<PathBuf> {
+/// Create the trace log of `name` when `trace` is true; emit a warning on
+/// failure.
+///
+/// The log is in the state directory of pent, not in the workspace: the
+/// sandboxed process can write the workspace, so it could put a symbolic link
+/// there and make pent write to another file.
+fn open_trace_log(trace: bool, store: &ProfileStore, name: &ProfileName) -> Option<PathBuf> {
     if !trace {
         return None;
     }
-    let pent_dir = cwd.join(".pent");
-    match std::fs::create_dir_all(&pent_dir) {
-        Ok(()) => {
-            let log_path = pent_dir.join("trace.log");
-            match std::fs::File::create(&log_path) {
-                Ok(_) => {
-                    ui::status("tracing", log_path.display());
-                    Some(log_path)
-                }
-                Err(e) => {
-                    ui::warn(format!("could not create trace log: {e}"));
-                    None
-                }
-            }
+    match store.create_trace_log(name) {
+        Ok(path) => {
+            ui::status("tracing", path.display());
+            Some(path)
         }
         Err(e) => {
-            ui::warn(format!("could not create .pent directory: {e}"));
+            ui::warn(format!("could not create the trace log: {e}"));
             None
         }
     }
@@ -527,9 +522,7 @@ fn format_trace_line(line: &TraceLine) -> String {
 /// entries do not mix.
 fn write_trace_line(log_path: Option<&Path>, line: &TraceLine) {
     let Some(log_path) = log_path else { return };
-    let result = std::fs::OpenOptions::new()
-        .append(true)
-        .open(log_path)
+    let result = pent_settings::open_log_nofollow(log_path, pent_settings::LogOpen::Append)
         .and_then(|mut f| f.write_all(format_trace_line(line).as_bytes()));
     if let Err(e) = result {
         tracing::warn!(path = %log_path.display(), error = %e, "could not write to the trace log");

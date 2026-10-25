@@ -318,11 +318,11 @@ Pent always records the domains that the proxy denies. Pent records the filesyst
 
 ### `--trace`: write the denials to a log
 
-Use `--trace` to write the sandbox and proxy events to `.pent/trace.log`, and to record the filesystem denials. The process continues after a denial. `--trace` does not change the network mode.
+Use `--trace` to write the sandbox and proxy events to `~/.local/state/pent/trace/<profile>.log` (`$XDG_STATE_HOME` when it is set), and to record the filesystem denials. The process continues after a denial. `--trace` does not change the network mode.
 
 ```bash
 pent run --trace -- claude
-cat .pent/trace.log
+cat ~/.local/state/pent/trace/claude.log
 ```
 
 Each denial has a fix hint:

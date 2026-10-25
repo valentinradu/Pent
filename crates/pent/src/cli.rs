@@ -79,7 +79,8 @@ pub(crate) struct RunArgs {
     #[arg(long, value_name = "PATH")]
     pub data_dir: Option<PathBuf>,
 
-    /// Write sandbox and proxy events to .pent/trace.log, and record the
+    /// Write sandbox and proxy events to ~/.local/state/pent/trace/NAME.log,
+    /// and record the
     /// filesystem accesses that the sandbox denies. The process continues
     /// after a denial. Tracing does not change the network mode
     #[arg(long)]

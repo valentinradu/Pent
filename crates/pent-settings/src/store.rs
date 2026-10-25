@@ -308,6 +308,36 @@ impl ProfileStore {
             .join(format!("{name}.{LOG_EXTENSION}"))
     }
 
+    /// The trace log of `name` (`pent run --trace`):
+    /// `$XDG_STATE_HOME/pent/trace/<name>.log`.
+    ///
+    /// The log is not in the workspace, because the sandboxed process can
+    /// write the workspace and could put a symbolic link there.
+    #[must_use]
+    pub fn trace_log_path(&self, name: &ProfileName) -> PathBuf {
+        self.dirs.state.join("trace").join(format!("{name}.log"))
+    }
+
+    /// Create an empty trace log for `name` and return its path.
+    ///
+    /// The directory gets the mode `0700` and the file the mode `0600`. Pent
+    /// does not follow a symbolic link at the path of the log.
+    ///
+    /// # Errors
+    /// Returns an error if the directory or the file cannot be created, or
+    /// if the path of the log is a symbolic link.
+    pub fn create_trace_log(&self, name: &ProfileName) -> Result<PathBuf, StoreError> {
+        let path = self.trace_log_path(name);
+        if let Some(parent) = path.parent() {
+            create_private_dir(parent)?;
+        }
+        open_log_nofollow(&path, LogOpen::Truncate).map_err(|source| StoreError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        Ok(path)
+    }
+
     fn open_trust(&self) -> Result<TrustStore, StoreError> {
         Ok(TrustStore::open(self.dirs.trust_store())?)
     }
@@ -696,6 +726,35 @@ fn names_in(dir: &Path, extension: &str) -> Result<Vec<ProfileName>, StoreError>
         .collect())
 }
 
+/// How [`open_log_nofollow`] opens a log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogOpen {
+    /// Create the file, or empty it.
+    Truncate,
+    /// Create the file, or append to it.
+    Append,
+}
+
+/// Open a log file for writing with the mode `0600`. The call fails if the
+/// last component of `path` is a symbolic link.
+///
+/// # Errors
+/// Returns the error of `open(2)` (`ELOOP` for a symbolic link).
+pub fn open_log_nofollow(path: &Path, how: LogOpen) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true);
+    match how {
+        LogOpen::Truncate => options.write(true).truncate(true),
+        LogOpen::Append => options.append(true),
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(path)
+}
+
 /// Create `dir` and its missing parents with the mode `0700`.
 fn create_private_dir(dir: &Path) -> Result<(), StoreError> {
     let mut builder = std::fs::DirBuilder::new();
@@ -714,6 +773,33 @@ fn create_private_dir(dir: &Path) -> Result<(), StoreError> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+
+    #[cfg(unix)]
+    #[test]
+    fn trace_log_is_private_and_does_not_follow_links() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ProfileStore::new(PentDirs {
+            config: tmp.path().join("config"),
+            state: tmp.path().join("state"),
+        });
+        let name: ProfileName = "tool".parse().unwrap();
+        let path = store.create_trace_log(&name).unwrap();
+        assert!(!path.starts_with(tmp.path().join("config")));
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(path.parent().unwrap()), 0o700);
+
+        // A symbolic link at the log path makes the open fail, and the
+        // target does not change.
+        let victim = tmp.path().join("victim");
+        std::fs::write(&victim, "keep").unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&victim, &path).unwrap();
+        assert!(store.create_trace_log(&name).is_err());
+        assert!(open_log_nofollow(&path, LogOpen::Append).is_err());
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
+    }
     use super::*;
     use pent_profile::{FsOp, Outcome, ProcessInfo};
 

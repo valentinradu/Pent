@@ -7,6 +7,7 @@ license.workspace = true
 description = "Layered TOML configuration for the pent sandbox"
 
 [dependencies]
+libc = "0.2"
 serde = { workspace = true }
 thiserror = { workspace = true }
 toml = "0.8"

@@ -556,6 +556,7 @@ name = "pent-settings"
 version = "0.0.5"
 dependencies = [
  "dirs",
+ "libc",
  "pent-profile",
  "serde",
  "serde_json",
