@@ -31,8 +31,8 @@ pub use guard::{
 };
 pub use name::{ProfileName, ProfileNameError};
 pub use render::{
-    render_draft, render_draft_with, render_header, render_profile, render_terminal, DraftSource,
-    Reasons, WatchHeader,
+    render_draft, render_draft_with, render_header, render_profile, render_terminal, safe_lines,
+    DraftSource, Reasons, WatchHeader,
 };
 pub use review::{review, Selection};
 pub use summary::{

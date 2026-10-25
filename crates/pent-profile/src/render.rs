@@ -5,8 +5,11 @@
 //! - [`render_profile`]: a profile for `pent trust` and `pent profile show`,
 //!   with the reasons when they are known.
 //!
-//! The functions replace control characters in paths, names and reasons with
-//! escapes, so the output cannot change the state of the terminal.
+//! The functions replace the control characters and the Unicode format
+//! characters in paths, names and reasons with escapes, so the output cannot
+//! change the state of the terminal and cannot change the order of the text.
+//! [`safe_lines`] does the same for a whole file text: `pent trust` and
+//! `pent profile show` print the draft or the profile file as it is.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -72,14 +75,76 @@ pub const fn note_label(note: &ItemNote) -> &'static str {
     }
 }
 
-/// Replace control characters with escapes (`\u{1b}`).
+/// Return true for a Unicode format character (category Cf) or a line or
+/// paragraph separator.
+///
+/// These characters are invisible, and some of them change the order of the
+/// text: a path with `U+202E` shows `exe.txt` for the file `txt.exe`. The
+/// output escapes them, as it escapes the control characters.
+///
+/// The list follows the Unicode character database (the ranges of the
+/// category Cf), plus `U+2028` and `U+2029`, which move the cursor in some
+/// programs.
+pub(crate) const fn is_format_char(c: char) -> bool {
+    matches!(c,
+        '\u{00ad}'                  // soft hyphen
+        | '\u{0600}'..='\u{0605}'   // Arabic number signs
+        | '\u{061c}'                // Arabic letter mark
+        | '\u{06dd}' | '\u{070f}'
+        | '\u{0890}'..='\u{0891}'
+        | '\u{08e2}'
+        | '\u{180e}'                // Mongolian vowel separator
+        | '\u{200b}'..='\u{200f}'   // zero width space to right-to-left mark
+        | '\u{2028}'..='\u{2029}'   // line and paragraph separator
+        | '\u{202a}'..='\u{202e}'   // bidi embedding and override
+        | '\u{2060}'..='\u{2064}'   // word joiner and invisible operators
+        | '\u{2066}'..='\u{206f}'   // bidi isolate and deprecated formats
+        | '\u{feff}'                // byte order mark
+        | '\u{fff9}'..='\u{fffb}'   // interlinear annotation
+        | '\u{110bd}' | '\u{110cd}'
+        | '\u{13430}'..='\u{1343f}'
+        | '\u{1bca0}'..='\u{1bca3}'
+        | '\u{1d173}'..='\u{1d17a}'
+        | '\u{e0001}'
+        | '\u{e0020}'..='\u{e007f}' // tag characters
+    )
+}
+
+/// Return true for a character that the output must escape: a control
+/// character (C0, DEL, C1) or a format character.
+pub(crate) const fn is_unsafe_char(c: char) -> bool {
+    c.is_control() || is_format_char(c)
+}
+
+/// Replace with escapes (`\u{1b}`) each character that
+/// [`is_unsafe_char`] names, the newline too. Use this function for one
+/// field of one line.
 pub(crate) fn safe(text: &str) -> Cow<'_, str> {
-    if !text.chars().any(char::is_control) {
+    escape_with(text, is_unsafe_char)
+}
+
+/// Replace with escapes (`\u{1b}`) each character that
+/// [`is_unsafe_char`] names, but keep the newline. Use this function for a
+/// text with more than one line, for example the text of a draft or of a
+/// profile file.
+///
+/// `pent trust` and `pent profile show` print the file as it is. A file
+/// that pent wrote has no such character, but a file that a person edited
+/// can have one.
+#[must_use]
+pub fn safe_lines(text: &str) -> Cow<'_, str> {
+    escape_with(text, |c| c != '\n' && is_unsafe_char(c))
+}
+
+/// Replace each character for which `unsafe_char` returns true with its
+/// `\u{...}` escape.
+fn escape_with(text: &str, unsafe_char: impl Fn(char) -> bool) -> Cow<'_, str> {
+    if !text.chars().any(&unsafe_char) {
         return Cow::Borrowed(text);
     }
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
-        if c.is_control() {
+        if unsafe_char(c) {
             out.extend(c.escape_unicode());
         } else {
             out.push(c);
@@ -440,10 +505,14 @@ fn split_string_literal(line: &str) -> Option<(String, &str)> {
 // ── Draft ────────────────────────────────────────────────────────────────────
 
 /// One entry of a draft list: the TOML string with the comma, and the
-/// reason.
-type DraftEntry<'a> = (String, Option<&'a str>);
+/// reason as a TOML comment ([`comment_text`]).
+type DraftEntry = (String, Option<String>);
 
 /// Encode `text` as a TOML basic string, with escapes.
+///
+/// The function escapes each control character and each format character
+/// (see [`is_unsafe_char`]), so the text of the draft shows the true rule.
+/// The string parses back to `text`.
 #[must_use]
 pub fn toml_string(text: &str) -> String {
     let mut out = String::with_capacity(text.len().saturating_add(2));
@@ -457,8 +526,13 @@ pub fn toml_string(text: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\u{c}' => out.push_str("\\f"),
             '\r' => out.push_str("\\r"),
-            c if c.is_control() => {
-                out.push_str(&format!("\\u{:04X}", u32::from(c)));
+            c if is_unsafe_char(c) => {
+                let code = u32::from(c);
+                if code <= 0xFFFF {
+                    out.push_str(&format!("\\u{code:04X}"));
+                } else {
+                    out.push_str(&format!("\\U{code:08X}"));
+                }
             }
             c => out.push(c),
         }
@@ -467,12 +541,13 @@ pub fn toml_string(text: &str) -> String {
     out
 }
 
-/// Make a reason safe for a TOML comment: a comment cannot have control
-/// characters, so the function replaces them with spaces.
-fn comment_text(reason: &str) -> String {
+/// Make a reason safe for a TOML comment: a comment cannot have a control
+/// character, and a format character can change the order of the text, so
+/// the function replaces both with spaces.
+pub(crate) fn comment_text(reason: &str) -> String {
     reason
         .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
+        .map(|c| if is_unsafe_char(c) { ' ' } else { c })
         .collect::<String>()
         .trim()
         .to_string()
@@ -535,14 +610,20 @@ pub fn render_draft_with(
         return out;
     }
 
-    // The entries, with the comma, and the comments.
-    let mut lists: Vec<(ListKind, Vec<DraftEntry<'_>>)> = Vec::new();
+    // The entries, with the comma, and the comments. A reason can come from
+    // the comments of an earlier draft, thus `comment_text` runs on each
+    // reason: a bare CR or ESC in a hand-edited comment must not make the
+    // new draft invalid.
+    let mut lists: Vec<(ListKind, Vec<DraftEntry>)> = Vec::new();
     for kind in ListKind::ALL {
-        let entries: Vec<DraftEntry<'_>> = kind
+        let entries: Vec<DraftEntry> = kind
             .list(doc)
             .iter()
             .map(|rule| {
-                let comment = reasons.get(&kind.grant(rule.clone()));
+                let comment = reasons
+                    .get(&kind.grant(rule.clone()))
+                    .map(comment_text)
+                    .filter(|c| !c.is_empty());
                 (format!("{},", toml_string(rule)), comment)
             })
             .collect();
@@ -569,7 +650,10 @@ pub fn render_draft_with(
         }
         out.push_str(&format!("{} = [\n", kind.key()));
         for (entry, comment) in entries {
-            let comment = comment.map(|c| format!("# {c}")).unwrap_or_default();
+            let comment = comment
+                .as_ref()
+                .map(|c| format!("# {c}"))
+                .unwrap_or_default();
             push_row(&mut out, "  ", entry, width, &comment);
         }
         out.push_str("]\n");
@@ -867,5 +951,35 @@ Network
     fn toml_strings_escape_special_characters() {
         assert_eq!(toml_string("a\"b\\c"), r#""a\"b\\c""#);
         assert_eq!(toml_string("\u{1}\u{7f}"), r#""\u0001\u007F""#);
+        assert_eq!(toml_string("\u{202e}\u{feff}"), r#""\u202E\uFEFF""#);
+        assert_eq!(toml_string("\u{e0041}"), r#""\U000E0041""#);
+    }
+
+    #[test]
+    fn format_characters_are_escaped_too() {
+        assert_eq!(safe("a\u{202e}b"), "a\\u{202e}b");
+        assert_eq!(safe("iso\u{2066}x\u{2069}"), "iso\\u{2066}x\\u{2069}");
+        assert_eq!(safe_lines("a\nb"), "a\nb");
+        assert_eq!(safe_lines("a\n\u{200f}b"), "a\n\\u{200f}b");
+        assert_eq!(safe_lines("plain"), "plain");
+        assert_eq!(comment_text("a\u{202e}b"), "a b");
+    }
+
+    /// A reason that comes back from an earlier draft can hold a bare CR or
+    /// an ESC. The new draft must stay valid.
+    #[test]
+    fn comments_from_an_earlier_draft_stay_valid() -> TestResult {
+        let mut doc = ProfileDoc::default();
+        doc.filesystem.read.push("~/a".to_string());
+        let earlier = "[filesystem]\nread = [\n  \"~/a\",  # one\rtwo\u{1b}[31m\n]\n";
+        let text = render_draft_with(
+            &name("tool")?,
+            DraftSource::WatchRuns(1),
+            &doc,
+            &Reasons::from_draft(earlier),
+        );
+        assert!(matches!(ProfileDoc::parse(&text), Ok(p) if p == doc), "{text}");
+        assert!(text.contains("# one two [31m\n"), "{text}");
+        Ok(())
     }
 }

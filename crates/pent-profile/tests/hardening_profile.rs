@@ -262,7 +262,6 @@ fn p1_terminal_summary_has_no_control_characters() -> TestResult {
 }
 
 #[test]
-#[ignore = "OPEN H-1: the terminal summary prints bidi override characters from events"]
 fn p1_terminal_summary_has_no_bidi_characters() -> TestResult {
     assert_clean(
         "render_terminal",
@@ -279,7 +278,6 @@ fn p1_review_prompts_have_no_control_characters() -> TestResult {
 }
 
 #[test]
-#[ignore = "OPEN H-1: the review prompts print bidi override characters from events"]
 fn p1_review_prompts_have_no_bidi_characters() -> TestResult {
     assert_clean("review", &review_text(&crafted_summary())?, Danger::Bidi);
     Ok(())
@@ -292,7 +290,6 @@ fn p1_draft_has_no_control_characters() -> TestResult {
 }
 
 #[test]
-#[ignore = "OPEN H-1: the draft keeps bidi override characters in rules and comments"]
 fn p1_draft_has_no_bidi_characters() -> TestResult {
     assert_clean("draft", &draft_text(&crafted_summary())?, Danger::Bidi);
     Ok(())
@@ -308,7 +305,6 @@ fn p1_render_profile_has_no_control_characters() {
 }
 
 #[test]
-#[ignore = "OPEN H-1: render_profile prints bidi override characters from rules"]
 fn p1_render_profile_has_no_bidi_characters() {
     assert_clean(
         "render_profile",
@@ -462,7 +458,6 @@ fn p2_render_draft_with_arbitrary_rules_round_trips() -> TestResult {
 /// Reasons that come back from an earlier draft keep their text. A bare CR
 /// in a comment of the earlier draft must not break the new draft.
 #[test]
-#[ignore = "OPEN H-6: a bare CR or ESC in a comment of the earlier draft makes the next draft invalid"]
 fn p2_reasons_from_an_earlier_draft_keep_the_draft_valid() -> TestResult {
     let mut doc = ProfileDoc::default();
     doc.filesystem.read.push("~/a".to_string());
