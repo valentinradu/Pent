@@ -146,7 +146,11 @@ Pent binds back only what the session needs:
 A tmpfs hides its mount point, so the child opens an `O_PATH` descriptor of
 each source before the tmpfs mounts and binds from `/proc/self/fd/<n>`. The
 `resolv.conf` of the proxy takes the same path, because the file lives under
-the runtime directory.
+the runtime directory. Its **mount point** can also be inside the tmpfs:
+on a host with `systemd-resolved`, `/etc/resolv.conf` is a symbolic link
+into `/run`. The parent reads the link chain first, and the child makes the
+directory chain and the mount point inside the tmpfs. See NET-5 in
+[`network.md`](network.md).
 
 `XDG_RUNTIME_DIR` and a `TMPDIR` that points into a covered directory become
 an empty directory inside the tmpfs, so that a program that reads them still

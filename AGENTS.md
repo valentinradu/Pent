@@ -156,7 +156,9 @@ Pent needs no root and no capability on Linux. It needs unprivileged user namesp
 
 In `ProxyOnly` mode, the child unshares a user namespace and a network namespace and brings up `lo`. In the `pre_exec` hook, it still has all capabilities in its user namespace. It makes the proxy listeners in its network namespace: TCP `127.0.0.1:3128` (SOCKS5 and HTTP CONNECT on one port), and `127.0.0.1:53` for DNS (UDP and TCP). `[::1]:3128` is added when IPv6 works. The child sends the listeners to the parent with `SCM_RIGHTS` (`linux_fdpass.rs`), closes its copies and continues to `exec`. A socket keeps the network namespace of its creation, so the parent serves the proxy on them (`ProxyHandle::attach_listeners`) and connects upstream from the host network.
 
-The child can reach only its own loopback. `/etc/resolv.conf` is a read-only bind mount of a file with `nameserver 127.0.0.1`. DNS works only through `127.0.0.1:53`: a program with a fixed resolver (for example `8.8.8.8`) cannot resolve names, and the sandbox stays closed.
+The child can reach only its own loopback. `/etc/resolv.conf` is a read-only bind mount of a file with `nameserver 127.0.0.1` and nothing else. DNS works only through `127.0.0.1:53`: a program with a fixed resolver (for example `8.8.8.8`) cannot resolve names, and the sandbox stays closed.
+
+On a host with `systemd-resolved` (Ubuntu, Fedora), `/etc/resolv.conf` is a symbolic link into `/run`, and the tmpfs of the child hides the target. The parent reads the link chain (`resolv_link_target`, up to eight links), the child makes the directory chain and the mount point inside the tmpfs (`resolv_bind`, mode `0755` for a directory and `0644` for the file), and `add_ruleset_rules` adds a Landlock read rule for that path: the child adds its rules after the mounts, so the rule binds to the inode of the file of pent. A link that leaves the private directories, a chain that is too long and a host with no `/etc/resolv.conf` each leave the child without a resolver, with a warning. See NET-5 in `docs/security/network.md`.
 
 ### Linux — private `/tmp`, `/var/tmp`, `/run` and `/proc`
 
