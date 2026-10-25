@@ -2237,6 +2237,16 @@ pub(crate) fn spawn_linux(
     }
     accessible.extend(write_set.iter().cloned());
     accessible.extend(compute_accessible_set(config, path_dirs));
+    // A profile entry can name a symbolic link. The overlay shows only
+    // the paths of this set, and Landlock binds a rule to an inode, so an
+    // entry that names a link needs the file that the link reaches too;
+    // without it the entry gives access to nothing (DIFF-2). The messages
+    // keep the path as the user wrote it.
+    let resolved: Vec<PathBuf> = accessible
+        .iter()
+        .filter_map(|p| std::fs::canonicalize(p).ok().filter(|real| real != p))
+        .collect();
+    accessible.extend(resolved);
 
     let home_dir: PathBuf = std::env::var("HOME")
         .map(PathBuf::from)

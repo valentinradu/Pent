@@ -258,20 +258,23 @@ pub const FS_CASES: &[FsCase] = &[
         verdict: Verdict::Deny,
         ..FS
     },
-    // A symbolic link.
+    // A symbolic link. The entry names the link, and the rule must give
+    // the file (DIFF-2).
     FsCase {
         id: "symlink-the-named-link",
         profile: P_SYMLINK,
         target: "link.txt",
         symlink: Some(("link.txt", "real.txt")),
-        open: Some("DIFF-2"),
         ..FS
     },
+    // The same file under its own name. Landlock binds a rule to an
+    // inode, so a rule that gives the file through the link gives the
+    // file under each name that reaches it. The access is the same
+    // content, and the user named that content.
     FsCase {
         id: "symlink-the-target-by-its-own-name",
         profile: P_SYMLINK,
         target: "real.txt",
-        verdict: Verdict::Deny,
         symlink: Some(("link.txt", "real.txt")),
         ..FS
     },

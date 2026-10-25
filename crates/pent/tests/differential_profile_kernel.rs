@@ -38,8 +38,8 @@ mod fs_table {
         have_tools, sandbox_ready, stderr, stdout, BoxError, TestEnv, TestResult,
     };
     use super::differential::{
-        fs_closed, fs_open, fs_rows, resolve, Access, FsCase, Verdict, EXECUTED, GREETING, MARKER,
-        RAN, WROTE,
+        fs_closed, fs_rows, resolve, Access, FsCase, Verdict, EXECUTED, GREETING, MARKER, RAN,
+        WROTE,
     };
 
     /// The content of every file that the table makes. The file is a shell
@@ -282,16 +282,22 @@ printf 'rc=%s\n' "$?"
         run_rows(test, &fs_closed())
     }
 
-    /// A profile entry that names a symbolic link must give access to the
-    /// file. Today it gives access to neither the link nor its target.
+    /// DIFF-2. A profile entry that names a symbolic link must give
+    /// access to the file. Before the fix it gave access to neither the
+    /// link nor its target.
     #[test]
-    #[ignore = "OPEN DIFF-2: a profile entry that names a symbolic link gives access to nothing"]
     fn diff_2_a_profile_entry_that_names_a_symbolic_link() -> TestResult {
         let test = "fs_diff_2_symlink";
         if !ready(test) {
             return Ok(());
         }
-        run_rows(test, &fs_open("DIFF-2"))
+        run_rows(
+            test,
+            &fs_rows(&[
+                "symlink-the-named-link",
+                "symlink-the-target-by-its-own-name",
+            ]),
+        )
     }
 
     /// DIFF-4. A profile has three lists, and `read` is not `execute`. A
@@ -432,7 +438,7 @@ printf 'rc=%s\n' "$?"
         ids.dedup();
         assert_eq!(
             ids,
-            vec!["DIFF-2"],
+            Vec::<&str>::new(),
             "a row of FS_CASES names a disagreement without an ignored test \
              in this file"
         );

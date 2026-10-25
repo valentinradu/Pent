@@ -72,7 +72,7 @@ proof of the finding.
 | ID | Severity | Which description is wrong | Finding |
 |---|---|---|---|
 | DIFF-1 | Medium | The summary | A read that the overlay hides is not a recorded denial. |
-| DIFF-2 | Medium | The kernel | A profile entry that names a symbolic link gives access to nothing. |
+| DIFF-2 | Medium | The kernel | **Fixed.** A profile entry that named a symbolic link gave access to nothing. |
 | DIFF-3 | Low | The kernel | A write to a read-only rule succeeds inside the run. |
 | DIFF-4 | Medium | The kernel | **Fixed.** A `read` rule also gave execute. |
 | DIFF-5 | High | The kernel | **Fixed.** The guard missed a private key behind a symbolic link, and the summary said "blocked". |
@@ -108,11 +108,13 @@ hidden set and record a denial.
 
 ### DIFF-2 — a profile entry that names a symbolic link gives access to nothing
 
-**Severity:** Medium. **Wrong description:** the kernel.
+**Severity:** Medium. **Wrong description:** the kernel. **Fixed** in
+`COMMIT-DIFF-2`.
 
 **Test:** `differential_profile_kernel.rs`,
-`diff_2_a_profile_entry_that_names_a_symbolic_link`. Row
-`symlink-the-named-link`.
+`diff_2_a_profile_entry_that_names_a_symbolic_link`. Rows
+`symlink-the-named-link` and `symlink-the-target-by-its-own-name`. The
+test runs now.
 
 The profile holds `read = ["~/link.txt"]`, and `~/link.txt` is a symbolic
 link to `~/real.txt`. The program reads neither file. The link stays
@@ -123,9 +125,18 @@ A watch run hides the problem: the recorder sees the link and the target,
 so the draft has both entries and the run works. A user who writes the
 profile by hand gets the failure.
 
-**The fix.** Resolve each profile entry one time before the sandbox starts.
-Add the rule for the link and for the target of the link. Report an entry
-that resolves to nothing.
+**The fix.** `prepare_spawn` resolves each path of the accessible set one
+time, before the overlay starts, and adds the real path to the set. The
+overlay then shows the target, and the Landlock rule of the entry, which
+the child binds by opening the path, reaches the inode of the target. The
+messages keep the path as the user wrote it.
+
+The row `symlink-the-target-by-its-own-name` changes from `deny` to
+`allow` with this fix. Landlock binds a rule to an inode, so a rule that
+gives the file through the link gives the file under each name that
+reaches it. No kernel interface can separate the two names. The access is
+the same content, and the user named that content, so the row now states
+`allow`.
 
 ### DIFF-3 — a write to a read-only rule succeeds inside the run
 
@@ -338,11 +349,13 @@ each character that a regular expression gives a meaning to.
 These results are solid. Each one comes from a real run of the `pent`
 binary, three times, alone, on Linux.
 
-**The profile against the kernel (37 of 38 rows).**
+**The profile against the kernel (38 of 38 rows).**
 
 - A rule on one file gives the file and no sibling.
 - A rule on one directory gives each child, at any depth, and no other
   directory.
+- An entry that names a symbolic link gives the file. The same file under
+  its own name opens too, because Landlock binds a rule to an inode.
 - A path with a space, a quotation mark, a newline or a name that is not
   ASCII works, and the sibling of each one stays closed. The TOML escape
   of a newline survives the whole flow.
