@@ -43,6 +43,7 @@ pent/
     │       ├── linux_landlock.rs # Landlock syscalls
     │       ├── linux_overlayfs.rs# overlayfs shadow and flush
     │       ├── linux_watch.rs    # seccomp-notify recorder and watch guard
+    │       ├── linux_unixconn.rs # the control of connect(2) to a Unix socket
     │       ├── linux_proxynet.rs # Linux proxy network (listeners made in the child)
     │       └── linux_fdpass.rs   # SCM_RIGHTS descriptor passing
     └── pent-proxy/               # DNS + TCP proxy with allowlist enforcement
@@ -163,7 +164,7 @@ With enforcement, the child gets an empty tmpfs over `/tmp`, `/var/tmp` and `/ru
 
 The child also gets a new PID namespace with a private `proc` mount, so it sees only the processes of the sandbox. A new `proc` mount needs a new PID namespace. `unshare(CLONE_NEWPID)` does not move the caller, so the `pre_exec` hook forks twice: a stub in the old namespace, PID 1 of the new namespace, and the command as PID 2 (see `fork_pid_namespace`). The command must not be PID 1: the kernel drops each signal that has the default action for the init of a namespace. Watch mode takes the private directories but no PID namespace: it must not change how the program runs, and an orphan of the program must keep its events.
 
-Landlock up to ABI v6 does not control `connect(2)` on a path Unix socket. A socket that the profile reaches, or a socket in a directory that no private tmpfs covers, is still usable. The full fix is a `connect(2)` filter in the supervisor; see `docs/security/linux-sandbox.md`.
+Landlock up to ABI v6 does not control `connect(2)` on a path Unix socket, so the supervisor controls each connection itself (`linux_unixconn.rs`). It reads the address one time, compares the canonical path with `SandboxConfig::unix_sockets`, makes the connection with its own socket, and gives that socket to the child with `SECCOMP_IOCTL_NOTIF_ADDFD`. Every other `AF_UNIX` address gets `EACCES`. The supervisor never answers `CONTINUE` after it reads an `AF_UNIX` address: the kernel would read the address again. With an empty allowlist the filter refuses `socket(AF_UNIX, ...)` with `EAFNOSUPPORT` in the BPF program, where no thread can change the domain. The control needs the supervisor, so `pent run` starts the recorder also without `--trace`; it then traps only `connect`. See `docs/security/linux-sandbox.md`.
 
 ### macOS — network containment with Seatbelt
 

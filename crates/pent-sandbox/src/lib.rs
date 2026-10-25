@@ -63,6 +63,9 @@ mod linux_overlayfs;
 #[cfg(target_os = "linux")]
 mod linux_watch;
 
+#[cfg(target_os = "linux")]
+mod linux_unixconn;
+
 pub use config::{system_default_paths, SandboxConfig};
 pub use env::{build_env, resolve_path_directories, resolve_path_dirs_from};
 #[cfg(target_os = "linux")]

@@ -95,8 +95,8 @@ fn tailscale_localapi_socket_is_masked() -> TestResult {
     // reached a host daemon that can open arbitrary connections for it.
     let script = r#"
 import socket, sys
-s = socket.socket(socket.AF_UNIX)
 try:
+    s = socket.socket(socket.AF_UNIX)
     s.connect("/run/tailscale/tailscaled.sock")
 except OSError as e:
     print("BLOCKED", e); sys.exit(0)
@@ -135,8 +135,8 @@ fn system_dbus_socket_is_masked() -> TestResult {
     // proxy) and other services.
     let script = r#"
 import socket, sys
-s = socket.socket(socket.AF_UNIX)
 try:
+    s = socket.socket(socket.AF_UNIX)
     s.connect("/run/dbus/system_bus_socket"); print("REACHED")
 except OSError as e:
     print("BLOCKED", e)

@@ -45,8 +45,11 @@ the kernel backend, and the notes in each report give the fix.
 ## The limits that pent cannot remove
 
 - **Unix sockets.** Landlock up to ABI v6 does not control `connect(2)` on a
-  Unix socket that has a path. Pent hides the sockets that it knows, but a
-  socket that the profile can reach is usable.
+  Unix socket that has a path. The supervisor makes each permitted
+  connection itself (see linux-sandbox.md, LS-1). A profile that names a
+  socket trusts the program not to race the supervisor: the address family
+  of `connect(2)` and the address of `sendto(2)` stay values in the memory
+  of the program.
 - **Data in a domain name.** A wildcard rule such as `*.example.com` lets the
   program put data in the name of a subdomain, and a `TXT` answer brings data
   back.

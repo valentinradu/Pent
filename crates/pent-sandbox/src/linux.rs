@@ -294,15 +294,6 @@ impl RuleSink for PreparedRuleset {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct AccessPolicy {
     rules: Vec<(PathBuf, u64)>,
-    /// The paths that the private mounts hide (a connection to a socket
-    /// below them fails).
-    hidden: Vec<PathBuf>,
-    /// The paths that pent binds back inside a private directory. A path
-    /// below one of them stays reachable, also when a hidden path covers it.
-    visible: Vec<PathBuf>,
-    /// True if a connection to an abstract Unix socket outside the sandbox
-    /// fails (a new network namespace, or the Landlock scope of ABI v6).
-    abstract_denied: bool,
 }
 
 impl RuleSink for AccessPolicy {
@@ -354,24 +345,6 @@ impl AccessPolicy {
             pent_profile::Outcome::Allowed
         } else {
             pent_profile::Outcome::Denied
-        }
-    }
-
-    /// Predict the result of a `connect()` to the Unix socket `target` (a
-    /// path, or `@name` for an abstract socket).
-    #[must_use]
-    pub(crate) fn predict_unix(&self, target: &str) -> pent_profile::Outcome {
-        let denied = if target.starts_with('@') {
-            self.abstract_denied
-        } else {
-            let path = Path::new(target);
-            self.hidden.iter().any(|h| path.starts_with(h))
-                && !self.visible.iter().any(|v| path.starts_with(v))
-        };
-        if denied {
-            pent_profile::Outcome::Denied
-        } else {
-            pent_profile::Outcome::Allowed
         }
     }
 }
@@ -2059,7 +2032,14 @@ pub(crate) enum SpawnMode<'a> {
     Sandbox,
     /// Watch mode: no Landlock, no overlay and no masks. The child gets the
     /// mounts of the watch guard, and the recorder always runs.
-    Watch(&'a crate::linux_watch::GuardPlan),
+    Watch {
+        /// The mounts of the watch guard.
+        guard: &'a crate::linux_watch::GuardPlan,
+        /// The Unix socket paths of the profile. Watch mode does not
+        /// enforce them; it marks each connection with the decision that
+        /// `pent run` would make.
+        unix_sockets: &'a [PathBuf],
+    },
 }
 
 /// The result of [`spawn_linux`].
@@ -2095,9 +2075,12 @@ pub(crate) fn spawn_linux(
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
-    let guard = match mode {
-        SpawnMode::Sandbox => None,
-        SpawnMode::Watch(plan) => Some(plan),
+    let (guard, unix_sockets) = match mode {
+        SpawnMode::Sandbox => (None, config.unix_sockets.as_slice()),
+        SpawnMode::Watch {
+            guard,
+            unix_sockets,
+        } => (Some(guard), unix_sockets),
     };
     let watch = guard.is_some();
     let enforce = !watch && !config.no_enforcement;
@@ -2309,28 +2292,36 @@ pub(crate) fn spawn_linux(
     // The recorder. The supervisor thread starts before `spawn`: the child
     // sends the listener file descriptor during `spawn`, and its `execve`
     // waits for an answer from the supervisor.
-    let recorder = if record {
-        let judge = match guard {
-            Some(plan) => crate::linux_watch::Judge::Guard {
-                enforced: plan.effective.clone(),
-                unenforced: plan.unenforced.clone(),
-            },
-            None => {
-                let mut policy = AccessPolicy::default();
-                add_ruleset_rules(&mut policy, config, path_dirs, &write_set, &overlay_dirs);
-                policy.hidden = mask_dirs
-                    .iter()
-                    .chain(&mask_files)
-                    .chain(&private.covered)
-                    .cloned()
-                    .collect();
-                policy.visible.clone_from(&private.visible);
-                policy.abstract_denied = net_flag != 0
-                    || (enforce && crate::linux_landlock::abi_version().is_ok_and(|abi| abi >= 6));
-                crate::linux_watch::Judge::Policy(policy)
-            }
+    //
+    // The supervisor also controls each `connect(2)` to a Unix socket, so
+    // it runs with enforcement too, even without `--trace`. It then traps
+    // only `connect` and makes no event. The cost is one notification for
+    // each connection of the child.
+    let unix_policy = crate::linux_unixconn::UnixPolicy::new(unix_sockets);
+    let unix = if enforce {
+        crate::linux_unixconn::UnixControl::Enforce(unix_policy)
+    } else {
+        crate::linux_unixconn::UnixControl::Observe(unix_policy)
+    };
+    let recorder = if record || enforce {
+        let judge = if record {
+            Some(match guard {
+                Some(plan) => crate::linux_watch::Judge::Guard {
+                    enforced: plan.effective.clone(),
+                    unenforced: plan.unenforced.clone(),
+                },
+                None => {
+                    let mut policy = AccessPolicy::default();
+                    add_ruleset_rules(&mut policy, config, path_dirs, &write_set, &overlay_dirs);
+                    crate::linux_watch::Judge::Policy(policy)
+                }
+            })
+        } else {
+            None
         };
-        Some(crate::linux_watch::start_recorder(judge)?)
+        Some(crate::linux_watch::start_recorder(
+            crate::linux_watch::RecorderPlan { judge, unix },
+        )?)
     } else {
         None
     };
@@ -4297,23 +4288,6 @@ mod tests {
     }
 
     #[test]
-    fn test_policy_predict_unix_with_a_visible_path() {
-        let policy = AccessPolicy {
-            hidden: vec![PathBuf::from("/tmp")],
-            visible: vec![PathBuf::from("/tmp/ws")],
-            ..AccessPolicy::default()
-        };
-        assert_eq!(
-            policy.predict_unix("/tmp/host.sock"),
-            pent_profile::Outcome::Denied
-        );
-        assert_eq!(
-            policy.predict_unix("/tmp/ws/app.sock"),
-            pent_profile::Outcome::Allowed
-        );
-    }
-
-    #[test]
     fn test_is_explicitly_allowed() {
         let mask = Path::new("/run/user/1000");
         let ancestor_only = vec![PathBuf::from("/"), PathBuf::from("/run")];
@@ -4578,12 +4552,6 @@ mod tests {
             policy.predict(FsOp::Exec, Path::new("/var/x"), false),
             denied
         );
-        policy.hidden = vec![PathBuf::from("/run/user/1000")];
-        assert_eq!(policy.predict_unix("/run/user/1000/bus"), denied);
-        assert_eq!(policy.predict_unix("/tmp/x.sock"), allowed);
-        assert_eq!(policy.predict_unix("@abstract"), allowed);
-        policy.abstract_denied = true;
-        assert_eq!(policy.predict_unix("@abstract"), denied);
         Ok(())
     }
 }
