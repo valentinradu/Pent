@@ -314,7 +314,7 @@ fn test_check_reports_platform() -> TestResult {
 fn test_run_reads_file_in_workspace() -> TestResult {
     if !sandbox_available() {
         common::e2e::skip(
-            "this test",
+            "test_run_reads_file_in_workspace",
             "sandbox-exec cannot apply a profile on this machine",
         );
         return Ok(());
@@ -337,7 +337,7 @@ fn test_run_reads_file_in_workspace() -> TestResult {
 fn test_run_writes_file_in_workspace() -> TestResult {
     if !sandbox_available() {
         common::e2e::skip(
-            "this test",
+            "test_run_writes_file_in_workspace",
             "sandbox-exec cannot apply a profile on this machine",
         );
         return Ok(());
@@ -367,7 +367,7 @@ fn test_run_cannot_read_file_in_home_dir() -> TestResult {
     // process should not be able to read files placed there.
     if !sandbox_available() {
         common::e2e::skip(
-            "this test",
+            "test_run_cannot_read_file_in_home_dir",
             "sandbox-exec cannot apply a profile on this machine",
         );
         return Ok(());
@@ -417,7 +417,7 @@ fn test_run_extra_read_gives_access_to_home_dir_file() -> TestResult {
     // inside the sandbox, even if it would otherwise be inaccessible.
     if !sandbox_available() {
         common::e2e::skip(
-            "this test",
+            "test_run_extra_read_gives_access_to_home_dir_file",
             "sandbox-exec cannot apply a profile on this machine",
         );
         return Ok(());
@@ -487,7 +487,7 @@ fn test_run_extra_write_gives_write_access() -> TestResult {
     // otherwise inaccessible.
     if !sandbox_available() {
         common::e2e::skip(
-            "this test",
+            "test_run_extra_write_gives_write_access",
             "sandbox-exec cannot apply a profile on this machine",
         );
         return Ok(());
@@ -598,7 +598,7 @@ fn test_run_blocked_network_by_direct_ip() -> TestResult {
 fn test_run_localhost_network_allows_loopback() -> TestResult {
     if !sandbox_available() {
         common::e2e::skip(
-            "this test",
+            "test_run_localhost_network_allows_loopback",
             "sandbox-exec cannot apply a profile on this machine",
         );
         return Ok(());
@@ -637,7 +637,7 @@ fn test_run_localhost_network_allows_loopback() -> TestResult {
 fn test_run_allow_flag_starts_proxy_without_crash() -> TestResult {
     if !sandbox_available() {
         common::e2e::skip(
-            "this test",
+            "test_run_allow_flag_starts_proxy_without_crash",
             "sandbox-exec cannot apply a profile on this machine",
         );
         return Ok(());
@@ -663,7 +663,7 @@ fn test_run_allow_flag_starts_proxy_without_crash() -> TestResult {
 fn test_run_env_flag_passes_named_variable() -> TestResult {
     if !sandbox_available() {
         common::e2e::skip(
-            "this test",
+            "test_run_env_flag_passes_named_variable",
             "sandbox-exec cannot apply a profile on this machine",
         );
         return Ok(());
@@ -686,7 +686,7 @@ fn test_run_env_flag_passes_named_variable() -> TestResult {
 fn test_run_env_explicit_kv_sets_variable() -> TestResult {
     if !sandbox_available() {
         common::e2e::skip(
-            "this test",
+            "test_run_env_explicit_kv_sets_variable",
             "sandbox-exec cannot apply a profile on this machine",
         );
         return Ok(());
@@ -719,7 +719,7 @@ fn test_proxy_mode_allows_localhost_mcp_connection() -> TestResult {
     // sandboxed process in proxy_only mode can reach a TCP server on 127.0.0.1.
     if !sandbox_available() {
         common::e2e::skip(
-            "this test",
+            "test_proxy_mode_allows_localhost_mcp_connection",
             "sandbox-exec cannot apply a profile on this machine",
         );
         return Ok(());

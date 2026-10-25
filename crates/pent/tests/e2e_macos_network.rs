@@ -105,6 +105,18 @@ mod macos {
         let env = TestEnv::new()?;
         env.install_profile("net", NET_PROFILE)?;
 
+        // The positive control: the same request through the proxy works.
+        // Without it, a broken curl or a sandbox that does not start gives
+        // the same result as the denial below.
+        let out = run(&env, &curl("https://example.com"))?;
+        let code = stdout(&out);
+        assert!(
+            code.len() == 3 && code != "000",
+            "the request through the proxy must work, else this run proves \
+             no denial (http code {code:?})\nstderr: {}",
+            stderr(&out)
+        );
+
         // `--noproxy '*'` makes curl ignore the proxy variables, so the
         // request goes straight to the address of the host.
         let mut args = curl("https://example.com");
@@ -116,6 +128,12 @@ mod macos {
             "a direct connection to an allowed domain must fail: the \
              Seatbelt profile allows only the proxy port\nstdout: {}\nstderr: {}",
             stdout(&out),
+            stderr(&out)
+        );
+        assert_eq!(
+            stdout(&out),
+            "000",
+            "curl must report no answer for the direct connection\nstderr: {}",
             stderr(&out)
         );
         Ok(())

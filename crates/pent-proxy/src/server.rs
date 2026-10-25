@@ -1041,16 +1041,20 @@ mod tests {
     // Integration Tests - End to End
     // ========================================================================
 
-    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_integration_allowed_domain_flow() -> TestResult {
         skip_if_no_bind!();
         use tokio::net::UdpSocket;
 
+        let Some(upstream) = fake_upstream() else {
+            crate::test_support::skip("this machine cannot bind a UDP socket on the loopback");
+            return Ok(());
+        };
         let config = ProxyConfig {
             dns_bind_addr: "127.0.0.1:25364".parse()?,
             proxy_bind_addr: "127.0.0.1:29311".parse()?,
             domain_allowlist: vec!["example.com".to_string()],
+            upstream_dns: Some(vec![upstream]),
             ..Default::default()
         };
         let server = ProxyServer::new(config)?;
@@ -1070,10 +1074,19 @@ mod tests {
         )
         .await??;
 
-        // Should get successful response (RCODE = 0 in byte 3)
+        // Success (RCODE 0) with the A record of the fake upstream.
         assert!(len > 12);
         let rcode = buf[3] & 0x0F;
         assert_eq!(rcode, 0, "Expected success RCODE");
+        assert_eq!(
+            u16::from_be_bytes([buf[6], buf[7]]),
+            1,
+            "the answer must hold one record"
+        );
+        assert!(
+            buf[..len].windows(4).any(|w| w == [203, 0, 113, 9]),
+            "the answer must carry the address of the upstream"
+        );
 
         handle.shutdown().await?;
         Ok(())
@@ -1237,16 +1250,20 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_integration_wildcard_subdomain() -> TestResult {
         skip_if_no_bind!();
         use tokio::net::UdpSocket;
 
+        let Some(upstream) = fake_upstream() else {
+            crate::test_support::skip("this machine cannot bind a UDP socket on the loopback");
+            return Ok(());
+        };
         let config = ProxyConfig {
             dns_bind_addr: "127.0.0.1:25367".parse()?,
             proxy_bind_addr: "127.0.0.1:29314".parse()?,
             domain_allowlist: vec!["*.github.com".to_string()],
+            upstream_dns: Some(vec![upstream]),
             ..Default::default()
         };
         let server = ProxyServer::new(config)?;
@@ -1265,10 +1282,22 @@ mod tests {
         )
         .await??;
 
-        // Should get success (wildcard matches)
+        // Success (the wildcard matches), with the record of the upstream.
         assert!(len > 12);
         let rcode = buf[3] & 0x0F;
         assert_eq!(rcode, 0, "Wildcard subdomain should be allowed");
+        assert_eq!(u16::from_be_bytes([buf[6], buf[7]]), 1);
+
+        // The parent name itself is not below the wildcard.
+        let query = build_test_dns_query("github.com", 1);
+        socket.send_to(&query, "127.0.0.1:25367").await?;
+        let (len, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            socket.recv_from(&mut buf),
+        )
+        .await??;
+        assert!(len > 12);
+        assert_eq!(buf[3] & 0x0F, 3, "the parent name must get NXDOMAIN");
 
         handle.shutdown().await?;
         Ok(())
@@ -1399,17 +1428,21 @@ mod tests {
     // Concurrent Operations Tests
     // ========================================================================
 
-    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_concurrent_dns_and_tcp() -> TestResult {
         skip_if_no_bind!();
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::{TcpStream, UdpSocket};
 
+        let Some(upstream) = fake_upstream() else {
+            crate::test_support::skip("this machine cannot bind a UDP socket on the loopback");
+            return Ok(());
+        };
         let config = ProxyConfig {
             dns_bind_addr: "127.0.0.1:25372".parse()?,
             proxy_bind_addr: "127.0.0.1:29319".parse()?,
             domain_allowlist: vec!["example.com".to_string()],
+            upstream_dns: Some(vec![upstream]),
             ..Default::default()
         };
         let server = ProxyServer::new(config)?;
@@ -1430,27 +1463,28 @@ mod tests {
                 socket.recv_from(&mut buf),
             )
             .await;
-            result.is_ok()
+            // The answer must be a DNS answer with RCODE 0, not only a
+            // datagram that arrived before the timeout.
+            matches!(result, Ok(Ok((len, _))) if len > 12 && buf[3] & 0x0F == 0)
         });
 
         // Spawn TCP connection
         let tcp_task = tokio::spawn(async {
-            let result = TcpStream::connect("127.0.0.1:29319").await;
-            if let Ok(mut stream) = result {
-                // SOCKS5 handshake
-                let _ = stream.write_all(&[0x05, 0x01, 0x00]).await;
-                let mut buf = [0u8; 2];
-                let _ = stream.read(&mut buf).await;
-                true
-            } else {
-                false
+            let Ok(mut stream) = TcpStream::connect("127.0.0.1:29319").await else {
+                return false;
+            };
+            // The greeting of SOCKS5 and the answer of the proxy.
+            if stream.write_all(&[0x05, 0x01, 0x00]).await.is_err() {
+                return false;
             }
+            let mut buf = [0u8; 2];
+            matches!(stream.read_exact(&mut buf).await, Ok(2)) && buf == [0x05, 0x00]
         });
 
-        // Both should complete
+        // Both must work at the same time.
         let (dns_result, tcp_result) = tokio::join!(dns_task, tcp_task);
-        assert!(dns_result?);
-        assert!(tcp_result?);
+        assert!(dns_result?, "the DNS server did not answer");
+        assert!(tcp_result?, "the proxy did not answer the SOCKS5 greeting");
 
         handle.shutdown().await?;
         Ok(())
@@ -1544,6 +1578,65 @@ mod tests {
     // ========================================================================
 
     /// Build a DNS query packet for testing.
+    /// Start a fake upstream DNS server on the loopback.
+    ///
+    /// It answers each A query with 203.0.113.9 and every other type with
+    /// NOERROR and no record. The tests of this file then need no internet
+    /// and no resolver of the host.
+    ///
+    /// Returns `None` when the machine cannot bind a UDP socket.
+    fn fake_upstream() -> Option<SocketAddr> {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").ok()?;
+        let addr = socket.local_addr().ok()?;
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 512];
+            loop {
+                let Ok((len, src)) = socket.recv_from(&mut buf) else {
+                    return;
+                };
+                let Some(query) = buf.get(..len) else {
+                    continue;
+                };
+                if let Some(answer) = fake_answer(query) {
+                    let _ = socket.send_to(&answer, src);
+                }
+            }
+        });
+        Some(addr)
+    }
+
+    /// Build the answer of [`fake_upstream`] for one query.
+    fn fake_answer(query: &[u8]) -> Option<Vec<u8>> {
+        // Walk the question to its end: the answer echoes it.
+        let mut pos = 12usize;
+        loop {
+            let len = *query.get(pos)? as usize;
+            pos += 1;
+            if len == 0 {
+                break;
+            }
+            pos += len;
+        }
+        let qtype = u16::from_be_bytes([*query.get(pos)?, *query.get(pos + 1)?]);
+        let question = query.get(12..pos + 4)?;
+        let mut out = query.get(..2)?.to_vec();
+        out.extend_from_slice(&[0x81, 0x80]); // QR + RD + RA, NOERROR
+        out.extend_from_slice(&[0x00, 0x01]); // QDCOUNT
+        let a_record = qtype == 1;
+        out.extend_from_slice(&u16::from(a_record).to_be_bytes()); // ANCOUNT
+        out.extend_from_slice(&[0, 0, 0, 0]);
+        out.extend_from_slice(question);
+        if a_record {
+            out.extend_from_slice(&[0xC0, 0x0C]); // the name of the question
+            out.extend_from_slice(&1u16.to_be_bytes()); // A
+            out.extend_from_slice(&1u16.to_be_bytes()); // IN
+            out.extend_from_slice(&60u32.to_be_bytes()); // TTL
+            out.extend_from_slice(&4u16.to_be_bytes()); // RDLENGTH
+            out.extend_from_slice(&[203, 0, 113, 9]);
+        }
+        Some(out)
+    }
+
     fn build_test_dns_query(domain: &str, record_type: u16) -> Vec<u8> {
         let mut query = Vec::new();
 
