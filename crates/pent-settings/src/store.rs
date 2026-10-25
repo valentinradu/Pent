@@ -1033,6 +1033,114 @@ mod tests {
         assert_eq!(f.store.load(&n).unwrap().status, ProfileStatus::NotTrusted);
     }
 
+    /// A draft comes back with its text and with its rules.
+    #[test]
+    fn a_draft_comes_back_with_its_text_and_its_rules() {
+        let f = fixture();
+        let n = name("claude");
+        assert_eq!(f.store.read_draft_text(&n).unwrap(), None);
+        assert_eq!(f.store.read_draft(&n).unwrap(), None);
+        f.store.write_draft(&n, DRAFT).unwrap();
+        assert_eq!(
+            f.store.read_draft_text(&n).unwrap(),
+            Some(DRAFT.to_string())
+        );
+        let doc = f.store.read_draft(&n).unwrap();
+        assert_eq!(
+            doc.as_ref().map(|d| d.filesystem.read.clone()),
+            Some(vec!["~/.gitconfig".to_string()])
+        );
+        assert_eq!(
+            doc.as_ref().map(|d| d.network.domains.clone()),
+            Some(vec!["a.com".to_string()])
+        );
+    }
+
+    /// `remove` reports true when it deleted a draft, also when there is no
+    /// profile file.
+    #[test]
+    fn remove_reports_a_draft_without_a_profile() {
+        let f = fixture();
+        let n = name("claude");
+        f.store.write_draft(&n, DRAFT).unwrap();
+        assert!(f.store.remove(&n).unwrap());
+        assert!(!f.store.remove(&n).unwrap());
+        // The other direction: a profile file with no draft.
+        std::fs::create_dir_all(f.store.profile_path(&n).parent().unwrap()).unwrap();
+        std::fs::write(f.store.profile_path(&n), DRAFT).unwrap();
+        assert!(f.store.remove(&n).unwrap());
+    }
+
+    /// Only a missing file gives `None`. Another I/O error is an error, so
+    /// a profile that pent cannot read never looks absent.
+    #[test]
+    fn a_file_that_pent_cannot_read_is_an_error_and_not_an_absence() {
+        let f = fixture();
+        let n = name("claude");
+        // A directory at the path of each file: the read gives
+        // `IsADirectory`, which is not `NotFound`.
+        std::fs::create_dir_all(f.store.profile_path(&n)).unwrap();
+        std::fs::create_dir_all(f.store.draft_path(&n)).unwrap();
+        std::fs::create_dir_all(f.store.denied_path(&n)).unwrap();
+        assert!(f.store.read_profile_text(&n).is_err());
+        assert!(f.store.read_draft(&n).is_err());
+        assert!(f.store.read_denied(&n).is_err());
+        assert!(f.store.remove(&n).is_err());
+        // A file at the path of the watch directory: `read_dir` gives
+        // `NotADirectory`, which is not `NotFound`.
+        let watch = f.store.watch_dir(&n);
+        std::fs::create_dir_all(watch.parent().unwrap()).unwrap();
+        std::fs::write(&watch, "x").unwrap();
+        assert!(f.store.watch_runs(&n).is_err());
+
+        // A log file whose parent directory is a file: `open` gives
+        // `NotADirectory`. A directory is not enough here, because `open`
+        // on a directory works and the error comes later, from the read.
+        let g = fixture();
+        let denied_dir = g.store.denied_path(&n).parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(denied_dir.parent().unwrap()).unwrap();
+        std::fs::write(&denied_dir, "x").unwrap();
+        assert!(g.store.read_denied(&n).is_err());
+    }
+
+    /// Each profile state has its own text. The `pent profile` list shows
+    /// it, so two states must not read the same.
+    #[test]
+    fn each_profile_status_has_its_own_text() {
+        let texts: Vec<String> = [
+            ProfileStatus::Trusted,
+            ProfileStatus::NotTrusted,
+            ProfileStatus::Changed,
+            ProfileStatus::DraftOnly,
+            ProfileStatus::Missing,
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        assert_eq!(
+            texts,
+            vec![
+                "trusted",
+                "not trusted",
+                "changed after trust",
+                "draft only",
+                "missing"
+            ]
+        );
+    }
+
+    /// `from_env` reads the XDG variables of the process and falls back to
+    /// the home directory.
+    #[test]
+    fn from_env_uses_the_variables_of_the_process() {
+        let expected = PentDirs::from_vars(
+            std::env::var_os("XDG_CONFIG_HOME"),
+            std::env::var_os("XDG_STATE_HOME"),
+            dirs::home_dir(),
+        );
+        assert_eq!(PentDirs::from_env(), expected);
+    }
+
     #[test]
     fn watch_runs_append_and_replace() {
         let f = fixture();

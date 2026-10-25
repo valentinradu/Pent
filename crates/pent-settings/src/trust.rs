@@ -445,6 +445,68 @@ mod tests {
         ));
     }
 
+    /// The key of an entry is the path of the file. The approval of one
+    /// file must never apply to another file, also when the two files have
+    /// the same content.
+    #[test]
+    fn the_approval_of_one_file_does_not_apply_to_another_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let approved = dir.path().join("approved.toml");
+        let other = dir.path().join("other.toml");
+        std::fs::write(&approved, "a").unwrap();
+        std::fs::write(&other, "a").unwrap();
+        let mut store = TrustStore::empty(dir.path().join("trusted.toml"));
+        store.trust(&approved, b"a");
+        assert_eq!(store.status(&approved, b"a"), TrustStatus::Trusted);
+        assert_eq!(store.status(&other, b"a"), TrustStatus::Untrusted);
+        assert!(!store.untrust(&other));
+        assert!(store.untrust(&approved));
+    }
+
+    /// Only a missing file gives an empty store. Another I/O error is an
+    /// error, so a trust store that pent cannot read never looks empty.
+    #[test]
+    fn a_trust_store_that_pent_cannot_read_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory at the path of the store: `read_to_string` gives
+        // `IsADirectory`, which is not `NotFound`.
+        let store_path = dir.path().join("trusted.toml");
+        std::fs::create_dir(&store_path).unwrap();
+        assert!(matches!(
+            TrustStore::open(store_path),
+            Err(TrustError::Io { .. })
+        ));
+        // A missing file still gives an empty store.
+        let missing = dir.path().join("missing.toml");
+        let store = TrustStore::open(missing);
+        assert!(store.is_ok(), "{store:?}");
+    }
+
+    /// The default trust store is `trusted.toml` in the pent config
+    /// directory. A wrong path reads the approvals of another file, or
+    /// none.
+    #[test]
+    fn the_default_trust_store_is_in_the_config_directory() {
+        let expected = crate::PentDirs::from_env().map(|d| d.config.join("trusted.toml"));
+        assert_eq!(TrustStore::default_path(), expected);
+        if let Some(path) = expected {
+            assert!(path.ends_with("pent/trusted.toml"), "{}", path.display());
+        }
+    }
+
+    /// The name of the temporary file must not be the same each time: a
+    /// name that another process can guess lets that process put a symbolic
+    /// link there before pent opens it.
+    #[test]
+    fn the_name_of_the_temporary_file_changes() {
+        let seen: std::collections::HashSet<u64> = (0..1000).map(|_| nonce(0)).collect();
+        assert!(
+            seen.len() > 1,
+            "the nonce of the temporary file is always the same: {seen:?}"
+        );
+        assert_ne!(nonce(0), nonce(1), "each try must give another name");
+    }
+
     #[test]
     fn test_digest_hex_roundtrip() {
         let d = ConfigDigest::of(b"hello");
