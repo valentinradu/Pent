@@ -49,7 +49,7 @@ Pent launches a child process inside a sandbox with two complementary controls.
 
 On macOS, Pent generates a [Sandbox Profile Language (SBPL)](https://reverse.put.as/wp-content/uploads/2011/09/Apple-Sandbox-Guide-v1.0.pdf) policy and launches the child process via `sandbox-exec`.
 
-The profile starts from `(allow default)`. It denies file reads (file content) and file writes, and then allows the configured paths and the workspace. The last matching rule wins, so the profile ends with a rule that denies writes to `<workspace>/.pent`. The sandboxed process cannot change the project config. See [Platform limitations](#platform-limitations) for the operations that the profile does not limit.
+The profile starts from `(allow default)`. It denies file reads (file content) and file writes, and then allows the configured paths and the workspace. See [Platform limitations](#platform-limitations) for the operations that the profile does not limit.
 
 macOS has no network namespaces. In proxy mode, the profile denies outbound connections and allows only the proxy port on loopback, the system name resolver socket and the Unix sockets in the writable paths. See [Platform limitations](#platform-limitations) below.
 
@@ -88,7 +88,7 @@ On macOS, the Seatbelt profile enforces proxy mode. The process can connect only
 
 The macOS profile is not a deny-by-default sandbox. It limits file content reads, file writes and (in the `blocked` and `localhost` modes) network access. All other operations stay allowed. For example, the process can read file metadata (`stat`) everywhere, look up Mach services, send signals and read sysctl values. The execute paths add allow rules for `process-exec`, but the profile has no global deny for `process-exec`.
 
-The macOS backend also ignores `[[sandbox.mounts]]`. Use `[sandbox.paths]` to give access to a path on macOS.
+The macOS backend also ignores `[[sandbox.mounts]]`. Use a profile rule (or `--read`, `--write`) to give access to a path on macOS.
 
 ### Linux: requirements and Unix sockets
 

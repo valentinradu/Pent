@@ -13,18 +13,36 @@ child process can access.
 pent/
 ├── Cargo.toml                    # Workspace root
 ├── AGENTS.md                     # This file
+├── docs/design/watch.md          # Design of watch mode and recorded profiles
 └── crates/
-    ├── pent-settings/            # Layered TOML config + shared types
+    ├── pent/                     # The CLI (run, watch, trust, profile, config, check)
+    ├── pent-profile/             # Watch events, profile files, guard, summary, review
     │   └── src/
-    │       ├── lib.rs            # PentConfig, SandboxMode, NetworkMode, …
-    │       └── loader.rs         # ConfigLoader (global + project merge)
-    ├── pent-sandbox/             # OS-level process sandboxing
+    │       ├── event.rs          # WatchEvent (the output of every recorder)
+    │       ├── doc.rs            # ProfileDoc (the profile file)
+    │       ├── name.rs           # ProfileName
+    │       ├── guard.rs          # guard_rules (dangerous accesses in watch mode)
+    │       ├── summary.rs        # summarize: group events into rules
+    │       ├── render.rs         # terminal summary, draft, profile text
+    │       ├── review.rs         # interactive review
+    │       └── psl.rs            # public suffix subset (wildcard rules)
+    ├── pent-settings/            # Global settings + profile store
     │   └── src/
-    │       ├── lib.rs            # spawn_sandboxed, SandboxError
+    │       ├── lib.rs            # PentConfig, NetworkMode, SandboxPaths, …
+    │       ├── loader.rs         # ConfigLoader (~/.config/pent/pent.toml)
+    │       ├── store.rs          # ProfileStore (profiles, drafts, watch logs)
+    │       └── trust.rs          # TrustStore (hash of each trusted profile)
+    ├── pent-sandbox/             # OS-level process sandboxing and recording
+    │   └── src/
+    │       ├── lib.rs            # spawn_sandboxed, spawn_watched, SandboxError
     │       ├── config.rs         # SandboxConfig builder
     │       ├── env.rs            # build_env, resolve_path_directories
     │       ├── macos.rs          # macOS Seatbelt (SBPL) backend
+    │       ├── macos_log.rs      # macOS Seatbelt report reader (log stream)
     │       ├── linux.rs          # Linux Landlock backend
+    │       ├── linux_landlock.rs # Landlock syscalls
+    │       ├── linux_overlayfs.rs# overlayfs shadow and flush
+    │       ├── linux_watch.rs    # seccomp-notify recorder and watch guard
     │       ├── linux_proxynet.rs # Linux proxy network (listeners made in the child)
     │       └── linux_fdpass.rs   # SCM_RIGHTS descriptor passing
     └── pent-proxy/               # DNS + TCP proxy with allowlist enforcement
@@ -32,7 +50,7 @@ pent/
             ├── lib.rs            # Public API surface
             ├── server.rs         # ProxyServer, ProxyHandle, ProxyConfig
             ├── dns.rs            # DnsServer (UDP and TCP, recursive resolution)
-            ├── proxy.rs          # TcpProxy (SOCKS5)
+            ├── proxy.rs          # TcpProxy (SOCKS5 and HTTP CONNECT)
             └── …
 ```
 
@@ -40,15 +58,18 @@ pent/
 
 | Crate | Description |
 |-------|-------------|
-| `pent-settings` | Owns `SandboxMode`, `NetworkMode`, `SandboxPaths`, `Mount`. Provides `PentConfig` (serializable TOML config) and `ConfigLoader` (global `~/.config/pent/pent.toml` + project `.pent/pent.toml` merge). |
+| `pent-profile` | The platform-independent part of watch mode: the event type, the profile file, the guard list, the summary, the renderers and the interactive review. |
+| `pent-settings` | Owns `NetworkMode`, `SandboxPaths`, `Mount`. Provides `PentConfig` (the global settings in `~/.config/pent/pent.toml`; there are no local settings), `ProfileStore` and `TrustStore`. |
 | `pent-sandbox` | Spawns or execs a process under OS-native sandbox constraints. Re-exports the shared types from `pent-settings`. |
-| `pent-proxy` | DNS server + SOCKS5 TCP proxy. Only forwards traffic to domains on the allowlist; everything else is rejected at the DNS layer. |
+| `pent-proxy` | DNS server + SOCKS5 and HTTP CONNECT proxy. In enforce mode it forwards only traffic to domains on the allowlist. In observe mode (watch) it allows each domain and records it. |
 
 ### Dependency graph
 
 ```
-pent-sandbox  →  pent-settings
-pent-proxy    (standalone, no dependency on the other crates)
+pent          →  pent-sandbox, pent-proxy, pent-settings, pent-profile
+pent-sandbox  →  pent-settings, pent-profile
+pent-proxy    →  pent-settings, pent-profile
+pent-settings →  pent-profile
 ```
 
 ---
