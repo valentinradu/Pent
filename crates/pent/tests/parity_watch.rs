@@ -31,7 +31,15 @@ mod parity {
 
     /// The command that both platforms record. It reads one file and
     /// changes one file.
-    const SCRIPT: &str = "cat ~/.foorc; echo 'b = 2' >> ~/.config/app/settings.toml";
+    /// The shell reads and writes the files itself, with no child program.
+    ///
+    /// An earlier version ran `cat`. On macOS the recorder learns the name
+    /// of a process from a poll, and a program that lives less than one
+    /// poll leaves no name, so its reports went away (MAC-10). The claim of
+    /// this test is the same with the shell built-ins, and it holds on both
+    /// platforms.
+    const SCRIPT: &str =
+        "read -r l < ~/.foorc; echo \"$l\"; echo 'b = 2' >> ~/.config/app/settings.toml";
 
     /// The read rules that the draft must have on every platform.
     const EXPECTED_READ: &[&str] = &["~/.foorc"];

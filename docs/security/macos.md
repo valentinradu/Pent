@@ -653,3 +653,25 @@ The test that was wrong: `execute_flag_runs_the_named_binary` asked that the
 command of the run not start. Pent gives exec access to the directory of
 that command by design, on both platforms.
 
+## MAC-11 — a removed profile kept its approval
+
+**Severity: medium. Fixed** by `fix(settings): keep the trust key when the
+file goes away`.
+
+`canonical_key` in `crates/pent-settings/src/trust.rs` asked
+`fs::canonicalize`, which needs the path to exist. `ProfileStore::remove`
+deletes the file and then calls `untrust`, so the key of the deleted path
+had another form and the entry stayed. A new file with the same bytes at
+that path then counted as trusted, and `pent run` applied a profile that
+the user had removed.
+
+On Linux the two forms of the path are the same, so no test saw it. On
+macOS `/var` is a symbolic link to `/private/var`, and the temporary
+directory of a test sits below it, so the first run on a Mac showed the
+defect. The key now resolves the parent directory, which exists in both
+cases, and keeps the file name.
+
+The two new tests in `trust.rs` hold the property on every platform: the
+key of a path does not change when the file goes away, and two names of
+one file give one key.
+

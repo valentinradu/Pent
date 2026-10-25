@@ -244,7 +244,73 @@ impl TrustStore {
 /// key is the path as given. Then `untrust` can still remove the entry when
 /// the caller gives the same path.
 fn canonical_key(config_path: &Path) -> PathBuf {
-    std::fs::canonicalize(config_path).unwrap_or_else(|_| config_path.to_path_buf())
+    // The key must not change when the file goes away. `canonicalize`
+    // needs the path to exist, so the key of a trusted file differed from
+    // the key of the same path after a delete, and `untrust` then missed
+    // the entry: a removed profile kept its approval, and a new file with
+    // the same bytes at that path counted as trusted. The parent directory
+    // exists in both cases, so the key resolves the parent and keeps the
+    // file name.
+    let Some(name) = config_path.file_name() else {
+        return std::fs::canonicalize(config_path).unwrap_or_else(|_| config_path.to_path_buf());
+    };
+    match config_path.parent() {
+        Some(parent) => std::fs::canonicalize(parent)
+            .map_or_else(|_| config_path.to_path_buf(), |dir| dir.join(name)),
+        None => config_path.to_path_buf(),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)] // test code
+mod key_tests {
+    use super::*;
+
+    /// The key of a path does not change when the file goes away.
+    ///
+    /// `untrust` runs after a delete in `ProfileStore::remove`, so a key
+    /// that needs the file would miss the entry and the approval would
+    /// stay. On a host where a parent of the path is a symbolic link (on
+    /// macOS `/var` is one) the two forms differ, and the defect showed.
+    #[test]
+    fn the_key_is_the_same_before_and_after_a_delete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let file = real.join("claude.toml");
+        std::fs::write(&file, "x").unwrap();
+
+        let with_file = canonical_key(&file);
+        std::fs::remove_file(&file).unwrap();
+        let without_file = canonical_key(&file);
+        assert_eq!(
+            with_file, without_file,
+            "the key must not depend on the file"
+        );
+    }
+
+    /// A path through a symbolic link gives the key of the real path, with
+    /// the file there or not.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_in_the_parent_gives_the_same_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let direct = real.join("claude.toml");
+        let through_link = link.join("claude.toml");
+        assert_eq!(
+            canonical_key(&direct),
+            canonical_key(&through_link),
+            "the two names of one file must give one key"
+        );
+
+        std::fs::write(&direct, "x").unwrap();
+        assert_eq!(canonical_key(&direct), canonical_key(&through_link));
+    }
 }
 
 /// The number of tries for a new temporary file name.
