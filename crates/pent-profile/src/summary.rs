@@ -235,8 +235,12 @@ impl Summary {
 ///   single written files.
 /// - The summary never makes a rule on a top-level directory, on the home
 ///   directory or its parents, or on a broad home directory (`~/.config`,
-///   `~/.local/share`, `~/.cache`, ...). It uses the child instead. Grouping
-///   never makes a rule on the workspace or on a parent of the workspace.
+///   `~/.local/share`, `~/.cache`, ...). It uses the child instead. The
+///   summary makes no rule on the workspace or on a parent of the workspace.
+///   This limit holds for each rule, also for a rule that comes from one
+///   direct access: `open("~")` gives no rule, and `mkdir ~/.config` gives
+///   no rule. A file directly in a broad directory (`~/.apprc`) keeps its
+///   own rule.
 /// - An exec gives execute on the directory of the binary. When the path has
 ///   a version directory (`versions/2.1.3`), the rule goes above it, so an
 ///   update of the program does not need a new rule.
@@ -522,6 +526,19 @@ impl Env {
         self.can_group(dir) && !self.is_broad_for_write(dir)
     }
 
+    /// Return true if a rule on `path` with `access` is too wide.
+    ///
+    /// The limit holds for every rule, not only for a rule that the grouping
+    /// makes. One access on a broad directory (`open("~")`,
+    /// `mkdir ~/.config`) must give no rule on it. The accesses below the
+    /// directory keep their own rules.
+    fn is_too_wide(&self, access: FsAccess, path: &Path) -> bool {
+        match access {
+            FsAccess::ReadWrite => self.is_broad_for_write(path),
+            FsAccess::Read | FsAccess::Execute => self.is_broad(path),
+        }
+    }
+
     fn is_cache(&self, path: &Path) -> bool {
         self.home
             .as_ref()
@@ -696,15 +713,15 @@ fn fs_items(fs: &FsLog, env: &Env, order: &[String]) -> Vec<Item> {
         let Some(dir) = path.parent() else {
             continue;
         };
-        if env.is_broad_for_write(dir) {
-            // A temporary file in a broad directory gets no rule: its next
-            // name is not known.
-            if !fs.is_transient(path) {
-                rw.insert(path.clone());
-            }
-        } else {
+        if env.can_group_for_write(dir) {
             rw_dirs.insert(dir.to_path_buf());
             rw.insert(dir.to_path_buf());
+        } else if !fs.is_transient(path) {
+            // A directory that is too wide for a rule (a broad directory,
+            // the workspace or a parent of it) gets no rule. The file keeps
+            // its own rule. A temporary file gets no rule: its next name is
+            // not known.
+            rw.insert(path.clone());
         }
     }
     // Writes to existing files: two or more files in one directory give the
@@ -728,9 +745,20 @@ fn fs_items(fs: &FsLog, env: &Env, order: &[String]) -> Vec<Item> {
             rw.insert(dir.to_path_buf());
         }
     }
-    let rw = group(&rw, |p| rw_dirs.contains(p), |d| env.can_group_for_write(d));
+    // Every final rule keeps the limit of the grouping, also a rule that
+    // comes from one direct access. A rule that is too wide goes away before
+    // the next step, so it does not hide a narrower rule below it.
+    let rw: BTreeSet<PathBuf> = group(&rw, |p| rw_dirs.contains(p), |d| env.can_group_for_write(d))
+        .into_iter()
+        .filter(|p| !env.is_too_wide(FsAccess::ReadWrite, p))
+        .collect();
 
-    let exec: BTreeSet<PathBuf> = fs.execs.keys().map(|b| env.exec_dir(b)).collect();
+    let exec: BTreeSet<PathBuf> = fs
+        .execs
+        .keys()
+        .map(|b| env.exec_dir(b))
+        .filter(|p| !env.is_too_wide(FsAccess::Execute, p))
+        .collect();
 
     let wider_exists = |path: &Path| path.ancestors().any(|a| rw.contains(a) || exec.contains(a));
     let read: BTreeSet<PathBuf> = fs
@@ -739,7 +767,10 @@ fn fs_items(fs: &FsLog, env: &Env, order: &[String]) -> Vec<Item> {
         .map(|p| env.cache_root(p).unwrap_or_else(|| p.clone()))
         .filter(|p| !wider_exists(p))
         .collect();
-    let read = group(&read, |_| true, |d| env.can_group(d));
+    let read: BTreeSet<PathBuf> = group(&read, |_| true, |d| env.can_group(d))
+        .into_iter()
+        .filter(|p| !env.is_too_wide(FsAccess::Read, p))
+        .collect();
 
     let mut rules: BTreeSet<(FsAccess, PathBuf)> = BTreeSet::new();
     rules.extend(rw.into_iter().map(|p| (FsAccess::ReadWrite, p)));

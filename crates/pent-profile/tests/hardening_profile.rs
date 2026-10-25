@@ -613,7 +613,6 @@ fn p3_mixed_generated_sessions_do_not_widen() {
 /// ~/.config/x` (which also tries `mkdir ~/.config`), a delete, and a path
 /// with `..` that normalizes to a broad directory.
 #[test]
-#[ignore = "OPEN H-2: one read or create on ~, ~/.config, ~/.cache, ... gives a rule on that directory"]
 fn p3_one_access_on_a_broad_dir_gives_no_rule() {
     let mut failures = Vec::new();
     for dir in BROAD_DIRS.iter().chain(["/", "/home"].iter()) {
@@ -634,7 +633,6 @@ fn p3_one_access_on_a_broad_dir_gives_no_rule() {
 /// them in one directory start the grouping, and a read rule on `~/.ssh`
 /// includes the private keys.
 #[test]
-#[ignore = "OPEN H-3: four reads in ~/.ssh give a read rule on ~/.ssh, which includes the private keys"]
 fn p3_reads_in_ssh_dir_do_not_widen_to_the_dir() {
     let events: Vec<WatchEvent> = [
         "config",
@@ -660,7 +658,6 @@ fn p3_reads_in_ssh_dir_do_not_widen_to_the_dir() {
 
 /// Hundreds of entries in `~/.ssh`, with each operation.
 #[test]
-#[ignore = "OPEN H-3: many entries in ~/.ssh give a rule on ~/.ssh"]
 fn p3_many_entries_in_ssh_dir_do_not_widen() {
     let mut failures = Vec::new();
     for op in ALL_OPS {
@@ -685,7 +682,6 @@ fn p3_many_entries_in_ssh_dir_do_not_widen() {
 /// the parent of the workspace: that rule includes the workspace and each
 /// sibling repository.
 #[test]
-#[ignore = "OPEN H-4: one create or delete in the workspace parent gives read-write on the parent"]
 fn p3_create_in_workspace_parent_gives_no_parent_rule() {
     let mut failures = Vec::new();
     for op in [FsOp::Create, FsOp::Delete] {
