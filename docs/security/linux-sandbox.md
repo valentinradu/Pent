@@ -19,7 +19,7 @@ message when the sandbox or `python3` is not available.
 |----|----------|--------|-------|------|
 | LS-1 | High | The child connects to a path Unix socket outside its profile. | Fixed | `test_unix_socket_connect_outside_profile` |
 | LS-2 | Low | The child reads and changes host files under `/tmp`. | Fixed | `test_tmp_not_shared_with_host` |
-| LS-3 | Medium | The child reads the command line of a host process. | Fixed | `test_proc_cmdline_of_host_process_denied` |
+| LS-3 | Medium | The child reads the command line of a host process. | Fixed on a host; absent in a container, with a warning | `test_proc_cmdline_of_host_process_denied` |
 
 ### LS-1 — Path Unix socket connect bypasses the file allowlist
 
@@ -270,6 +270,95 @@ The evidence for watch mode: `watch_proc_shows_only_the_sandbox` and
 `test_background_process_does_not_outlive_pent`,
 `test_exit_status_passes_through_the_namespace` and
 `test_signal_status_passes_through_the_namespace`.
+
+### LS-3 in a container — the kernel refuses the private `proc`
+
+**State: the protection is absent, and pent says so.**
+
+Inside a container `pent run` gave `EPERM` for every command, with the
+message `pent: cannot mount a private /proc`. A container runtime hides a
+part of `/proc` with its own mounts, for example on `/proc/acpi` and on
+`/proc/kcore`. The kernel gives a new `proc` mount to a process that has no
+privilege on the host only when the mount namespace already holds a `proc`
+mount that hides nothing. The rule is `mount_too_revealing` in
+`fs/namespace.c`: it walks the mounts of the namespace and looks for a
+`proc` mount whose root is the root of the filesystem, whose flags are not
+narrower than the new flags, and which has no locked child mount over a
+directory that is not permanently empty. Each inherited mount of a child
+user namespace is locked (`lock_mnt_tree` in `copy_mnt_ns`), thus the masks
+of the runtime make the inherited `/proc` "too revealing", and the new
+mount gets `EPERM`.
+
+**A mount at another target does not help.** The rule looks at the mounts
+of the namespace, not at the target. A mount of `proc` on a fresh empty
+directory inside a new tmpfs gives the same `EPERM`, so an `MS_MOVE` of it
+onto `/proc` never runs. The measurement, on this host, with the masks of a
+container simulated in an outer user namespace:
+
+```
+--- way 0: mount proc directly on /proc ---
+mount: /proc: fsmount() failed: VFS: Mount too revealing.
+--- way 1: mount proc on a fresh dir, then move ---
+mount: /tmp/pentscratch/proc: fsmount() failed: VFS: Mount too revealing.
+mount: /proc: wrong fs type, bad option, bad superblock ...
+```
+
+Pent also cannot clear the masks: `umount` of a locked mount gives
+`EINVAL`, and so does a move of the inherited `/proc` away.
+
+**The fix.** The decision comes before the `unshare`. A child that is
+already in a new PID namespace cannot leave it, and the `/proc` that it
+inherits then names the processes of another namespace, which confuses each
+tool that reads it. Thus the PID namespace and the private `proc` mount go
+together: `proc_isolation` in `linux.rs` probes one time for the life of the
+process, as `check_user_namespaces` does. The probe forks, unshares a user
+namespace, a mount namespace and a PID namespace, writes the identity maps,
+forks again, and the grandchild mounts a new `proc` over `/proc`. The exit
+status carries the answer. Each mount of the probe lives in the mount
+namespace of the grandchild, so the probe changes nothing.
+
+Where the answer is `ProcIsolation::Shared`, pent runs the command without
+the PID namespace and without the private `proc`, and it never fails the
+run. `pent run`, `pent watch` and `pent check` each print the same four
+lines:
+
+```
+▲ pent cannot give the command a private /proc: the kernel refuses the mount with EPERM
+▲ a mount hides a part of /proc (/proc/acpi, /proc/kcore), as a container runtime does
+▲ thus the command keeps the PID namespace of this host and sees each process of it
+▲ the command reads /proc/<pid>/cmdline of a neighbour, and a command line can hold a token
+```
+
+The warning names the error number (`EPERM`), not the message of the C
+library ("Operation not permitted"): that message is the one that a denied
+access prints, and a reader of the output must not confuse the two.
+
+**What the user keeps, and what the user loses.** The file rules, the
+network rules, the private temporary directories, the masks and the control
+of each Unix socket hold without the PID namespace. Two properties of this
+finding do not:
+
+- The command sees each process of the container and reads
+  `/proc/<pid>/cmdline` of a neighbour.
+- The exit status of the command waits for a background process of the
+  command. Pent is the child subreaper of the orphans, and the teardown
+  waits for them, because no PID 1 of a namespace ends them. No process of
+  the session survives the run, as before; only the wait is longer.
+
+**The evidence.** `hidden_proc_paths` reads the layout of the host from the
+content of `/proc/self/mountinfo`, and the unit tests give it the layout of
+a plain host and the layout of a container as data
+(`a_plain_host_hides_no_part_of_proc`,
+`a_container_hides_the_masked_paths_of_proc`). The tests of the probe are
+`the_probe_answers_and_leaves_no_process_behind` and
+`the_probe_costs_one_fork_for_the_life_of_the_process`, and
+`the_mount_step_follows_the_answer_of_the_probe` states that the PID
+namespace flag and the private `proc` mount always agree. Each test of the
+two properties above calls `private_proc_ready` (in
+`crates/pent/tests/common/e2e.rs`) or `skip_without_private_proc` (in
+`crates/pent/tests/security_linux_sandbox.rs`) first. Those helpers print
+`SKIP (container)` with the reason, also with `PENT_REQUIRE_ALL_TESTS=1`,
+and the same tests run and pass outside a container.
 
 ## The mounts of the watch guard
 

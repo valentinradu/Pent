@@ -136,6 +136,17 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
         check_availability()?;
     }
 
+    // The command gets a private `/proc` only where the kernel gives one. A
+    // container runtime hides a part of `/proc`, and the kernel then refuses
+    // the mount. Pent goes on, and the user learns what the command can
+    // see. See `ProcIsolation` in pent-sandbox.
+    #[cfg(target_os = "linux")]
+    if !args.no_sandbox {
+        for line in pent_sandbox::proc_isolation().warning_lines() {
+            ui::warn(line);
+        }
+    }
+
     let (cmd, cmd_args) = args
         .command
         .split_first()

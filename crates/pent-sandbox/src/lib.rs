@@ -73,6 +73,8 @@ pub use linux::check_user_namespaces;
 #[cfg(target_os = "linux")]
 pub use linux::compute_accessible_set;
 #[cfg(target_os = "linux")]
+pub use linux::{proc_isolation, ProcDenial, ProcIsolation};
+#[cfg(target_os = "linux")]
 pub use linux_overlayfs::{
     cleanup_stale_overlays, DiscardKind, DiscardedWrite, FlushError, FlushFailure, OverlayHandle,
     OverlayTeardownReport,

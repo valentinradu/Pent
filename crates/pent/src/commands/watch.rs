@@ -124,6 +124,12 @@ pub(crate) async fn watch(args: WatchArgs, cwd: PathBuf) -> Result<(), CliError>
     for warning in network_warnings(net.decision, &args.allow, false) {
         ui::warn(warning);
     }
+    // Watch mode takes the PID namespace too, where the kernel gives one.
+    // See `ProcIsolation` in pent-sandbox.
+    #[cfg(target_os = "linux")]
+    for warning in pent_sandbox::proc_isolation().warning_lines() {
+        ui::warn(warning);
+    }
 
     let store = ProfileStore::open_default()?;
     let settings = ConfigLoader::load(&cwd, pent_settings::PentDirs::from_env().as_ref())?;

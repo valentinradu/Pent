@@ -32,7 +32,9 @@ use std::os::unix::process::CommandExt as _;
 use std::path::Path;
 use std::process::{Output, Stdio};
 
-use common::e2e::{have_tools, sandbox_ready, stderr, stdout, TestEnv, TestResult};
+use common::e2e::{
+    have_tools, private_proc_ready, sandbox_ready, stderr, stdout, TestEnv, TestResult,
+};
 
 /// The marker that each probe prints first.
 const RAN: &str = "PENT_CHILD_RAN";
@@ -463,7 +465,7 @@ fn the_recorder_keeps_the_events_of_an_orphan() -> TestResult {
 #[test]
 fn watch_mode_also_hides_the_processes_of_the_host() -> TestResult {
     let test = "watch_mode_also_hides_the_processes_of_the_host";
-    if !ready(test) {
+    if !ready(test) || !private_proc_ready(test) {
         return Ok(());
     }
     let env = TestEnv::new()?;

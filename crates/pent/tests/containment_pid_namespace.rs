@@ -18,6 +18,11 @@
 //! The tests need unprivileged user namespaces, Landlock and `python3`.
 //! They print `SKIP <test>: <reason>` and pass when the host cannot run
 //! them. Set `PENT_REQUIRE_ALL_TESTS=1` to make each skip a failure.
+//!
+//! A container gives no private `/proc`, thus no PID namespace: the kernel
+//! refuses the mount (see `private_proc_ready`). Property 1, and the
+//! promptness of the exit code, need the namespace, so those two tests
+//! print `SKIP (container)` there. The other properties hold without it.
 
 #![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // test code: a setup failure must abort loudly
@@ -29,7 +34,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-use common::e2e::{have_tools, sandbox_ready, stderr, stdout, TestEnv, TestResult};
+use common::e2e::{
+    have_tools, private_proc_ready, sandbox_ready, stderr, stdout, TestEnv, TestResult,
+};
 
 /// The marker that each probe prints first.
 const RAN: &str = "PENT_CHILD_RAN";
@@ -167,7 +174,7 @@ fn python3() -> PathBuf {
 #[test]
 fn the_child_sees_only_the_processes_of_the_sandbox() -> TestResult {
     let test = "the_child_sees_only_the_processes_of_the_sandbox";
-    if !ready(test) {
+    if !ready(test) || !private_proc_ready(test) {
         return Ok(());
     }
     let env = TestEnv::new()?;
@@ -357,7 +364,10 @@ fn kill_self_under_pent(env: &TestEnv, sig: libc::c_int) -> std::io::Result<Outp
 #[test]
 fn the_exit_code_passes_while_a_grandchild_still_runs() -> TestResult {
     let test = "the_exit_code_passes_while_a_grandchild_still_runs";
-    if !ready(test) {
+    // Without the PID namespace, pent is the subreaper of the orphans of
+    // the command, and the teardown waits for them. The exit code then
+    // comes after the grandchild, not before it.
+    if !ready(test) || !private_proc_ready(test) {
         return Ok(());
     }
     let env = TestEnv::new()?;
