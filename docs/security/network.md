@@ -145,6 +145,33 @@ the `keep` list of `plan_private_dirs`. Bind the configured path itself and
 make only the directories above it with `mount_point_parents`, which the plan
 already does for a path that does not exist.
 
+## NET-4 — pent refuses each address of the Unix family
+
+**Severity: medium (it limits the use of pent, it does not open it). Open.**
+
+The fix of LS-1 makes the supervisor perform each permitted connection to
+a Unix socket. Two parts of that fix are wider than they need to be.
+
+1. When the profile names no Unix socket, the filter refuses
+   `socket(AF_UNIX, ...)` itself. The child then cannot make a socket of
+   that family at all, not even one that it uses only with itself.
+2. The supervisor refuses each abstract address. The network namespace of
+   the child already separates the abstract names of the sandbox from the
+   names of the host, so an abstract address of the child is harmless.
+
+Together they stop a program from using its own abstract socket, which
+some runtimes need. The test
+`child_cannot_reach_a_host_abstract_unix_socket` states the behaviour that
+pent must have: the child reaches its own abstract socket, and it does not
+reach the abstract name of a host process.
+
+The reason for part 1 is real: a datagram socket sends to a path with
+`sendto(2)`, with no `connect(2)`, so the control of `connect` alone does
+not cover it. The fix is to control `sendto` and `sendmsg` in the same way
+as `connect`, and then to permit the family again. Pent must still refuse
+an abstract address when the child has no network namespace of its own
+(`--network unrestricted`).
+
 ## Verified defenses
 
 Each item below has a test that passes. The test stays as a regression test.

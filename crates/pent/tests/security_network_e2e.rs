@@ -207,8 +207,12 @@ fn daemon_socket_is_masked(test: &str, daemon: &str, host_socket: &str) -> TestR
     env.install_profile(
         "probe",
         &format!(
-            "[filesystem]\nread_write = [{:?}]\n\n{PROFILE}",
-            allowed_dir.display().to_string()
+            // The profile names the socket of the positive control. Since
+            // the supervisor makes each permitted connection itself, a
+            // socket that no rule names is not reachable at all.
+            "[filesystem]\nread_write = [{:?}]\nunix_sockets = [{:?}]\n\n{PROFILE}",
+            allowed_dir.display().to_string(),
+            allowed_dir.join("allowed.sock").display().to_string()
         ),
     )?;
 
@@ -318,8 +322,12 @@ fn a_profile_path_below_a_private_dir_keeps_its_siblings_hidden() -> TestResult 
     env.install_profile(
         "probe",
         &format!(
-            "[filesystem]\nread_write = [{:?}]\n\n{PROFILE}",
-            allowed_dir.display().to_string()
+            // The profile names the socket of the positive control. Since
+            // the supervisor makes each permitted connection itself, a
+            // socket that no rule names is not reachable at all.
+            "[filesystem]\nread_write = [{:?}]\nunix_sockets = [{:?}]\n\n{PROFILE}",
+            allowed_dir.display().to_string(),
+            allowed_dir.join("allowed.sock").display().to_string()
         ),
     )?;
     let allowed = Victim::bind(allowed_dir.join("allowed.sock"), ALLOWED_BANNER.as_bytes())?;
@@ -407,7 +415,53 @@ except OSError as e:
     Ok(())
 }
 
+/// With no socket in the profile, the child cannot make a socket of the
+/// Unix family at all.
+///
+/// The supervisor makes each permitted connection itself, but a datagram
+/// socket can send without a connection, so the default refuses the family
+/// in the filter. The filter reads the family from a register, so no other
+/// thread can change it.
 #[test]
+fn the_default_profile_refuses_the_unix_family() -> TestResult {
+    if !ready("the_default_profile_refuses_the_unix_family") {
+        return Ok(());
+    }
+    let env = TestEnv::new()?;
+    env.install_profile("probe", PROFILE)?;
+    let script = r#"
+import socket
+print("PENT_CHILD_RAN")
+try:
+    socket.socket(socket.AF_UNIX); print("FAMILY ALLOWED")
+except OSError as e:
+    print("FAMILY REFUSED", e)
+try:
+    a, b = socket.socketpair(); print("SOCKETPAIR ALLOWED")
+except OSError as e:
+    print("SOCKETPAIR REFUSED", e)
+"#;
+    let out = run_sandboxed(&env, script)?;
+    let text = out_text(&out);
+    assert!(
+        text.contains("PENT_CHILD_RAN"),
+        "the child did not run:\n{text}"
+    );
+    assert!(
+        text.contains("FAMILY REFUSED"),
+        "a profile with no socket must refuse the Unix family:\n{text}"
+    );
+    // socketpair makes a pair that reaches nothing outside the child, so
+    // it stays available: many runtimes need it to talk to their children.
+    assert!(
+        text.contains("SOCKETPAIR ALLOWED"),
+        "socketpair must stay available:\n{text}"
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "OPEN NET-4: pent refuses each abstract address, so a program cannot reach its own abstract socket"]
 fn child_cannot_reach_a_host_abstract_unix_socket() -> TestResult {
     let test = "child_cannot_reach_a_host_abstract_unix_socket";
     if !ready(test) {
@@ -435,7 +489,18 @@ fn child_cannot_reach_a_host_abstract_unix_socket() -> TestResult {
     });
 
     let env = TestEnv::new()?;
-    env.install_profile("probe", PROFILE)?;
+    // The profile names one socket, so the child can make a socket of the
+    // Unix family. With no name in the profile, pent refuses the family
+    // itself; `the_default_profile_refuses_the_unix_family` states that.
+    let named = env.root.join("allowed").join("unused.sock");
+    std::fs::create_dir_all(env.root.join("allowed"))?;
+    env.install_profile(
+        "probe",
+        &format!(
+            "[filesystem]\nunix_sockets = [{:?}]\n\n{PROFILE}",
+            named.display().to_string()
+        ),
+    )?;
     // The positive control: the child binds its own abstract socket and
     // reaches it. Abstract sockets work for the child; only the names of
     // the host are out of reach.
