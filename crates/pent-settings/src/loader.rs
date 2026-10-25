@@ -20,8 +20,8 @@ impl ConfigLoader {
     ///
     /// # Errors
     /// Returns an error if the global config exists but cannot be parsed.
-    pub fn load(workspace: &Path) -> Result<PentConfig, SettingsError> {
-        Self::load_from(workspace, Self::global_config_path().as_deref())
+    pub fn load(workspace: &Path, dirs: Option<&PentDirs>) -> Result<PentConfig, SettingsError> {
+        Self::load_from(workspace, Self::global_config_path(dirs).as_deref())
     }
 
     /// Load with an explicit global config path.
@@ -42,9 +42,12 @@ impl ConfigLoader {
     /// Returns `None` if the pent config directory cannot be determined
     /// (e.g., `$HOME` is unset). Callers should treat `None` as "no global
     /// config" rather than falling back to a relative path.
+    /// The caller passes the directories, so that one call to
+    /// [`PentDirs::from_env`] serves the whole program and a test can give
+    /// its own directories.
     #[must_use]
-    pub fn global_config_path() -> Option<PathBuf> {
-        PentDirs::from_env().map(|d| d.global_config())
+    pub fn global_config_path(dirs: Option<&PentDirs>) -> Option<PathBuf> {
+        dirs.map(PentDirs::global_config)
     }
 
     /// Load one config file, returning `None` if it is absent or inaccessible.
@@ -87,6 +90,7 @@ fn read_optional(path: &Path) -> Result<Option<Vec<u8>>, SettingsError> {
 }
 
 #[cfg(test)]
+#[allow(clippy::panic)] // a test that cannot set itself up must stop loudly
 mod tests {
     use super::*;
     use std::fs;
@@ -143,10 +147,40 @@ mod tests {
     /// reads the environment of the process. A test cannot change the
     /// environment without a race with the other tests.
     #[test]
-    #[ignore = "NEEDS SEAM: ConfigLoader::load and ConfigLoader::global_config_path must take \
-                the PentDirs as a parameter, and PentDirs::from_vars must be public, so the \
-                caller (the CLI) does the one call to PentDirs::from_env"]
-    fn test_load_reads_the_global_config_of_the_given_directories() {}
+    fn test_load_reads_the_global_config_of_the_given_directories() {
+        let tmp = match tempfile::tempdir() {
+            Ok(t) => t,
+            Err(e) => panic!("the test needs a temporary directory: {e}"),
+        };
+        let config_home = tmp.path().join("config");
+        let dirs = PentDirs::from_vars(
+            Some(config_home.clone().into()),
+            None,
+            Some(tmp.path().to_path_buf()),
+        );
+        let Some(dirs) = dirs else {
+            panic!("from_vars must answer for an absolute config directory");
+        };
+        let global = dirs.global_config();
+        if let Some(parent) = global.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                panic!("the test needs the config directory: {e}");
+            }
+        }
+        if let Err(e) = std::fs::write(&global, "[proxy]\ndns_ttl_seconds = 7\n") {
+            panic!("the test needs the config file: {e}");
+        }
+        match ConfigLoader::load(tmp.path(), Some(&dirs)) {
+            Ok(config) => assert_eq!(config.proxy.dns_ttl_seconds, Some(7)),
+            Err(e) => panic!("the config must load: {e}"),
+        }
+        // With no directories there is no global config, and the load
+        // gives the defaults instead of an error.
+        match ConfigLoader::load(tmp.path(), None) {
+            Ok(config) => assert_eq!(config.proxy.dns_ttl_seconds, None),
+            Err(e) => panic!("a load with no directories must give the defaults: {e}"),
+        }
+    }
 
     /// [`ConfigLoader::global_config_path`] names `pent.toml` in the config
     /// directory of the given directories.
@@ -160,14 +194,25 @@ mod tests {
     /// assert_eq!(ConfigLoader::global_config_path(None), None);
     /// ```
     #[test]
-    #[ignore = "NEEDS SEAM: ConfigLoader::global_config_path must take the PentDirs as a \
-                parameter instead of calling PentDirs::from_env"]
-    fn test_global_config_path_names_pent_toml_in_the_config_directory() {}
+    fn test_global_config_path_names_pent_toml_in_the_config_directory() {
+        // Both variables are absolute, so the function needs no home
+        // directory.
+        let dirs = PentDirs::from_vars(Some("/c".into()), Some("/s".into()), None);
+        let Some(dirs) = dirs else {
+            panic!("from_vars must answer for an absolute config directory");
+        };
+        assert_eq!(
+            ConfigLoader::global_config_path(Some(&dirs)),
+            Some(PathBuf::from("/c/pent/pent.toml"))
+        );
+        assert_eq!(ConfigLoader::global_config_path(None), None);
+    }
 
     #[test]
     fn test_global_config_path_ends_with_pent_toml() {
         // global_config_path() may be None in environments without $HOME.
-        if let Some(path) = ConfigLoader::global_config_path() {
+        let dirs = PentDirs::from_env();
+        if let Some(path) = ConfigLoader::global_config_path(dirs.as_ref()) {
             assert!(path.ends_with("pent/pent.toml"));
         }
     }

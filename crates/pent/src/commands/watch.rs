@@ -126,7 +126,7 @@ pub(crate) async fn watch(args: WatchArgs, cwd: PathBuf) -> Result<(), CliError>
     }
 
     let store = ProfileStore::open_default()?;
-    let settings = ConfigLoader::load(&cwd)?;
+    let settings = ConfigLoader::load(&cwd, pent_settings::PentDirs::from_env().as_ref())?;
     let home = home_dir()?;
     let mode = if args.append {
         WatchRunMode::Append

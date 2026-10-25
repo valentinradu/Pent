@@ -106,9 +106,13 @@ impl PentDirs {
 
     /// Find the pent directories from the given values.
     ///
+    /// A test calls this function instead of [`PentDirs::from_env`]: the
+    /// environment belongs to the whole process, so a test that changes it
+    /// races the other tests.
+    ///
     /// The XDG Base Directory specification tells programs to ignore a value
     /// that is empty or not absolute. Pent does the same.
-    fn from_vars(
+    pub fn from_vars(
         xdg_config: Option<OsString>,
         xdg_state: Option<OsString>,
         home: Option<PathBuf>,

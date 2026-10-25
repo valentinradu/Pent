@@ -49,7 +49,7 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
     let store = ProfileStore::open_default()?;
     let profile = load_trusted(&store, &selected, &args.command)?;
     let name = selected.name;
-    let settings = ConfigLoader::load(&cwd)?;
+    let settings = ConfigLoader::load(&cwd, pent_settings::PentDirs::from_env().as_ref())?;
 
     let mut paths = profile_paths(&profile);
     add_cli_paths(&mut paths, &args);

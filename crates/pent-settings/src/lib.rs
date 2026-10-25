@@ -15,9 +15,10 @@
 //! # Example
 //!
 //! ```no_run
-//! use pent_settings::ConfigLoader;
+//! use pent_settings::{ConfigLoader, PentDirs};
 //!
-//! let config = ConfigLoader::load(std::path::Path::new(".")).unwrap();
+//! let dirs = PentDirs::from_env();
+//! let config = ConfigLoader::load(std::path::Path::new("."), dirs.as_ref()).unwrap();
 //! println!("{:?}", config.proxy.upstream_dns);
 //! ```
 

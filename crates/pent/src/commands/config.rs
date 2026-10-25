@@ -31,12 +31,14 @@ const STARTER: &str = "\
 
 /// The path of the global settings file.
 fn global_path() -> Result<PathBuf, CliError> {
-    ConfigLoader::global_config_path().ok_or_else(|| {
-        CliError::Other(
-            "Cannot determine the global config path: the home directory is not available"
-                .to_string(),
-        )
-    })
+    ConfigLoader::global_config_path(pent_settings::PentDirs::from_env().as_ref()).ok_or_else(
+        || {
+            CliError::Other(
+                "Cannot determine the global config path: the home directory is not available"
+                    .to_string(),
+            )
+        },
+    )
 }
 
 pub(crate) fn config(args: crate::cli::ConfigArgs, cwd: &Path) -> Result<(), CliError> {
@@ -64,7 +66,7 @@ fn init() -> Result<(), CliError> {
 }
 
 fn show(format: OutputFormat, cwd: &Path) -> Result<(), CliError> {
-    let config = ConfigLoader::load(cwd)?;
+    let config = ConfigLoader::load(cwd, pent_settings::PentDirs::from_env().as_ref())?;
     match format {
         OutputFormat::Toml => print!("{}", config.to_toml()?),
         OutputFormat::Json => {

@@ -59,7 +59,7 @@ pub(crate) async fn check(cwd: PathBuf) -> Result<(), CliError> {
     }
 
     // 4. Config and profile paths
-    match ConfigLoader::global_config_path() {
+    match ConfigLoader::global_config_path(pent_settings::PentDirs::from_env().as_ref()) {
         Some(path) => {
             let found = if path.exists() { "found" } else { "not found" };
             ui::status("global", format!("{} ({found})", path.display()));
@@ -77,7 +77,7 @@ pub(crate) async fn check(cwd: PathBuf) -> Result<(), CliError> {
         }
     }
 
-    match ConfigLoader::load(&cwd) {
+    match ConfigLoader::load(&cwd, pent_settings::PentDirs::from_env().as_ref()) {
         Ok(_) => ui::ok("config"),
         Err(e) => {
             ui::error(format!("config: {e}"));
