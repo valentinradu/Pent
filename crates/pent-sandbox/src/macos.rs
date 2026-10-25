@@ -21,6 +21,19 @@
 //! Each path goes into the profile as a quoted SBPL string. The generator
 //! escapes backslashes and double quotes, so a path cannot add rules.
 //!
+//! # Network
+//!
+//! In proxy mode the profile denies `network-outbound` and allows only the
+//! proxy port on loopback, the `mDNSResponder` socket and the Unix sockets
+//! in the writable paths. A program that ignores the proxy variables cannot
+//! connect to a remote host.
+//!
+//! # Watch mode
+//!
+//! [`generate_watch_profile`] makes a profile that allows each operation
+//! with `(with report)` and denies only the guard accesses. The module
+//! `macos_log` reads the reports from `log stream`.
+//!
 //! # Note
 //! sandbox-exec is deprecated by Apple but still functional.
 //! No lightweight alternative exists for process sandboxing on macOS.
@@ -155,10 +168,27 @@ fn push_rule(
     filter: &str,
     value: &str,
 ) -> Result<(), SandboxError> {
+    push_rule_with(profile, action, access, filter, value, Report::No)
+}
+
+/// Add one rule `(<action> <access> (<filter> "<value>")[ (with report)])`
+/// to `profile`.
+///
+/// # Errors
+/// Returns `SandboxError::InvalidConfig` if `value` contains NUL or a newline.
+fn push_rule_with(
+    profile: &mut String,
+    action: RuleAction,
+    access: &str,
+    filter: &str,
+    value: &str,
+    report: Report,
+) -> Result<(), SandboxError> {
     let quoted = sbpl_string(value)?;
     profile.push_str(&format!(
-        "({} {access} ({filter} {quoted}))\n",
-        action.keyword()
+        "({} {access} ({filter} {quoted}){})\n",
+        action.keyword(),
+        report.suffix()
     ));
     Ok(())
 }
@@ -321,8 +351,60 @@ pub fn generate_sbpl_profile(config: &SandboxConfig) -> Result<String, SandboxEr
         profile.push_str(&network_rules);
         profile.push('\n');
     }
+    if matches!(config.network, NetworkMode::ProxyOnly { .. }) {
+        let tmpdir = std::env::var_os("TMPDIR").map(std::path::PathBuf::from);
+        let mut dirs: Vec<&Path> = vec![config.workspace.as_path()];
+        dirs.extend(tmpdir.as_deref());
+        dirs.extend(
+            read_write
+                .iter()
+                .filter(|(_, is_glob)| !*is_glob)
+                .map(|(path, _)| path.as_path()),
+        );
+        add_unix_socket_allows(&mut profile, &dirs)?;
+    }
 
     Ok(profile)
+}
+
+/// Allow connections to the Unix sockets in the paths that the process can
+/// write (proxy mode only).
+///
+/// `(deny network-outbound)` also denies a `connect()` to a Unix socket.
+/// Programs use Unix sockets for their own IPC (for example a socket in
+/// `TMPDIR` between a parent and its child). The process can create a socket
+/// in a writable path, so a connection to a socket there gives no new
+/// access. The sockets in the other paths (for example the Docker socket or
+/// the SSH agent socket) stay denied.
+///
+/// The Apple profiles use path filters (`literal`, `regex`) on
+/// `network-outbound` for Unix sockets. This function uses `subpath` in the
+/// same position. Test this on a Mac.
+///
+/// # Errors
+/// Returns `SandboxError::InvalidConfig` if a path contains NUL or a newline.
+fn add_unix_socket_allows(profile: &mut String, dirs: &[&Path]) -> Result<(), SandboxError> {
+    for dir in dirs {
+        let original = dir.to_string_lossy();
+        let canonical = canonical_or_original(dir);
+        push_rule(
+            profile,
+            RuleAction::Allow,
+            "network-outbound",
+            "subpath",
+            &canonical,
+        )?;
+        if original != canonical {
+            push_rule(
+                profile,
+                RuleAction::Allow,
+                "network-outbound",
+                "subpath",
+                &original,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// Add rules that deny writes to `<workspace>/.pent`.
@@ -357,24 +439,90 @@ fn add_project_config_deny(profile: &mut String, workspace: &Path) -> Result<(),
     Ok(())
 }
 
+/// The Unix socket of `mDNSResponder`, the system name resolver.
+///
+/// `getaddrinfo` sends each name query to this socket. On macOS the DNS
+/// queries of the child do not go through the pent DNS server: the system
+/// resolver (outside the sandbox) resolves the names. The child gets the
+/// addresses, but `(deny network-outbound)` stops a direct connection to
+/// them. Proxy-aware clients send the name to the proxy (`socks5h://`,
+/// HTTP `CONNECT`), and the proxy resolves it and applies the allowlist.
+const MDNS_RESPONDER_SOCKET: &str = "/private/var/run/mDNSResponder";
+
+/// Whether an SBPL rule asks the kernel to log each match.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Report {
+    /// A normal rule. The kernel logs only denials.
+    No,
+    /// The rule has the `(with report)` modifier. The kernel logs each
+    /// operation that the rule allows. Watch mode reads these log lines.
+    Yes,
+}
+
+impl Report {
+    const fn suffix(self) -> &'static str {
+        match self {
+            Self::No => "",
+            Self::Yes => " (with report)",
+        }
+    }
+}
+
+/// Generate the SBPL rules that let the process reach only the proxy.
+///
+/// The rules are:
+///
+/// ```text
+/// (deny network-outbound)
+/// (allow network-outbound (remote ip "localhost:<port>"))
+/// (allow network-outbound (literal "/private/var/run/mDNSResponder"))
+/// ```
+///
+/// The source of the syntax (from memory; nobody tested these rules on a
+/// Mac yet):
+///
+/// - `(remote ip "localhost:<port>")`: the form that the Anthropic
+///   `sandbox-runtime` macOS profile uses for its proxy ports, and the form
+///   that the `LocalhostOnly` rules of this file use with the port `*`.
+///   Seatbelt accepts only `*` or `localhost` as the host part.
+/// - `(literal "<socket path>")` on `network-outbound`: the form that the
+///   Apple system profiles (`system.sb`, macro `system-network`) and the
+///   Chromium profiles use for `mDNSResponder`. A path filter on
+///   `network-outbound` matches only the address of a Unix socket.
+///
+/// The rules do not deny `network-bind` or `network-inbound`, so the process
+/// can open a server socket. It cannot connect to the other loopback ports.
+///
+/// The rules do not allow the kernel control sockets
+/// (`com.apple.netsrc`). Some programs that use `Network.framework` can need
+/// them. Test this on a Mac.
+fn proxy_network_rules(port: u16, report: Report) -> String {
+    let rep = report.suffix();
+    format!(
+        "(deny network-outbound)\n\
+         (allow network-outbound (remote ip \"localhost:{port}\"){rep})\n\
+         (allow network-outbound (literal \"{MDNS_RESPONDER_SOCKET}\"){rep})\n"
+    )
+}
+
 /// Generate SBPL network rules based on NetworkMode.
 ///
 /// # Network Rules
 /// - Unrestricted: No network rules (allow default permits it)
 /// - LocalhostOnly: Deny network, then allow all loopback outbound
-/// - ProxyOnly: No network rules — proxy enforcement is not supported on macOS.
-///   On macOS there is no per-process network namespace (unlike Linux), so traffic
-///   cannot be transparently redirected through a proxy regardless of DYLD injection
-///   limitations. ProxyOnly is therefore treated as Unrestricted at the Seatbelt
-///   level. The pent CLI shows a warning and gives `Unrestricted` to the sandbox
-///   when the effective mode is proxy on macOS.
+/// - ProxyOnly: Deny outbound connections, then allow the proxy port on
+///   loopback and the `mDNSResponder` socket (see [`proxy_network_rules`]).
+///   [`generate_sbpl_profile`] also allows the Unix sockets in the writable
+///   paths.
 /// - Blocked: `(deny network*)`
 fn generate_network_rules(mode: &NetworkMode) -> String {
     match mode {
-        NetworkMode::Unrestricted | NetworkMode::ProxyOnly { .. } => {
+        NetworkMode::Unrestricted => {
             // Allow default already permits network.
-            // ProxyOnly is treated as Unrestricted on macOS — see doc comment above.
             String::new()
+        }
+        NetworkMode::ProxyOnly { proxy_addr, .. } => {
+            proxy_network_rules(proxy_addr.port(), Report::No)
         }
         NetworkMode::LocalhostOnly => {
             // Deny all network, then allow only loopback.
@@ -479,6 +627,298 @@ fn is_executable(path: &Path) -> bool {
     path.metadata()
         .map(|m| m.permissions().mode() & 0o111 != 0)
         .unwrap_or(false)
+}
+
+/// Escape all regex metacharacters in `text`, so the regex matches only
+/// `text` itself.
+///
+/// The result is a regex, not an SBPL string. Give it to [`sbpl_string`]
+/// to escape the backslashes for the SBPL reader.
+fn regex_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len().saturating_add(8));
+    for ch in text.chars() {
+        if matches!(
+            ch,
+            '\\' | '.' | '+' | '*' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '$' | '|'
+        ) {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// The operations that watch mode logs with `(with report)`.
+///
+/// Watch mode reports `file-read-data`, not `file-read*`: the metadata
+/// reads (`stat`) occur on almost each path and make a large volume of log
+/// lines with no value for a profile.
+const WATCH_REPORTED_OPERATIONS: &[&str] = &[
+    "file-read-data",
+    "file-write*",
+    "process-exec",
+    "network-outbound",
+];
+
+/// Generate the SBPL profile of watch mode.
+///
+/// Watch mode does not sandbox the program. The profile allows all
+/// operations, asks the kernel to log each file read, file write, exec and
+/// outbound connection, limits the network as in run mode, and adds the deny
+/// rules of the guard:
+///
+/// ```text
+/// (version 1)
+/// (allow default)
+/// (allow file-read-data (with report))
+/// (allow file-write* (with report))
+/// (allow process-exec (with report))
+/// (allow network-outbound (with report))
+/// (deny network-outbound)                                   ; proxy mode
+/// (allow network-outbound (remote ip "localhost:8080") (with report))
+/// (allow network-outbound (literal "/private/var/run/mDNSResponder") (with report))
+/// (allow network-outbound (subpath "/") (with report))      ; all Unix sockets
+/// (deny file-read-data (regex "^/Users/u/\\.ssh/id_[^/]*$"))
+/// (allow file-read-data (regex "^/Users/u/\\.ssh/id_[^/]*\\.pub$") (with report))
+/// (deny file-write* (literal "/Users/u/.bashrc"))
+/// (deny process-exec (regex "/sudo$"))
+/// ```
+///
+/// Uncertain points (from memory; nobody tested them on a Mac yet):
+///
+/// - `(with report)` is a valid modifier on an `allow` rule. The author is
+///   not sure that `(allow default (with report))` is valid, so the profile
+///   keeps a plain `(allow default)` and adds one reported `allow` rule for
+///   each operation of interest. This also keeps the volume of reports
+///   small.
+/// - The modifier comes after the filter. Apple profiles put `(with ...)`
+///   before or after the filters.
+/// - When more than one rule matches an operation, the last rule wins. The
+///   run-mode profile already uses this (the global `(deny file-read-data)`
+///   comes before the allow rules), and the `sandbox-runtime` profiles also
+///   use it. Thus a guard deny comes after the reported allow, and the
+///   `.pub` allow comes after the deny of the SSH key prefix (SBPL regex has
+///   no lookahead).
+///
+/// # Errors
+/// Returns `SandboxError::InvalidConfig` if a path contains NUL or a newline.
+pub fn generate_watch_profile(
+    config: &SandboxConfig,
+    guard: &[pent_profile::GuardRule],
+) -> Result<String, SandboxError> {
+    let mut profile = String::from("(version 1)\n(allow default)\n");
+    for op in WATCH_REPORTED_OPERATIONS {
+        profile.push_str(&format!("(allow {op}{})\n", Report::Yes.suffix()));
+    }
+    match &config.network {
+        NetworkMode::ProxyOnly { proxy_addr, .. } => {
+            profile.push_str(&proxy_network_rules(proxy_addr.port(), Report::Yes));
+            // Watch mode does not limit the Unix sockets. The recorder
+            // records each connection.
+            push_rule_with(
+                &mut profile,
+                RuleAction::Allow,
+                "network-outbound",
+                "subpath",
+                "/",
+                Report::Yes,
+            )?;
+        }
+        other => {
+            let rules = generate_network_rules(other);
+            if !rules.is_empty() {
+                profile.push_str(&rules);
+                profile.push('\n');
+            }
+        }
+    }
+    add_guard_rules(&mut profile, guard, Report::Yes)?;
+    Ok(profile)
+}
+
+/// Add the SBPL deny rules for the guard rules.
+///
+/// - [`GuardAccess::Read`](pent_profile::GuardAccess::Read) gives
+///   `(deny file-read-data ...)`.
+/// - [`GuardAccess::Write`](pent_profile::GuardAccess::Write) gives
+///   `(deny file-write* ...)`.
+/// - [`GuardAccess::ExecName`](pent_profile::GuardAccess::ExecName) gives
+///   `(deny process-exec ...)`.
+///
+/// An exact path gives a `literal` filter, a subtree gives `subpath`, and a
+/// file name prefix gives a `regex`. For an excluded suffix, an allow rule
+/// (with `report`) follows the deny. A binary name gives the regex
+/// `/<name>$`. Each path rule is added for the canonical path and also for
+/// the original path if it is different.
+///
+/// # Errors
+/// Returns `SandboxError::InvalidConfig` if a path contains NUL or a newline.
+fn add_guard_rules(
+    profile: &mut String,
+    guard: &[pent_profile::GuardRule],
+    reallow_report: Report,
+) -> Result<(), SandboxError> {
+    use pent_profile::{GuardAccess, GuardTarget};
+
+    for rule in guard {
+        let op = match rule.access {
+            GuardAccess::Read => "file-read-data",
+            GuardAccess::Write => "file-write*",
+            GuardAccess::ExecName => "process-exec",
+        };
+        match &rule.target {
+            GuardTarget::Exact(path) | GuardTarget::Subtree(path) => {
+                let filter = if matches!(rule.target, GuardTarget::Exact(_)) {
+                    "literal"
+                } else {
+                    "subpath"
+                };
+                for variant in path_variants(path) {
+                    push_rule(profile, RuleAction::Deny, op, filter, &variant)?;
+                }
+            }
+            GuardTarget::FilesInDir {
+                dir,
+                prefix,
+                exclude_suffix,
+            } => {
+                for variant in path_variants(dir) {
+                    let base = format!("^{}/{}[^/]*", regex_escape(&variant), regex_escape(prefix));
+                    push_rule(profile, RuleAction::Deny, op, "regex", &format!("{base}$"))?;
+                    if let Some(suffix) = exclude_suffix {
+                        push_rule_with(
+                            profile,
+                            RuleAction::Allow,
+                            op,
+                            "regex",
+                            &format!("{base}{}$", regex_escape(suffix)),
+                            reallow_report,
+                        )?;
+                    }
+                }
+            }
+            GuardTarget::BinaryName(name) => {
+                push_rule(
+                    profile,
+                    RuleAction::Deny,
+                    op,
+                    "regex",
+                    &format!("/{}$", regex_escape(name)),
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Return the canonical form of `path` and also the original form if it is
+/// different.
+fn path_variants(path: &Path) -> Vec<String> {
+    let original = path.to_string_lossy().into_owned();
+    let canonical = canonical_or_original(path);
+    if canonical == original {
+        vec![original]
+    } else {
+        vec![canonical, original]
+    }
+}
+
+/// Return the environment of the child.
+///
+/// In proxy mode, add the proxy variables. The values are the same as on
+/// Linux: `HTTP_PROXY` and `HTTPS_PROXY` use HTTP `CONNECT`, `ALL_PROXY`
+/// uses SOCKS5 with name resolution in the proxy (`socks5h`), and
+/// `NO_PROXY` names the loopback addresses. The proxy listens on loopback.
+pub(crate) fn child_env(config: &SandboxConfig) -> std::collections::HashMap<String, String> {
+    let mut e = config.env.clone();
+    if let NetworkMode::ProxyOnly { proxy_addr, .. } = &config.network {
+        let port = proxy_addr.port();
+        let http_url = format!("http://127.0.0.1:{port}");
+        let socks_url = format!("socks5h://127.0.0.1:{port}");
+        let no_proxy = "localhost,127.0.0.1,::1";
+        for key in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
+            e.insert(key.to_string(), http_url.clone());
+        }
+        for key in ["ALL_PROXY", "all_proxy", "GRPC_PROXY", "grpc_proxy"] {
+            e.insert(key.to_string(), socks_url.clone());
+        }
+        for key in ["NO_PROXY", "no_proxy"] {
+            e.insert(key.to_string(), no_proxy.to_string());
+        }
+        // Send git-over-SSH through the SOCKS5 proxy (nc -X 5 = SOCKS5).
+        e.insert(
+            "GIT_SSH_COMMAND".to_string(),
+            format!("ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:{port} %h %p'"),
+        );
+        e.insert("SANDBOX_RUNTIME".to_string(), "1".to_string());
+    }
+    e
+}
+
+/// Spawn `cmd` under the run-mode profile of `config`.
+///
+/// When [`SandboxConfig::record_events`] is set, start the log reader before
+/// the spawn and return the denials in [`crate::SandboxChild::events`]. If
+/// `log stream` cannot start, the child still runs, without events.
+///
+/// # Errors
+/// Returns `InvalidConfig` for a path that cannot go into the profile, or
+/// `SpawnFailed` if the spawn fails.
+#[cfg(target_os = "macos")]
+pub(crate) fn spawn_run(
+    config: &SandboxConfig,
+    cmd: &str,
+    args: &[String],
+) -> Result<crate::SandboxChild, SandboxError> {
+    let profile = generate_sbpl_profile(config)?;
+    let env = child_env(config);
+    let reader = if config.record_events {
+        match crate::macos_log::LogReader::start() {
+            Ok(reader) => Some(reader),
+            Err(e) => {
+                tracing::warn!(error = %e, "the trace has no sandbox denials");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let child = spawn_with_sandbox(&profile, cmd, args, &env, &config.cwd)?;
+    let events = reader.map(|r| r.attach(child.id(), crate::macos_log::RecordMode::Run));
+    Ok(crate::SandboxChild { child, events })
+}
+
+/// Spawn `cmd` in watch mode.
+///
+/// Start the log reader, wait until it is ready, then spawn the child under
+/// the watch profile (see [`generate_watch_profile`]).
+///
+/// # Errors
+/// Returns `SandboxUnavailable` if `log stream` cannot start, `InvalidConfig`
+/// for a path that cannot go into the profile, or `SpawnFailed` if the spawn
+/// fails.
+#[cfg(target_os = "macos")]
+pub(crate) fn spawn_watched(
+    config: &SandboxConfig,
+    options: &crate::WatchOptions,
+    cmd: &str,
+    args: &[String],
+) -> Result<crate::WatchedChild, SandboxError> {
+    let profile = generate_watch_profile(config, &options.guard)?;
+    let env = child_env(config);
+    let reader = crate::macos_log::LogReader::start()?;
+    let child = spawn_with_sandbox(&profile, cmd, args, &env, &config.cwd)?;
+    let events = reader.attach(
+        child.id(),
+        crate::macos_log::RecordMode::Watch(options.guard.clone()),
+    );
+    Ok(crate::WatchedChild {
+        child: crate::SandboxChild {
+            child,
+            events: None,
+        },
+        events,
+    })
 }
 
 /// Spawn a command under sandbox-exec, returning Child handle.
@@ -677,12 +1117,213 @@ mod tests {
             proxy_addr: addr,
             dns_port: 0,
         });
-        // On macOS, ProxyOnly produces no Seatbelt network rules — enforcement is
-        // impossible without per-process network namespaces (Linux-only).
-        assert!(
-            rules.is_empty(),
-            "ProxyOnly should generate no network rules on macOS, got: {rules}"
+        // Only the proxy port on loopback and the system resolver socket.
+        assert_eq!(
+            rules,
+            "(deny network-outbound)\n\
+             (allow network-outbound (remote ip \"localhost:8080\"))\n\
+             (allow network-outbound (literal \"/private/var/run/mDNSResponder\"))\n"
         );
+    }
+
+    fn proxy_mode() -> NetworkMode {
+        NetworkMode::ProxyOnly {
+            proxy_addr: "127.0.0.1:4321".parse().unwrap(),
+            dns_port: 0,
+        }
+    }
+
+    #[test]
+    fn test_sbpl_profile_proxy_allows_unix_sockets_in_writable_paths() {
+        let config =
+            SandboxConfig::new("/workspace".into(), make_test_paths(), "/workspace".into())
+                .with_network(proxy_mode());
+        let profile = generate_sbpl_profile(&config).unwrap();
+        let deny_at = profile.find("(deny network-outbound)\n").unwrap();
+        let unix_at = profile
+            .find(r#"(allow network-outbound (subpath "/workspace"))"#)
+            .unwrap();
+        assert!(profile.contains(r#"(allow network-outbound (remote ip "localhost:4321"))"#));
+        assert!(
+            profile.contains(r#"(allow network-outbound (subpath "/tmp"))"#) || {
+                // On macOS, /tmp is a link to /private/tmp.
+                profile.contains(r#"(allow network-outbound (subpath "/private/tmp"))"#)
+            }
+        );
+        // The Unix socket allows come after the deny, so they win.
+        assert!(unix_at > deny_at, "{profile}");
+        assert!(!profile.contains("(with report)"), "{profile}");
+    }
+
+    #[test]
+    fn test_child_env_sets_proxy_variables() {
+        let config =
+            SandboxConfig::new("/workspace".into(), make_test_paths(), "/workspace".into())
+                .with_network(proxy_mode());
+        let env = child_env(&config);
+        for key in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
+            assert_eq!(
+                env.get(key).map(String::as_str),
+                Some("http://127.0.0.1:4321")
+            );
+        }
+        for key in ["ALL_PROXY", "all_proxy"] {
+            assert_eq!(
+                env.get(key).map(String::as_str),
+                Some("socks5h://127.0.0.1:4321")
+            );
+        }
+        assert_eq!(
+            env.get("NO_PROXY").map(String::as_str),
+            Some("localhost,127.0.0.1,::1")
+        );
+        let blocked = SandboxConfig::new("/w".into(), make_test_paths(), "/w".into());
+        assert!(!child_env(&blocked).contains_key("HTTP_PROXY"));
+    }
+
+    // ========================================================================
+    // watch profile tests
+    // ========================================================================
+
+    use pent_profile::{GuardAccess, GuardClass, GuardRule, GuardTarget};
+
+    fn rule(access: GuardAccess, target: GuardTarget) -> GuardRule {
+        GuardRule {
+            class: GuardClass::Credential,
+            access,
+            target,
+        }
+    }
+
+    fn watch_profile(guard: &[GuardRule]) -> String {
+        let config = SandboxConfig::new("/w".into(), make_test_paths(), "/w".into())
+            .with_network(proxy_mode());
+        generate_watch_profile(&config, guard).unwrap()
+    }
+
+    #[test]
+    fn test_watch_profile_reports_and_limits_network() {
+        let profile = watch_profile(&[]);
+        assert!(profile.starts_with("(version 1)\n(allow default)\n"));
+        for op in [
+            "file-read-data",
+            "file-write*",
+            "process-exec",
+            "network-outbound",
+        ] {
+            assert!(
+                profile.contains(&format!("(allow {op} (with report))\n")),
+                "{profile}"
+            );
+        }
+        let report_at = profile
+            .find("(allow network-outbound (with report))")
+            .unwrap();
+        let deny_at = profile.find("(deny network-outbound)\n").unwrap();
+        assert!(deny_at > report_at, "the deny must come last: {profile}");
+        assert!(profile
+            .contains(r#"(allow network-outbound (remote ip "localhost:4321") (with report))"#));
+        assert!(profile.contains(r#"(allow network-outbound (subpath "/") (with report))"#));
+        assert!(!profile.contains(".pent"), "watch mode has no run policy");
+    }
+
+    #[test]
+    fn test_watch_profile_unrestricted_has_no_network_deny() {
+        let config = SandboxConfig::new("/w".into(), make_test_paths(), "/w".into())
+            .with_network(NetworkMode::Unrestricted);
+        let profile = generate_watch_profile(&config, &[]).unwrap();
+        assert!(!profile.contains("(deny network"), "{profile}");
+    }
+
+    #[test]
+    fn test_watch_profile_guard_exact_and_subtree() {
+        let profile = watch_profile(&[
+            rule(
+                GuardAccess::Read,
+                GuardTarget::Exact("/nonexistent/u/.netrc".into()),
+            ),
+            rule(
+                GuardAccess::Write,
+                GuardTarget::Subtree("/nonexistent/u/Library/LaunchAgents".into()),
+            ),
+        ]);
+        assert!(profile.contains(r#"(deny file-read-data (literal "/nonexistent/u/.netrc"))"#));
+        assert!(profile
+            .contains(r#"(deny file-write* (subpath "/nonexistent/u/Library/LaunchAgents"))"#));
+        // The guard denies come after the reported allows.
+        let deny_at = profile.find("(deny file-read-data").unwrap();
+        let allow_at = profile
+            .find("(allow file-read-data (with report))")
+            .unwrap();
+        assert!(deny_at > allow_at);
+    }
+
+    #[test]
+    fn test_watch_profile_guard_prefix_with_excluded_suffix() {
+        let profile = watch_profile(&[rule(
+            GuardAccess::Read,
+            GuardTarget::FilesInDir {
+                dir: "/nonexistent/u/.ssh".into(),
+                prefix: "id_".to_string(),
+                exclude_suffix: Some(".pub".to_string()),
+            },
+        )]);
+        let deny = r#"(deny file-read-data (regex "^/nonexistent/u/\\.ssh/id_[^/]*$"))"#;
+        let allow = r#"(allow file-read-data (regex "^/nonexistent/u/\\.ssh/id_[^/]*\\.pub$") (with report))"#;
+        let deny_at = profile.find(deny);
+        let allow_at = profile.find(allow);
+        assert!(deny_at.is_some(), "{profile}");
+        assert!(allow_at.is_some(), "{profile}");
+        // The last matching rule wins: the .pub allow follows the deny.
+        assert!(allow_at > deny_at);
+    }
+
+    #[test]
+    fn test_watch_profile_guard_exec_name() {
+        let profile = watch_profile(&[rule(
+            GuardAccess::ExecName,
+            GuardTarget::BinaryName("sudo".to_string()),
+        )]);
+        assert!(
+            profile.contains(r#"(deny process-exec (regex "/sudo$"))"#),
+            "{profile}"
+        );
+    }
+
+    #[test]
+    fn test_watch_profile_guard_escapes_paths() {
+        let profile = watch_profile(&[
+            rule(
+                GuardAccess::Read,
+                GuardTarget::Exact("/nonexistent/a\"b) (allow default".into()),
+            ),
+            rule(
+                GuardAccess::Read,
+                GuardTarget::FilesInDir {
+                    dir: "/nonexistent/x (1)".into(),
+                    prefix: "k.".to_string(),
+                    exclude_suffix: None,
+                },
+            ),
+        ]);
+        assert!(
+            profile
+                .contains(r#"(deny file-read-data (literal "/nonexistent/a\"b) (allow default"))"#),
+            "{profile}"
+        );
+        assert!(
+            profile
+                .contains(r#"(deny file-read-data (regex "^/nonexistent/x \\(1\\)/k\\.[^/]*$"))"#),
+            "{profile}"
+        );
+        let bad = rule(GuardAccess::Read, GuardTarget::Exact("/a\nb".into()));
+        let config = SandboxConfig::new("/w".into(), make_test_paths(), "/w".into());
+        assert!(generate_watch_profile(&config, &[bad]).is_err());
+    }
+
+    #[test]
+    fn test_regex_escape() {
+        assert_eq!(regex_escape("a.b*c(d)"), r"a\.b\*c\(d\)");
     }
 
     #[test]

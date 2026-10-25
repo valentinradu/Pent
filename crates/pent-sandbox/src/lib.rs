@@ -34,6 +34,12 @@ mod env;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod macos;
 
+// The parse and filter functions of the macOS log reader are pure Rust, so
+// their unit tests also run on Linux.
+#[cfg(any(target_os = "macos", test))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod macos_log;
+
 #[cfg(target_os = "linux")]
 mod linux;
 
@@ -89,19 +95,33 @@ pub struct WatchedChild {
 /// Watch mode uses [`NetworkMode::ProxyOnly`] with the proxy in observe mode,
 /// so that network events have domain names.
 ///
-/// CONTRACT STUB: the platform recorders are not implemented yet.
+/// On macOS, the child runs under a Seatbelt profile that allows each
+/// operation with `(with report)` and denies the guard accesses. A reader of
+/// `log stream` (started before the spawn) turns the reports of the process
+/// tree into events. macOS limits the rate of the reports, so the events are
+/// a lower bound.
+///
+/// CONTRACT STUB: the Linux recorder is not implemented yet.
 ///
 /// # Errors
 /// Returns [`SandboxError::UnsupportedPlatform`] until a recorder exists for
-/// the platform, or a spawn error.
+/// the platform, [`SandboxError::SandboxUnavailable`] on macOS if
+/// `log stream` cannot start, or a spawn error.
 pub fn spawn_watched(
     config: &SandboxConfig,
     options: &WatchOptions,
     cmd: &str,
     args: &[String],
 ) -> Result<WatchedChild, SandboxError> {
-    let _ = (config, options, cmd, args);
-    Err(SandboxError::UnsupportedPlatform)
+    #[cfg(target_os = "macos")]
+    {
+        macos::spawn_watched(config, options, cmd, args)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (config, options, cmd, args);
+        Err(SandboxError::UnsupportedPlatform)
+    }
 }
 
 /// A sandboxed child process, optionally with an overlayfs handle.
@@ -120,7 +140,9 @@ pub struct SandboxChild {
     /// (`pent run --trace`). The recorder observes next to the enforcement.
     /// Events that the policy denies have [`pent_profile::Outcome::Denied`].
     ///
-    /// CONTRACT STUB: no platform fills this channel yet.
+    /// On macOS, the channel has the Seatbelt denials of the process tree.
+    /// It is `None` if `log stream` cannot start. CONTRACT STUB: Linux does
+    /// not fill this channel yet.
     pub events: Option<std::sync::mpsc::Receiver<pent_profile::WatchEvent>>,
 }
 
@@ -206,39 +228,7 @@ pub fn spawn_sandboxed(
 
     #[cfg(target_os = "macos")]
     {
-        let profile = macos::generate_sbpl_profile(config)?;
-        let env_with_proxy;
-        let env = if let NetworkMode::ProxyOnly { proxy_addr, .. } = &config.network {
-            let port = proxy_addr.port();
-            let http_url = format!("http://127.0.0.1:{port}");
-            let socks_url = format!("socks5h://127.0.0.1:{port}");
-            let no_proxy = "localhost,127.0.0.1,::1";
-            let mut e = config.env.clone();
-            e.insert("HTTP_PROXY".to_string(), http_url.clone());
-            e.insert("HTTPS_PROXY".to_string(), http_url.clone());
-            e.insert("http_proxy".to_string(), http_url.clone());
-            e.insert("https_proxy".to_string(), http_url.clone());
-            e.insert("ALL_PROXY".to_string(), socks_url.clone());
-            e.insert("all_proxy".to_string(), socks_url.clone());
-            e.insert("GRPC_PROXY".to_string(), socks_url.clone());
-            e.insert("grpc_proxy".to_string(), socks_url);
-            e.insert("NO_PROXY".to_string(), no_proxy.to_string());
-            e.insert("no_proxy".to_string(), no_proxy.to_string());
-            e.insert(
-                "GIT_SSH_COMMAND".to_string(),
-                format!("ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:{port} %h %p'"),
-            );
-            e.insert("SANDBOX_RUNTIME".to_string(), "1".to_string());
-            env_with_proxy = e;
-            &env_with_proxy
-        } else {
-            &config.env
-        };
-        let child = macos::spawn_with_sandbox(&profile, cmd, args, env, &config.cwd)?;
-        Ok(SandboxChild {
-            child,
-            events: None,
-        })
+        macos::spawn_run(config, cmd, args)
     }
     #[cfg(target_os = "linux")]
     {
