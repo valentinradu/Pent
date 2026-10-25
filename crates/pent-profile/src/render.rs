@@ -24,10 +24,11 @@ use crate::{GuardClass, ProfileDoc, ProfileName};
 const LABEL_CAP: usize = 40;
 
 /// The sections in the order of the summary.
-pub(crate) const SECTIONS: [Section; 5] = [
+pub(crate) const SECTIONS: [Section; 6] = [
     Section::ReadWrite,
     Section::Read,
     Section::Execute,
+    Section::UnixSockets,
     Section::Network,
     Section::Blocked,
 ];
@@ -49,6 +50,7 @@ pub const fn section_title(section: Section) -> &'static str {
         Section::ReadWrite => "Read-write",
         Section::Read => "Read",
         Section::Execute => "Execute",
+        Section::UnixSockets => "Unix sockets",
         Section::Network => "Network",
         Section::Blocked => "Blocked by the guard",
     }
@@ -156,7 +158,7 @@ fn escape_with(text: &str, unsafe_char: impl Fn(char) -> bool) -> Cow<'_, str> {
 /// Return the rule text of a grant (the path or the domain).
 fn grant_text(grant: &Grant) -> &str {
     match grant {
-        Grant::Fs { path, .. } => path,
+        Grant::Fs { path, .. } | Grant::UnixSocket(path) => path,
         Grant::Domain(domain) => domain,
     }
 }
@@ -174,7 +176,7 @@ pub(crate) fn item_label(item: &Item) -> String {
             FsAccess::ReadWrite => "write",
             FsAccess::Execute => "exec",
         },
-        Grant::Domain(_) => "connect",
+        Grant::Domain(_) | Grant::UnixSocket(_) => "connect",
     };
     format!("{verb} {text}")
 }
@@ -275,6 +277,75 @@ pub fn render_header(summary: &Summary, header: &WatchHeader<'_>) -> String {
     out
 }
 
+/// The facts of a run that the user must see without a careful read.
+///
+/// `pent watch` prints one warning line for each count that is not zero,
+/// under the header, and writes the same lines into the first lines of the
+/// draft.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Warnings {
+    /// The number of rules outside the home directory.
+    pub outside_home: usize,
+    /// The number of rules in another repository.
+    pub other_repository: usize,
+    /// The number of connections to a Unix socket that pent refused.
+    pub refused_unix_sockets: usize,
+}
+
+impl Warnings {
+    /// Count the facts of `summary`.
+    #[must_use]
+    pub fn of(summary: &Summary) -> Self {
+        let count = |note: &ItemNote| {
+            summary
+                .items
+                .iter()
+                .filter(|item| item.notes.contains(note))
+                .count()
+        };
+        Self {
+            outside_home: count(&ItemNote::OutsideHome),
+            other_repository: count(&ItemNote::OtherRepository),
+            refused_unix_sockets: summary.stats.refused_unix_sockets,
+        }
+    }
+
+    /// Return true if each count is zero.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.outside_home == 0 && self.other_repository == 0 && self.refused_unix_sockets == 0
+    }
+
+    /// One short line for each count that is not zero.
+    #[must_use]
+    pub fn lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        if self.outside_home > 0 {
+            lines.push(format!(
+                "{} outside the home directory",
+                plural(self.outside_home, "rule reads", "rules read")
+            ));
+        }
+        if self.other_repository > 0 {
+            lines.push(format!(
+                "{} in another repository",
+                plural(self.other_repository, "rule reads", "rules read")
+            ));
+        }
+        if self.refused_unix_sockets > 0 {
+            lines.push(format!(
+                "pent refused {}",
+                plural(
+                    self.refused_unix_sockets,
+                    "connection to a Unix socket",
+                    "connections to a Unix socket"
+                )
+            ));
+        }
+        lines
+    }
+}
+
 /// Render the summary block that `pent watch` prints after the child exits.
 ///
 /// Example:
@@ -317,11 +388,11 @@ pub fn render_terminal(summary: &Summary, header: &WatchHeader<'_>) -> String {
         }
     }
 
-    if !stats.unix_sockets.is_empty() || !stats.ip_hosts.is_empty() {
+    if !stats.unreachable_sockets.is_empty() || !stats.ip_hosts.is_empty() {
         out.push_str("\n  Not in the rules\n");
-        for socket in &stats.unix_sockets {
+        for socket in &stats.unreachable_sockets {
             out.push_str(&format!(
-                "    Unix socket {}: the sandbox cannot allow a Unix socket by rule\n",
+                "    Unix socket {}: a rule cannot name it, so it is not reachable\n",
                 safe(socket)
             ));
         }
@@ -411,23 +482,31 @@ impl Reasons {
     }
 }
 
-/// The four lists of a profile.
+/// The five lists of a profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ListKind {
     ReadWrite,
     Read,
     Execute,
+    UnixSockets,
     Domains,
 }
 
 impl ListKind {
-    const ALL: [Self; 4] = [Self::ReadWrite, Self::Read, Self::Execute, Self::Domains];
+    const ALL: [Self; 5] = [
+        Self::ReadWrite,
+        Self::Read,
+        Self::Execute,
+        Self::UnixSockets,
+        Self::Domains,
+    ];
 
     const fn key(self) -> &'static str {
         match self {
             Self::ReadWrite => "read_write",
             Self::Read => "read",
             Self::Execute => "execute",
+            Self::UnixSockets => "unix_sockets",
             Self::Domains => "domains",
         }
     }
@@ -437,6 +516,7 @@ impl ListKind {
             Self::ReadWrite => Section::ReadWrite,
             Self::Read => Section::Read,
             Self::Execute => Section::Execute,
+            Self::UnixSockets => Section::UnixSockets,
             Self::Domains => Section::Network,
         }
     }
@@ -446,6 +526,7 @@ impl ListKind {
             Self::ReadWrite => &doc.filesystem.read_write,
             Self::Read => &doc.filesystem.read,
             Self::Execute => &doc.filesystem.execute,
+            Self::UnixSockets => &doc.filesystem.unix_sockets,
             Self::Domains => &doc.network.domains,
         }
     }
@@ -455,6 +536,7 @@ impl ListKind {
             Self::ReadWrite => FsAccess::ReadWrite,
             Self::Read => FsAccess::Read,
             Self::Execute => FsAccess::Execute,
+            Self::UnixSockets => return Grant::UnixSocket(value),
             Self::Domains => return Grant::Domain(value),
         };
         Grant::Fs {
@@ -571,6 +653,7 @@ pub fn render_draft(
         DraftSource::WatchRuns(runs),
         doc,
         &Reasons::from_summary(summary),
+        Warnings::of(summary),
     )
 }
 
@@ -587,12 +670,17 @@ pub enum DraftSource {
 /// Render a draft with the reasons in `reasons`. Use this function when the
 /// draft keeps rules from an earlier draft or profile: merge their reasons
 /// into `reasons` with [`Reasons::merge_missing`].
+///
+/// `facts` goes into the first lines, as a comment for each count that is
+/// not zero. A user who reads the file later sees the same facts as the
+/// user who saw the review.
 #[must_use]
 pub fn render_draft_with(
     name: &ProfileName,
     source: DraftSource,
     doc: &ProfileDoc,
     reasons: &Reasons,
+    facts: Warnings,
 ) -> String {
     let mut out = String::new();
     match source {
@@ -605,6 +693,9 @@ pub fn render_draft_with(
         )),
     }
     out.push_str("# Each comment tells why the rule exists. Remove a line to remove the rule.\n");
+    for line in facts.lines() {
+        out.push_str(&format!("# {}.\n", comment_text(&line)));
+    }
     if doc.is_empty() {
         out.push_str("# The profile has no rules.\n");
         return out;
@@ -710,13 +801,13 @@ mod tests {
         summarize(&claude_session(), &ctx())
     }
 
-    /// Select each item that the guard did not block.
+    /// Select each item of a section that the review selects by default.
     fn default_selection(summary: &Summary) -> Vec<usize> {
         summary
             .items
             .iter()
             .enumerate()
-            .filter(|(_, i)| i.blocked.is_none())
+            .filter(|(_, i)| i.section().selects_by_default())
             .map(|(i, _)| i)
             .collect()
     }
@@ -734,7 +825,7 @@ mod tests {
         );
         let expected = "\
 pent watch: claude
-  13 rules from 1,834 accesses by 4 processes. The guard blocked 2 accesses.
+  14 rules from 1,835 accesses by 4 processes. The guard blocked 2 accesses.
 
   Read-write
     ~/.cache/claude         cache
@@ -748,6 +839,8 @@ pent watch: claude
   Execute
     ~/.local/share/claude   runs claude
     ~/.nvm/versions/node    runs node
+  Unix sockets
+    /run/user/1000/bus      D-Bus
   Network
     api.anthropic.com       HTTPS
     github.com              port 22
@@ -758,7 +851,7 @@ pent watch: claude
     read ~/.ssh/id_ed25519  ssh (credential)
 
   Not in the rules
-    Unix socket /run/user/1000/bus: the sandbox cannot allow a Unix socket by rule
+    Unix socket @/tmp/.X11-unix/X0: a rule cannot name it, so it is not reachable
     140.82.112.3:443: the proxy cannot allow an IP address
 ";
         assert_eq!(text, expected, "\n{text}");
@@ -789,6 +882,7 @@ pent watch: claude
         let text = render_draft(&name("claude")?, 3, &doc, &summary);
         let expected = r#"# Profile for "claude". Pent made it from 3 watch runs.
 # Each comment tells why the rule exists. Remove a line to remove the rule.
+# pent refused 1 connection to a Unix socket.
 
 [filesystem]
 read_write = [
@@ -900,7 +994,11 @@ domains = [
         let text = render_draft(&name("claude")?, 1, &doc, &summary);
         let from_draft = Reasons::from_draft(&text);
         let from_summary = Reasons::from_summary(&summary);
-        for item in summary.items.iter().filter(|i| i.blocked.is_none()) {
+        for item in summary
+            .items
+            .iter()
+            .filter(|i| i.section().selects_by_default())
+        {
             assert_eq!(from_draft.get(&item.grant), from_summary.get(&item.grant));
             assert!(from_draft.get(&item.grant).is_some());
         }
@@ -977,6 +1075,7 @@ Network
             DraftSource::WatchRuns(1),
             &doc,
             &Reasons::from_draft(earlier),
+            Warnings::default(),
         );
         assert!(
             matches!(ProfileDoc::parse(&text), Ok(p) if p == doc),

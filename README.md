@@ -110,6 +110,8 @@ A fixed list of sockets can never be complete, so Pent hides a directory, not a 
 
 A socket in another directory still works. The full fix is a `connect(2)` filter in the supervisor; see [`docs/security/linux-sandbox.md`](docs/security/linux-sandbox.md).
 
+A profile names the sockets that the program needs in `filesystem.unix_sockets`, and `pent run --unix-socket PATH` adds one for a single run. Pent makes each permitted connection itself and gives the connected socket to the program.
+
 #### Processes
 
 The sandboxed process runs in a new PID namespace with its own `proc` mount. It sees only the processes of the sandbox, so it cannot read the command line of your other programs (a command line often holds a token). When the command exits, the kernel ends every other process of the sandbox, so no background process outlives `pent run`. The exit code and the signal of the command reach you unchanged. Watch mode (`pent watch`) does not take a PID namespace: it must not change how the program runs.
@@ -166,6 +168,7 @@ Watch mode does not sandbox the program. Pent shows a banner and asks before the
 pent watch: claude
   Watch mode does not sandbox the program. It records what the program does.
   The program can read and change your files and use the network.
+  The network is open in this run. Use --allow DOMAIN or --network blocked to close it.
   Pent blocks only the most dangerous accesses (credentials, persistence).
   If you do not trust this binary, run it in a VM or a container.
 Continue? [y/N]
@@ -181,7 +184,36 @@ Read-write (3)
 Accept: [a]ll, [n]one, or the numbers (1,3-5)? [a]
 ```
 
+Two sections have the default `[n]`, because their rules are strong: `Blocked by the guard` and `Unix sockets`. Pent selects an item of these sections only when you ask for it.
+
 Pent writes the selected rules to a draft and asks `Trust this profile now? [y/N]`.
+
+Under the header, pent shows one warning line for each fact that needs your attention:
+
+```
+pent watch: claude
+  14 rules from 1,835 accesses by 4 processes. The guard blocked 2 accesses.
+▲ 2 rules read outside the home directory
+▲ pent refused 1 connection to a Unix socket
+```
+
+The same facts are comments in the first lines of the draft.
+
+### The network of a watch run
+
+A watch run must learn which domains the program needs, so the network is open by default: the proxy observes each request and allows each domain. A hostile program can then send out everything that it reads.
+
+To close the network, use the same two flags as in `pent run`. The proxy then enforces the allowlist, and each refused request becomes an item of the summary:
+
+```bash
+# Allow one domain. The proxy refuses each other domain
+pent watch --allow api.anthropic.com -- claude
+
+# No network at all
+pent watch --network blocked -- claude
+```
+
+`--network` has precedence over `--allow`, as in `pent run`.
 
 ### Trust and run
 
@@ -210,6 +242,9 @@ pent run --allow example.com -- claude
 
 # One more read-only path, read-write path or executable path
 pent run --read /etc/ssl/certs --write ./out --execute ~/tools/bin -- claude
+
+# One more Unix socket
+pent run --unix-socket ~/.gnupg/S.gpg-agent -- claude
 
 # No network access
 pent run --network blocked -- claude
@@ -283,6 +318,7 @@ The draft has one comment for each rule. The comment tells why the rule exists. 
 ```toml
 # Profile for "claude". Pent made it from 3 watch runs.
 # Each comment tells why the rule exists. Remove a line to remove the rule.
+# pent refused 1 connection to a Unix socket.
 
 [filesystem]
 read_write = [
@@ -295,6 +331,9 @@ read = [
 execute = [
   "~/.local/share/claude",
 ]
+unix_sockets = [
+  "~/.gnupg/S.gpg-agent",  # gpg-agent
+]
 
 [network]
 domains = [
@@ -304,6 +343,10 @@ domains = [
 ```
 
 Pent expands a leading `~` to your home directory. A relative path resolves against the workspace. The workspace (the current directory) is always read-write, and the system paths (`/usr`, `/etc`, `/tmp`, ...) are always available.
+
+`unix_sockets` names the Unix sockets that the program can connect to. Pent makes each permitted connection itself, so a socket that the list does not name is not reachable, also when a path rule gives access to its directory. This rule is strong: a program that reaches the socket of an agent can use the key of that agent. Thus the review never selects such an item for you. The reason names the agent when pent knows the socket (`ssh-agent`, `gpg-agent`, `D-Bus`, `Docker`), else it names the process that connected.
+
+A program can also connect to an abstract address (`@name`). A rule cannot name an abstract address, so the summary lists it under "Not in the rules".
 
 To record more accesses into the same draft, run `pent watch --append -- claude`. Each run adds to the draft.
 
@@ -321,6 +364,12 @@ Pent applies a profile only after you trust its exact content, as `direnv allow`
 | `pent profile rm NAME` | Remove the profile, its draft, its trust and its logs. |
 
 ## Debugging
+
+### The program needs a Unix socket
+
+A program that cannot reach its agent fails with "Permission denied" on the socket, or it asks for a passphrase that the agent holds. Record the run with `pent watch`: the connection becomes an item in the `Unix sockets` section, with the name of the agent. Accept the item, or add the path with `--unix-socket PATH` for one run.
+
+An abstract address (`@name`) has no path, so no rule can allow it. The summary lists it under "Not in the rules".
 
 ### Denied accesses and `pent trust --review`
 

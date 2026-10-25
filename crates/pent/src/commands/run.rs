@@ -116,10 +116,12 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
     }
 
     let mut sandbox_cfg =
-        SandboxConfig::from_sandbox_settings(settings.sandbox, paths, cwd.clone(), cwd)
+        SandboxConfig::from_sandbox_settings(settings.sandbox, paths, cwd.clone(), cwd.clone())
             .with_network(resolved_network)
             .with_env(env_map);
     sandbox_cfg.record_events = args.trace;
+    sandbox_cfg.unix_sockets =
+        unix_socket_paths(&profile.filesystem.unix_sockets, &args.unix_socket, &cwd);
 
     if let Some(data_dir) = args.data_dir {
         sandbox_cfg = sandbox_cfg.with_data_dir(data_dir);
@@ -248,6 +250,33 @@ fn add_cli_paths(paths: &mut pent_settings::SandboxPaths, args: &RunArgs) {
     paths.read.extend(strings(&args.read));
     paths.read_write.extend(strings(&args.write));
     paths.execute.extend(strings(&args.execute));
+}
+
+/// The Unix sockets of the profile and of `--unix-socket`, without
+/// duplicates.
+///
+/// A leading `~` expands to the home directory, as it does for the other
+/// path lists. A relative path resolves against the workspace.
+fn unix_socket_paths(profile: &[String], flags: &[PathBuf], workspace: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut add = |entry: &Path| {
+        let path = pent_settings::expand_home(entry);
+        let path = if path.is_absolute() {
+            path
+        } else {
+            workspace.join(path)
+        };
+        if !out.contains(&path) {
+            out.push(path);
+        }
+    };
+    for entry in profile {
+        add(Path::new(entry));
+    }
+    for entry in flags {
+        add(entry);
+    }
+    out
 }
 
 /// The profile domains and the `--allow` domains, without duplicates.
@@ -379,7 +408,7 @@ fn denied_message(count: usize, name: &ProfileName) -> Option<String> {
 
 /// The network mode that the user asks for, before pent starts a proxy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NetworkChoice {
+pub(crate) enum NetworkChoice {
     Unrestricted,
     Localhost,
     Proxy,
@@ -400,7 +429,7 @@ impl NetworkChoice {
 
 /// The input that decided the network mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NetworkSource {
+pub(crate) enum NetworkSource {
     /// An explicit `--network` flag.
     NetworkFlag,
     /// One or more `--allow` flags.
@@ -413,9 +442,11 @@ enum NetworkSource {
 
 /// The resolved network mode and the input that decided it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct NetworkDecision {
-    choice: NetworkChoice,
-    source: NetworkSource,
+pub(crate) struct NetworkDecision {
+    /// The mode.
+    pub choice: NetworkChoice,
+    /// The input that decided the mode.
+    pub source: NetworkSource,
 }
 
 /// Resolve the network mode. This rule is the same on all platforms.
@@ -428,7 +459,7 @@ struct NetworkDecision {
 ///
 /// `--trace` is not an input: tracing never changes the network mode.
 /// `profile_domains` must not contain the `--allow` values.
-fn resolve_network(
+pub(crate) fn resolve_network(
     network_flag: Option<NetworkModeArg>,
     allow_flags: &[String],
     profile_domains: &[String],
@@ -453,7 +484,7 @@ fn resolve_network(
 }
 
 /// The network mode for a choice without a proxy.
-const fn base_network_mode(choice: NetworkChoice) -> NetworkMode {
+pub(crate) const fn base_network_mode(choice: NetworkChoice) -> NetworkMode {
     match choice {
         NetworkChoice::Unrestricted => NetworkMode::Unrestricted,
         NetworkChoice::Localhost => NetworkMode::LocalhostOnly,
@@ -465,7 +496,11 @@ const fn base_network_mode(choice: NetworkChoice) -> NetworkMode {
 }
 
 /// Return the warnings to show for a network decision.
-fn network_warnings(decision: NetworkDecision, allow_flags: &[String], trace: bool) -> Vec<String> {
+pub(crate) fn network_warnings(
+    decision: NetworkDecision,
+    allow_flags: &[String],
+    trace: bool,
+) -> Vec<String> {
     let mut warnings = Vec::new();
     if decision.source == NetworkSource::NetworkFlag
         && decision.choice != NetworkChoice::Proxy
@@ -487,7 +522,7 @@ fn network_warnings(decision: NetworkDecision, allow_flags: &[String], trace: bo
 }
 
 /// Return the status line for the network mode, if there is one.
-fn network_status(mode: &NetworkMode, source: NetworkSource) -> Option<&'static str> {
+pub(crate) fn network_status(mode: &NetworkMode, source: NetworkSource) -> Option<&'static str> {
     match mode {
         // The proxy is the expected mode.
         NetworkMode::ProxyOnly { .. } => None,
