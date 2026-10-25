@@ -2390,6 +2390,101 @@ mod tests {
         assert_eq!(clamp_ttl(5, (30, 1)), 1);
     }
 
+    /// The longest name in wire format is 255 bytes. The parser must
+    /// accept a name of exactly 255 bytes, and reject one byte more. A
+    /// wrong limit rejects a name that the allowlist permits.
+    #[test]
+    fn a_name_of_255_wire_bytes_is_accepted_and_256_is_not() {
+        let wire_name = |lengths: &[usize]| -> Vec<u8> {
+            let mut message = Vec::new();
+            for &len in lengths {
+                message.push(u8::try_from(len).unwrap());
+                message.extend(std::iter::repeat_n(b'a', len));
+            }
+            message.push(0);
+            message
+        };
+
+        // Each label takes its length byte too, and the name ends with
+        // the byte of the root label. Three labels of 63 bytes and one
+        // label of 61 bytes give 64 + 64 + 64 + 62 + 1 = 255.
+        let longest = wire_name(&[63, 63, 63, 61]);
+        let read = read_name(&longest, 0, Pointers::Forbidden, LabelBytes::Any);
+        assert!(
+            read.is_ok(),
+            "a name of 255 bytes must be accepted: {read:?}"
+        );
+
+        let too_long = wire_name(&[63, 63, 63, 62]);
+        assert_eq!(
+            read_name(&too_long, 0, Pointers::Forbidden, LabelBytes::Any),
+            Err(WireError::NameTooLong)
+        );
+    }
+
+    /// The parser of an upstream reply takes the response code from the low
+    /// four bits of the second flag byte, and it takes the addresses from
+    /// the answer section only. A record of the authority section or of the
+    /// additional section must not reach the cache of the proxy.
+    #[test]
+    fn the_upstream_reply_gives_the_code_and_only_the_answer_addresses() {
+        let query = build_dns_query(0x1234, "example.com", rtype::A);
+        let question = read_question(&query, Pointers::Forbidden).unwrap();
+        let record = |rr_type: u16, ttl: u32, rdata: &[u8]| {
+            let mut r = vec![0xC0, 0x0C];
+            r.extend_from_slice(&rr_type.to_be_bytes());
+            r.extend_from_slice(&CLASS_IN.to_be_bytes());
+            r.extend_from_slice(&ttl.to_be_bytes());
+            r.extend_from_slice(&u16::try_from(rdata.len()).unwrap().to_be_bytes());
+            r.extend_from_slice(rdata);
+            r
+        };
+
+        let mut reply = query[..2].to_vec();
+        reply.extend_from_slice(&[0x81, 0x80 | rcode::NOERROR]);
+        reply.extend_from_slice(&[0, 1]); // one question
+        reply.extend_from_slice(&[0, 1]); // one answer
+        reply.extend_from_slice(&[0, 1]); // one record in the authority section
+        reply.extend_from_slice(&[0, 0]); // no record in the additional section
+        reply.extend_from_slice(&query[HEADER_LEN..question.end]);
+        reply.extend_from_slice(&record(rtype::A, 60, &[93, 184, 216, 34]));
+        reply.extend_from_slice(&record(rtype::A, 60, &[203, 0, 113, 9]));
+
+        let result =
+            process_upstream_response(reply.clone(), 0x1234, "example.com", rtype::A, (30, 300));
+        let code = result.as_ref().ok().map(|reply| reply.rcode);
+        assert_eq!(code, Some(rcode::NOERROR), "{result:?}");
+        let addresses = result.as_ref().ok().map(|reply| reply.addresses.clone());
+        assert_eq!(
+            addresses,
+            Some(vec!["93.184.216.34".parse::<IpAddr>().unwrap()]),
+            "only the answer section gives addresses"
+        );
+
+        // A message with no QR bit is a query, not a response. The server
+        // must not take it as an answer: an answer to a response can make
+        // a loop, and a query of another host must not reach the cache.
+        let mut not_a_response = reply;
+        not_a_response[2] = 0x01;
+        assert_eq!(
+            process_upstream_response(not_a_response, 0x1234, "example.com", rtype::A, (30, 300)),
+            Err(WireError::Mismatch)
+        );
+
+        // A reply that holds only a header has no question. The length
+        // guard accepts it, and the rule for one question rejects it.
+        let header_only = vec![0x12, 0x34, 0x81, 0x80, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(
+            process_upstream_response(header_only, 0x1234, "example.com", rtype::A, (30, 300)),
+            Err(WireError::Mismatch)
+        );
+        // A reply that is shorter than the header is truncated.
+        assert_eq!(
+            process_upstream_response(vec![0x12, 0x34], 0x1234, "example.com", rtype::A, (30, 300)),
+            Err(WireError::Truncated)
+        );
+    }
+
     #[test]
     fn test_upstream_response_with_wrong_id_rejected() {
         let query = build_dns_query(0x1234, "example.com", rtype::A);
