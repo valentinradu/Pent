@@ -351,11 +351,11 @@ impl AccessPolicy {
     /// covers nor leads to. A path below such an entry is not there for
     /// the child, so a read of it gives `ENOENT` and no Landlock denial.
     ///
-    /// The answer is a prediction: the child can make a file of its own at
-    /// a hidden name, and the upper layer then shows that file. The
-    /// recorder drops a read of a path that does not exist, so a name that
-    /// only the child made reaches this function only after the child made
-    /// it on the host, which the sandbox does not permit.
+    /// The answer has one limit: the upper layer is writable, so a child
+    /// that makes a file of its own at a hidden name can read that file
+    /// back. The policy calls such a read a denial too. The report stays
+    /// true, because the file of the host stays hidden: the child reads
+    /// its own content, never the content that the overlay hides.
     fn hidden(&self, path: &Path) -> bool {
         if !self
             .overlay_roots
