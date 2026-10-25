@@ -120,13 +120,17 @@ struct Harness {
     upstream: FakeUpstream,
 }
 
+/// Start the proxy with a fake upstream.
+///
+/// Every step must work: the test proves nothing without a proxy, so a
+/// failure here fails the test instead of a silent return.
 async fn start(
     allowlist: &[&str],
     answer_ip: Ipv4Addr,
     policy: ProxyPolicy,
     private: PrivateDestinations,
-) -> Option<Harness> {
-    let upstream = spawn_upstream(answer_ip).ok()?;
+) -> Harness {
+    let upstream = spawn_upstream(answer_ip).expect("the fake upstream must bind on the loopback");
     let config = ProxyConfig {
         dns_bind_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
         proxy_bind_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
@@ -138,13 +142,17 @@ async fn start(
         tcp_connect_timeout: Duration::from_secs(3),
         ..Default::default()
     };
-    let handle = ProxyServer::new(config).ok()?.start().await.ok()?;
-    let proxy_addr = handle.proxy_addr()?;
-    Some(Harness {
+    let handle = ProxyServer::new(config)
+        .expect("the proxy configuration is valid")
+        .start()
+        .await
+        .expect("the proxy must start on the loopback");
+    let proxy_addr = handle.proxy_addr().expect("the proxy has a TCP address");
+    Harness {
         handle,
         proxy_addr,
         upstream,
-    })
+    }
 }
 
 // ── SOCKS5 / HTTP CONNECT clients ───────────────────────────────────────────
@@ -202,7 +210,9 @@ fn http_connect(proxy: SocketAddr, target: &str) -> std::io::Result<(TcpStream, 
     s.set_read_timeout(Some(Duration::from_secs(5)))?;
     s.write_all(format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n").as_bytes())?;
     let mut buf = [0u8; 256];
-    let n = s.read(&mut buf).unwrap_or(0);
+    // A read error gives an error, not an empty status: an empty status
+    // would let a timeout look like a refusal.
+    let n = s.read(&mut buf)?;
     Ok((s, String::from_utf8_lossy(&buf[..n]).into_owned()))
 }
 
@@ -225,16 +235,13 @@ const PUBLIC_IP: Ipv4Addr = Ipv4Addr::new(93, 184, 216, 34); // documentation IP
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn disallowed_name_gets_nxdomain_and_is_not_forwarded_upstream() {
-    let Some(h) = start(
+    let h = start(
         &["allowed.example.com"],
         PUBLIC_IP,
         ProxyPolicy::Enforce,
         PrivateDestinations::Deny,
     )
-    .await
-    else {
-        return;
-    };
+    .await;
     let dns = h.handle.dns_addr().expect("dns addr");
 
     // Query a disallowed name over UDP.
@@ -264,16 +271,13 @@ async fn inherent_dns_subdomain_exfil_under_allowed_wildcard() {
     // of a subdomain. The proxy forwards the query upstream, where an
     // attacker name server reads the data. This is an inherent limit of a
     // domain allowlist: the query itself is the channel.
-    let Some(h) = start(
+    let h = start(
         &["*.example.com"],
         PUBLIC_IP,
         ProxyPolicy::Enforce,
         PrivateDestinations::Deny,
     )
-    .await
-    else {
-        return;
-    };
+    .await;
     let dns = h.handle.dns_addr().expect("dns addr");
     let client = UdpSocket::bind("127.0.0.1:0").expect("bind client");
     client.set_read_timeout(Some(Duration::from_secs(3))).ok();
@@ -299,16 +303,13 @@ async fn inherent_txt_record_for_allowed_name_is_a_receive_channel() {
     // An attacker name server for an allowed domain can send commands in a
     // TXT record. This is inherent: the proxy cannot read the meaning of a
     // record for an allowed name.
-    let Some(h) = start(
+    let h = start(
         &["allowed.example.com"],
         PUBLIC_IP,
         ProxyPolicy::Enforce,
         PrivateDestinations::Deny,
     )
-    .await
-    else {
-        return;
-    };
+    .await;
     let dns = h.handle.dns_addr().expect("dns addr");
     let client = UdpSocket::bind("127.0.0.1:0").expect("bind client");
     client.set_read_timeout(Some(Duration::from_secs(3))).ok();
@@ -327,16 +328,13 @@ async fn inherent_txt_record_for_allowed_name_is_a_receive_channel() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn socks5_connect_to_disallowed_domain_is_refused() {
-    let Some(h) = start(
+    let h = start(
         &["allowed.example.com"],
         PUBLIC_IP,
         ProxyPolicy::Enforce,
         PrivateDestinations::Deny,
     )
-    .await
-    else {
-        return;
-    };
+    .await;
     let (_s, code) = socks5_connect_domain(h.proxy_addr, "evil.example.com", 443).expect("connect");
     assert_eq!(
         code, 0x02,
@@ -347,16 +345,13 @@ async fn socks5_connect_to_disallowed_domain_is_refused() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn http_connect_to_disallowed_domain_is_forbidden() {
-    let Some(h) = start(
+    let h = start(
         &["allowed.example.com"],
         PUBLIC_IP,
         ProxyPolicy::Enforce,
         PrivateDestinations::Deny,
     )
-    .await
-    else {
-        return;
-    };
+    .await;
     let (_s, status) = http_connect(h.proxy_addr, "evil.example.com:443").expect("connect");
     assert!(
         status.contains("403"),
@@ -370,30 +365,39 @@ async fn non_connect_http_proxy_request_is_rejected() {
     // A plain HTTP proxy request (absolute-URI GET) must not work: the proxy
     // supports only CONNECT and SOCKS5. Otherwise the child could fetch
     // `GET http://evil/` and the host would never be checked as a tunnel.
-    let Some(h) = start(
+    let h = start(
         &["allowed.example.com"],
         PUBLIC_IP,
         ProxyPolicy::Enforce,
         PrivateDestinations::Deny,
     )
-    .await
-    else {
-        return;
-    };
+    .await;
     let mut s = TcpStream::connect(h.proxy_addr).expect("connect");
     s.set_read_timeout(Some(Duration::from_secs(5))).ok();
     s.write_all(b"GET http://evil.example.com/ HTTP/1.1\r\nHost: evil.example.com\r\n\r\n")
         .expect("write");
     let mut buf = [0u8; 256];
-    let n = s.read(&mut buf).unwrap_or(0);
+    // A read error or a timeout is not a proof: the proxy must either
+    // close the connection or answer with an error status.
+    let n = s
+        .read(&mut buf)
+        .expect("the proxy must close the connection or answer, not time out");
     let status = String::from_utf8_lossy(&buf[..n]);
+    if n == 0 {
+        // The proxy closed the connection without an answer.
+    } else {
+        assert!(
+            status.contains("400") || status.contains("403"),
+            "a non-CONNECT proxy request must get 400 or 403: {status:?}"
+        );
+    }
+
+    // The positive control: the same proxy still serves a CONNECT for the
+    // allowed domain, so the rejection above is about the method.
+    let (_s, status) = http_connect(h.proxy_addr, "evil.example.com:443").expect("connect");
     assert!(
-        n == 0 || !status.contains("200"),
-        "a non-CONNECT proxy request must not succeed: {status:?}"
-    );
-    assert!(
-        status.is_empty() || status.contains("400") || status.contains("403"),
-        "expected an error or a closed connection: {status:?}"
+        status.contains("403"),
+        "the proxy still answers a CONNECT request: {status:?}"
     );
     drop(h);
 }
@@ -404,16 +408,13 @@ async fn non_connect_http_proxy_request_is_rejected() {
 async fn socks5_ip_literal_to_cloud_metadata_is_blocked() {
     // The cloud metadata address 169.254.169.254 is link-local. A direct IP
     // connect to it must be refused, also for an allowed allowlist.
-    let Some(h) = start(
+    let h = start(
         &["allowed.example.com"],
         PUBLIC_IP,
         ProxyPolicy::Enforce,
         PrivateDestinations::Deny,
     )
-    .await
-    else {
-        return;
-    };
+    .await;
     let meta = Ipv4Addr::new(169, 254, 169, 254);
     let (_s, code) = socks5_connect_ipv4(h.proxy_addr, meta, 80).expect("connect");
     assert_eq!(code, 0x02, "the metadata address must be blocked");
@@ -427,16 +428,13 @@ async fn allowed_name_that_resolves_to_loopback_is_blocked() {
     // allowlist that holds "localhost", the non-public rule must still block
     // the connection, because the resolved address is loopback. This proves
     // the defense against a DNS rebinding to the host.
-    let Some(h) = start(
+    let h = start(
         &["localhost"],
         PUBLIC_IP,
         ProxyPolicy::Enforce,
         PrivateDestinations::Deny,
     )
-    .await
-    else {
-        return;
-    };
+    .await;
     let (_s, code) = socks5_connect_domain(h.proxy_addr, "localhost", 80).expect("connect");
     assert_eq!(
         code, 0x02,
@@ -447,16 +445,13 @@ async fn allowed_name_that_resolves_to_loopback_is_blocked() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn socks5_ip_literal_to_private_is_blocked() {
-    let Some(h) = start(
+    let h = start(
         &["allowed.example.com"],
         PUBLIC_IP,
         ProxyPolicy::Enforce,
         PrivateDestinations::Deny,
     )
-    .await
-    else {
-        return;
-    };
+    .await;
     let (_s, code) =
         socks5_connect_ipv4(h.proxy_addr, Ipv4Addr::new(10, 0, 0, 1), 80).expect("connect");
     assert_eq!(code, 0x02, "a private IP literal must be blocked");
@@ -467,16 +462,13 @@ async fn socks5_ip_literal_to_private_is_blocked() {
 async fn socks5_ipv6_mapped_loopback_literal_is_blocked() {
     // ::ffff:127.0.0.1 is an IPv4-mapped IPv6 address that reaches loopback.
     // The classifier must map it to the IPv4 form and block it.
-    let Some(h) = start(
+    let h = start(
         &["allowed.example.com"],
         PUBLIC_IP,
         ProxyPolicy::Enforce,
         PrivateDestinations::Deny,
     )
-    .await
-    else {
-        return;
-    };
+    .await;
     let mut s = TcpStream::connect(h.proxy_addr).expect("connect");
     s.set_read_timeout(Some(Duration::from_secs(5))).ok();
     s.write_all(&[0x05, 0x01, 0x00]).expect("greet");
@@ -500,16 +492,13 @@ async fn socks5_ipv6_mapped_loopback_literal_is_blocked() {
 async fn socks5_ip_literal_not_in_cache_is_blocked() {
     // A public IP literal that no allowed name resolved to has no domain in
     // the cache, so enforce mode must refuse it.
-    let Some(h) = start(
+    let h = start(
         &["allowed.example.com"],
         PUBLIC_IP,
         ProxyPolicy::Enforce,
         PrivateDestinations::Deny,
     )
-    .await
-    else {
-        return;
-    };
+    .await;
     let (_s, code) =
         socks5_connect_ipv4(h.proxy_addr, Ipv4Addr::new(203, 0, 113, 7), 443).expect("connect");
     assert_eq!(
@@ -524,16 +513,13 @@ async fn http_connect_decimal_ip_form_is_not_resolved_to_loopback() {
     // `2130706433` is the decimal form of 127.0.0.1. The proxy must not
     // treat it as that IP. It becomes a one-label name, which the allowlist
     // refuses.
-    let Some(h) = start(
+    let h = start(
         &["allowed.example.com"],
         Ipv4Addr::LOCALHOST,
         ProxyPolicy::Enforce,
         PrivateDestinations::Allow,
     )
-    .await
-    else {
-        return;
-    };
+    .await;
     let (_s, status) = http_connect(h.proxy_addr, "2130706433:80").expect("connect");
     assert!(
         !status.contains("200"),
@@ -552,20 +538,14 @@ async fn inherent_ports_other_than_443_and_80_get_no_host_inspection() {
     // to the allowed domain's own resolved address, but the proxy cannot see
     // what protocol or host it carries. This documents the behaviour; a
     // victim binds a high port because an unprivileged test cannot bind 443.
-    let victim = match spawn_victim(b"VICTIM-ANY-PORT") {
-        Ok(a) => a,
-        Err(_) => return,
-    };
-    let Some(h) = start(
+    let victim = spawn_victim(b"VICTIM-ANY-PORT").expect("the victim must bind on the loopback");
+    let h = start(
         &["localhost"],
         PUBLIC_IP,
         ProxyPolicy::Enforce,
         PrivateDestinations::Allow,
     )
-    .await
-    else {
-        return;
-    };
+    .await;
     let (mut s, code) =
         socks5_connect_domain(h.proxy_addr, "localhost", victim.port()).expect("connect");
     assert_eq!(

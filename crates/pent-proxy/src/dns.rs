@@ -1064,10 +1064,21 @@ mod tests {
     #[test]
     fn test_dns_server_new_with_valid_config() {
         use crate::SharedState;
-        let config = DnsServerConfig::default();
+        let upstream: SocketAddr = "198.51.100.7:53".parse().unwrap();
+        let config = DnsServerConfig {
+            upstream: Some(vec![upstream]),
+            ..Default::default()
+        };
         let state = Arc::new(SharedState::new(vec!["example.com".to_string()]));
-        let server = DnsServer::new(config, state);
-        assert!(server.is_ok());
+        let Ok(server) = DnsServer::new(config.clone(), state) else {
+            panic!("DnsServer::new must accept a valid configuration");
+        };
+        // The server keeps the configuration, reads the upstream list one
+        // time, and uses the allowlist of the shared state.
+        assert_eq!(server.config.bind_addr, config.bind_addr);
+        assert_eq!(server.upstreams.as_ref(), [upstream]);
+        assert!(server.state.is_allowed("example.com"));
+        assert!(!server.state.is_allowed("other.example"));
     }
 
     #[test]
@@ -1078,8 +1089,12 @@ mod tests {
             ..Default::default()
         };
         let state = Arc::new(SharedState::new(vec![]));
-        let server = DnsServer::new(config, state);
-        assert!(server.is_ok());
+        let Ok(server) = DnsServer::new(config, state) else {
+            panic!("DnsServer::new must accept an empty upstream list");
+        };
+        // An explicit empty list stays empty: the server does not fall back
+        // to the resolvers of the host.
+        assert!(server.upstreams.is_empty());
     }
 
     #[test]
@@ -1098,79 +1113,110 @@ mod tests {
     // DNS Query Handling - Allowed Domains
     // ========================================================================
 
-    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_dns_query_allowed_domain_exact_match() {
-        use crate::SharedState;
-        let state = Arc::new(SharedState::new(vec!["example.com".to_string()]));
-        let config = DnsServerConfig::default();
-        let server = DnsServer::new(config, state.clone()).unwrap();
+        let Some((upstream, _task)) = fake_upstream("127.0.0.1:0").await else {
+            return;
+        };
+        let (server, state, _rx) = server_with_upstream(upstream, &["example.com"]);
 
-        // Build a DNS query for example.com (A record)
-        let query = build_test_dns_query("example.com", 1); // 1 = A record
+        let query = build_test_dns_query("example.com", rtype::A);
         let response = server.handle_query(&query).await.unwrap();
-        // Response should contain resolved IPs
-        assert!(!response.is_empty());
-        // RCODE should be 0 (no error)
-        assert_eq!(response[3] & 0x0F, 0);
+        assert_eq!(rcode_of(&response), rcode::NOERROR);
+        assert_eq!(u16::from_be_bytes([response[6], response[7]]), 1);
+        assert_eq!(first_answer(&response).0, rtype::A);
+        let ip: IpAddr = "93.184.216.34".parse().unwrap();
+        assert_eq!(state.cache.lookup(&ip), Some("example.com".to_string()));
     }
 
-    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_dns_query_allowed_domain_wildcard_match() {
-        use crate::SharedState;
-        let state = Arc::new(SharedState::new(vec!["*.github.com".to_string()]));
-        let config = DnsServerConfig::default();
-        let server = DnsServer::new(config, state).unwrap();
+        let Some((upstream, _task)) = fake_upstream("127.0.0.1:0").await else {
+            return;
+        };
+        let (server, state, _rx) = server_with_upstream(upstream, &["*.example.com"]);
 
-        let query = build_test_dns_query("api.github.com", 1);
+        // The wildcard allows a subdomain, and the cache keeps the name of
+        // the subdomain, not the name of the rule.
+        let query = build_test_dns_query("api.example.com", rtype::A);
         let response = server.handle_query(&query).await.unwrap();
-        assert!(!response.is_empty());
-        assert_eq!(response[3] & 0x0F, 0); // RCODE = 0
+        assert_eq!(rcode_of(&response), rcode::NOERROR);
+        assert_eq!(first_answer(&response).0, rtype::A);
+        let ip: IpAddr = "93.184.216.34".parse().unwrap();
+        assert_eq!(state.cache.lookup(&ip), Some("api.example.com".to_string()));
+
+        // The wildcard does not allow the parent name itself.
+        let query = build_test_dns_query("example.com", rtype::A);
+        let response = server.handle_query(&query).await.unwrap();
+        assert_eq!(rcode_of(&response), rcode::NXDOMAIN);
     }
 
-    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_dns_query_returns_multiple_ips() {
-        use crate::SharedState;
-        let state = Arc::new(SharedState::new(vec!["example.com".to_string()]));
-        let config = DnsServerConfig::default();
-        let server = DnsServer::new(config, state).unwrap();
+        let Some((upstream, _task)) = fake_upstream("127.0.0.1:0").await else {
+            return;
+        };
+        let (server, state, _rx) = server_with_upstream(upstream, &[MULTI_NAME]);
 
-        let query = build_test_dns_query("example.com", 1);
+        // The upstream answers this name with two A records. The server
+        // keeps both, and the cache holds both addresses.
+        let query = build_test_dns_query(MULTI_NAME, rtype::A);
         let response = server.handle_query(&query).await.unwrap();
-        // Parse answer count from response header (bytes 6-7)
-        let answer_count = u16::from_be_bytes([response[6], response[7]]);
-        // Real domains often have multiple A records
-        assert!(answer_count >= 1);
+        assert_eq!(rcode_of(&response), rcode::NOERROR);
+        assert_eq!(u16::from_be_bytes([response[6], response[7]]), 2);
+        for text in ["198.51.100.1", "198.51.100.2"] {
+            let ip: IpAddr = text.parse().unwrap();
+            assert_eq!(
+                state.cache.lookup(&ip),
+                Some(MULTI_NAME.to_string()),
+                "{ip}"
+            );
+        }
     }
 
-    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_dns_query_returns_ipv4_and_ipv6() {
-        use crate::SharedState;
-        let state = Arc::new(SharedState::new(vec!["example.com".to_string()]));
-        let config = DnsServerConfig::default();
-        let server = DnsServer::new(config, state).unwrap();
+        let Some((upstream, _task)) = fake_upstream("127.0.0.1:0").await else {
+            return;
+        };
+        let (server, state, _rx) = server_with_upstream(upstream, &["example.com"]);
 
-        // Query for AAAA record (type 28)
-        let query_aaaa = build_test_dns_query("example.com", 28);
-        let response = server.handle_query(&query_aaaa).await.unwrap();
-        assert!(!response.is_empty());
+        // An A query gives an A record, and an AAAA query gives an AAAA
+        // record. The cache holds the address of each one.
+        let response = server
+            .handle_query(&build_test_dns_query("example.com", rtype::A))
+            .await
+            .unwrap();
+        assert_eq!(first_answer(&response).0, rtype::A);
+        let response = server
+            .handle_query(&build_test_dns_query("example.com", rtype::AAAA))
+            .await
+            .unwrap();
+        assert_eq!(first_answer(&response).0, rtype::AAAA);
+        for text in ["93.184.216.34", "2606:2800:220:1::1"] {
+            let ip: IpAddr = text.parse().unwrap();
+            assert_eq!(
+                state.cache.lookup(&ip),
+                Some("example.com".to_string()),
+                "{ip}"
+            );
+        }
     }
 
-    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_dns_query_case_insensitive() {
-        use crate::SharedState;
-        let state = Arc::new(SharedState::new(vec!["github.com".to_string()]));
-        let config = DnsServerConfig::default();
-        let server = DnsServer::new(config, state).unwrap();
+        let Some((upstream, _task)) = fake_upstream("127.0.0.1:0").await else {
+            return;
+        };
+        let (server, state, _rx) = server_with_upstream(upstream, &["example.com"]);
 
-        let query = build_test_dns_query("GITHUB.COM", 1);
+        // The allowlist folds the case of the name of the query.
+        let query = build_test_dns_query("ExAmPlE.COM", rtype::A);
         let response = server.handle_query(&query).await.unwrap();
-        // Should resolve despite case difference
-        assert_eq!(response[3] & 0x0F, 0); // RCODE = 0 (success)
+        assert_eq!(rcode_of(&response), rcode::NOERROR);
+        assert_eq!(first_answer(&response).0, rtype::A);
+        let ip: IpAddr = "93.184.216.34".parse().unwrap();
+        assert_eq!(state.cache.lookup(&ip), Some("example.com".to_string()));
     }
 
     // ========================================================================
@@ -1260,97 +1306,104 @@ mod tests {
     // Caching Behavior
     // ========================================================================
 
-    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_dns_resolution_cached_on_success() {
-        use crate::SharedState;
-        let state = Arc::new(SharedState::new(vec!["example.com".to_string()]));
-        let config = DnsServerConfig::default();
-        let server = DnsServer::new(config, state.clone()).unwrap();
+        let Some((upstream, _task)) = fake_upstream("127.0.0.1:0").await else {
+            return;
+        };
+        let (server, state, _rx) = server_with_upstream(upstream, &["example.com"]);
 
-        let query = build_test_dns_query("example.com", 1);
-        server.handle_query(&query).await.unwrap();
-        // Cache should now contain the resolved IPs
-        assert!(!state.cache.is_empty());
+        // A blocked name reaches no upstream, so it leaves the cache empty.
+        server
+            .handle_query(&build_test_dns_query("other.example", rtype::A))
+            .await
+            .unwrap();
+        assert!(state.cache.is_empty());
+
+        // An allowed name puts its address in the cache.
+        server
+            .handle_query(&build_test_dns_query("example.com", rtype::A))
+            .await
+            .unwrap();
+        let ip: IpAddr = "93.184.216.34".parse().unwrap();
+        assert_eq!(state.cache.lookup(&ip), Some("example.com".to_string()));
     }
 
-    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_dns_cache_respects_ttl() {
-        use crate::SharedState;
-        let state = Arc::new(SharedState::new(vec!["example.com".to_string()]));
-        let config = DnsServerConfig {
-            ttl: std::time::Duration::from_secs(1), // 1 second TTL
-            ..Default::default()
+        let Some((upstream, _task)) = fake_upstream("127.0.0.1:0").await else {
+            return;
         };
-        let server = DnsServer::new(config, state.clone()).unwrap();
+        let (server, state, _rx) = server_with_upstream(upstream, &["example.com"]);
 
-        let query = build_test_dns_query("example.com", 1);
-        server.handle_query(&query).await.unwrap();
-        // The server resolved the domain and populated the cache.
-        assert!(
-            !state.cache.is_empty(),
-            "cache should be populated after resolution"
-        );
-        // TTL-based expiry semantics (lookup returns None after expiry) are
-        // covered by test_resolution_cache_lookup_expired in lib.rs.
+        // The entry lives as long as the TTL of the answer. The upstream
+        // gives 5 s for an A record, and the server raises it to the floor
+        // of 30 s, so the entry is still there after the query.
+        let response = server
+            .handle_query(&build_test_dns_query("example.com", rtype::A))
+            .await
+            .unwrap();
+        assert_eq!(first_answer(&response), (rtype::A, 30));
+        let ip: IpAddr = "93.184.216.34".parse().unwrap();
+        assert_eq!(state.cache.lookup(&ip), Some("example.com".to_string()));
+        // The expiry itself is in test_resolution_cache_lookup_expired of
+        // lib.rs, which moves the clock of the entry.
     }
 
-    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_dns_cache_allows_tcp_proxy_lookup() {
-        use crate::SharedState;
-        let state = Arc::new(SharedState::new(vec!["example.com".to_string()]));
-        let config = DnsServerConfig::default();
-        let server = DnsServer::new(config, state.clone()).unwrap();
+        let Some((upstream, _task)) = fake_upstream("127.0.0.1:0").await else {
+            return;
+        };
+        let (server, state, _rx) = server_with_upstream(upstream, &["example.com"]);
 
-        let query = build_test_dns_query("example.com", 1);
+        let query = build_test_dns_query("example.com", rtype::A);
         server.handle_query(&query).await.unwrap();
 
-        // TCP proxy should be able to look up cached IP
-        // (We'd need to parse the response to get the IP, but conceptually:)
-        let test_ip: std::net::IpAddr = "93.184.216.34".parse().unwrap(); // example.com IP
-        let domain = state.cache.lookup(&test_ip);
-        // If the IP was cached, we should get the domain back
-        if let Some(d) = domain {
-            assert_eq!(d, "example.com");
-        }
+        // The TCP proxy asks the cache for the domain of an address. This
+        // is the only way it knows which name a connection belongs to.
+        let resolved: IpAddr = "93.184.216.34".parse().unwrap();
+        assert_eq!(
+            state.cache.lookup(&resolved),
+            Some("example.com".to_string())
+        );
+        let other: IpAddr = "203.0.113.9".parse().unwrap();
+        assert_eq!(state.cache.lookup(&other), None);
     }
 
     // ========================================================================
     // Upstream Resolution
     // ========================================================================
 
-    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_resolve_upstream_success() {
-        use crate::SharedState;
-        let state = Arc::new(SharedState::new(vec!["example.com".to_string()]));
-        let config = DnsServerConfig::default();
-        let server = DnsServer::new(config, state).unwrap();
+        let Some((upstream, _task)) = fake_upstream("127.0.0.1:0").await else {
+            return;
+        };
+        let (server, _state, _rx) = server_with_upstream(upstream, &["example.com"]);
 
-        let reply = server.query_upstream("example.com", 1).await.unwrap();
-        assert!(
-            !reply.addresses.is_empty(),
-            "Should resolve to at least one IP"
-        );
+        let reply = server
+            .query_upstream("example.com", rtype::A)
+            .await
+            .unwrap();
+        let expected: IpAddr = "93.184.216.34".parse().unwrap();
+        assert_eq!(reply.addresses, vec![expected]);
     }
 
-    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_resolve_upstream_nonexistent_domain() {
-        use crate::SharedState;
-        let state = Arc::new(SharedState::new(vec![
-            "nonexistent-domain-12345.invalid".to_string()
-        ]));
-        let config = DnsServerConfig::default();
-        let server = DnsServer::new(config, state).unwrap();
+        let Some((upstream, _task)) = fake_upstream("127.0.0.1:0").await else {
+            return;
+        };
+        let (server, _state, _rx) = server_with_upstream(upstream, &["*.example.com"]);
 
-        let result = server
-            .query_upstream("nonexistent-domain-12345.invalid", 1)
-            .await;
-        // An NXDOMAIN answer or a failure: the result has no addresses.
-        assert!(result.map_or(true, |r| r.addresses.is_empty()));
+        // The upstream answers NXDOMAIN for this name. The server passes
+        // the answer on and gives no address.
+        let Ok(reply) = server.query_upstream("nx.example.com", rtype::A).await else {
+            panic!("an NXDOMAIN answer is an answer, not an error");
+        };
+        assert!(reply.addresses.is_empty());
+        assert_eq!(rcode_of(&reply.message), rcode::NXDOMAIN);
     }
 
     #[tokio::test]
@@ -1373,39 +1426,45 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_resolve_upstream_fallback_to_secondary() {
         use crate::SharedState;
 
-        // Bind a local UDP socket that accepts queries but never responds.
-        // This is the "unresponsive primary" that should trigger fallback.
-        let silent = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        // A local UDP socket that accepts a query and never answers. This
+        // is the primary that does not work.
+        let Some(silent) = udp_bind_or_skip("127.0.0.1:0").await else {
+            return;
+        };
         let primary_addr = silent.local_addr().unwrap();
         let _silent_task = tokio::spawn(async move {
             let mut buf = [0u8; 512];
             loop {
-                // Read and discard queries; never send a response
+                // Read and discard each query; never answer.
                 let _ = silent.recv_from(&mut buf).await;
             }
         });
 
-        // Use the system resolver(s) as the secondary so the test is
-        // self-contained (no dependency on reaching a specific external IP).
-        let system_dns = DnsServerConfig::default().get_upstream();
-        let mut upstreams = vec![primary_addr];
-        upstreams.extend(system_dns);
+        // The fake upstream is the secondary, so the test needs no
+        // internet and the answer is a known address.
+        let Some((secondary, _task)) = fake_upstream("127.0.0.1:0").await else {
+            return;
+        };
 
         let state = Arc::new(SharedState::new(vec!["example.com".to_string()]));
         let config = DnsServerConfig {
-            upstream: Some(upstreams),
+            upstream: Some(vec![primary_addr, secondary]),
+            resolve_timeout: Duration::from_millis(300),
             ..Default::default()
         };
         let server = DnsServer::new(config, state).unwrap();
 
-        // Primary will time out (5 s), then the system resolver should succeed
-        let reply = server.query_upstream("example.com", 1).await.unwrap();
-        assert!(!reply.addresses.is_empty());
+        // The primary runs into the timeout; the secondary answers.
+        let reply = server
+            .query_upstream("example.com", rtype::A)
+            .await
+            .unwrap();
+        let expected: IpAddr = "93.184.216.34".parse().unwrap();
+        assert_eq!(reply.addresses, vec![expected]);
     }
 
     // ========================================================================
@@ -1444,24 +1503,29 @@ mod tests {
         assert!(result.is_err() || !result.unwrap().is_empty());
     }
 
-    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_dns_query_unsupported_record_type() {
-        use crate::SharedState;
-        let state = Arc::new(SharedState::new(vec!["example.com".to_string()]));
-        let config = DnsServerConfig::default();
-        let server = DnsServer::new(config, state).unwrap();
+        let Some((upstream, _task)) = fake_upstream("127.0.0.1:0").await else {
+            return;
+        };
+        let (server, state, _rx) = server_with_upstream(upstream, &["example.com"]);
 
-        // Query for MX record (type 15)
+        // An MX query (type 15) for an allowed name goes upstream like any
+        // other type. The fake upstream has no MX record, so the answer is
+        // NOERROR with no record, and nothing reaches the address cache.
         let query = build_test_dns_query("example.com", 15);
-        let result = server.handle_query(&query).await;
+        let Ok(response) = server.handle_query(&query).await else {
+            panic!("the server must answer an MX query, not fail");
+        };
+        assert_eq!(rcode_of(&response), rcode::NOERROR);
+        assert_eq!(u16::from_be_bytes([response[6], response[7]]), 0);
+        assert!(state.cache.is_empty());
 
-        // Should handle gracefully; skip if DNS resolution isn't available in this sandbox.
-        match result {
-            Ok(_) => {}
-            Err(crate::ProxyError::DnsResolution { .. }) => return,
-            Err(err) => panic!("Unexpected DNS error: {err:?}"),
-        }
+        // The same type for a name that the allowlist does not have gets
+        // NXDOMAIN, like every other type.
+        let query = build_test_dns_query("other.example", 15);
+        let response = server.handle_query(&query).await.unwrap();
+        assert_eq!(rcode_of(&response), rcode::NXDOMAIN);
     }
 
     #[tokio::test]
@@ -1555,13 +1619,15 @@ mod tests {
         assert_eq!(buf[2] & 0x80, 0x80, "the answer has the response bit");
     }
 
-    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_dns_server_handles_concurrent_queries() {
         use crate::SharedState;
-        let state = Arc::new(SharedState::new(vec!["example.com".to_string()]));
+        let Some((upstream, _task)) = fake_upstream("127.0.0.1:0").await else {
+            return;
+        };
+        let state = Arc::new(SharedState::new(vec!["*.example.com".to_string()]));
 
-        // Pre-bind to get port
+        // Pre-bind to get a free port.
         let Some(socket) = udp_bind_or_skip("127.0.0.1:0").await else {
             return;
         };
@@ -1570,6 +1636,8 @@ mod tests {
 
         let config = DnsServerConfig {
             bind_addr: bound_addr,
+            upstream: Some(vec![upstream]),
+            resolve_timeout: Duration::from_secs(5),
             ..Default::default()
         };
         let server = DnsServer::new(config.clone(), state).unwrap();
@@ -1578,40 +1646,53 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        if udp_bind_or_skip("127.0.0.1:0").await.is_none() {
-            handle.abort();
-            return;
-        }
-
-        // Send multiple concurrent queries
-        let mut handles = vec![];
-        for _ in 0..10 {
-            let addr = config.bind_addr;
-            handles.push(tokio::spawn(async move {
-                let Some(socket) = udp_bind_or_skip("127.0.0.1:0").await else {
-                    return false;
-                };
-                let query = build_test_dns_query("example.com", 1);
-                socket.send_to(&query, addr).await.unwrap();
-                let mut buf = [0u8; 512];
-                let got =
-                    tokio::time::timeout(std::time::Duration::from_secs(5), socket.recv(&mut buf))
-                        .await;
-                matches!(got, Ok(Ok(len)) if len >= 12)
-            }));
-        }
-
-        let mut answered = 0;
-        for h in handles {
-            if matches!(h.await, Ok(true)) {
-                answered += 1;
+        /// Send one query and wait for the answer. Returns the answer.
+        async fn ask(addr: SocketAddr, name: &str) -> Option<Vec<u8>> {
+            let socket = udp_bind_or_skip("127.0.0.1:0").await?;
+            let query = build_test_dns_query(name, rtype::A);
+            socket.send_to(&query, addr).await.ok()?;
+            let mut buf = [0u8; 512];
+            let got = tokio::time::timeout(Duration::from_secs(5), socket.recv(&mut buf)).await;
+            match got {
+                Ok(Ok(len)) => buf.get(..len).map(<[u8]>::to_vec),
+                _ => None,
             }
         }
 
+        // One query for which the upstream waits one second, and nine
+        // queries that the upstream answers at once.
+        let addr = config.bind_addr;
+        let slow = tokio::spawn(async move { ask(addr, SLOW_NAME).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let fast: Vec<_> = (0..9)
+            .map(|_| tokio::spawn(async move { ask(addr, "fast.example.com").await }))
+            .collect();
+
+        let start = std::time::Instant::now();
+        let mut answered = 0;
+        for task in fast {
+            if matches!(task.await, Ok(Some(ref answer)) if rcode_of(answer) == rcode::NOERROR) {
+                answered += 1;
+            }
+        }
+        let fast_time = start.elapsed();
+
+        // The nine fast answers come back while the slow one still waits.
+        // A server that handles one query at a time needs more than the
+        // second of the slow query.
+        assert_eq!(answered, 9, "the server answered {answered} of 9 queries");
+        assert!(
+            fast_time < Duration::from_millis(800),
+            "a slow query blocked the others: the fast answers took {fast_time:?}"
+        );
+
+        // The slow query gets its answer too.
+        let slow = slow.await;
         handle.abort();
-        // The server answers each query. One lost answer means that a slow
-        // query blocks the others, which was a defect of an older server.
-        assert_eq!(answered, 10, "the server answered {answered} of 10 queries");
+        let Ok(Some(answer)) = slow else {
+            panic!("the server lost the slow query");
+        };
+        assert_eq!(rcode_of(&answer), rcode::NOERROR);
     }
 
     #[tokio::test]
@@ -1705,6 +1786,9 @@ mod tests {
     /// The name for which the fake upstream waits before it answers.
     const SLOW_NAME: &str = "slow.example.com";
 
+    /// The name for which the fake upstream gives two A records.
+    const MULTI_NAME: &str = "multi.example.com";
+
     /// Build the answer of the fake upstream for one query.
     fn fake_answer(query: &[u8]) -> Option<Vec<u8>> {
         let question = read_question(query, Pointers::Forbidden).ok()?;
@@ -1721,6 +1805,11 @@ mod tests {
         };
         if question.name.eq_ignore_ascii_case("nx.example.com") {
             code = rcode::NXDOMAIN;
+        } else if question.name.eq_ignore_ascii_case(MULTI_NAME) {
+            if question.qtype == rtype::A {
+                records.push(record(rtype::A, 60, &[198, 51, 100, 1]));
+                records.push(record(rtype::A, 60, &[198, 51, 100, 2]));
+            }
         } else {
             match question.qtype {
                 rtype::A => records.push(record(rtype::A, 5, &[93, 184, 216, 34])),

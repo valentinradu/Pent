@@ -135,10 +135,62 @@ fn sandboxed_run(workspace: &Path, extra_args: &[String], cmd_args: &[&str]) -> 
 /// $HOME is typically /Users/<username> on macOS — not under /tmp, not
 /// under /usr/lib, and not under $TMPDIR (which is /var/folders/…/T/).
 #[cfg(target_os = "macos")]
-fn home_path(name: &str) -> Option<std::path::PathBuf> {
-    std::env::var("HOME").ok().map(|h| {
-        std::path::PathBuf::from(h).join(format!("pent-integration-{}-{name}", std::process::id()))
-    })
+fn home_path(test: &str, name: &str) -> Option<std::path::PathBuf> {
+    match std::env::var("HOME") {
+        Ok(home) => Some(
+            std::path::PathBuf::from(home)
+                .join(format!("pent-integration-{}-{name}", std::process::id())),
+        ),
+        Err(_) => {
+            common::e2e::skip(
+                test,
+                "HOME is not set, so the test has no path outside the sandbox",
+            );
+            None
+        }
+    }
+}
+
+/// Return true when the host reaches `host:port` with `nc`, without pent.
+///
+/// A test of a network denial needs this: a host without the internet
+/// gives the same exit status as a denial of the sandbox.
+#[cfg(target_os = "macos")]
+fn host_can_reach(test: &str, host: &str, port: &str) -> bool {
+    let reached = Command::new("/usr/bin/nc")
+        .args(["-zw2", host, port])
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !reached {
+        common::e2e::skip(
+            test,
+            &format!("nc cannot reach {host}:{port} without pent (no internet, or no nc)"),
+        );
+    }
+    reached
+}
+
+/// Run `nc -zw2 <host> <port>` in a shell under pent and return the text
+/// of stdout.
+///
+/// The shell prints `NC_RC=<status>` after `nc`, so the test can tell a
+/// denial of the connection from a child that never ran.
+#[cfg(target_os = "macos")]
+fn nc_under_pent(workspace: &Path, net_args: &[&str], host: &str, port: &str) -> String {
+    let mut extra = sys_exec_args();
+    for a in net_args {
+        extra.push((*a).to_string());
+    }
+    let script = format!("/usr/bin/nc -zw2 {host} {port} 2>&1; echo NC_RC=$?");
+    let out = sandboxed_run(workspace, &extra, &["/bin/sh", "-c", &script]);
+    // The shell itself always exits 0, thus pent exits 0. A failure here
+    // means that the sandbox did not start, not that nc was denied.
+    let text = expect_success(&out);
+    assert!(
+        text.contains("NC_RC="),
+        "the child did not run nc at all: {text}"
+    );
+    text
 }
 
 // ============================================================================
@@ -262,7 +314,7 @@ fn test_check_reports_platform() -> TestResult {
 fn test_run_reads_file_in_workspace() -> TestResult {
     if !sandbox_available() {
         common::e2e::skip(
-            "this test",
+            "test_run_reads_file_in_workspace",
             "sandbox-exec cannot apply a profile on this machine",
         );
         return Ok(());
@@ -285,7 +337,7 @@ fn test_run_reads_file_in_workspace() -> TestResult {
 fn test_run_writes_file_in_workspace() -> TestResult {
     if !sandbox_available() {
         common::e2e::skip(
-            "this test",
+            "test_run_writes_file_in_workspace",
             "sandbox-exec cannot apply a profile on this machine",
         );
         return Ok(());
@@ -315,31 +367,44 @@ fn test_run_cannot_read_file_in_home_dir() -> TestResult {
     // process should not be able to read files placed there.
     if !sandbox_available() {
         common::e2e::skip(
-            "this test",
+            "test_run_cannot_read_file_in_home_dir",
             "sandbox-exec cannot apply a profile on this machine",
         );
         return Ok(());
     }
 
-    let Some(secret_path) = home_path("secret.txt") else {
-        return Ok(()); // no HOME env var, skip
+    let Some(secret_path) = home_path("test_run_cannot_read_file_in_home_dir", "secret.txt") else {
+        return Ok(());
     };
 
-    fs::write(&secret_path, "should-not-be-readable\n")?;
+    const SECRET: &str = "should-not-be-readable";
+    fs::write(&secret_path, format!("{SECRET}\n"))?;
 
     let dir = TempDir::new()?;
-    let out = sandboxed_run(
-        dir.path(),
-        &sys_exec_args(),
-        &[
-            "/bin/cat",
-            secret_path
-                .to_str()
-                .ok_or("secret path is not valid UTF-8")?,
-        ],
+    // The workspace file is the positive control: the same child must read
+    // it in the same run. Without it, a child that never started gives the
+    // same output as a denied read.
+    fs::write(dir.path().join("inside.txt"), "WORKSPACE_CONTENT\n")?;
+    let secret = secret_path
+        .to_str()
+        .ok_or("secret path is not valid UTF-8")?;
+    let script = format!("/bin/cat '{secret}' 2>&1; /bin/cat inside.txt");
+    let out = sandboxed_run(dir.path(), &sys_exec_args(), &["/bin/sh", "-c", &script]);
+    let text = format!(
+        "{}{}",
+        expect_success(&out),
+        String::from_utf8_lossy(&out.stderr)
     );
-    // Sandbox blocks the read → non-zero exit
-    expect_failure(&out);
+
+    assert!(
+        text.contains("WORKSPACE_CONTENT"),
+        "the child did not read the file of the workspace, so this run \
+         proves no denial: {text}"
+    );
+    assert!(
+        !text.contains(SECRET),
+        "the child read the file in the home directory: {text}"
+    );
 
     let _ = fs::remove_file(&secret_path); // cleanup
     Ok(())
@@ -352,13 +417,16 @@ fn test_run_extra_read_gives_access_to_home_dir_file() -> TestResult {
     // inside the sandbox, even if it would otherwise be inaccessible.
     if !sandbox_available() {
         common::e2e::skip(
-            "this test",
+            "test_run_extra_read_gives_access_to_home_dir_file",
             "sandbox-exec cannot apply a profile on this machine",
         );
         return Ok(());
     }
 
-    let Some(secret_dir) = home_path("extra-read-dir") else {
+    let Some(secret_dir) = home_path(
+        "test_run_extra_read_gives_access_to_home_dir_file",
+        "extra-read-dir",
+    ) else {
         return Ok(());
     };
     fs::create_dir_all(&secret_dir)?;
@@ -419,13 +487,14 @@ fn test_run_extra_write_gives_write_access() -> TestResult {
     // otherwise inaccessible.
     if !sandbox_available() {
         common::e2e::skip(
-            "this test",
+            "test_run_extra_write_gives_write_access",
             "sandbox-exec cannot apply a profile on this machine",
         );
         return Ok(());
     }
 
-    let Some(write_dir) = home_path("extra-write-dir") else {
+    let Some(write_dir) = home_path("test_run_extra_write_gives_write_access", "extra-write-dir")
+    else {
         return Ok(());
     };
     fs::create_dir_all(&write_dir)?;
@@ -463,79 +532,65 @@ fn test_run_extra_write_gives_write_access() -> TestResult {
 // D. Run — network isolation tests (macOS sandbox required)
 // ============================================================================
 
-/// Run `nc -zw2 <host> <port>` inside the sandbox with the given network args.
-/// Returns the Output of the pent invocation.
+/// Assert that pent denies a TCP connection to `host:port`.
+///
+/// The test first proves that the host reaches the address without pent,
+/// then that the same `nc` under pent does not. The shell prints the exit
+/// status of `nc`, so a child that never ran cannot pass.
 #[cfg(target_os = "macos")]
-fn nc_test(workspace: &Path, net_args: &[&str]) -> Output {
-    let mut extra = sys_exec_args();
-    for a in net_args {
-        extra.push((*a).to_string());
+fn assert_connect_denied(test: &str, net_args: &[&str], host: &str, port: &str) -> TestResult {
+    if !sandbox_available() {
+        common::e2e::skip(test, "sandbox-exec cannot apply a profile on this machine");
+        return Ok(());
     }
-    // nc -zw2 1.1.1.1 80 — TCP connect to Cloudflare DNS, 2s timeout
-    // Exit 0 if connected, non-zero if blocked/failed
-    sandboxed_run(workspace, &extra, &["/usr/bin/nc", "-zw2", "1.1.1.1", "80"])
+    if !host_can_reach(test, host, port) {
+        return Ok(());
+    }
+    let dir = TempDir::new()?;
+    let text = nc_under_pent(dir.path(), net_args, host, port);
+    assert!(
+        !text.contains("NC_RC=0"),
+        "pent {net_args:?} must deny the connection to {host}:{port}, and \
+         the same connection works without pent: {text}"
+    );
+    Ok(())
 }
 
 #[cfg(target_os = "macos")] // the Linux behaviour is in e2e_linux.rs
 #[test]
 fn test_run_blocked_network_prevents_tcp_connect() -> TestResult {
-    if !sandbox_available() {
-        common::e2e::skip(
-            "this test",
-            "sandbox-exec cannot apply a profile on this machine",
-        );
-        return Ok(());
-    }
-
-    let dir = TempDir::new()?;
     // --network blocked: SBPL generates (deny network*) → connect() returns EPERM
-    let out = nc_test(dir.path(), &["--network", "blocked"]);
-    expect_failure(&out);
-    Ok(())
+    assert_connect_denied(
+        "test_run_blocked_network_prevents_tcp_connect",
+        &["--network", "blocked"],
+        "1.1.1.1",
+        "80",
+    )
 }
 
 #[cfg(target_os = "macos")] // the Linux behaviour is in e2e_linux.rs
 #[test]
 fn test_run_localhost_network_blocks_external_connect() -> TestResult {
-    if !sandbox_available() {
-        common::e2e::skip(
-            "this test",
-            "sandbox-exec cannot apply a profile on this machine",
-        );
-        return Ok(());
-    }
-
-    let dir = TempDir::new()?;
     // --network localhost: only loopback allowed; 1.1.1.1 is not localhost
-    let out = nc_test(dir.path(), &["--network", "localhost"]);
-    expect_failure(&out);
-    Ok(())
+    assert_connect_denied(
+        "test_run_localhost_network_blocks_external_connect",
+        &["--network", "localhost"],
+        "1.1.1.1",
+        "80",
+    )
 }
 
 #[cfg(target_os = "macos")] // the Linux behaviour is in e2e_linux.rs
 #[test]
 fn test_run_blocked_network_by_direct_ip() -> TestResult {
-    if !sandbox_available() {
-        common::e2e::skip(
-            "this test",
-            "sandbox-exec cannot apply a profile on this machine",
-        );
-        return Ok(());
-    }
-
-    // Direct IP (bypasses DNS) under blocked mode. The sandbox network* deny
-    // covers connect() regardless of how the destination was obtained.
-    let dir = TempDir::new()?;
-    let mut extra = sys_exec_args();
-    extra.extend_from_slice(&["--network".into(), "blocked".into()]);
-    // Use 8.8.8.8:53 (Google DNS) — different IP to avoid any local-network edge cases
-    let out = sandboxed_run(
-        dir.path(),
-        &extra,
-        &["/usr/bin/nc", "-zw2", "8.8.8.8", "53"],
-    );
-    expect_failure(&out);
-    Ok(())
+    // A direct IP needs no DNS. The deny of the sandbox covers connect()
+    // for each way to name the destination.
+    assert_connect_denied(
+        "test_run_blocked_network_by_direct_ip",
+        &["--network", "blocked"],
+        "8.8.8.8",
+        "53",
+    )
 }
 
 #[cfg(target_os = "macos")] // the Linux behaviour is in e2e_linux.rs
@@ -543,7 +598,7 @@ fn test_run_blocked_network_by_direct_ip() -> TestResult {
 fn test_run_localhost_network_allows_loopback() -> TestResult {
     if !sandbox_available() {
         common::e2e::skip(
-            "this test",
+            "test_run_localhost_network_allows_loopback",
             "sandbox-exec cannot apply a profile on this machine",
         );
         return Ok(());
@@ -582,7 +637,7 @@ fn test_run_localhost_network_allows_loopback() -> TestResult {
 fn test_run_allow_flag_starts_proxy_without_crash() -> TestResult {
     if !sandbox_available() {
         common::e2e::skip(
-            "this test",
+            "test_run_allow_flag_starts_proxy_without_crash",
             "sandbox-exec cannot apply a profile on this machine",
         );
         return Ok(());
@@ -608,7 +663,7 @@ fn test_run_allow_flag_starts_proxy_without_crash() -> TestResult {
 fn test_run_env_flag_passes_named_variable() -> TestResult {
     if !sandbox_available() {
         common::e2e::skip(
-            "this test",
+            "test_run_env_flag_passes_named_variable",
             "sandbox-exec cannot apply a profile on this machine",
         );
         return Ok(());
@@ -631,7 +686,7 @@ fn test_run_env_flag_passes_named_variable() -> TestResult {
 fn test_run_env_explicit_kv_sets_variable() -> TestResult {
     if !sandbox_available() {
         common::e2e::skip(
-            "this test",
+            "test_run_env_explicit_kv_sets_variable",
             "sandbox-exec cannot apply a profile on this machine",
         );
         return Ok(());
@@ -664,7 +719,7 @@ fn test_proxy_mode_allows_localhost_mcp_connection() -> TestResult {
     // sandboxed process in proxy_only mode can reach a TCP server on 127.0.0.1.
     if !sandbox_available() {
         common::e2e::skip(
-            "this test",
+            "test_proxy_mode_allows_localhost_mcp_connection",
             "sandbox-exec cannot apply a profile on this machine",
         );
         return Ok(());
@@ -952,6 +1007,12 @@ mod no_hang {
     //
     // detect_binary uses the REAL $HOME (the test process's env) to locate the
     // binary.  pent itself gets a fresh empty home so it finds no global config.
+    //
+    // Only `claude` has a test here. The tests for `codex` and `gemini` are
+    // gone: no machine that we use installs those two programs, so the six
+    // tests skipped on each machine and proved nothing. A developer with one
+    // of them runs the `claude` tests with the other name by hand. Install a
+    // program in `e2e/Dockerfile` before you add a test for it.
 
     #[allow(clippy::unwrap_used)] // infrastructure helper: to_str() only fails on non-UTF-8 paths
     fn assert_version_exits_quickly(name: &str) {
@@ -977,14 +1038,6 @@ mod no_hang {
     #[test]
     fn claude_version_exits_quickly() {
         assert_version_exits_quickly("claude");
-    }
-    #[test]
-    fn codex_version_exits_quickly() {
-        assert_version_exits_quickly("codex");
-    }
-    #[test]
-    fn gemini_version_exits_quickly() {
-        assert_version_exits_quickly("gemini");
     }
 
     // ── with a profile: the profile has domains → ProxyOnly ─────────────────
@@ -1022,14 +1075,6 @@ mod no_hang {
     #[test]
     fn claude_proxy_mode_exits_quickly() {
         assert_proxy_mode_exits_quickly("claude");
-    }
-    #[test]
-    fn codex_proxy_mode_exits_quickly() {
-        assert_proxy_mode_exits_quickly("codex");
-    }
-    #[test]
-    fn gemini_proxy_mode_exits_quickly() {
-        assert_proxy_mode_exits_quickly("gemini");
     }
 
     // ── PTY-simulated interactive sessions ────────────────────────────────────
@@ -1266,13 +1311,5 @@ mod no_hang {
     #[test]
     fn pty_claude_interactive_exits_quickly() {
         assert_pty_interactive("claude");
-    }
-    #[test]
-    fn pty_codex_interactive_exits_quickly() {
-        assert_pty_interactive("codex");
-    }
-    #[test]
-    fn pty_gemini_interactive_exits_quickly() {
-        assert_pty_interactive("gemini");
     }
 }

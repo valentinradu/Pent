@@ -274,10 +274,24 @@ run in the normal suite.
 
 ## Open items
 
-| ID | Severity | Description |
-|---|---|---|
-| H-13 | Medium | The kernel enforces less than the new guard rules with a file name pattern say. See "What the kernel enforces" in Property 4. The fix belongs in `pent-sandbox`. |
-| H-14 | Low | `guard_rules_with` moves only the `PentFiles` rules to the real directories. The other rules below `~/.config` (fish, nushell, autostart, systemd, git, direnv, nvim) still use `~/.config`. `$XDG_CONFIG_HOME` does not move them. |
+| ID | Severity | Description | Test |
+|---|---|---|---|
+| H-13 | Medium | The kernel enforces less than the new guard rules with a file name pattern say. See "What the kernel enforces" in Property 4. The fix belongs in `pent-sandbox`. | None yet |
+| H-14 | Low | `guard_rules_with` moves only the `PentFiles` rules to the real directories. The other rules below `~/.config` (fish, nushell, autostart, systemd, direnv, nvim, cron) still use `~/.config`. `$XDG_CONFIG_HOME` does not move them. | `p4_persistence_rules_follow_the_xdg_config_directory` |
+
+The test of H-14 is in `crates/pent-profile/tests/hardening_profile.rs` with
+the mark `#[ignore = "OPEN H-14: ..."]`. It states the behaviour that the
+guard must have, and it fails on its own assertion today:
+
+```
+"/home/u/dotfiles/config/fish/config.fish is not protected",
+"/home/u/dotfiles/config/autostart/x.desktop is not protected",
+…
+```
+
+**The fix.** Give `guard_rules_with` the base directories, not only the pent
+directories, and make each rule below `~/.config` use the real base. Then
+remove the `#[ignore]`.
 
 ## Other observations (no test)
 

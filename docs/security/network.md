@@ -26,6 +26,7 @@ Test files:
 |----|----------|----------|-------|------|
 | NET-1 | Critical | The Tailscale daemon socket is not masked; its `ts-dial` call gives full network egress past the proxy. | Fixed | `tailscale_localapi_socket_is_masked` |
 | NET-2 | High | The system D-Bus socket is reachable; it resolves names and reaches network services past the proxy. | Fixed | `system_dbus_socket_is_masked` |
+| NET-3 | High | One profile path below a private directory restores the whole subtree above it, so the sibling sockets of the host come back. | **Open** | `a_profile_path_below_a_private_dir_keeps_its_siblings_hidden` |
 
 ### NET-1 — the Tailscale daemon socket gives full egress (Critical)
 
@@ -106,6 +107,44 @@ mask the systemd-resolved socket, which the audit confirmed is already on the
 mask list, and say clearly in the documentation that the system bus is a
 resolver and an egress path.
 
+### NET-3 — a profile path below a private directory restores its siblings (High)
+
+**State: open.** The test
+`a_profile_path_below_a_private_dir_keeps_its_siblings_hidden` in
+`crates/pent/tests/security_network_e2e.rs` has the mark
+`#[ignore = "OPEN NET-3: ..."]`. It fails on its own assertion today.
+
+**Attack.** The user gives the profile one path below a private directory,
+for example `read_write = ["/run/user/1000/myapp"]` or a directory below
+`/tmp`. `plan_private_dirs` in `crates/pent-sandbox/src/linux.rs` builds the
+list `keep` from the configured paths. `configured_paths` gives the traversal
+paths too, thus the list holds each parent directory of the rule. The plan
+then binds only "the outermost path of each subtree", so it binds
+`/run/user/1000` — the whole runtime directory of the user, with the message
+bus, the agent sockets and each other control socket in it. The tmpfs of
+`/run` is then empty of effect for that subtree, and NET-1 and NET-2 come
+back for every profile that names one path below `/run`.
+
+The same holds for `/tmp` and `/var/tmp`: a rule for `/tmp/build/out`
+restores all of `/tmp/build`. A rule for a direct child of a private
+directory (`/tmp/x`) is safe, because the `keep` list drops the covered
+directory itself.
+
+**Evidence.** The output of the failing test:
+
+```
+ALLOWED REACHED b'PENT_ALLOWED_BANNER'
+VICTIM REACHED b'PENT_VICTIM_SECRET'
+```
+
+The profile named only the directory of `ALLOWED`. `VICTIM` is a sibling of
+it, and the child read its content.
+
+**Recommended fix.** Do not put the traversal paths of a configured path in
+the `keep` list of `plan_private_dirs`. Bind the configured path itself and
+make only the directories above it with `mount_point_parents`, which the plan
+already does for a path that does not exist.
+
 ## Verified defenses
 
 Each item below has a test that passes. The test stays as a regression test.
@@ -137,6 +176,11 @@ Proxy level (`crates/pent-proxy/tests/security_network.rs`):
 
 End to end (`crates/pent/tests/security_network_e2e.rs`):
 
+- The child cannot reach a daemon socket of the host below `/run`, `/tmp` or
+  `/var/tmp`. The test binds its own socket in a private directory, and it
+  also probes the real socket when the host has one.
+  (`tailscale_localapi_socket_is_masked` for NET-1,
+  `system_dbus_socket_is_masked` for NET-2)
 - The child cannot reach a service on the host loopback.
   (`child_cannot_reach_a_host_loopback_service`)
 - The child cannot reach a host abstract Unix socket. The new network
@@ -189,5 +233,7 @@ cannot fix them. pent must document them. Each has a test with the name prefix
    the directory, not the name. The mask lists in
    `crates/pent-sandbox/src/linux.rs` stay as the second layer, and as the
    data that a user setting can extend later.
-2. **Documentation.** Add the inherent limits above to the README, next to the
+2. **NET-3: open.** Bind the configured path itself in `plan_private_dirs`,
+   not the outermost traversal path above it.
+3. **Documentation.** Add the inherent limits above to the README, next to the
    limits that it already names.
