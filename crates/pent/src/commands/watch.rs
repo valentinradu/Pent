@@ -11,7 +11,6 @@ use pent_sandbox::{
 use pent_settings::{ConfigLoader, ProfileStore, WatchRunMode};
 
 use crate::cli::WatchArgs;
-use crate::commands::render_local::DraftOrigin;
 use crate::commands::review_flow::{
     home_dir, summarize_review_and_draft, ReviewInput, TrustAnswer,
 };
@@ -23,6 +22,7 @@ use crate::commands::session::{
 use crate::commands::tty::Tty;
 use crate::error::CliError;
 use crate::ui;
+use pent_profile::DraftSource;
 
 /// The longest time to wait for the last events after the child exits.
 const FINAL_DRAIN: Duration = Duration::from_secs(5);
@@ -175,7 +175,7 @@ pub(crate) async fn watch(args: WatchArgs, cwd: PathBuf) -> Result<(), CliError>
         events: &events,
         existing,
         keep,
-        origin: DraftOrigin::WatchRuns(runs),
+        origin: DraftSource::WatchRuns(runs),
         trust: TrustAnswer::Ask,
     })?;
     Ok(())

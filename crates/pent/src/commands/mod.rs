@@ -1,6 +1,5 @@
 pub mod check;
 pub mod config;
-pub mod render_local;
 pub mod review_flow;
 pub mod run;
 pub mod select;

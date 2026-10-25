@@ -160,25 +160,11 @@ pub(crate) fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{} {}", format_count(n), if n == 1 { one } else { many })
 }
 
-/// Render the summary block that `pent watch` prints after the child exits.
-///
-/// Example:
-///
-/// ```text
-/// pent watch: claude
-///   13 rules from 1,834 accesses by 5 processes. The guard blocked 2 accesses.
-///
-///   Read-write
-///     ~/.claude                creates and edits files (37 new)
-///     ~/.claude.json           config file
-///   Network
-///     api.anthropic.com        HTTPS
-///     *.npmjs.org              registry, www, cdn
-///   Blocked by the guard
-///     read ~/.ssh/id_ed25519   ssh (credential)
-/// ```
+/// Render only the first lines of the terminal summary: the profile name and
+/// the counts. The interactive review shows the items itself, so pent prints
+/// this header before the review instead of the full summary.
 #[must_use]
-pub fn render_terminal(summary: &Summary, header: &WatchHeader<'_>) -> String {
+pub fn render_header(summary: &Summary, header: &WatchHeader<'_>) -> String {
     let mut out = String::new();
     out.push_str(&format!("pent watch: {}", header.name));
     if header.runs > 1 {
@@ -207,6 +193,30 @@ pub fn render_terminal(summary: &Summary, header: &WatchHeader<'_>) -> String {
     }
     out.push('\n');
 
+    out
+}
+
+/// Render the summary block that `pent watch` prints after the child exits.
+///
+/// Example:
+///
+/// ```text
+/// pent watch: claude
+///   13 rules from 1,834 accesses by 5 processes. The guard blocked 2 accesses.
+///
+///   Read-write
+///     ~/.claude                creates and edits files (37 new)
+///     ~/.claude.json           config file
+///   Network
+///     api.anthropic.com        HTTPS
+///     *.npmjs.org              registry, www, cdn
+///   Blocked by the guard
+///     read ~/.ssh/id_ed25519   ssh (credential)
+/// ```
+#[must_use]
+pub fn render_terminal(summary: &Summary, header: &WatchHeader<'_>) -> String {
+    let mut out = render_header(summary, header);
+    let stats = &summary.stats;
     let labels: Vec<String> = summary.items.iter().map(item_label).collect();
     let width = column_width(labels.iter().map(String::as_str));
     if !summary.items.is_empty() {
@@ -306,6 +316,13 @@ impl Reasons {
     #[must_use]
     pub fn get(&self, grant: &Grant) -> Option<&str> {
         self.0.get(grant).map(String::as_str)
+    }
+
+    /// Add the reasons of `other` for the rules that have no reason yet.
+    pub fn merge_missing(&mut self, other: Self) {
+        for (grant, reason) in other.0 {
+            self.0.entry(grant).or_insert(reason);
+        }
     }
 
     /// Return true if no rule has a reason.
@@ -460,12 +477,44 @@ pub fn render_draft(
     doc: &ProfileDoc,
     summary: &Summary,
 ) -> String {
-    let reasons = Reasons::from_summary(summary);
+    render_draft_with(
+        name,
+        DraftSource::WatchRuns(runs),
+        doc,
+        &Reasons::from_summary(summary),
+    )
+}
+
+/// Where the rules of a draft come from. The first line of the draft names
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DraftSource {
+    /// One or more `pent watch` runs.
+    WatchRuns(usize),
+    /// The review of the accesses that `pent run` denied.
+    DeniedReview,
+}
+
+/// Render a draft with the reasons in `reasons`. Use this function when the
+/// draft keeps rules from an earlier draft or profile: merge their reasons
+/// into `reasons` with [`Reasons::merge_missing`].
+#[must_use]
+pub fn render_draft_with(
+    name: &ProfileName,
+    source: DraftSource,
+    doc: &ProfileDoc,
+    reasons: &Reasons,
+) -> String {
     let mut out = String::new();
-    out.push_str(&format!(
-        "# Profile for \"{name}\". Pent made it from {}.\n",
-        plural(runs, "watch run", "watch runs")
-    ));
+    match source {
+        DraftSource::WatchRuns(runs) => out.push_str(&format!(
+            "# Profile for \"{name}\". Pent made it from {}.\n",
+            plural(runs, "watch run", "watch runs")
+        )),
+        DraftSource::DeniedReview => out.push_str(&format!(
+            "# Profile for \"{name}\". Pent added the denied accesses that you accepted.\n"
+        )),
+    }
     out.push_str("# Each comment tells why the rule exists. Remove a line to remove the rule.\n");
     if doc.is_empty() {
         out.push_str("# The profile has no rules.\n");

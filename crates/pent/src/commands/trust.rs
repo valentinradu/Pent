@@ -6,12 +6,12 @@ use pent_profile::ProfileName;
 use pent_settings::{ProfileStatus, ProfileStore};
 
 use crate::cli::{ProfileArgs, ProfileSubcommand, TrustArgs, UntrustArgs};
-use crate::commands::render_local::DraftOrigin;
 use crate::commands::review_flow::{summarize_review_and_draft, ReviewInput, TrustAnswer};
 use crate::commands::select::not_trusted_message;
 use crate::commands::tty::Tty;
 use crate::error::CliError;
 use crate::ui;
+use pent_profile::DraftSource;
 
 /// `pent trust NAME [--yes] [--review]`.
 pub(crate) fn trust(args: &TrustArgs, cwd: PathBuf) -> Result<(), CliError> {
@@ -106,7 +106,7 @@ fn review_denied(
         events: &events,
         existing: loaded.doc,
         keep: None,
-        origin: DraftOrigin::DeniedReview,
+        origin: DraftSource::DeniedReview,
         trust: answer,
     })?;
     // The selected rules are in the draft (or in the profile). The review

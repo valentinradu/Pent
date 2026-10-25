@@ -28,7 +28,10 @@ pub use doc::{DocError, FilesystemRules, NetworkRules, ProfileDoc};
 pub use event::{FsOp, GuardClass, NetProtocol, Outcome, ProcessInfo, WatchEvent};
 pub use guard::{classify, guard_rules, GuardAccess, GuardRule, GuardTarget};
 pub use name::{ProfileName, ProfileNameError};
-pub use render::{render_draft, render_profile, render_terminal, Reasons, WatchHeader};
+pub use render::{
+    render_draft, render_draft_with, render_header, render_profile, render_terminal, DraftSource,
+    Reasons, WatchHeader,
+};
 pub use review::{review, Selection};
 pub use summary::{
     summarize, FsAccess, Grant, Item, ItemNote, Section, Stats, Summary, SummaryContext,

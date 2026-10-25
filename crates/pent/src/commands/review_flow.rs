@@ -5,10 +5,12 @@ use std::path::{Path, PathBuf};
 
 use pent_profile::review::{review, Selection};
 use pent_profile::summary::{summarize, Summary, SummaryContext};
-use pent_profile::{ProfileDoc, ProfileName, WatchEvent};
+use pent_profile::{
+    render_draft_with, render_header, render_terminal, DraftSource, ProfileDoc, ProfileName,
+    Reasons, WatchEvent, WatchHeader,
+};
 use pent_settings::ProfileStore;
 
-use crate::commands::render_local::{render_draft, render_terminal_summary, DraftOrigin};
 use crate::commands::tty::Tty;
 use crate::error::CliError;
 use crate::ui;
@@ -58,7 +60,7 @@ pub(crate) struct ReviewInput<'a> {
     /// Rules that the draft keeps in addition (the current draft for
     /// `pent watch --append`).
     pub keep: Option<ProfileDoc>,
-    pub origin: DraftOrigin,
+    pub origin: DraftSource,
     pub trust: TrustAnswer,
 }
 
@@ -100,15 +102,26 @@ pub(crate) fn summarize_review_and_draft(
         existing: existing.clone(),
     };
     let summary = summarize(events, &ctx);
-    eprint!("{}", render_terminal_summary(&summary));
+    let runs = match origin {
+        DraftSource::WatchRuns(runs) => runs,
+        DraftSource::DeniedReview => 1,
+    };
+    let header = WatchHeader { name, runs };
 
+    // With a terminal, the review shows the items itself, so pent prints only
+    // the header first. Without a terminal, pent prints the full summary.
     let mut tty = Tty::open();
     let selection = match &tty {
         Some(t) => {
+            eprint!("{}", render_header(&summary, &header));
+            eprintln!();
             let (input, output) = t.split()?;
             review(&summary, input, output)?
         }
-        None => select_unblocked(&summary),
+        None => {
+            eprint!("{}", render_terminal(&summary, &header));
+            select_unblocked(&summary)
+        }
     };
     let added = summary.to_doc(&selection.indices);
 
@@ -119,7 +132,7 @@ pub(crate) fn summarize_review_and_draft(
     // A watch run always writes a draft: `pent run` needs a trusted profile,
     // also an empty one. A review of denied accesses that adds nothing
     // leaves the profile as it is.
-    if added.is_empty() && origin == DraftOrigin::DeniedReview {
+    if added.is_empty() && origin == DraftSource::DeniedReview {
         ui::ok(format!(
             "no new rules; the profile \"{name}\" does not change"
         ));
@@ -127,7 +140,15 @@ pub(crate) fn summarize_review_and_draft(
     }
     doc.extend(&added);
 
-    let text = render_draft(name, &doc, &summary, origin);
+    // The draft keeps the rules of the earlier draft and profile, so it also
+    // keeps their reasons.
+    let mut reasons = Reasons::from_summary(&summary);
+    for earlier in [store.read_draft_text(name), store.read_profile_text(name)] {
+        if let Ok(Some(text)) = earlier {
+            reasons.merge_missing(Reasons::from_draft(&text));
+        }
+    }
+    let text = render_draft_with(name, origin, &doc, &reasons);
     let path = store.write_draft(name, &text)?;
     ui::ok(format!("draft written: {}", path.display()));
 
