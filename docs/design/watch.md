@@ -141,8 +141,9 @@ of the reports, so the result is a lower bound. `--append` merges more runs.
 **Network (both platforms).** The proxy runs in observe mode: it allows each
 request and emits `WatchEvent::Dns` and `WatchEvent::Connect` with the domain
 name (from the request, the TLS SNI or the DNS cache). The kernel lets the
-process reach only the proxy: on Linux the network namespace and the firewall,
-on macOS `(deny network-outbound)` plus
+process reach only the proxy: on Linux the network namespace of the child,
+where the proxy listens on sockets that the child made (no privilege is
+necessary); on macOS `(deny network-outbound)` plus
 `(allow network-outbound (remote ip "localhost:<port>"))`. Pent sets
 `HTTPS_PROXY`, `HTTP_PROXY` and `ALL_PROXY` in both modes.
 

@@ -54,6 +54,9 @@
 //! - Binds to `127.0.0.1` only (not reachable from network)
 //! - Sandboxed processes forced to use this proxy via network namespace (Linux)
 //!   or sandbox-exec localhost-only rule (macOS)
+//! - On Linux, the proxy has no host listener: it serves on listeners that
+//!   the child made in its own network namespace
+//!   ([`ProxyHandle::attach_listeners`])
 //! - No authentication needed (localhost-only binding is the security boundary)
 //! - The TCP proxy rejects destinations that are not public addresses
 //!   (loopback, private, link-local and similar ranges), unless
