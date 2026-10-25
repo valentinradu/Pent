@@ -595,8 +595,15 @@ pub fn spawn_with_landlock(
     let overlay_mounts = if no_enforcement {
         Vec::new()
     } else {
-        super::linux_overlayfs::prepare_overlay_dirs(&accessible, &home_dir, pid)
+        super::linux_overlayfs::prepare_overlay_dirs(&accessible, &home_dir, pid)?
     };
+    // Teardown must wait for orphaned session processes before the final
+    // flush. As a child subreaper, pent gets them instead of init.
+    if !overlay_mounts.is_empty() {
+        if let Err(e) = super::linux_overlayfs::enable_child_subreaper() {
+            tracing::warn!("cannot become a child subreaper: {e}");
+        }
+    }
 
     // Compute the set of parent directories covered by overlayfs (for Landlock rules).
     let overlay_dirs: HashSet<PathBuf> =
@@ -1137,6 +1144,7 @@ pub fn spawn_with_landlock(
             overlay_mounts,
             write_set,
             rw_dirs,
+            child.id(),
         ))
     };
 

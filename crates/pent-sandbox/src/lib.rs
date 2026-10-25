@@ -44,7 +44,10 @@ pub use env::{build_env, resolve_path_directories, resolve_path_dirs_from};
 #[cfg(target_os = "linux")]
 pub use linux::compute_accessible_set;
 #[cfg(target_os = "linux")]
-pub use linux_overlayfs::{cleanup_stale_overlays, OverlayHandle};
+pub use linux_overlayfs::{
+    cleanup_stale_overlays, DiscardKind, DiscardedWrite, FlushError, FlushFailure, OverlayHandle,
+    OverlayTeardownReport,
+};
 pub use pent_settings::{Mount, NetworkMode, SandboxPaths, SandboxSettings};
 
 use std::process::Child;
@@ -269,17 +272,24 @@ pub const fn delete_sandbox_netns(_pid: u32) -> Result<(), SandboxError> {
 /// Flush write-listed files from the overlay upper layer back to the real
 /// filesystem inodes and clean up staging directories.
 ///
-/// Call this **after** `child.wait()` returns. The child's mount namespace
-/// (and all overlayfs mounts) are already destroyed at this point.
+/// Call this **after** `child.wait()` returns.
 ///
 /// # Linux
 ///
-/// Signals the inotify watcher thread to stop, joins it, performs a final
-/// flush of any writes not already caught by inotify, then removes the staging
-/// directories under `/tmp/pent-ovl-<pid>-N/`.
+/// First waits until no background process of the session is alive. Pent
+/// is a child subreaper (the spawn sets this), so the kernel gives orphaned
+/// session processes to pent. Processes that do not exit in a grace time get
+/// `SIGKILL`. Then the function stops the inotify watcher thread, does a
+/// final flush of any writes not already caught by inotify, and removes the
+/// staging directories.
+///
+/// The returned report lists the paths that pent could not flush and the
+/// writes that the overlay discards. When a flush fails, the function keeps
+/// the staging directory, so the data stays recoverable. Show the report to
+/// the user.
 #[cfg(target_os = "linux")]
-pub fn teardown_overlay(handle: OverlayHandle) {
-    linux_overlayfs::teardown(handle);
+pub fn teardown_overlay(handle: OverlayHandle) -> OverlayTeardownReport {
+    linux_overlayfs::teardown(handle)
 }
 
 /// Check if sandboxing is available on this system.

@@ -113,7 +113,8 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
     // namespace is already destroyed and no writes are in flight.
     #[cfg(target_os = "linux")]
     if let Some(handle) = overlay_handle {
-        teardown_overlay(handle);
+        let report = teardown_overlay(handle);
+        show_overlay_report(&report, args.trace);
     }
 
     // Drop the netns handle — removes firewall/routing rules added during setup.
@@ -216,6 +217,33 @@ fn build_run_env(args_env: &[String]) -> HashMap<String, String> {
         env_map.insert(k, v);
     }
     env_map
+}
+
+/// Tell the user about edits that pent could not save, and (in trace mode)
+/// about writes that the overlay discards.
+#[cfg(target_os = "linux")]
+fn show_overlay_report(report: &pent_sandbox::OverlayTeardownReport, trace: bool) {
+    for failure in &report.failures {
+        ui::error(format!(
+            "edit not saved: {}: {}",
+            failure.path.display(),
+            failure.error
+        ));
+    }
+    for dir in &report.kept_staging {
+        ui::warn(format!("pent keeps the unsaved edits in {}", dir.display()));
+    }
+    if report.killed_descendants > 0 {
+        ui::warn(format!(
+            "pent stopped {} sandbox processes that still ran after the command exited",
+            report.killed_descendants
+        ));
+    }
+    if trace {
+        for discarded in &report.discarded {
+            ui::warn(discarded);
+        }
+    }
 }
 
 /// Create `.pent/trace.log` when `trace` is true; emit warnings on failure.
