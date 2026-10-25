@@ -26,14 +26,14 @@ The commands and the results are the same on Linux and on macOS.
 
 | Command | Description |
 |---|---|
-| `pent watch [--profile NAME] [--append] [--yes] -- CMD...` | Record a run. `--append` merges the new run into the current draft. `--yes` skips the banner question (for scripts). |
+| `pent watch [--profile NAME] [--append] [--yes] [--allow D] [--network M] -- CMD...` | Record a run. `--append` merges the new run into the current draft. `--yes` skips the banner question (for scripts). `--allow` and `--network` have the meaning and the precedence of `pent run`; without them the network is open. |
 | `pent trust NAME [--yes]` | Show the draft of NAME, ask, then move it to the store and record its hash. |
 | `pent trust NAME --review` | Review the accesses that `pent run` denied since the last trust, then update the draft. |
 | `pent untrust NAME` | Remove the trust of the profile. |
 | `pent profile list` | List the profiles and their trust status, and the drafts. |
 | `pent profile show NAME` | Print the profile. |
 | `pent profile rm NAME` | Remove the profile, its draft and its trust entry. |
-| `pent run [--profile NAME] [--read P] [--write P] [--execute P] [--allow D] [--network M] [--trace] -- CMD...` | Run with the trusted profile. The flags add to the profile. They never replace it. |
+| `pent run [--profile NAME] [--read P] [--write P] [--execute P] [--unix-socket P] [--allow D] [--network M] [--trace] -- CMD...` | Run with the trusted profile. The flags add to the profile. They never replace it. |
 | `pent config init/show/edit` | The global settings (`~/.config/pent/pent.toml`). |
 
 Removed: `pent config add`, `pent config rm`, `pent config trust`,
@@ -93,10 +93,14 @@ When the profile changed after the trust, the message says so.
 pent watch: claude
   Watch mode does not sandbox the program. It records what the program does.
   The program can read and change your files and use the network.
+  The network is open in this run. Use --allow DOMAIN or --network blocked to close it.
   Pent blocks only the most dangerous accesses (credentials, persistence).
   If you do not trust this binary, run it in a VM or a container.
 Continue? [y/N]
 ```
+
+The third line appears only when the proxy observes. With `--allow` or
+`--network`, the proxy enforces the allowlist, so the line goes away.
 
 ### The guard
 
@@ -139,9 +143,15 @@ the check.
 `log stream` and keeps only the PIDs of the process tree. macOS limits the rate
 of the reports, so the result is a lower bound. `--append` merges more runs.
 
-**Network (both platforms).** The proxy runs in observe mode: it allows each
-request and emits `WatchEvent::Dns` and `WatchEvent::Connect` with the domain
-name (from the request, the TLS SNI or the DNS cache). The kernel lets the
+**Network (both platforms).** By default the proxy runs in observe mode: it
+allows each request and emits `WatchEvent::Dns` and `WatchEvent::Connect` with
+the domain name (from the request, the TLS SNI or the DNS cache). This is the
+default because a watch run must learn what the program needs. It is also a
+risk: a hostile program can send out everything that it reads. The banner says
+so, and `--allow DOMAIN` or `--network MODE` closes the network. With one of
+the two flags, the proxy enforces the allowlist and emits each refused request
+with `Outcome::Denied`. Such a request becomes an item of the summary, as a
+denial of `pent run` does. The kernel lets the
 process reach only the proxy: on Linux the network namespace of the child,
 where the proxy listens on sockets that the child made (no privilege is
 necessary); on macOS `(deny network-outbound)` plus
@@ -182,6 +192,31 @@ Network rules:
 3. A connection to an IP address without a name is listed with the note that
    the proxy cannot allow an IP address. The user can ignore it.
 
+Unix socket rules:
+
+1. A `connect()` to a socket with a path becomes one rule
+   (`Grant::UnixSocket`) in the section "Unix sockets". The rule goes into
+   `filesystem.unix_sockets`.
+2. The reason names the agent when pent knows the socket (`ssh-agent`,
+   `gpg-agent`, `D-Bus`, `Docker`), else it names the processes that
+   connected.
+3. The rule is strong: a program that reaches the socket of an agent can use
+   the key of that agent. Thus the review does not select such an item by
+   default (`[n]`), as it does not select a blocked access.
+4. An abstract address (`@name`) and a relative path cannot be a rule. The
+   summary lists them in `Stats::unreachable_sockets`, under "Not in the
+   rules".
+
+The counts of the header:
+
+1. The header counts the accesses that the guard blocked.
+2. Under the header, pent writes one warning line for each count that is not
+   zero: the rules outside the home directory, the rules in another
+   repository, and the connections to a Unix socket that pent refused
+   (`render::Warnings`). The lines use the marker of `ui::warn`.
+3. The same lines are comments in the first lines of the draft, so a user who
+   reads the file later sees the same facts.
+
 ## The interactive review
 
 The review runs after the child exits, on `/dev/tty`. It shows one section at a
@@ -194,16 +229,22 @@ Read-write (3)
   3  ~/.cache/claude        cache
 Accept: [a]ll, [n]one, or the numbers (1,3-5)? [a]
 
+Unix sockets (1)
+  1  ~/.gnupg/S.gpg-agent       gpg-agent
+Accept: [a]ll, [n]one, or the numbers (1,3-5)? [n]
+
 Blocked by the guard (2)
   1  read ~/.ssh/id_ed25519     ssh (credential)
   2  write ~/.bashrc            node (persistence)
 Accept: [a]ll, [n]one, or the numbers (1,3-5)? [n]
 ```
 
-The default is "all" for normal sections and "none" for the blocked section.
+The default is "all" for the normal sections and "none" for the two sections
+with a strong grant: "Blocked by the guard" and "Unix sockets"
+(`Section::selects_by_default`).
 After the sections, pent writes the draft, prints its path, and asks
-`Trust this profile now? [y/N]`. Without a terminal, pent writes all items
-except the blocked ones to the draft and does not ask.
+`Trust this profile now? [y/N]`. Without a terminal, pent writes to the draft each
+item of a section that the review selects by default, and it does not ask.
 
 ## The draft file
 
@@ -212,6 +253,7 @@ The draft has the same rules as the review, and one comment for each rule:
 ```toml
 # Profile for "claude". Pent made it from 3 watch runs.
 # Each comment tells why the rule exists. Remove a line to remove the rule.
+# pent refused 1 connection to a Unix socket.
 
 [filesystem]
 read_write = [
@@ -223,6 +265,9 @@ read = [
 ]
 execute = [
   "~/.local/share/claude",
+]
+unix_sockets = [
+  "~/.gnupg/S.gpg-agent",  # gpg-agent
 ]
 
 [network]
