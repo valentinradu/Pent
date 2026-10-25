@@ -106,82 +106,33 @@ pub fn spawn_sandboxed(
     args: &[String],
 ) -> Result<SandboxChild, SandboxError> {
     // ── Auto-grant access to the binary's location ───────────────────────────
-    // Rule: the binary's resolved directory (and the package root when it lives
-    // in a `bin/` subdirectory) is always readable and executable.  This lets
-    // runtimes like Node.js find sibling dirs (lib/node_modules/, etc.).
-    //
-    // Two-step resolution:
-    // 1. Locate the binary in PATH without canonicalising — the symlink path
-    //    preserves the `bin/` structure we need for the package-root heuristic.
-    //    (e.g. ~/.npm-global/bin/gemini → ../lib/…/index.js: the symlink parent
-    //    IS `bin/`, but the canonicalized parent is `dist/`.)
-    // 2. Canonicalize separately and add the real parent as well, so the
-    //    Landlock execute rule covers the actual inode the kernel will check.
+    // The binary's directories receive read + execute access (see
+    // `binary_grant_dirs` for the rules). This lets runtimes like Node.js read
+    // the files of their own package.
     //
     // Must happen before any platform-specific call:
     // - Linux: overlayfs accessible set is built from config at mount time.
     // - macOS: SBPL profile is generated from config before spawn.
     let mut effective_config = config.clone();
-    // Canonical binary parent directories that need ReadFile for execve to work.
-    // These are collected separately from execute_paths so they can receive
-    // syslib_access (ReadFile | ReadDir | Execute) rather than execute_access
-    // (ReadDir | Execute only). On Linux, the kernel requires ReadFile on the
-    // binary's directory for execve to succeed under Landlock, even though
-    // Execute alone should theoretically be sufficient.
+    // Directories that need ReadFile for execve to work. On Linux these get
+    // read + execute access (ReadFile | ReadDir | Execute), not the
+    // execute-only access of configured execute paths.
     let mut binary_real_parents: Vec<std::path::PathBuf> = Vec::new();
     {
         let path_env = config.env.get("PATH").map_or("", String::as_str);
-
-        // Step 1: find the binary as it appears in PATH (symlink not resolved).
-        let found: Option<std::path::PathBuf> = if std::path::Path::new(cmd).is_absolute() {
-            Some(std::path::PathBuf::from(cmd))
-        } else {
-            path_env
-                .split(':')
-                .map(|dir| std::path::Path::new(dir).join(cmd))
-                .find(|p| p.is_file())
-        };
-
-        let mut add = |s: String| {
-            if !effective_config.paths.execute.contains(&s) {
-                effective_config.paths.execute.push(s);
-            }
-        };
-
-        if let Some(ref fp) = found {
-            if let Some(parent) = fp.parent() {
-                // Symlink-path parent → always add (covers bin/ dirs).
-                add(parent.to_string_lossy().into_owned());
-                // The symlink parent also needs syslib_access so that any
-                // binaries symlinked from it can be read and executed.
-                binary_real_parents.push(parent.to_path_buf());
-                // Package-root heuristic: `bin/` sibling dirs (lib/, etc.).
-                // The package root receives syslib_access so that Node.js
-                // runtimes can read .js files and spawn nested binaries from
-                // anywhere in the package tree.
-                // Only apply for user-space package roots (e.g. ~/.npm-global),
-                // NOT for system directories like / (pkg_root of /bin/true is /).
-                // Adding / to accessible/path_dirs would make every path appear
-                // to be "in an accessible subtree", breaking overlay stub logic.
-                if parent.file_name().is_some_and(|n| n == "bin") {
-                    if let Some(pkg_root) = parent.parent() {
-                        // Skip filesystem root and other degenerate cases.
-                        if pkg_root.parent().is_some() {
-                            add(pkg_root.to_string_lossy().into_owned());
-                            binary_real_parents.push(pkg_root.to_path_buf());
-                        }
-                    }
+        if let Some(found) = find_in_path(cmd, path_env) {
+            let canonical = std::fs::canonicalize(&found).unwrap_or_else(|_| found.clone());
+            let home = config
+                .env
+                .get("HOME")
+                .map(std::path::PathBuf::from)
+                .or_else(dirs::home_dir);
+            for dir in binary_grant_dirs(&found, &canonical, home.as_deref()) {
+                let s = dir.to_string_lossy().into_owned();
+                if !effective_config.paths.execute.contains(&s) {
+                    effective_config.paths.execute.push(s);
                 }
-            }
-            // Step 2: canonical parent for Landlock execute on the real inode.
-            // Added to binary_real_parents so it receives syslib_access (with
-            // ReadFile) — required for execve to succeed under Landlock on Linux.
-            if let Ok(real) = std::fs::canonicalize(fp) {
-                if let Some(real_parent) = real.parent() {
-                    binary_real_parents.push(real_parent.to_path_buf());
-                    // Also add as execute path for the accessible set computation.
-                    add(real_parent.to_string_lossy().into_owned());
-                }
+                binary_real_parents.push(dir);
             }
         }
     }
@@ -224,6 +175,16 @@ pub fn spawn_sandboxed(
     {
         let child_path = config.env.get("PATH").map_or("", |s| s.as_str());
         let mut path_dirs = resolve_path_dirs_from(child_path);
+        // Landlock checks the inode that a symbolic link resolves to. Add the
+        // canonical target of each PATH directory too (for example
+        // /run/current-system/sw/bin -> /nix/store/...-system-path/bin).
+        for dir in path_dirs.clone() {
+            if let Ok(real) = std::fs::canonicalize(&dir) {
+                if !path_dirs.contains(&real) {
+                    path_dirs.push(real);
+                }
+            }
+        }
         // Add canonical binary parent dirs to path_dirs so they receive
         // syslib_access (ReadFile | ReadDir | Execute) — execve requires ReadFile.
         for p in binary_real_parents {
@@ -243,6 +204,115 @@ pub fn spawn_sandboxed(
     {
         Err(SandboxError::UnsupportedPlatform)
     }
+}
+
+/// Find `cmd` the way `execvp` does: a path with a slash is used as is; a
+/// bare name is searched in `path_env`. The result is not canonical, so the
+/// caller sees the symbolic link in PATH.
+fn find_in_path(cmd: &str, path_env: &str) -> Option<std::path::PathBuf> {
+    if cmd.contains('/') {
+        return Some(std::path::PathBuf::from(cmd));
+    }
+    path_env
+        .split(':')
+        .filter(|dir| !dir.is_empty())
+        .map(|dir| std::path::Path::new(dir).join(cmd))
+        .find(|p| p.is_file())
+}
+
+/// Paths in `$HOME` that must never receive an automatic grant. Their
+/// ancestors must not receive one either.
+const SENSITIVE_HOME_PATHS: &[&str] = &[
+    ".ssh",
+    ".gnupg",
+    ".aws",
+    ".config",
+    ".local",
+    ".netrc",
+    ".kube",
+    ".docker",
+    ".password-store",
+    ".cargo/credentials.toml",
+    ".npmrc",
+];
+
+/// Return true if an automatic grant on `dir` is too broad.
+///
+/// A grant is too broad if `dir` is `/`, `$HOME`, an ancestor of `$HOME`, a
+/// direct child of `$HOME` (for example `~/.cargo` or `~/.bun`, which can
+/// hold credentials), or an ancestor of a sensitive path in `$HOME`.
+fn is_too_broad(dir: &std::path::Path, home: Option<&std::path::Path>) -> bool {
+    if dir.parent().is_none() {
+        return true;
+    }
+    let Some(home) = home else {
+        return false;
+    };
+    home.starts_with(dir)
+        || dir.parent() == Some(home)
+        || SENSITIVE_HOME_PATHS
+            .iter()
+            .any(|s| home.join(s).starts_with(dir))
+}
+
+/// Return the nearest Node.js package directory that contains `file`.
+///
+/// A package directory is `.../node_modules/<name>` or
+/// `.../node_modules/@scope/<name>`, with a `package.json` file.
+fn node_package_dir(file: &std::path::Path) -> Option<std::path::PathBuf> {
+    let is_node_modules = |p: &std::path::Path| p.file_name().is_some_and(|n| n == "node_modules");
+    file.ancestors().skip(1).find_map(|dir| {
+        let parent = dir.parent()?;
+        let scoped = parent
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with('@'))
+            && parent.parent().is_some_and(is_node_modules);
+        ((is_node_modules(parent) || scoped) && dir.join("package.json").is_file())
+            .then(|| dir.to_path_buf())
+    })
+}
+
+/// Compute the directories that receive automatic read + execute access for
+/// the binary `found` (as found in PATH) with the canonical path `canonical`.
+///
+/// The heuristic:
+/// 1. The directory of `found` (usually a PATH directory such as `bin/`).
+/// 2. The directory of `canonical` (the real file that `execve` opens).
+/// 3. If `canonical` is inside a Node.js package
+///    (`.../node_modules/<pkg>/...`), that package directory, so that the
+///    runtime can read the other files of the package.
+/// 4. Otherwise, if the directory of `canonical` is a `bin/` directory, its
+///    parent (the package root, for example `/opt/tool/bin` → `/opt/tool`).
+///
+/// A directory that [`is_too_broad`] rejects (`/`, `$HOME`, `~/.local`, a
+/// direct child of `$HOME`, an ancestor of `~/.ssh`, ...) never receives a
+/// grant.
+#[must_use]
+pub(crate) fn binary_grant_dirs(
+    found: &std::path::Path,
+    canonical: &std::path::Path,
+    home: Option<&std::path::Path>,
+) -> Vec<std::path::PathBuf> {
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    let mut push = |d: &std::path::Path| {
+        if !is_too_broad(d, home) && !dirs.iter().any(|x| x == d) {
+            dirs.push(d.to_path_buf());
+        }
+    };
+    if let Some(p) = found.parent() {
+        push(p);
+    }
+    if let Some(real_parent) = canonical.parent() {
+        push(real_parent);
+        if let Some(pkg) = node_package_dir(canonical) {
+            push(&pkg);
+        } else if real_parent.file_name().is_some_and(|n| n == "bin") {
+            if let Some(root) = real_parent.parent() {
+                push(root);
+            }
+        }
+    }
+    dirs
 }
 
 /// Clean up Linux sandbox resources created by `spawn_sandboxed`.
@@ -399,8 +469,11 @@ mod tests {
     #[serial]
     #[cfg(target_os = "linux")]
     fn test_spawn_sandboxed_native_linux() -> TestResult {
+        let Some(true_bin) = which("true") else {
+            return Ok(()); // skip: no `true` in PATH
+        };
         let dirs = make_test_config();
-        let result = spawn_sandboxed(&dirs.config, "/bin/true", &[]);
+        let result = spawn_sandboxed(&dirs.config, &true_bin.to_string_lossy(), &[]);
 
         if check_availability().is_ok() {
             match result {
@@ -468,8 +541,15 @@ mod tests {
         let test_file = workspace.join("hello.txt");
         std::fs::write(&test_file, "hello landlock").map_err(|e| format!("write: {e}"))?;
 
+        let Some(cat) = which("cat") else {
+            return Ok(()); // skip: no `cat` in PATH
+        };
         let config = linux_test_config(workspace, NetworkMode::LocalhostOnly);
-        let code = match sandboxed_exit(&config, "/bin/cat", &[test_file.to_str().unwrap_or("")]) {
+        let code = match sandboxed_exit(
+            &config,
+            &cat.to_string_lossy(),
+            &[test_file.to_str().unwrap_or("")],
+        ) {
             Ok(code) => code,
             Err(SandboxError::SpawnFailed(err))
                 if err.kind() == std::io::ErrorKind::PermissionDenied =>
@@ -503,8 +583,11 @@ mod tests {
         let temp = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
         let workspace = temp.path().to_path_buf();
 
+        let Some(cat) = which("cat") else {
+            return Ok(()); // skip: no `cat` in PATH
+        };
         let config = linux_test_config(workspace, NetworkMode::LocalhostOnly);
-        let code = match sandboxed_exit(&config, "/bin/cat", &["/sys/kernel/version"]) {
+        let code = match sandboxed_exit(&config, &cat.to_string_lossy(), &["/sys/kernel/version"]) {
             Ok(code) => code,
             Err(SandboxError::SpawnFailed(err))
                 if err.kind() == std::io::ErrorKind::PermissionDenied =>
@@ -531,9 +614,9 @@ mod tests {
             return Ok(());
         }
         // Skip if bash is not available (needed for /dev/tcp redirection).
-        if !std::path::Path::new("/bin/bash").exists() {
+        let Some(bash) = which("bash") else {
             return Ok(());
-        }
+        };
         let temp = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
         let workspace = temp.path().to_path_buf();
 
@@ -543,7 +626,7 @@ mod tests {
         // has no routes — a reliable signal that the namespace is isolated.
         let code = match sandboxed_exit(
             &config,
-            "/bin/bash",
+            &bash.to_string_lossy(),
             &["-c", "exec 3<>/dev/tcp/1.1.1.1/80 2>/dev/null"],
         ) {
             Ok(code) => code,
@@ -572,9 +655,9 @@ mod tests {
         if check_availability().is_err() {
             return Ok(());
         }
-        if !std::path::Path::new("/bin/bash").exists() {
+        let Some(bash) = which("bash") else {
             return Ok(());
-        }
+        };
         let temp = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
         let workspace = temp.path().to_path_buf();
 
@@ -584,7 +667,7 @@ mod tests {
         // the loopback interface exists and routes work.
         let code = match sandboxed_exit(
             &config,
-            "/bin/bash",
+            &bash.to_string_lossy(),
             &["-c", "exec 3<>/dev/tcp/127.0.0.1/1 2>/dev/null; echo $?"],
         ) {
             Ok(code) => code,
@@ -601,6 +684,94 @@ mod tests {
             code.is_some(),
             "Child should exit (even with an error) when loopback is available"
         );
+        Ok(())
+    }
+
+    // =========================================================================
+    // Binary grants and PATH resolution
+    // =========================================================================
+
+    /// Find `name` in PATH (like `which`). Returns `None` if it is absent.
+    fn which(name: &str) -> Option<std::path::PathBuf> {
+        std::env::var_os("PATH").and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|d| d.join(name))
+                .find(|p| p.is_file())
+        })
+    }
+
+    #[test]
+    fn test_find_in_path() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let a = temp.path().join("a");
+        let b = temp.path().join("b");
+        std::fs::create_dir_all(&a)?;
+        std::fs::create_dir_all(&b)?;
+        std::fs::write(b.join("tool"), "")?;
+        let path_env = format!("{}::{}", a.display(), b.display());
+        assert_eq!(find_in_path("tool", &path_env), Some(b.join("tool")));
+        assert_eq!(find_in_path("missing", &path_env), None);
+        assert_eq!(
+            find_in_path("./rel/tool", &path_env),
+            Some(std::path::PathBuf::from("./rel/tool"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_binary_grant_dirs_never_home_or_local() {
+        use std::path::Path;
+        let home = Path::new("/home/u");
+        // ~/.local/bin/tool -> ~/.local/share/tool/bin/tool
+        let dirs = binary_grant_dirs(
+            Path::new("/home/u/.local/bin/tool"),
+            Path::new("/home/u/.local/share/tool/bin/tool"),
+            Some(home),
+        );
+        for d in &dirs {
+            assert_ne!(d, Path::new("/home/u"));
+            assert_ne!(d, Path::new("/home/u/.local"));
+            assert!(!Path::new("/home/u/.ssh").starts_with(d));
+        }
+        assert!(dirs.contains(&std::path::PathBuf::from("/home/u/.local/bin")));
+        assert!(dirs.contains(&std::path::PathBuf::from("/home/u/.local/share/tool/bin")));
+        assert!(dirs.contains(&std::path::PathBuf::from("/home/u/.local/share/tool")));
+
+        // A binary directly in $HOME/bin: $HOME is never granted.
+        let dirs = binary_grant_dirs(
+            Path::new("/home/u/bin/x"),
+            Path::new("/home/u/bin/x"),
+            Some(home),
+        );
+        assert!(!dirs.iter().any(|d| d == Path::new("/home/u")));
+
+        // ~/.cargo/bin/x: ~/.cargo (direct child of $HOME) is not granted.
+        let dirs = binary_grant_dirs(
+            Path::new("/home/u/.cargo/bin/x"),
+            Path::new("/home/u/.cargo/bin/x"),
+            Some(home),
+        );
+        assert!(!dirs.iter().any(|d| d == Path::new("/home/u/.cargo")));
+
+        // /bin/true: `/` is never granted.
+        let dirs = binary_grant_dirs(Path::new("/bin/true"), Path::new("/bin/true"), None);
+        assert!(!dirs.iter().any(|d| d == Path::new("/")));
+    }
+
+    #[test]
+    fn test_binary_grant_dirs_node_package() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path().join("home");
+        let pkg = home.join(".npm-global/lib/node_modules/@scope/tool");
+        std::fs::create_dir_all(pkg.join("dist"))?;
+        std::fs::write(pkg.join("package.json"), "{}")?;
+        std::fs::write(pkg.join("dist/cli.js"), "")?;
+        let bin = home.join(".npm-global/bin");
+        let dirs = binary_grant_dirs(&bin.join("tool"), &pkg.join("dist/cli.js"), Some(&home));
+        assert!(dirs.contains(&pkg), "package dir must be granted: {dirs:?}");
+        assert!(dirs.contains(&bin));
+        assert!(!dirs.contains(&home.join(".npm-global")));
+        assert!(!dirs.iter().any(|d| d.ends_with("node_modules")));
         Ok(())
     }
 }
