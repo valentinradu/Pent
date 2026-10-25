@@ -679,7 +679,11 @@ const WATCH_REPORTED_OPERATIONS: &[&str] = &[
 /// (allow network-outbound (literal "/private/var/run/mDNSResponder") (with report))
 /// (allow network-outbound (subpath "/") (with report))      ; all Unix sockets
 /// (deny file-read-data (regex "^/Users/u/\\.ssh/id_[^/]*$"))
+/// (deny file-read-data (regex "^/Users/u/\\.ssh/.*/id_[^/]*$"))
 /// (allow file-read-data (regex "^/Users/u/\\.ssh/id_[^/]*\\.pub$") (with report))
+/// (allow file-read-data (regex "^/Users/u/\\.ssh/.*/id_[^/]*\\.pub$") (with report))
+/// (deny file-read-data (regex "^/Users/u/\\.ssh/[^/]*_rsa$"))
+/// (deny file-read-data (regex "^/Users/u/\\.ssh/.*/[^/]*_rsa$"))
 /// (deny file-write* (literal "/Users/u/.bashrc"))
 /// (deny process-exec (regex "/sudo$"))
 /// ```
@@ -736,6 +740,66 @@ pub fn generate_watch_profile(
     Ok(profile)
 }
 
+/// The two forms of the text between a guarded directory and a file name.
+///
+/// A [`GuardTarget::FilesInDir`](pent_profile::GuardTarget::FilesInDir)
+/// rule matches a file at any depth below the directory, as
+/// [`pent_profile::classify`] does. The first form is a direct child of the
+/// directory, the second form is a file deeper in the tree. The generator
+/// makes one rule for each form, because it uses only the regex constructs
+/// that the rest of this file already uses (`^`, `$`, `.*` and `[^/]*`).
+const GUARD_DEPTH_FORMS: &[&str] = &["", ".*/"];
+
+/// Translate the file name pattern of a
+/// [`GuardTarget::FilesInDir`](pent_profile::GuardTarget::FilesInDir) rule
+/// into the regex of the file name.
+///
+/// A pattern without a leading `*` is a file name prefix: `id_` gives
+/// `id_[^/]*`. A pattern with a leading `*` is a file name suffix: `*_rsa`
+/// gives `[^/]*_rsa`, and `*.pem` gives `[^/]*\.pem`. The fixed part of the
+/// pattern goes through [`regex_escape`], so a dot, a plus or a bracket
+/// matches only itself.
+///
+/// This function is the macOS form of `pent_profile::name_matches`. The two
+/// must give the same answer for each file name; the unit test
+/// `the_watch_profile_and_classify_agree_on_the_key_names` holds this.
+fn name_pattern_regex(pattern: &str) -> String {
+    pattern.strip_prefix('*').map_or_else(
+        || format!("{}[^/]*", regex_escape(pattern)),
+        |suffix| format!("[^/]*{}", regex_escape(suffix)),
+    )
+}
+
+/// Translate the exception of a
+/// [`GuardTarget::FilesInDir`](pent_profile::GuardTarget::FilesInDir) rule
+/// into the regex of the file names that match the pattern and that end
+/// with `suffix`.
+///
+/// The profile denies the pattern and then allows this regex again, because
+/// SBPL regex has no "not" and the last matching rule wins.
+///
+/// Return `None` when no file name can match the pattern and also end with
+/// the suffix. A name that ends with `_rsa` never ends with `.pub`, so the
+/// SSH key rules with a suffix pattern need no exception rule.
+fn excluded_name_regex(pattern: &str, suffix: &str) -> Option<String> {
+    let escaped = regex_escape(suffix);
+    match pattern.strip_prefix('*') {
+        // A prefix pattern: the name starts with the prefix and ends with
+        // the suffix. The form needs the two parts to be separate. A name
+        // in which the end of the prefix is also the start of the suffix
+        // stays denied. No pattern of the guard list has such an overlap:
+        // `id_` and `.pub` have no common text.
+        None => Some(format!("{}[^/]*{escaped}", regex_escape(pattern))),
+        // A suffix pattern: a name ends with both suffixes only when one
+        // suffix ends with the other.
+        Some(pattern_suffix) if suffix.ends_with(pattern_suffix) => Some(format!("[^/]*{escaped}")),
+        Some(pattern_suffix) if pattern_suffix.ends_with(suffix) => {
+            Some(format!("[^/]*{}", regex_escape(pattern_suffix)))
+        }
+        Some(_) => None,
+    }
+}
+
 /// Add the SBPL deny rules for the guard rules.
 ///
 /// - [`GuardAccess::Read`](pent_profile::GuardAccess::Read) gives
@@ -746,10 +810,16 @@ pub fn generate_watch_profile(
 ///   `(deny process-exec ...)`.
 ///
 /// An exact path gives a `literal` filter, a subtree gives `subpath`, and a
-/// file name prefix gives a `regex`. For an excluded suffix, an allow rule
-/// (with `report`) follows the deny. A binary name gives the regex
+/// file name pattern gives a `regex`. A binary name gives the regex
 /// `/<name>$`. Each path rule is added for the canonical path and also for
 /// the original path if it is different.
+///
+/// A file name pattern gives two or four rules for each form of the
+/// directory path: a deny for a direct child of the directory, a deny for a
+/// file deeper in the tree (see [`GUARD_DEPTH_FORMS`]), and, for an
+/// excluded suffix, an allow rule (with `report`) of each form after the
+/// two denies. The last matching rule wins, so the exception comes after
+/// the denies of the same guard rule.
 ///
 /// # Errors
 /// Returns `SandboxError::InvalidConfig` if a path contains NUL or a newline.
@@ -782,16 +852,29 @@ fn add_guard_rules(
                 prefix,
                 exclude_suffix,
             } => {
+                let name = name_pattern_regex(prefix);
+                let excepted = exclude_suffix
+                    .as_deref()
+                    .and_then(|suffix| excluded_name_regex(prefix, suffix));
                 for variant in path_variants(dir) {
-                    let base = format!("^{}/{}[^/]*", regex_escape(&variant), regex_escape(prefix));
-                    push_rule(profile, RuleAction::Deny, op, "regex", &format!("{base}$"))?;
-                    if let Some(suffix) = exclude_suffix {
+                    let dir_regex = regex_escape(&variant);
+                    for depth in GUARD_DEPTH_FORMS {
+                        push_rule(
+                            profile,
+                            RuleAction::Deny,
+                            op,
+                            "regex",
+                            &format!("^{dir_regex}/{depth}{name}$"),
+                        )?;
+                    }
+                    let Some(excepted) = &excepted else { continue };
+                    for depth in GUARD_DEPTH_FORMS {
                         push_rule_with(
                             profile,
                             RuleAction::Allow,
                             op,
                             "regex",
-                            &format!("{base}{}$", regex_escape(suffix)),
+                            &format!("^{dir_regex}/{depth}{excepted}$"),
                             reallow_report,
                         )?;
                     }
@@ -1201,6 +1284,396 @@ mod tests {
         generate_watch_profile(&config, guard).unwrap()
     }
 
+    // ========================================================================
+    // A reader of the generated profile.
+    //
+    // A test on Linux cannot ask Seatbelt what a profile does. The reader
+    // below takes the text of the profile and applies the rule of the
+    // kernel: the last rule that matches the operation and the path wins.
+    // It knows only the rule shapes and the regex constructs that this file
+    // writes, and it fails the test on any other shape, so a new shape
+    // cannot pass without a check. The test
+    // `the_watch_profile_with_the_guard_rules_compiles` and the end-to-end
+    // tests are the check against the real kernel.
+    // ========================================================================
+
+    /// The result of a profile for one operation on one path.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Verdict {
+        Allowed,
+        Denied,
+    }
+
+    /// One atom of the regex subset that the generator writes.
+    #[derive(Debug, Clone, Copy)]
+    enum Atom {
+        /// One character, with no special meaning.
+        Lit(char),
+        /// `.*`: any characters.
+        AnySeq,
+        /// `[^/]*`: any characters of one path part.
+        SegmentSeq,
+    }
+
+    /// Return the verdict of `profile` for `op` on `path`.
+    ///
+    /// A test helper: an unknown rule shape panics, so the test fails with
+    /// the line that it cannot read.
+    #[allow(clippy::panic)]
+    fn verdict(profile: &str, op: &str, path: &str) -> Verdict {
+        // Before `(allow default)` the Seatbelt default is a denial.
+        let mut result = Verdict::Denied;
+        for line in profile.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with("(version") {
+                continue;
+            }
+            let (action, ops, filter) = parse_rule(line);
+            if !ops.iter().any(|o| o == "default" || o == op) {
+                continue;
+            }
+            let hit = match &filter {
+                None => true,
+                Some((kind, value)) => match kind.as_str() {
+                    "literal" => path == value,
+                    "subpath" => path == value || path.starts_with(&format!("{value}/")),
+                    "regex" => regex_matches(value, path),
+                    // A network filter never matches a path.
+                    "remote" | "local" => false,
+                    other => panic!("the test cannot read the filter {other:?}: {line}"),
+                },
+            };
+            if hit {
+                result = action;
+            }
+        }
+        result
+    }
+
+    /// Split one rule line into the action, the operations and the filter.
+    #[allow(clippy::panic)]
+    fn parse_rule(line: &str) -> (Verdict, Vec<String>, Option<(String, String)>) {
+        let inner = line
+            .strip_prefix('(')
+            .and_then(|rest| rest.strip_suffix(')'))
+            .unwrap_or_else(|| panic!("not a rule: {line}"));
+        let head_end = inner.find('(').unwrap_or(inner.len());
+        let mut words = inner.get(..head_end).unwrap_or_default().split_whitespace();
+        let action = match words.next() {
+            Some("allow") => Verdict::Allowed,
+            Some("deny") => Verdict::Denied,
+            other => panic!("the test cannot read the action {other:?}: {line}"),
+        };
+        let ops: Vec<String> = words.map(str::to_string).collect();
+        assert!(!ops.is_empty(), "a rule without an operation: {line}");
+        let mut filter = None;
+        for group in groups(inner.get(head_end..).unwrap_or_default()) {
+            let (kind, value) = group.split_once(' ').unwrap_or((group.as_str(), ""));
+            match kind {
+                // The report modifier does not change the verdict.
+                "with" => {}
+                "literal" | "subpath" | "regex" => {
+                    filter = Some((kind.to_string(), unquote(value, line)));
+                }
+                "remote" | "local" => filter = Some((kind.to_string(), String::new())),
+                other => panic!("the test cannot read the filter {other:?}: {line}"),
+            }
+        }
+        (action, ops, filter)
+    }
+
+    /// Return the text of each top-level `( ... )` group of `text`.
+    ///
+    /// A double-quoted string can hold a parenthesis, so the scan knows the
+    /// SBPL string escapes.
+    #[allow(clippy::panic)]
+    fn groups(text: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut current = String::new();
+        let mut depth: usize = 0;
+        let mut in_string = false;
+        let mut escaped = false;
+        for ch in text.chars() {
+            if in_string {
+                current.push(ch);
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            match ch {
+                '(' => {
+                    if depth > 0 {
+                        current.push(ch);
+                    }
+                    depth += 1;
+                }
+                ')' => {
+                    assert!(
+                        depth > 0,
+                        "a rule with too many closing parentheses: {text}"
+                    );
+                    depth -= 1;
+                    if depth == 0 {
+                        out.push(std::mem::take(&mut current));
+                    } else {
+                        current.push(ch);
+                    }
+                }
+                '"' => {
+                    in_string = true;
+                    current.push(ch);
+                }
+                _ if depth > 0 => current.push(ch),
+                _ => {}
+            }
+        }
+        assert_eq!(depth, 0, "a rule with an open parenthesis: {text}");
+        out
+    }
+
+    /// Read back the text of an SBPL string literal.
+    #[allow(clippy::panic)]
+    fn unquote(text: &str, line: &str) -> String {
+        let body = text
+            .trim()
+            .strip_prefix('"')
+            .and_then(|rest| rest.strip_suffix('"'))
+            .unwrap_or_else(|| panic!("the filter value is not a string: {line}"));
+        let mut out = String::new();
+        let mut escaped = false;
+        for ch in body.chars() {
+            if escaped {
+                out.push(ch);
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else {
+                out.push(ch);
+            }
+        }
+        out
+    }
+
+    /// Return true if the regex `pattern` matches `text`.
+    #[allow(clippy::panic)]
+    fn regex_matches(pattern: &str, text: &str) -> bool {
+        let anchored_start = pattern.starts_with('^');
+        let anchored_end = pattern.ends_with('$');
+        let body = pattern.strip_prefix('^').unwrap_or(pattern);
+        let body = body.strip_suffix('$').unwrap_or(body);
+        let atoms = parse_regex(body, pattern);
+        if anchored_start {
+            return match_atoms(&atoms, text, anchored_end);
+        }
+        std::iter::once(text.len())
+            .chain(text.char_indices().map(|(i, _)| i))
+            .any(|start| {
+                text.get(start..)
+                    .is_some_and(|rest| match_atoms(&atoms, rest, anchored_end))
+            })
+    }
+
+    /// Translate the regex subset of the generator into atoms.
+    #[allow(clippy::panic)]
+    fn parse_regex(body: &str, pattern: &str) -> Vec<Atom> {
+        let mut atoms = Vec::new();
+        let mut chars = body.chars().peekable();
+        while let Some(ch) = chars.next() {
+            match ch {
+                '\\' => match chars.next() {
+                    Some(escaped) => atoms.push(Atom::Lit(escaped)),
+                    None => panic!("a backslash at the end of the regex: {pattern}"),
+                },
+                '.' if chars.peek() == Some(&'*') => {
+                    chars.next();
+                    atoms.push(Atom::AnySeq);
+                }
+                '[' => {
+                    let rest: String = chars.by_ref().take(4).collect();
+                    assert_eq!(
+                        rest, "^/]*",
+                        "the test knows only the class [^/]* in the regex: {pattern}"
+                    );
+                    atoms.push(Atom::SegmentSeq);
+                }
+                '*' | '+' | '?' | '(' | ')' | ']' | '{' | '}' | '^' | '$' | '|' | '.' => {
+                    panic!("the regex has the unescaped metacharacter {ch:?}: {pattern}")
+                }
+                other => atoms.push(Atom::Lit(other)),
+            }
+        }
+        atoms
+    }
+
+    /// Match `atoms` against the start of `text`.
+    fn match_atoms(atoms: &[Atom], text: &str, anchored_end: bool) -> bool {
+        match atoms.split_first() {
+            None => !anchored_end || text.is_empty(),
+            Some((Atom::Lit(c), rest)) => text
+                .strip_prefix(*c)
+                .is_some_and(|tail| match_atoms(rest, tail, anchored_end)),
+            Some((atom, rest)) => {
+                let one_part = matches!(atom, Atom::SegmentSeq);
+                let mut end = 0;
+                loop {
+                    let Some(tail) = text.get(end..) else {
+                        return false;
+                    };
+                    if match_atoms(rest, tail, anchored_end) {
+                        return true;
+                    }
+                    let Some(ch) = tail.chars().next() else {
+                        return false;
+                    };
+                    if one_part && ch == '/' {
+                        return false;
+                    }
+                    end = end.saturating_add(ch.len_utf8());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_profile_reader_reads_the_rule_shapes() {
+        let profile = concat!(
+            "(version 1)\n",
+            "(allow default)\n",
+            "(deny file-read-data)\n",
+            "(allow file-read-data (literal \"/a/b\"))\n",
+            "(allow file-read-data file-write* (subpath \"/c\"))\n",
+            "(allow file-read-data (regex \"^/d/[^/]*\\\\.txt$\") (with report))\n",
+            "(deny network-outbound)\n",
+            "(allow network-outbound (remote ip \"localhost:1\"))\n",
+        );
+        let read = |path: &str| verdict(profile, "file-read-data", path);
+        assert_eq!(read("/a/b"), Verdict::Allowed);
+        assert_eq!(read("/a/bb"), Verdict::Denied);
+        assert_eq!(read("/c/x/y"), Verdict::Allowed);
+        assert_eq!(read("/cx"), Verdict::Denied);
+        assert_eq!(read("/d/x.txt"), Verdict::Allowed);
+        assert_eq!(read("/d/sub/x.txt"), Verdict::Denied);
+        // The network rules do not change a file read.
+        assert_eq!(read("/e"), Verdict::Denied);
+        assert_eq!(
+            verdict(profile, "file-write*", "/c/x"),
+            Verdict::Allowed,
+            "a rule with two operations covers both"
+        );
+        // `.*` crosses a path part; a name part does not.
+        assert!(regex_matches("^/a/.*/b$", "/a/x/y/b"));
+        assert!(!regex_matches("^/a/[^/]*/b$", "/a/x/y/b"));
+        assert!(regex_matches("/sudo$", "/usr/bin/sudo"));
+        assert!(!regex_matches("/sudo$", "/usr/bin/sudoedit"));
+    }
+
+    /// MAC-2 and MAC-3: the generated profile and `pent_profile::classify`
+    /// must give the same answer for each SSH key name, at each depth below
+    /// `~/.ssh`.
+    #[test]
+    fn the_watch_profile_and_classify_agree_on_the_key_names() {
+        let home = Path::new("/nonexistent/home/u");
+        let guard = pent_profile::guard_rules(home);
+        let config = SandboxConfig::new("/w".into(), make_test_paths(), "/w".into());
+        let profile = generate_watch_profile(&config, &guard).unwrap();
+        // The name of the file, and whether the guard must block a read.
+        let keys = [
+            ("id_ed25519", true),
+            ("github_rsa", true),
+            ("work.pem", true),
+            ("deploy.key", true),
+            ("id_ed25519.pub", false),
+            ("notes.txt", false),
+        ];
+        for (name, blocked) in keys {
+            for dir in [".ssh", ".ssh/keys", ".ssh/old/2026"] {
+                let path = home.join(dir).join(name);
+                let text = path.to_string_lossy();
+                assert_eq!(
+                    verdict(&profile, "file-read-data", &text) == Verdict::Denied,
+                    blocked,
+                    "the profile does not block {text} as expected"
+                );
+                assert_eq!(
+                    pent_profile::classify(&guard, &path, GuardAccess::Read).is_some(),
+                    blocked,
+                    "classify does not block {text} as expected"
+                );
+            }
+        }
+    }
+
+    /// The same agreement for the Python user site, where the real files
+    /// are two or three levels below the guarded directory.
+    #[test]
+    fn the_watch_profile_and_classify_agree_on_the_python_user_site() {
+        let home = Path::new("/nonexistent/home/u");
+        let guard = pent_profile::guard_rules(home);
+        let config = SandboxConfig::new("/w".into(), make_test_paths(), "/w".into());
+        let profile = generate_watch_profile(&config, &guard).unwrap();
+        let files = [
+            (".local/lib/python3.12/site-packages/evil.pth", true),
+            (".local/lib/python3.12/site-packages/usercustomize.py", true),
+            ("Library/Python/3.12/lib/python/site-packages/x.pth", true),
+            (".local/lib/python3.12/site-packages/notes.txt", false),
+        ];
+        for (rel, blocked) in files {
+            let path = home.join(rel);
+            let text = path.to_string_lossy();
+            assert_eq!(
+                verdict(&profile, "file-write*", &text) == Verdict::Denied,
+                blocked,
+                "the profile does not block a write to {text} as expected"
+            );
+            assert_eq!(
+                pent_profile::classify(&guard, &path, GuardAccess::Write).is_some(),
+                blocked,
+                "classify does not block a write to {text} as expected"
+            );
+        }
+    }
+
+    /// A metacharacter in the directory matches only itself, so the rule
+    /// does not become wider.
+    #[test]
+    fn a_metacharacter_in_the_guard_directory_does_not_widen_the_rule() {
+        let profile = watch_profile(&[rule(
+            GuardAccess::Read,
+            GuardTarget::FilesInDir {
+                dir: "/nonexistent/a+b[1]/.ssh".into(),
+                prefix: "id_".to_string(),
+                exclude_suffix: None,
+            },
+        )]);
+        assert!(
+            profile.contains(
+                r#"(deny file-read-data (regex "^/nonexistent/a\\+b\\[1\\]/\\.ssh/id_[^/]*$"))"#
+            ),
+            "{profile}"
+        );
+        assert_eq!(
+            verdict(&profile, "file-read-data", "/nonexistent/a+b[1]/.ssh/id_x"),
+            Verdict::Denied
+        );
+        for other in [
+            "/nonexistent/ab[1]/.ssh/id_x",
+            "/nonexistent/aab[1]/.ssh/id_x",
+            "/nonexistent/a+b1/.ssh/id_x",
+            "/nonexistent/a+b[1]/Xssh/id_x",
+        ] {
+            assert_eq!(
+                verdict(&profile, "file-read-data", other),
+                Verdict::Allowed,
+                "the rule became wider: {other}"
+            );
+        }
+    }
+
     #[test]
     fn test_watch_profile_reports_and_limits_network() {
         let profile = watch_profile(&[]);
@@ -1269,13 +1742,76 @@ mod tests {
             },
         )]);
         let deny = r#"(deny file-read-data (regex "^/nonexistent/u/\\.ssh/id_[^/]*$"))"#;
+        let deny_deep = r#"(deny file-read-data (regex "^/nonexistent/u/\\.ssh/.*/id_[^/]*$"))"#;
         let allow = r#"(allow file-read-data (regex "^/nonexistent/u/\\.ssh/id_[^/]*\\.pub$") (with report))"#;
+        let allow_deep = r#"(allow file-read-data (regex "^/nonexistent/u/\\.ssh/.*/id_[^/]*\\.pub$") (with report))"#;
         let deny_at = profile.find(deny);
+        let deny_deep_at = profile.find(deny_deep);
         let allow_at = profile.find(allow);
+        let allow_deep_at = profile.find(allow_deep);
         assert!(deny_at.is_some(), "{profile}");
+        assert!(deny_deep_at.is_some(), "{profile}");
         assert!(allow_at.is_some(), "{profile}");
-        // The last matching rule wins: the .pub allow follows the deny.
-        assert!(allow_at > deny_at);
+        assert!(allow_deep_at.is_some(), "{profile}");
+        // The last matching rule wins: the .pub allows follow the denies.
+        assert!(allow_at > deny_deep_at);
+        assert!(allow_deep_at > deny_deep_at);
+    }
+
+    #[test]
+    fn test_watch_profile_guard_suffix_pattern() {
+        // A pattern with a leading `*` is a file name suffix. A name that
+        // ends with `_rsa` never ends with `.pub`, so the rule has no
+        // exception.
+        let profile = watch_profile(&[rule(
+            GuardAccess::Read,
+            GuardTarget::FilesInDir {
+                dir: "/nonexistent/u/.ssh".into(),
+                prefix: "*_rsa".to_string(),
+                exclude_suffix: Some(".pub".to_string()),
+            },
+        )]);
+        assert!(
+            profile
+                .contains(r#"(deny file-read-data (regex "^/nonexistent/u/\\.ssh/[^/]*_rsa$"))"#),
+            "{profile}"
+        );
+        assert!(
+            profile.contains(
+                r#"(deny file-read-data (regex "^/nonexistent/u/\\.ssh/.*/[^/]*_rsa$"))"#
+            ),
+            "{profile}"
+        );
+        assert!(
+            !profile.contains(r"\\*_rsa"),
+            "the leading star is a suffix mark, not a literal: {profile}"
+        );
+        assert!(
+            !profile.contains(".pub"),
+            "the exception matches no name: {profile}"
+        );
+    }
+
+    #[test]
+    fn test_name_pattern_regex_forms() {
+        assert_eq!(name_pattern_regex("id_"), "id_[^/]*");
+        assert_eq!(name_pattern_regex("*_rsa"), "[^/]*_rsa");
+        assert_eq!(name_pattern_regex("*.pem"), r"[^/]*\.pem");
+        assert_eq!(name_pattern_regex("a+b"), r"a\+b[^/]*");
+        assert_eq!(
+            excluded_name_regex("id_", ".pub"),
+            Some(r"id_[^/]*\.pub".to_string())
+        );
+        assert_eq!(excluded_name_regex("*_rsa", ".pub"), None);
+        // One suffix ends with the other: every `.tar.gz` ends with `.gz`.
+        assert_eq!(
+            excluded_name_regex("*.gz", ".tar.gz"),
+            Some(r"[^/]*\.tar\.gz".to_string())
+        );
+        assert_eq!(
+            excluded_name_regex("*.tar.gz", ".gz"),
+            Some(r"[^/]*\.tar\.gz".to_string())
+        );
     }
 
     #[test]

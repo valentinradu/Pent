@@ -607,17 +607,16 @@ mod macos {
 
     /// MAC-2. The guard rule for an SSH key uses a file name pattern. A
     /// pattern with a leading `*` is a name suffix (`*_rsa` matches
-    /// `github_rsa`). `add_guard_rules` escapes the `*` instead of
-    /// translating it, so the deny rule matches only a file whose name
-    /// starts with `*_rsa`.
+    /// `github_rsa`). `add_guard_rules` translates it into the regex
+    /// `^<dir>/[^/]*_rsa$`, so the guard hides such a key too.
     #[test]
-    #[ignore = "OPEN MAC-2: the macOS guard does not translate the suffix key patterns"]
     fn watch_guard_blocks_a_key_with_a_suffix_name() -> TestResult {
         if !ready("guard_suffix_key", &[SH]) {
             return Ok(());
         }
         let env = TestEnv::new()?;
         env.write_home(".ssh/github_rsa", "SUFFIX-KEY\n")?;
+        env.write_home(".ssh/github_rsa.pub", "PUBLIC-KEY\n")?;
         let out = env.pent_ok(&[
             "watch",
             "--yes",
@@ -626,27 +625,31 @@ mod macos {
             "--",
             SH,
             "-c",
-            "echo \"key=[$(cat ~/.ssh/github_rsa 2>/dev/null)]\"",
+            "echo \"key=[$(cat ~/.ssh/github_rsa 2>/dev/null)]\"; \
+             echo \"pub=[$(cat ~/.ssh/github_rsa.pub 2>/dev/null)]\"",
         ])?;
         assert!(
             stdout(&out).contains("key=[]\n"),
             "the guard must hide a key whose name ends with _rsa:\n{}",
             stdout(&out)
         );
+        assert!(
+            stdout(&out).contains("pub=[PUBLIC-KEY]\n"),
+            "the public key must stay readable:\n{}",
+            stdout(&out)
+        );
         let draft = fs::read_to_string(env.draft_path("k")).unwrap_or_default();
         assert!(
-            !draft.contains("github_rsa"),
+            !draft.contains("github_rsa\""),
             "the key went into the draft:\n{draft}"
         );
         Ok(())
     }
 
-    /// MAC-3. The macOS guard rule for a directory of keys is the regex
-    /// `^<dir>/<prefix>[^/]*$`, which matches only the direct children. The
-    /// Linux backend walks the tree (see H-13 in
-    /// `docs/security/linux-sandbox.md`).
+    /// MAC-3. The macOS guard rule for a directory of keys has two forms:
+    /// `^<dir>/<name>$` for a direct child and `^<dir>/.*/<name>$` for a
+    /// file deeper in the tree. A key in a subdirectory is thus hidden too.
     #[test]
-    #[ignore = "OPEN MAC-3: the macOS guard covers only the direct children of a guarded directory"]
     fn watch_guard_blocks_a_key_in_a_subdirectory() -> TestResult {
         if !ready("guard_subdirectory_key", &[SH]) {
             return Ok(());
@@ -667,6 +670,11 @@ mod macos {
             stdout(&out).contains("key=[]\n"),
             "the guard must hide a key in a subdirectory of ~/.ssh:\n{}",
             stdout(&out)
+        );
+        let draft = fs::read_to_string(env.draft_path("n")).unwrap_or_default();
+        assert!(
+            !draft.contains("id_x\""),
+            "the key went into the draft:\n{draft}"
         );
         Ok(())
     }
