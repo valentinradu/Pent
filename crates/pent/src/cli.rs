@@ -29,11 +29,13 @@ pub(crate) enum Command {
 
 #[derive(Args)]
 pub(crate) struct RunArgs {
-    /// Network containment mode
+    /// Network containment mode. This flag has precedence over --allow and
+    /// over the config. On macOS, proxy mode does not restrict the network
     #[arg(long, value_enum)]
     pub network: Option<NetworkModeArg>,
 
-    /// Add domain to proxy allowlist (implies --network proxy; repeatable)
+    /// Add domain to proxy allowlist (implies --network proxy if --network is
+    /// not set; repeatable)
     #[arg(long = "allow", value_name = "DOMAIN")]
     pub allow: Vec<String>,
 
@@ -69,16 +71,16 @@ pub(crate) struct RunArgs {
     #[arg(long)]
     pub no_config: bool,
 
-    /// Log every sandbox and proxy violation to .pent/trace.log without
-    /// killing the process (useful for discovering which paths and domains to
-    /// add to a profile)
+    /// Write sandbox and proxy events to .pent/trace.log. The process
+    /// continues after a denial. On Linux, pent records only the network
+    /// events of the proxy (proxy mode only), not filesystem denials. On
+    /// macOS, pent records the Seatbelt denials of the process tree. Tracing
+    /// does not change the network mode
     #[arg(long)]
     pub trace: bool,
 
     /// Disable filesystem sandbox (no Landlock, no overlayfs). Linux only.
     /// Network isolation is preserved unless --network unrestricted is also set.
-    /// When combined with --trace, logs every file open that would have been
-    /// denied, so you can discover which paths to add to your config.
     #[arg(long, hide = cfg!(target_os = "macos"))]
     pub no_sandbox: bool,
 

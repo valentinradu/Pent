@@ -27,7 +27,11 @@
 mod config;
 mod env;
 
-#[cfg(target_os = "macos")]
+// The SBPL generator is pure Rust, so its unit tests also run on Linux.
+// On Linux, only the tests use the module; the allow stops dead-code
+// warnings for the macOS spawn functions.
+#[cfg(any(target_os = "macos", test))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod macos;
 
 #[cfg(target_os = "linux")]

@@ -49,6 +49,8 @@ Pent launches a child process inside a sandbox with two complementary controls.
 
 On macOS, Pent generates a [Sandbox Profile Language (SBPL)](https://reverse.put.as/wp-content/uploads/2011/09/Apple-Sandbox-Guide-v1.0.pdf) policy and launches the child process via `sandbox-exec`.
 
+The profile starts from `(allow default)`. It denies file reads (file content) and file writes, and then allows the configured paths and the workspace. The last matching rule wins, so the profile ends with a rule that denies writes to `<workspace>/.pent`. The sandboxed process cannot change the project config. See [Platform limitations](#platform-limitations) for the operations that the profile does not limit.
+
 Network containment is not yet available on macOS. macOS does not expose network namespaces or a programmable packet filter API accessible without root, so the veth+proxy approach used on Linux has no direct equivalent. See [Platform limitations](#platform-limitations) below.
 
 ### Linux: Landlock + overlayfs + network namespaces
@@ -59,11 +61,31 @@ On Linux, Pent combines three kernel mechanisms. **Landlock LSM** restricts file
 
 Pent includes a DNS and TCP proxy. The DNS side returns `NXDOMAIN` for disallowed domains. The TCP side only forwards connections when the destination IP resolves to an allowed domain.
 
+### Network mode
+
+Pent uses the same rule on all platforms to select the network mode. The first item that applies sets the mode:
+
+1. An explicit `--network` flag.
+2. One or more `--allow` flags. These select proxy mode.
+3. The `[sandbox.network]` mode in the config.
+4. A `domain_allowlist` in the `[proxy]` section of the config. This selects proxy mode.
+5. The default: `blocked`.
+
+`--trace` does not change the network mode.
+
+### Signals
+
+Pent sends SIGTERM, SIGHUP, SIGUSR1 and SIGUSR2 to the child. Pent ignores SIGINT and SIGQUIT while the child runs: the terminal sends these signals to the child directly. After the child exits, Pent removes its temporary resources and exits with the status of the child. If a signal stopped the child, Pent stops itself with the same signal.
+
 ## Platform limitations
 
 ### macOS: network containment not yet available
 
-`--allow` and `--network proxy` are accepted on macOS but do not yet enforce network policy. Pent runs with unrestricted network access until a macOS-compatible isolation mechanism is implemented. On Linux, network policy is enforced at the kernel level via network namespaces.
+`--allow`, `--network proxy` and a `domain_allowlist` in the config are accepted on macOS, but they do not restrict the network. In proxy mode, Pent shows a warning and runs the process with unrestricted network access. `--network blocked` and `--network localhost` work on macOS. On Linux, network policy is enforced at the kernel level via network namespaces.
+
+### macOS: the profile starts from `(allow default)`
+
+The macOS profile is not a deny-by-default sandbox. It limits file content reads, file writes and (in the `blocked` and `localhost` modes) network access. All other operations stay allowed. For example, the process can read file metadata (`stat`) everywhere, look up Mach services, send signals and read sysctl values. The execute paths add allow rules for `process-exec`, but the profile has no global deny for `process-exec`.
 
 The macOS backend also ignores `[[sandbox.mounts]]`. Use `[sandbox.paths]` to give access to a path on macOS.
 
@@ -180,22 +202,34 @@ Profiles do not give access to secrets that you do not expect. `@keychain` gives
 
 ## Debugging
 
-### `--trace`: log policy violations at runtime
+### `--trace`: record denials at runtime
 
-Use `--trace` to log every denial without killing the process. Pent will emit a fix hint for each violation so you can copy-paste the missing paths and domains into your config.
+Use `--trace` to record denials in `.pent/trace.log`. The process continues after a denial. `--trace` does not change the network mode.
 
 ```bash
 pent run --trace -- claude
 cat .pent/trace.log
 ```
 
-Example output:
+The events that Pent records are different on each platform.
+
+**macOS.** Pent reads the Seatbelt denials of the process and of its child processes from the unified log (`log stream`). Pent starts `log stream` before the process. For a denied file read, file write or `process-exec`, Pent adds a fix hint with the correct config key. Network denials and other denials have no fix hint. Example output:
+
 ```
-pent: [denied] filesystem: "claude" was denied "read" access to "/Users/alice/.ssh/id_rsa"
-pent: fix: add "/Users/alice/.ssh/id_rsa" to [sandbox.paths.read] in your pent config
+pent: [denied] filesystem: "cat" (pid 4321) was denied file-read-data on "/Users/alice/.ssh/id_rsa"
+pent: fix: add "/Users/alice/.ssh/id_rsa" to read in the [sandbox.paths] section of your pent config
 ```
 
-`--trace` only records accesses that Pent's sandbox actually intercepts and denies. It cannot tell you everything a binary will try to open before you run it. For a complete picture, use `strace`.
+**Linux.** Pent records the DNS queries and connections that go through the proxy. This occurs only in proxy mode (`--allow`, `--network proxy`, or a `domain_allowlist` in the config). In other modes, Pent shows a note and records no network events. Pent does not record filesystem denials on Linux yet. Use `strace` (see below) to find the paths. Example output:
+
+```
+pent: [denied] network: DNS query for "evil.example" blocked — domain not in allowlist
+pent: fix: add "evil.example" to domain_allowlist in the [proxy] section of your pent config
+
+pent: [allowed] network: connection to "example.com" allowed
+```
+
+`--trace` records only the accesses that the sandbox or the proxy denies. It cannot show all the files that a program tries to open before you run it. For a complete list, use `strace`.
 
 ### `strace`: discover all filesystem access upfront
 
