@@ -465,6 +465,11 @@ mod macos {
     /// child: the shell runs `cat` with the process ID of the root, and
     /// the recorder keeps each access of it. The fork is the gap, not the
     /// exec.
+    ///
+    /// Read the summary in the message of the failure. "27 accesses by 3
+    /// processes" is MAC-10: the root is there and the child is not.
+    /// "0 accesses" is MAC-12: this is the first watch run of the machine,
+    /// and the first `log stream` gives no report at all.
     #[test]
     #[ignore = "OPEN MAC-10: the recorder misses a child that lives less than one ps poll; kqueue NOTE_TRACK gives ENOTSUP, so the next step is EndpointSecurity"]
     fn watch_records_a_read_of_a_short_lived_child() -> TestResult {

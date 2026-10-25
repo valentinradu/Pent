@@ -2029,6 +2029,42 @@ mod tests {
         assert!(!profile.contains(".pent"), "watch mode has no run policy");
     }
 
+    /// MAC-4. The run profile denies the three ways to run a program that
+    /// no profile holds, and each allow of a Mach service comes after the
+    /// deny, because the last matching rule wins.
+    #[test]
+    fn the_run_profile_denies_each_route_out_of_the_sandbox() {
+        let config = SandboxConfig::new("/w".into(), make_test_paths(), "/w".into());
+        let profile = generate_sbpl_profile(&config).unwrap();
+        for deny in [
+            "(deny process-exec)\n",
+            "(deny job-creation)\n",
+            "(deny mach-lookup)\n",
+        ] {
+            assert!(profile.contains(deny), "the profile has no {deny}{profile}");
+        }
+        let deny_at = profile.find("(deny mach-lookup)\n").unwrap();
+        assert!(!SYSTEM_MACH_SERVICES.is_empty(), "the allowlist is empty");
+        for (name, why) in SYSTEM_MACH_SERVICES {
+            let rule = format!("(allow mach-lookup (global-name \"{name}\"))\n");
+            let allow_at = profile.find(&rule);
+            assert!(
+                allow_at.is_some_and(|at| at > deny_at),
+                "the allow of {name} must come after the deny: {profile}"
+            );
+            assert!(!why.is_empty(), "the service {name} names no reason");
+        }
+    }
+
+    /// Watch mode observes; it must not deny a Mach service or a job.
+    #[test]
+    fn the_watch_profile_denies_no_mach_service() {
+        let config = SandboxConfig::new("/w".into(), make_test_paths(), "/w".into());
+        let profile = generate_watch_profile(&config, &[]).unwrap();
+        assert!(!profile.contains("(deny mach-lookup)"), "{profile}");
+        assert!(!profile.contains("(deny job-creation)"), "{profile}");
+    }
+
     #[test]
     fn test_watch_profile_unrestricted_has_no_network_deny() {
         let config = SandboxConfig::new("/w".into(), make_test_paths(), "/w".into())

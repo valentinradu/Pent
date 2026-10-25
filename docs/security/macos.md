@@ -12,10 +12,12 @@ MAC-7, MAC-8, MAC-9 and MAC-11, each macOS suite is green on
 | `e2e_macos_network` | 4 passed |
 | `integration_test` (the thirteen tests of MAC-7) | 20 passed |
 | `differential_guard` | each row agrees (DIFF-9) |
-| `pent-sandbox` unit and oracle tests | 117 passed |
+| `pent-sandbox` unit and oracle tests | each test passed |
 
-MAC-10 is the one finding that stays open. The runs of 2026-10-25
-measured each way out of it; the section of MAC-10 holds the numbers.
+Two findings stay open. MAC-10 is the one that the review named: the runs
+of 2026-10-25 measured each way out of it, and the section of MAC-10 holds
+the numbers. MAC-12 is new: the same runs showed that the first watch run
+of a machine records nothing.
 
 ## What this document is
 
@@ -191,6 +193,7 @@ out.
 | MAC-8 | High | The reader took the name of each report from the process table only, so it dropped the reports of a process that lives a short time or that runs a new file. Watch mode recorded nothing. | Fixed | `watch_records_a_read_of_a_known_file` |
 | MAC-9 | Low | `sandbox-exec` refuses a string over about 1000 bytes in a profile. | Documented | `a_path_over_the_limit_of_the_reader_gives_a_profile_that_it_refuses` |
 | MAC-10 | Medium | The recorder loses the accesses of a child process that lives less than one poll of `ps`. | Open; `kqueue` cannot fix it | `watch_records_a_read_of_a_short_lived_child` (ignored) |
+| MAC-12 | Medium | The first watch run of a machine records nothing: the first `log stream` delivers no report. | Open; measured, no test | None yet |
 
 ### MAC-1 — the program forges its own events
 
@@ -733,6 +736,45 @@ file itself, with the `read` builtin and a redirect, so the access is in
 the root process. `watch_records_a_read_of_a_short_lived_child` holds the
 gap with an `#[ignore]` mark, and `pent watch --append` merges more runs.
 The README says the same in its own words.
+
+### MAC-12 — the first watch run of a machine records nothing
+
+**Severity: medium. Open. Measured on 2026-10-25; no test yet.**
+
+The runs of MAC-10 found a second effect. The **first** `log stream` of a
+machine delivers no report at all, and the next one works. The run
+40239388624 holds the measurement: the step first ran one watch command by
+hand and then the test of MAC-10, which runs the same command.
+
+```text
+W   the first watch run of the job:  No new rules from 0 accesses
+    (the raw log of the run is a file of 0 bytes)
+the test right after it:            No new rules from 27 accesses by 3 processes
+```
+
+Each earlier run shows the same order: the first watch command of a macOS
+job records nothing, and every one after it records its accesses. The
+cause is in the start of the stream, not in the reader:
+`LogReader::start` waits for the **header** of `log stream`, which `log`
+prints before it connects to the log, and the comment of the function
+already names that race. On a machine whose log system is cold, the
+connection takes longer than the whole run of a short command.
+
+**The fix.** Wait for a report, not for the header. Pent can ask the
+kernel for one report of its own before the spawn — for example a read
+that a one-rule profile reports — and start the child only when that
+report comes back through the stream. A timeout then warns instead of
+recording a silent nothing. The warning matters more than the wait: a
+watch run that records nothing must say so, and today it says
+"No new rules from 0 accesses", which reads like a program that did
+nothing.
+
+**Why there is no test yet.** The effect shows only on the first
+`log stream` of a machine, so a test of it passes as soon as another test
+of the suite has run before it. A test needs a way to put the log system
+back into its cold state, and this work found none. The finding thus
+carries the measurement and no test, which the rules of the repository
+allow only with this sentence: **nobody holds MAC-12 against a change.**
 
 ## What the first run told us
 

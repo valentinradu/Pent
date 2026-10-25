@@ -51,7 +51,7 @@ Pent launches a child process inside a sandbox with two complementary controls.
 
 On macOS, Pent generates a [Sandbox Profile Language (SBPL)](https://reverse.put.as/wp-content/uploads/2011/09/Apple-Sandbox-Guide-v1.0.pdf) policy and launches the child process via `sandbox-exec`.
 
-The profile starts from `(allow default)`. It denies file reads (file content), file writes and program execution, and then allows the configured paths, the workspace and the system program directories. Every other operation stays allowed, so a program that wants to leave the sandbox can leave it: see [macOS: the profile starts from `(allow default)`](#macos-the-profile-starts-from-allow-default).
+The profile starts from `(allow default)`. It denies file reads (file content), file writes, program execution, a launchd job and a Mach service lookup, and then allows the configured paths, the workspace, the system program directories and the Mach services that an ordinary program needs. The other operation families stay allowed: see [macOS: the profile starts from `(allow default)`](#macos-the-profile-starts-from-allow-default).
 
 macOS has no network namespaces. In proxy mode, the profile denies outbound connections and allows only the proxy port on loopback, the system name resolver socket and the Unix sockets in the writable paths. See [Platform limitations](#platform-limitations) below.
 
@@ -88,25 +88,28 @@ On macOS, the Seatbelt profile enforces proxy mode. The process can connect only
 
 ### macOS: the profile starts from `(allow default)`
 
-The macOS profile is not a deny-by-default sandbox. It limits file content reads, file writes and (in the `blocked` and `localhost` modes) network access. All other operations stay allowed:
+The macOS profile is not a deny-by-default sandbox. It limits file content reads, file writes, program execution, a launchd job, a Mach service lookup and (in the `blocked` and `localhost` modes) network access. These operation families stay allowed:
 
-- a Mach service lookup, so the process reaches `launchd` and the services of your applications;
 - a metadata read (`stat`) on every path, also outside the profile;
-- a signal to another process of yours, a sysctl read, and the other operation families of SBPL.
+- a signal to another process of yours, a sysctl read, an IOKit open, and the other operation families of SBPL.
 
-Program execution has a global deny since the first run on a Mac. The profile allows `process-exec` for the `execute` paths, for the executable files of the read paths and for the system program directories. The workspace is in none of these, so a program in the workspace runs only with `--execute`, as on Linux.
+**The three ways to run a program are closed.** Pent denies `process-exec`, and it allows it again for the `execute` paths, for the executable files of the read paths and for the system program directories. The workspace is in none of these, so a program in the workspace runs only with `--execute`, as on Linux. Pent also denies `job-creation`, so the process cannot ask `launchd` for a job, and `mach-lookup`, so it cannot ask a service of another program to act for it. The allowlist of the Mach services holds the ones that an ordinary program needs; a run on a Mac named each one. See MAC-4 in [docs/security/macos.md](docs/security/macos.md).
 
-**A program can still leave the macOS sandbox.** It asks `launchd` to start a program, and that program is a child of `launchd`, not of the sandboxed process, so it runs with no profile at all. On macOS, the filesystem sandbox of Pent stops an accident; it does not stop a program that wants out. Linux has no such hole: the Landlock rules and the namespaces hold for every descendant. The finding is MAC-4 in [docs/security/macos.md](docs/security/macos.md), with the test that states the secure behaviour.
+None of the operation families that stay allowed runs a program outside the sandbox. A deny-by-default profile is still the stronger form, and it needs a run on a Mac for each family that an ordinary program uses.
 
 The macOS backend also ignores `[[sandbox.mounts]]`. Use a profile rule (or `--read`, `--write`) to give access to a path on macOS.
 
-### macOS: watch mode records the root process, not every child
+### macOS: watch mode records the root process, not every forked child
 
 The macOS test suite ran on a Mac for the first time on 2026-10-25. The profile forms and the reader of the unified log hold, with these results.
 
-Watch mode reads the Seatbelt reports of the kernel from the unified log. To tell a real report from a line that the watched program writes itself, Pent checks the name of each report against the program that the process runs, and it reads the process tree from `ps`. A child process that lives less than one poll of `ps` (about 100 ms) never reaches that tree, so Pent loses its accesses. The root process of the run has no such gap.
+Watch mode reads the Seatbelt reports of the kernel from the unified log. To tell a real report from a line that the watched program writes itself, Pent checks the name of each report against the program that the process runs, and it reads the process tree from `ps`. A child process that lives less than one poll of `ps` (about 100 ms) never reaches that tree, so Pent loses its accesses. The root process of the run has no such gap, and a program that the root runs **in place** has none either: it keeps the process ID of the root, and Pent learns its name from the exec report of the kernel. A shell that runs one command (`sh -c 'cat FILE'`) works this way. A shell that runs two forks for the first one, and that child is the gap.
 
-Watch mode on macOS is therefore a lower bound: the draft can miss an access of a short-lived child, and `pent watch --append` merges more runs. Linux has no such gap, because the Linux recorder reads each access from the kernel through seccomp. The finding is MAC-10 in [docs/security/macos.md](docs/security/macos.md), with the test that states the secure behaviour.
+A run on a Mac measured the recommended fix and it does not work: `kqueue` with `EVFILT_PROC` and `NOTE_TRACK` answers `ENOTSUP`, so the kernel of macOS never names the child of a fork. The next step needs the `EndpointSecurity` framework, which needs an Apple entitlement that a tool you build yourself cannot have.
+
+The first watch run of a machine also records nothing, because the first `log stream` delivers no report: run `pent watch` a second time if the summary says "No new rules from 0 accesses" (MAC-12).
+
+Watch mode on macOS is therefore a lower bound: the draft can miss an access of a forked short-lived child, and `pent watch --append` merges more runs. Linux has no such gap, because the Linux recorder reads each access from the kernel through seccomp. The finding is MAC-10 in [docs/security/macos.md](docs/security/macos.md), with the test that states the secure behaviour.
 
 ### Linux: requirements and Unix sockets
 

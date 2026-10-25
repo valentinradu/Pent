@@ -39,6 +39,7 @@ pent/
     │       ├── env.rs            # build_env, resolve_path_directories
     │       ├── macos.rs          # macOS Seatbelt (SBPL) backend
     │       ├── macos_log.rs      # macOS Seatbelt report reader (log stream)
+    │       ├── macos_kqueue.rs   # the measurement of kqueue for MAC-10 (tests only)
     │       ├── linux.rs          # Linux Landlock backend
     │       ├── linux_landlock.rs # Landlock syscalls
     │       ├── linux_overlayfs.rs# overlayfs shadow and flush
@@ -183,4 +184,6 @@ The differences from Linux:
 - DNS does not go through the pent DNS server. The system resolver answers each query, so the child can resolve names that the allowlist does not have. It cannot connect to them. The proxy resolves the names for proxy-aware clients.
 - The child cannot connect to the other loopback ports of the host.
 
-Watch mode uses a Seatbelt profile that allows each operation with `(with report)` and denies the guard accesses. `macos_log.rs` reads the reports from `log stream`. The suite ran on a Mac on 2026-10-25, and each SBPL form of `macos.rs` holds. The reader builds the process tree from a poll of `ps`, so it loses the accesses of a child process that lives less than one poll (MAC-10 in `docs/security/macos.md`). The run profile also denies `process-exec` and allows the `execute` paths and `SYSTEM_EXEC_PATHS`.
+Watch mode uses a Seatbelt profile that allows each operation with `(with report)` and denies the guard accesses. `macos_log.rs` reads the reports from `log stream`. The suite ran on a Mac on 2026-10-25, and each SBPL form of `macos.rs` holds. The reader builds the process tree from a poll of `ps`, so it loses the accesses of a child process that forks and exits inside one poll (MAC-10 in `docs/security/macos.md`). `kqueue` cannot close that gap: macOS answers `ENOTSUP` for `NOTE_TRACK`, so the kernel never names the child of a fork. A program that the root runs in place keeps the PID of the root and has no gap.
+
+The run profile denies the three ways to run a program that no profile holds: `process-exec` (it allows the `execute` paths and `SYSTEM_EXEC_PATHS` again), `job-creation` (a launchd job) and `mach-lookup` (a service of another program; it allows `SYSTEM_MACH_SERVICES` again). The other operation families of SBPL stay allowed, so the profile is still not deny-by-default. See MAC-4.
