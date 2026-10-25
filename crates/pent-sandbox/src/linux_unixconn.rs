@@ -245,7 +245,10 @@ fn socket_kind(tid: u32, fd: RawFd) -> Option<libc::c_int> {
 /// Return the inode number of the target of `/proc/<pid>/fd/<fd>` when the
 /// descriptor is a socket (`socket:[12345]`).
 fn parse_socket_inode(link: &str) -> Option<u64> {
-    link.strip_prefix("socket:[")?.strip_suffix(']')?.parse().ok()
+    link.strip_prefix("socket:[")?
+        .strip_suffix(']')?
+        .parse()
+        .ok()
 }
 
 /// Return the socket type of the line of `inode` in the text of
@@ -420,7 +423,10 @@ mod tests {
 
     #[test]
     fn fdinfo_flags_are_octal() {
-        assert_eq!(parse_fdinfo_flags("pos:\t0\nflags:\t02000002\n"), Some(0o2000002));
+        assert_eq!(
+            parse_fdinfo_flags("pos:\t0\nflags:\t02000002\n"),
+            Some(0o2000002)
+        );
         assert_eq!(parse_fdinfo_flags("flags:\t0\n"), Some(0));
         assert_eq!(parse_fdinfo_flags("pos:\t0\n"), None);
     }
@@ -451,10 +457,7 @@ mod tests {
         let kind = socket_kind(tid, listener.as_raw_fd());
         assert_eq!(kind, Some(libc::SOCK_STREAM), "{kind:?}");
         let dgram = UnixDatagram::unbound()?;
-        assert_eq!(
-            socket_kind(tid, dgram.as_raw_fd()),
-            Some(libc::SOCK_DGRAM)
-        );
+        assert_eq!(socket_kind(tid, dgram.as_raw_fd()), Some(libc::SOCK_DGRAM));
         Ok(())
     }
 

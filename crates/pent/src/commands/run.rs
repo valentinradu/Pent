@@ -257,7 +257,11 @@ fn add_cli_paths(paths: &mut pent_settings::SandboxPaths, args: &RunArgs) {
 ///
 /// A leading `~` expands to the home directory, as it does for the other
 /// path lists. A relative path resolves against the workspace.
-fn unix_socket_paths(profile: &[String], flags: &[PathBuf], workspace: &Path) -> Vec<PathBuf> {
+pub(crate) fn unix_socket_paths(
+    profile: &[String],
+    flags: &[PathBuf],
+    workspace: &Path,
+) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
     let mut add = |entry: &Path| {
         let path = pent_settings::expand_home(entry);

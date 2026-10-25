@@ -837,7 +837,6 @@ impl Judge {
             Self::Policy(_) => false,
         }
     }
-
 }
 
 /// The guard access that matches a filesystem operation.
@@ -1714,12 +1713,7 @@ mod tests {
 
     /// The same interpreter, with a value for the first argument of the
     /// system call.
-    fn run_bpf_with_arg0(
-        prog: &[libc::sock_filter],
-        nr: u32,
-        arch: u32,
-        arg0: u64,
-    ) -> Option<u32> {
+    fn run_bpf_with_arg0(prog: &[libc::sock_filter], nr: u32, arch: u32, arg0: u64) -> Option<u32> {
         let mut data = [0u8; 64];
         data.get_mut(0..4)?.copy_from_slice(&nr.to_ne_bytes());
         data.get_mut(4..8)?.copy_from_slice(&arch.to_ne_bytes());
@@ -2024,10 +2018,7 @@ mod tests {
     fn unix_targets() {
         let resolve = |raw: &[u8]| resolve_path(raw, false, || Some(PathBuf::from("/cwd")));
         let target = |bytes: &[u8]| unix_target(bytes, resolve).map(|a| a.display());
-        assert_eq!(
-            target(b"/run/x.sock\0\0"),
-            Some("/run/x.sock".to_string())
-        );
+        assert_eq!(target(b"/run/x.sock\0\0"), Some("/run/x.sock".to_string()));
         assert_eq!(target(b"rel.sock"), Some("/cwd/rel.sock".to_string()));
         assert_eq!(target(b"\0abstract"), Some("@abstract".to_string()));
         // The kernel keeps the whole address of an abstract name, so the

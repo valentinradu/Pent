@@ -1,9 +1,9 @@
 //! `pent watch`: record what a command does, then make a draft profile.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use pent_profile::{guard_rules_with, WatchEvent};
+use pent_profile::{guard_rules_with, ProfileName, WatchEvent};
 use pent_proxy::ProxyPolicy;
 use pent_sandbox::{
     build_env, spawn_watched, SandboxConfig, SandboxError, SandboxPaths, WatchOptions,
@@ -183,9 +183,13 @@ pub(crate) async fn watch(args: WatchArgs, cwd: PathBuf) -> Result<(), CliError>
             &home,
             &[store.dirs().config.clone(), store.dirs().state.clone()],
         ),
-        // Watch mode records each connection to a Unix socket and refuses
-        // it, so that the review can propose the path.
-        unix_sockets: Vec::new(),
+        // Watch mode does not refuse a connection to a Unix socket: a
+        // refusal would change the run that pent records. The supervisor
+        // marks a connection to a socket that this list does not name as
+        // denied, and the review proposes the path. The list holds the
+        // sockets that the profile and the current draft already name, so
+        // the review does not propose them again.
+        unix_sockets: known_unix_sockets(&store, &name, &cwd)?,
     };
 
     let mut signals = SignalRelay::install()?;
@@ -291,6 +295,32 @@ fn spawn_error(e: SandboxError) -> CliError {
         )),
         other => CliError::Sandbox(other),
     }
+}
+
+/// The Unix socket paths that the profile and the current draft of `name`
+/// already name.
+fn known_unix_sockets(
+    store: &ProfileStore,
+    name: &ProfileName,
+    workspace: &Path,
+) -> Result<Vec<PathBuf>, CliError> {
+    let mut entries = store
+        .load(name)?
+        .doc
+        .map(|doc| doc.filesystem.unix_sockets)
+        .unwrap_or_default();
+    if let Some(draft) = store.read_draft(name)? {
+        for entry in draft.filesystem.unix_sockets {
+            if !entries.contains(&entry) {
+                entries.push(entry);
+            }
+        }
+    }
+    Ok(crate::commands::run::unix_socket_paths(
+        &entries,
+        &[],
+        workspace,
+    ))
 }
 
 #[cfg(test)]
