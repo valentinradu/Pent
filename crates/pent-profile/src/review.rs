@@ -11,7 +11,7 @@ use std::collections::BTreeSet;
 use crate::render::{
     column_width, item_comment, item_label, plural, push_row, safe, section_title, SECTIONS,
 };
-use crate::summary::{Section, Summary};
+use crate::summary::Summary;
 
 /// The items that the user selected, as indices into [`Summary::items`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -156,10 +156,10 @@ pub fn review<R: BufRead, W: Write>(
         }
         output.write_all(text.as_bytes())?;
 
-        let (default, hint) = if section == Section::Blocked {
-            (Answer::Nothing, 'n')
-        } else {
+        let (default, hint) = if section.selects_by_default() {
             (Answer::All, 'a')
+        } else {
+            (Answer::Nothing, 'n')
         };
         let answer = loop {
             write!(output, "{PROMPT} [{hint}] ")?;
@@ -223,16 +223,22 @@ mod tests {
         Ok((selection, String::from_utf8_lossy(&output).into_owned()))
     }
 
-    /// The indices of the fixture items, by section. The fixture has 3
-    /// read-write, 4 read, 2 execute, 4 network and 2 blocked items.
-    const BLOCKED: [usize; 2] = [13, 14];
+    /// The indices of the fixture items that the review does not select by
+    /// default. The fixture has 3 read-write, 4 read, 2 execute, 1 Unix
+    /// socket, 4 network and 2 blocked items.
+    const NOT_BY_DEFAULT: [usize; 3] = [9, 14, 15];
+
+    /// The indices that the review selects by default.
+    fn by_default() -> Vec<usize> {
+        (0..16).filter(|i| !NOT_BY_DEFAULT.contains(i)).collect()
+    }
 
     /// The output has no echo of the input, so each prompt ends with a
     /// space and the next line follows it.
     #[test]
     fn session_snapshot_with_defaults() -> io::Result<()> {
         let summary = claude_summary();
-        let (selection, text) = run(&summary, "\n\n\n\n\n")?;
+        let (selection, text) = run(&summary, "\n\n\n\n\n\n")?;
         let expected = "\
 Read-write (3)
   1  ~/.cache/claude  cache
@@ -249,6 +255,9 @@ Execute (2)
   1  ~/.local/share/claude  runs claude
   2  ~/.nvm/versions/node   runs node
 Accept: [a]ll, [n]one, or the numbers (1,3-5)? [a] 
+Unix sockets (1)
+  1  /run/user/1000/bus  D-Bus
+Accept: [a]ll, [n]one, or the numbers (1,3-5)? [n] 
 Network (4)
   1  api.anthropic.com      HTTPS
   2  github.com             port 22
@@ -259,36 +268,37 @@ Blocked by the guard (2)
   1  write ~/.bashrc         node (persistence)
   2  read ~/.ssh/id_ed25519  ssh (credential)
 Accept: [a]ll, [n]one, or the numbers (1,3-5)? [n] 
-13 of 15 rules selected
+13 of 16 rules selected
 ";
         assert_eq!(text, expected, "\n{text}");
-        assert_eq!(selection.indices, (0..13).collect::<Vec<_>>());
+        assert_eq!(selection.indices, by_default());
         Ok(())
     }
 
     #[test]
     fn none_rejects_each_section() -> io::Result<()> {
         let summary = claude_summary();
-        let (selection, text) = run(&summary, "n\nnone\nN\n NONE \nn\n")?;
+        let (selection, text) = run(&summary, "n\nnone\nN\nnone\n NONE \nn\n")?;
         assert!(selection.indices.is_empty());
-        assert!(text.ends_with("\n0 of 15 rules selected\n"), "{text}");
+        assert!(text.ends_with("\n0 of 16 rules selected\n"), "{text}");
         Ok(())
     }
 
     #[test]
-    fn all_selects_blocked_items_too() -> io::Result<()> {
+    fn all_selects_the_strong_grants_too() -> io::Result<()> {
         let summary = claude_summary();
-        let (selection, _) = run(&summary, "a\nall\nA\n\nall\n")?;
-        assert_eq!(selection.indices, (0..15).collect::<Vec<_>>());
+        let (selection, _) = run(&summary, "a\nall\nA\na\n\nall\n")?;
+        assert_eq!(selection.indices, (0..16).collect::<Vec<_>>());
         Ok(())
     }
 
     #[test]
     fn numbers_and_ranges_pick_items() -> io::Result<()> {
         let summary = claude_summary();
-        // Read-write: 1 and 3. Read: 2-4. Execute: 2. Network: 1, 3. Blocked: 2.
-        let (selection, _) = run(&summary, "1,3\n2-4\n2\n1 3\n2\n")?;
-        assert_eq!(selection.indices, vec![0, 2, 4, 5, 6, 8, 9, 11, 14]);
+        // Read-write: 1 and 3. Read: 2-4. Execute: 2. Unix sockets: 1.
+        // Network: 1, 3. Blocked: 2.
+        let (selection, _) = run(&summary, "1,3\n2-4\n2\n1\n1 3\n2\n")?;
+        assert_eq!(selection.indices, vec![0, 2, 4, 5, 6, 8, 9, 10, 12, 15]);
         Ok(())
     }
 
@@ -302,21 +312,23 @@ Accept: [a]ll, [n]one, or the numbers (1,3-5)? [n]
         assert_eq!(errors, 6, "{text}");
         // Read-write: item 2. The input ends, so the other sections get
         // their defaults.
-        let mut expected = vec![1];
-        expected.extend(3..13);
+        let expected: Vec<usize> = by_default()
+            .into_iter()
+            .filter(|&i| i != 0 && i != 2)
+            .collect();
         assert_eq!(selection.indices, expected);
         Ok(())
     }
 
     #[test]
-    fn end_of_input_keeps_blocked_items_unselected() -> io::Result<()> {
+    fn end_of_input_keeps_the_strong_grants_unselected() -> io::Result<()> {
         let summary = claude_summary();
         let (selection, text) = run(&summary, "")?;
-        assert_eq!(selection.indices, (0..13).collect::<Vec<_>>());
-        for i in BLOCKED {
+        assert_eq!(selection.indices, by_default());
+        for i in NOT_BY_DEFAULT {
             assert!(!selection.indices.contains(&i));
         }
-        assert!(text.ends_with("13 of 15 rules selected\n"), "{text}");
+        assert!(text.ends_with("13 of 16 rules selected\n"), "{text}");
         Ok(())
     }
 

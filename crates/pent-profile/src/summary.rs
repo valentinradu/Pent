@@ -80,6 +80,13 @@ pub enum Grant {
     },
     /// A domain for the proxy allowlist (can start with `*.`).
     Domain(String),
+    /// A Unix socket that the program can connect to. The path uses `~/` for
+    /// the home directory.
+    ///
+    /// This rule is a strong grant: a program that reaches the socket of an
+    /// agent can use the key of that agent. The review does not select such
+    /// an item by default.
+    UnixSocket(String),
 }
 
 /// A note that the summary shows next to an item.
@@ -118,10 +125,24 @@ pub enum Section {
     Read,
     /// Execute filesystem rules.
     Execute,
+    /// Unix sockets.
+    UnixSockets,
     /// Domains.
     Network,
     /// Accesses that the watch guard blocked.
     Blocked,
+}
+
+impl Section {
+    /// Return true if the review selects the items of this section by
+    /// default.
+    ///
+    /// A blocked access and a Unix socket are strong grants, so the user
+    /// must select them. The default of these two sections is `[n]`.
+    #[must_use]
+    pub const fn selects_by_default(self) -> bool {
+        !matches!(self, Self::Blocked | Self::UnixSockets)
+    }
 }
 
 impl Item {
@@ -138,6 +159,7 @@ impl Item {
                 FsAccess::Execute => Section::Execute,
             },
             Grant::Domain(_) => Section::Network,
+            Grant::UnixSocket(_) => Section::UnixSockets,
         }
     }
 }
@@ -152,10 +174,12 @@ pub struct Stats {
     pub net_events: usize,
     /// The distinct process names, in order of first appearance.
     pub processes: Vec<String>,
-    /// The distinct Unix sockets that the program connected to (`~/` for the
-    /// home directory, `@name` for an abstract socket). The sandbox cannot
-    /// allow a Unix socket by rule, so the summary makes no item for them.
-    pub unix_sockets: Vec<String>,
+    /// The distinct Unix socket targets that a rule cannot name: an abstract
+    /// address (`@name`) and a relative path. The sandbox cannot reach them,
+    /// so the summary makes no item for them.
+    pub unreachable_sockets: Vec<String>,
+    /// The number of connections to a Unix socket that pent refused.
+    pub refused_unix_sockets: usize,
     /// The distinct connections to an IP address without a name, as
     /// `address:port`. The proxy cannot allow an IP address, so the summary
     /// makes no item for them.
@@ -211,6 +235,7 @@ impl Summary {
                     (list, path)
                 }
                 Grant::Domain(d) => (&mut doc.network.domains, d),
+                Grant::UnixSocket(s) => (&mut doc.filesystem.unix_sockets, s),
             };
             if !list.0.contains(list.1) {
                 list.0.push(list.1.clone());
@@ -250,8 +275,12 @@ impl Summary {
 ///   [`Outcome::Denied`] become normal items.
 /// - Three or more names below one registrable domain become `*.domain`,
 ///   except on a public suffix.
-/// - Connections to an IP address and to Unix sockets give no item. The
-///   summary lists them in [`Stats`].
+/// - A `connect()` to a Unix socket with a path gives one item with
+///   [`Grant::UnixSocket`]. An abstract address (`@name`) and a relative
+///   path give no item: a rule cannot name them. The summary lists them in
+///   [`Stats::unreachable_sockets`].
+/// - Connections to an IP address give no item. The summary lists them in
+///   [`Stats::ip_hosts`].
 #[must_use]
 pub fn summarize<'a, I>(events: I, ctx: &SummaryContext) -> Summary
 where
@@ -262,7 +291,7 @@ where
     let mut fs = FsLog::default();
     let mut blocked: BTreeMap<(FsAccess, PathBuf), BlockedEntry> = BTreeMap::new();
     let mut net = NetLog::default();
-    let mut unix = Names::default();
+    let mut unix = UnixLog::default();
     let mut ips = Names::default();
 
     for event in events {
@@ -293,18 +322,23 @@ where
                 }
             }
             WatchEvent::UnixConnect {
-                target, process, ..
+                target,
+                process,
+                outcome,
             } => {
                 stats.fs_events = stats.fs_events.saturating_add(1);
                 add_name(&mut stats.processes, &process.name);
-                let shown = if target.starts_with('@') {
-                    target.clone()
-                } else {
-                    normalize(Path::new(target))
-                        .and_then(|p| env.display(&p))
-                        .unwrap_or_else(|| target.clone())
-                };
-                unix.add(&shown);
+                if *outcome == Outcome::Denied {
+                    stats.refused_unix_sockets = stats.refused_unix_sockets.saturating_add(1);
+                }
+                // An abstract address and a relative path cannot be a rule.
+                let path = (!target.starts_with('@'))
+                    .then(|| normalize(Path::new(target)))
+                    .flatten();
+                match path.as_deref().and_then(|p| env.display(p)) {
+                    Some(shown) => unix.add(&shown, &process.name),
+                    None => unix.unreachable.add(target),
+                }
             }
             WatchEvent::Dns { name, .. } => {
                 stats.net_events = stats.net_events.saturating_add(1);
@@ -320,12 +354,13 @@ where
             }
         }
     }
-    stats.unix_sockets = unix.0;
+    stats.unreachable_sockets = unix.unreachable.0.clone();
     stats.ip_hosts = ips.0;
 
     let mut items = fs_items(&fs, &env, &stats.processes);
     items.extend(blocked_items(blocked, &env));
     items.extend(net.items());
+    items.extend(unix.items());
     if let Some(existing) = &ctx.existing {
         items.retain(|item| !doc_covers(existing, &item.grant, &env));
     }
@@ -1121,6 +1156,78 @@ fn port_reason(ports: &BTreeSet<u16>) -> String {
     list_names(&parts)
 }
 
+// ── Unix sockets ─────────────────────────────────────────────────────────────
+
+/// Return the name of a common Unix socket, or `None` for a socket that
+/// pent does not know.
+///
+/// The name tells the user what the rule gives. A program that reaches the
+/// socket of an agent can use the key of that agent.
+fn known_socket(path: &str) -> Option<&'static str> {
+    let lower = path.to_ascii_lowercase();
+    let name = lower.rsplit('/').next().unwrap_or(lower.as_str());
+    if lower.contains("ssh-agent")
+        || name.starts_with("agent.")
+        || lower.ends_with("/keyring/ssh")
+        || lower.ends_with("/gcr/ssh")
+    {
+        return Some("ssh-agent");
+    }
+    if lower.contains("gpg-agent") {
+        return Some("gpg-agent");
+    }
+    if name == "bus" || name.ends_with("_bus_socket") || lower.contains("dbus") {
+        return Some("D-Bus");
+    }
+    if name == "docker.sock" || name == "podman.sock" {
+        return Some("Docker");
+    }
+    None
+}
+
+/// The connections to a Unix socket that the summary keeps.
+#[derive(Default)]
+struct UnixLog {
+    /// The processes of each socket, by the path in the form of the profile.
+    sockets: BTreeMap<String, Names>,
+    /// The targets that a rule cannot name.
+    unreachable: Names,
+}
+
+impl UnixLog {
+    fn add(&mut self, shown: &str, process: &str) {
+        self.sockets
+            .entry(shown.to_string())
+            .or_default()
+            .add(process);
+    }
+
+    /// One item for each socket path.
+    fn items(&self) -> Vec<Item> {
+        self.sockets
+            .iter()
+            .map(|(path, processes)| Item {
+                grant: Grant::UnixSocket(path.clone()),
+                reason: unix_reason(path, &processes.0),
+                blocked: None,
+                notes: Vec::new(),
+            })
+            .collect()
+    }
+}
+
+/// Return the reason of a Unix socket rule: the name of the agent when pent
+/// knows the socket, else the processes that connected to it.
+fn unix_reason(path: &str, processes: &[String]) -> String {
+    if let Some(known) = known_socket(path) {
+        return known.to_string();
+    }
+    if processes.is_empty() {
+        return "Unix socket".to_string();
+    }
+    format!("used by {}", list_names(processes))
+}
+
 // ── Existing profile and order ───────────────────────────────────────────────
 
 /// Return true if the domain rule `rule` matches the domain or wildcard
@@ -1161,6 +1268,12 @@ fn doc_covers(doc: &ProfileDoc, grant: &Grant, env: &Env) -> bool {
             .domains
             .iter()
             .any(|rule| domain_covers(rule, domain)),
+        // A socket rule names one path, so only the same path covers it.
+        Grant::UnixSocket(path) => doc
+            .filesystem
+            .unix_sockets
+            .iter()
+            .any(|rule| env.rule_form(rule) == Path::new(path)),
     }
 }
 
@@ -1168,7 +1281,7 @@ fn doc_covers(doc: &ProfileDoc, grant: &Grant, env: &Env) -> bool {
 /// wildcard sorts next to its domain.
 fn sort_key(item: &Item) -> (Section, &str, bool) {
     match &item.grant {
-        Grant::Fs { path, .. } => (item.section(), path.as_str(), false),
+        Grant::Fs { path, .. } | Grant::UnixSocket(path) => (item.section(), path.as_str(), false),
         Grant::Domain(domain) => match domain.strip_prefix("*.") {
             Some(base) => (item.section(), base, true),
             None => (item.section(), domain.as_str(), false),
@@ -1192,6 +1305,7 @@ mod tests {
                     Section::ReadWrite => "rw",
                     Section::Read => "r",
                     Section::Execute => "x",
+                    Section::UnixSockets => "unix",
                     Section::Network => "net",
                     Section::Blocked => "blocked",
                 };
@@ -1199,7 +1313,7 @@ mod tests {
                     Grant::Fs { access, path } if item.blocked.is_some() => {
                         format!("{access:?} {path}")
                     }
-                    Grant::Fs { path, .. } => path.clone(),
+                    Grant::Fs { path, .. } | Grant::UnixSocket(path) => path.clone(),
                     Grant::Domain(d) => d.clone(),
                 };
                 let mut line = format!("{section} {rule} | {}", item.reason);
@@ -1234,6 +1348,7 @@ mod tests {
                 "r ~/.ssh/known_hosts | read by git, ssh",
                 "x ~/.local/share/claude | runs claude",
                 "x ~/.nvm/versions/node | runs node",
+                "unix /run/user/1000/bus | D-Bus",
                 "net api.anthropic.com | HTTPS",
                 "net github.com | port 22",
                 "net *.npmjs.org | registry, www, cdn",
@@ -1244,7 +1359,8 @@ mod tests {
         );
         let stats = &summary.stats;
         assert_eq!(stats.processes, vec!["claude", "git", "ssh", "node"]);
-        assert_eq!(stats.unix_sockets, vec!["/run/user/1000/bus"]);
+        assert_eq!(stats.unreachable_sockets, vec!["@/tmp/.X11-unix/X0"]);
+        assert_eq!(stats.refused_unix_sockets, 1);
         assert_eq!(stats.ip_hosts, vec!["140.82.112.3:443"]);
         assert_eq!(stats.net_events, 508);
         assert_eq!(stats.total_events(), events.len());
@@ -1662,32 +1778,105 @@ mod tests {
         assert_eq!(run(&events), vec!["r ~/.shared | read by a, b, c +2"]);
     }
 
+    /// A `connect()` to a socket with a path.
+    fn unix(target: &str, process: &str, outcome: Outcome) -> WatchEvent {
+        WatchEvent::UnixConnect {
+            target: target.to_string(),
+            process: crate::ProcessInfo {
+                pid: 1,
+                name: process.to_string(),
+            },
+            outcome,
+        }
+    }
+
     #[test]
-    fn unix_sockets_use_the_home_form() {
+    fn unix_sockets_use_the_home_form_and_name_the_agent() {
         let events = [
-            WatchEvent::UnixConnect {
-                target: "/home/u/.gnupg/S.gpg-agent".to_string(),
-                process: crate::ProcessInfo {
-                    pid: 1,
-                    name: "gpg".to_string(),
-                },
-                outcome: Outcome::Allowed,
-            },
-            WatchEvent::UnixConnect {
-                target: "@/tmp/.X11-unix/X0".to_string(),
-                process: crate::ProcessInfo {
-                    pid: 1,
-                    name: "gpg".to_string(),
-                },
-                outcome: Outcome::Allowed,
-            },
+            unix("/home/u/.gnupg/S.gpg-agent", "gpg", Outcome::Denied),
+            unix("/home/u/.tool/tool.sock", "tool", Outcome::Denied),
+            unix("/home/u/.tool/tool.sock", "other", Outcome::Denied),
+        ];
+        let summary = summarize(&events, &ctx());
+        assert_eq!(
+            lines(&summary),
+            vec![
+                "unix ~/.gnupg/S.gpg-agent | gpg-agent",
+                "unix ~/.tool/tool.sock | used by tool, other",
+            ]
+        );
+        assert!(summary.stats.unreachable_sockets.is_empty());
+        assert_eq!(summary.stats.refused_unix_sockets, 3);
+    }
+
+    /// An abstract address and a relative path cannot be a rule.
+    #[test]
+    fn unreachable_sockets_give_no_rule() {
+        let events = [
+            unix("@/tmp/.X11-unix/X0", "x", Outcome::Denied),
+            unix("relative.sock", "x", Outcome::Allowed),
         ];
         let summary = summarize(&events, &ctx());
         assert!(summary.items.is_empty());
         assert_eq!(
-            summary.stats.unix_sockets,
-            vec!["~/.gnupg/S.gpg-agent", "@/tmp/.X11-unix/X0"]
+            summary.stats.unreachable_sockets,
+            vec!["@/tmp/.X11-unix/X0", "relative.sock"]
         );
+        assert_eq!(summary.stats.refused_unix_sockets, 1);
+    }
+
+    #[test]
+    fn known_sockets_have_a_name() {
+        for (path, name) in [
+            ("/run/user/1000/bus", "D-Bus"),
+            ("/run/dbus/system_bus_socket", "D-Bus"),
+            ("~/.gnupg/S.gpg-agent.ssh", "gpg-agent"),
+            ("/run/user/1000/gnupg/S.gpg-agent", "gpg-agent"),
+            ("~/.ssh/agent.4242", "ssh-agent"),
+            ("/tmp/ssh-XoP1/agent.900", "ssh-agent"),
+            ("/run/user/1000/keyring/ssh", "ssh-agent"),
+            ("/var/run/docker.sock", "Docker"),
+        ] {
+            assert_eq!(known_socket(path), Some(name), "{path}");
+        }
+        assert_eq!(known_socket("~/.tool/tool.sock"), None);
+    }
+
+    /// A Unix socket rule is a strong grant, so the review does not select
+    /// it by default.
+    #[test]
+    fn unix_sockets_are_not_selected_by_default() {
+        assert!(!Section::UnixSockets.selects_by_default());
+        assert!(!Section::Blocked.selects_by_default());
+        for section in [Section::ReadWrite, Section::Read, Section::Execute] {
+            assert!(section.selects_by_default(), "{section:?}");
+        }
+    }
+
+    #[test]
+    fn a_socket_rule_of_the_profile_is_omitted() {
+        let mut ctx = ctx();
+        let mut doc = ProfileDoc::default();
+        doc.filesystem
+            .unix_sockets
+            .push("/home/u/.gnupg/S.gpg-agent".to_string());
+        ctx.existing = Some(doc);
+        let events = [
+            unix("/home/u/.gnupg/S.gpg-agent", "gpg", Outcome::Allowed),
+            unix("/home/u/.other.sock", "gpg", Outcome::Allowed),
+        ];
+        assert_eq!(
+            lines(&summarize(&events, &ctx)),
+            vec!["unix ~/.other.sock | used by gpg"]
+        );
+    }
+
+    #[test]
+    fn to_doc_writes_the_socket_rules() {
+        let events = [unix("/home/u/.gnupg/S.gpg-agent", "gpg", Outcome::Denied)];
+        let summary = summarize(&events, &ctx());
+        let doc = summary.to_doc(&[0]);
+        assert_eq!(doc.filesystem.unix_sockets, vec!["~/.gnupg/S.gpg-agent"]);
     }
 
     #[test]

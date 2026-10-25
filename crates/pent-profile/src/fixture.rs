@@ -218,7 +218,8 @@ pub(crate) fn claude_session() -> Vec<WatchEvent> {
         GuardClass::Persistence,
     ));
 
-    // A Unix socket.
+    // The Unix sockets: one with a path, and one abstract address that pent
+    // refused.
     e.push(WatchEvent::UnixConnect {
         target: "/run/user/1000/bus".to_string(),
         process: ProcessInfo {
@@ -226,6 +227,14 @@ pub(crate) fn claude_session() -> Vec<WatchEvent> {
             name: "claude".to_string(),
         },
         outcome: Outcome::Allowed,
+    });
+    e.push(WatchEvent::UnixConnect {
+        target: "@/tmp/.X11-unix/X0".to_string(),
+        process: ProcessInfo {
+            pid: 4242,
+            name: "claude".to_string(),
+        },
+        outcome: Outcome::Denied,
     });
 
     // The network.

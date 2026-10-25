@@ -32,7 +32,7 @@ pub use guard::{
 pub use name::{ProfileName, ProfileNameError};
 pub use render::{
     render_draft, render_draft_with, render_header, render_profile, render_terminal, safe_lines,
-    DraftSource, Reasons, WatchHeader,
+    DraftSource, Reasons, Warnings, WatchHeader,
 };
 pub use review::{review, Selection};
 pub use summary::{

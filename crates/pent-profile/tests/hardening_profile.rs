@@ -21,7 +21,7 @@ use pent_profile::{
     classify, guard_rules, render_draft, render_draft_with, render_header, render_profile,
     render_terminal, review, summarize, DraftSource, FsAccess, FsOp, Grant, GuardAccess,
     GuardClass, NetProtocol, Outcome, ProcessInfo, ProfileDoc, ProfileName, Reasons, Summary,
-    SummaryContext, WatchEvent, WatchHeader,
+    SummaryContext, Warnings, WatchEvent, WatchHeader,
 };
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -213,13 +213,21 @@ fn p1_crafted_events_reach_each_output_field() {
     let has_payload = |text: &str| PAYLOADS.iter().any(|p| text.contains(p));
     assert!(summary.items.iter().any(|i| match &i.grant {
         Grant::Fs { path, .. } => has_payload(path),
-        Grant::Domain(_) => false,
+        Grant::Domain(_) | Grant::UnixSocket(_) => false,
     }));
     assert!(summary
         .items
         .iter()
         .any(|i| i.blocked.is_some() && has_payload(&i.reason)));
-    assert!(summary.stats.unix_sockets.iter().any(|s| has_payload(s)));
+    assert!(summary
+        .stats
+        .unreachable_sockets
+        .iter()
+        .any(|s| has_payload(s)));
+    assert!(summary.items.iter().any(|i| match &i.grant {
+        Grant::UnixSocket(path) => has_payload(path),
+        _ => false,
+    }));
 }
 
 fn terminal_text(summary: &Summary) -> Result<String, pent_profile::ProfileNameError> {
@@ -442,14 +450,22 @@ fn p2_render_draft_with_arbitrary_rules_round_trips() -> TestResult {
         doc.filesystem.read.push(format!("~/r{p}"));
         doc.filesystem.read_write.push(format!("/rw{p}"));
         doc.filesystem.execute.push(format!("~/x{p}"));
+        doc.filesystem.unix_sockets.push(format!("~/s{p}.sock"));
         doc.network.domains.push(format!("d{p}.example"));
     }
+    // The first lines of the draft hold the counts, thus they are part of
+    // the round trip too.
+    let facts = Warnings {
+        outside_home: 2,
+        other_repository: 1,
+        refused_unix_sockets: 3,
+    };
     let profile = name("tool")?;
     for source in [DraftSource::WatchRuns(3), DraftSource::DeniedReview] {
-        let text = render_draft_with(&profile, source, &doc, &Reasons::default());
+        let text = render_draft_with(&profile, source, &doc, &Reasons::default(), facts);
         assert_eq!(ProfileDoc::parse(&text)?, doc, "\n{text}");
         // A second pass reads the reasons back from the comments.
-        let again = render_draft_with(&profile, source, &doc, &Reasons::from_draft(&text));
+        let again = render_draft_with(&profile, source, &doc, &Reasons::from_draft(&text), facts);
         assert_eq!(ProfileDoc::parse(&again)?, doc, "\n{again}");
     }
     Ok(())
@@ -465,7 +481,13 @@ fn p2_reasons_from_an_earlier_draft_keep_the_draft_valid() -> TestResult {
     let earlier =
         "[filesystem]\nread = [\n  \"~/a\",  # one\rtwo\n  \"~/b\",  # \u{1b}[31mred\n]\n";
     let reasons = Reasons::from_draft(earlier);
-    let text = render_draft_with(&name("tool")?, DraftSource::WatchRuns(1), &doc, &reasons);
+    let text = render_draft_with(
+        &name("tool")?,
+        DraftSource::WatchRuns(1),
+        &doc,
+        &reasons,
+        Warnings::default(),
+    );
     let parsed = ProfileDoc::parse(&text);
     assert!(parsed.is_ok(), "{parsed:?}\n{}", text.escape_debug());
     Ok(())
@@ -533,7 +555,7 @@ fn bad_rules(summary: &Summary) -> Vec<String> {
                     .any(|c| c == Component::ParentDir);
                 (forbidden.contains(path) || dotdot).then(|| format!("{access:?} {path}"))
             }
-            Grant::Domain(_) => None,
+            Grant::Domain(_) | Grant::UnixSocket(_) => None,
         })
         .collect()
 }
@@ -1322,7 +1344,7 @@ fn p6_blocked_items_keep_their_access() {
         .filter(|i| i.blocked.is_some())
         .filter_map(|i| match &i.grant {
             Grant::Fs { access, .. } => Some(*access),
-            Grant::Domain(_) => None,
+            Grant::Domain(_) | Grant::UnixSocket(_) => None,
         })
         .collect();
     assert!(accesses.contains(&FsAccess::Read));
