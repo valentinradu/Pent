@@ -38,8 +38,8 @@ mod fs_table {
         have_tools, sandbox_ready, stderr, stdout, BoxError, TestEnv, TestResult,
     };
     use super::differential::{
-        fs_closed, fs_open, resolve, Access, FsCase, Verdict, EXECUTED, GREETING, MARKER, RAN,
-        WROTE,
+        fs_closed, fs_open, fs_rows, resolve, Access, FsCase, Verdict, EXECUTED, GREETING, MARKER,
+        RAN, WROTE,
     };
 
     /// The content of every file that the table makes. The file is a shell
@@ -294,16 +294,22 @@ printf 'rc=%s\n' "$?"
         run_rows(test, &fs_open("DIFF-2"))
     }
 
-    /// A profile has three lists, and `read` is not `execute`. A rule that
-    /// gives read access must not let the program run the file.
+    /// DIFF-4. A profile has three lists, and `read` is not `execute`. A
+    /// rule that gives read access must not let the program run the file.
     #[test]
-    #[ignore = "OPEN DIFF-4: a read rule also gives execute"]
     fn diff_4_a_read_rule_also_gives_execute() -> TestResult {
         let test = "fs_diff_4_read_gives_execute";
         if !ready(test) {
             return Ok(());
         }
-        run_rows(test, &fs_open("DIFF-4"))
+        run_rows(
+            test,
+            &fs_rows(&[
+                "read-rule-does-not-run",
+                "execute-rule-run",
+                "read-write-rule-run",
+            ]),
+        )
     }
 
     /// A rule that gives read access must not let the program change what
@@ -426,7 +432,7 @@ printf 'rc=%s\n' "$?"
         ids.dedup();
         assert_eq!(
             ids,
-            vec!["DIFF-2", "DIFF-4"],
+            vec!["DIFF-2"],
             "a row of FS_CASES names a disagreement without an ignored test \
              in this file"
         );

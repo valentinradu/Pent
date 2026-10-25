@@ -478,8 +478,11 @@ fn add_ruleset_rules(
     }
     // Overlay parent directories: inside the namespace, writes go to the
     // upper layer; the watcher of the parent flushes write-listed files.
+    // The rule gives no execution: a `read` entry is not an `execute`
+    // entry, and the overlay must not turn one into the other (DIFF-4).
+    // The right to run a file comes from the rule of its own entry.
     for dir in overlay_dirs {
-        ruleset.add_rule(dir, access::ALL);
+        ruleset.add_rule(dir, access::ALL_NO_EXECUTE);
     }
     // PATH directories and system libraries: the dynamic linker must open()
     // binaries and shared libraries, so these get ReadFile too.

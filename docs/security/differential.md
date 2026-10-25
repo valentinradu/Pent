@@ -24,7 +24,7 @@ code.
 
 | File | Table | Compares |
 |---|---|---|
-| `crates/pent/tests/differential_profile_kernel.rs` | `FS_CASES` (37 rows) | the profile against the kernel |
+| `crates/pent/tests/differential_profile_kernel.rs` | `FS_CASES` (38 rows) | the profile against the kernel |
 | `crates/pent/tests/differential_watch_round_trip.rs` | `WATCH_CASES` (9 rows) | the summary against the kernel |
 | `crates/pent/tests/differential_guard.rs` | `GUARD_CASES` (23 rows) | `classify` against the kernel |
 | `crates/pent/tests/differential_network.rs` | `NET_CASES` (7 rows) | the DNS answer, the proxy and the profile |
@@ -74,7 +74,7 @@ proof of the finding.
 | DIFF-1 | Medium | The summary | A read that the overlay hides is not a recorded denial. |
 | DIFF-2 | Medium | The kernel | A profile entry that names a symbolic link gives access to nothing. |
 | DIFF-3 | Low | The kernel | A write to a read-only rule succeeds inside the run. |
-| DIFF-4 | Medium | The kernel | A `read` rule also gives execute. |
+| DIFF-4 | Medium | The kernel | **Fixed.** A `read` rule also gave execute. |
 | DIFF-5 | High | The kernel | **Fixed.** The guard missed a private key behind a symbolic link, and the summary said "blocked". |
 | DIFF-6 | High | The kernel | **Fixed.** The guard missed a private key that the program makes during the run, and the summary said "blocked". |
 | DIFF-7 | High | The summary | **Fixed.** The draft granted a path that the same summary showed as a blocked credential. |
@@ -151,10 +151,12 @@ word "read".
 
 ### DIFF-4 — a `read` rule also gives execute
 
-**Severity:** Medium. **Wrong description:** the kernel.
+**Severity:** Medium. **Wrong description:** the kernel. **Fixed** in
+`COMMIT-DIFF-4`.
 
 **Test:** `differential_profile_kernel.rs`,
-`diff_4_a_read_rule_also_gives_execute`. Row `read-rule-does-not-run`.
+`diff_4_a_read_rule_also_gives_execute`. Rows `read-rule-does-not-run`,
+`execute-rule-run` and `read-write-rule-run`. The test runs now.
 
 The profile has three lists: `read`, `read_write` and `execute`. The
 profile holds `read = ["~/bin"]`, and the program runs `~/bin/tool`. The
@@ -165,8 +167,20 @@ The other direction holds: the row `execute-rule-write` shows that an
 `execute` rule gives no write, and the row `execute-rule-read` shows that
 it gives read, as the design says.
 
-**The fix.** Add `LANDLOCK_ACCESS_FS_EXECUTE` to the rule of an `execute`
-entry only. A `read` entry gets `READ_FILE` and `READ_DIR`.
+**The fix.** The rule of a `read` entry already held `READ_FILE` and
+`READ_DIR` only. The right came from the overlay: `add_ruleset_rules`
+gave the parent directory of each overlay mount `access::ALL`, and that
+directory is the home directory. The rule now gives
+`access::ALL_NO_EXECUTE`, so the right to run a file comes from the rule
+of its own entry: an `execute` entry, a `read_write` entry on a
+directory, a directory of the `PATH`, a system path or the workspace.
+
+One shape loses the right: a `read_write` entry that names one file.
+Landlock binds a rule to an inode, and the overlay gives such a file a
+new inode at the first write, so the only stable rule for it is the rule
+of the overlay directory. The profile never promised execution for a
+`read_write` entry, and the row `read-write-rule-run` holds the
+behaviour of a `read_write` entry on a directory.
 
 ### DIFF-5 — the guard misses a private key behind a symbolic link
 
@@ -324,7 +338,7 @@ each character that a regular expression gives a meaning to.
 These results are solid. Each one comes from a real run of the `pent`
 binary, three times, alone, on Linux.
 
-**The profile against the kernel (36 of 37 rows).**
+**The profile against the kernel (37 of 38 rows).**
 
 - A rule on one file gives the file and no sibling.
 - A rule on one directory gives each child, at any depth, and no other
@@ -337,8 +351,9 @@ binary, three times, alone, on Linux.
 - A `~` entry gives the whole home directory and nothing above it.
 - A directory that does not exist when the run starts works: the program
   makes it and writes in it, and the files stay on the host.
-- A `read_write` rule gives read and write. An `execute` rule gives read
-  and execute, and no write.
+- A `read_write` rule gives read and write. A `read_write` rule on a
+  directory also gives execute; a `read` rule gives no execute. An
+  `execute` rule gives read and execute, and no write.
 - `filesystem.unix_sockets` gives the named socket. Another socket of the
   same directory stays closed, also with a read rule on the directory.
 - A rule that covers another rule keeps the wider access.
@@ -385,7 +400,7 @@ are stable:
 
 | Test | Times |
 |---|---|
-| `the_profile_and_the_kernel_agree` (37 rows) | 2.7 s, 2.8 s, 3.0 s |
+| `the_profile_and_the_kernel_agree` (38 rows) | 2.7 s, 2.8 s, 3.0 s |
 | `the_draft_has_each_rule_that_the_program_needs` | 0.8 s, 0.4 s, 0.4 s |
 | `the_draft_has_no_rule_that_the_program_never_needed` | 0.4 s, 0.4 s, 0.4 s |
 | `a_run_with_the_draft_makes_no_denial` | 1.4 s, 1.2 s, 1.1 s |

@@ -350,6 +350,15 @@ pub const FS_CASES: &[FsCase] = &[
         access: Access::Write,
         ..FS
     },
+    // A `read_write` rule on a directory keeps the right to run a file of
+    // that directory. Only a `read` rule loses it (DIFF-4).
+    FsCase {
+        id: "read-write-rule-run",
+        profile: P_RW,
+        target: "rw/f.txt",
+        access: Access::Execute,
+        ..FS
+    },
     // Execute.
     FsCase {
         id: "execute-rule-run",
@@ -378,7 +387,6 @@ pub const FS_CASES: &[FsCase] = &[
         target: "bin/tool",
         access: Access::Execute,
         verdict: Verdict::Deny,
-        open: Some("DIFF-4"),
         ..FS
     },
     // A Unix socket.
@@ -970,6 +978,24 @@ pub fn fs_closed() -> Vec<&'static FsCase> {
 #[must_use]
 pub fn fs_open(id: &str) -> Vec<&'static FsCase> {
     FS_CASES.iter().filter(|c| c.open == Some(id)).collect()
+}
+
+/// The rows of [`FS_CASES`] with these names.
+///
+/// A test of a closed finding names its rows, so the test keeps its rows
+/// after the fix moves them out of [`fs_open`].
+///
+/// # Panics
+/// Panics when a name is not in the table.
+#[must_use]
+pub fn fs_rows(ids: &[&str]) -> Vec<&'static FsCase> {
+    let rows: Vec<&'static FsCase> = FS_CASES.iter().filter(|c| ids.contains(&c.id)).collect();
+    assert_eq!(
+        rows.len(),
+        ids.len(),
+        "FS_CASES does not hold each row of {ids:?}"
+    );
+    rows
 }
 
 /// The rows of [`GUARD_CASES`] that have no open disagreement on this
