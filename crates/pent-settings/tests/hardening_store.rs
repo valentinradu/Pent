@@ -13,8 +13,8 @@ use std::os::unix::fs::{symlink, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
 use pent_profile::{
-    classify, guard_rules, FsOp, GuardAccess, GuardClass, NetProtocol, Outcome, ProcessInfo,
-    ProfileName, WatchEvent,
+    classify, guard_rules, guard_rules_with, FsOp, GuardAccess, GuardClass, NetProtocol, Outcome,
+    ProcessInfo, ProfileName, WatchEvent,
 };
 use pent_settings::{PentDirs, ProfileStatus, ProfileStore, TrustStatus, TrustStore, WatchRunMode};
 
@@ -312,7 +312,6 @@ fn p5_trust_moves_the_bytes_that_the_user_saw() -> TestResult {
 /// when they are set. Then the profiles, the trust store and the drafts are
 /// in other directories, and the guard does not block writes to them.
 #[test]
-#[ignore = "OPEN H-11: the watch guard protects only the default pent dirs; with XDG_CONFIG_HOME or XDG_STATE_HOME set, the watched program can write profiles and the trust store"]
 fn p5_guard_protects_pent_files_in_xdg_dirs() -> TestResult {
     let home = Path::new("/home/u");
     let dirs = PentDirs {
@@ -321,7 +320,13 @@ fn p5_guard_protects_pent_files_in_xdg_dirs() -> TestResult {
     };
     let store = ProfileStore::new(dirs.clone());
     let n = name("tool")?;
-    let rules = guard_rules(home);
+    // `pent watch` gives the real pent directories to the guard.
+    let rules = guard_rules_with(home, &[dirs.config.clone(), dirs.state.clone()]);
+    // The default rules alone do not cover these paths.
+    assert_eq!(
+        classify(&guard_rules(home), &dirs.trust_store(), GuardAccess::Write),
+        None
+    );
     for path in [
         dirs.trust_store(),
         store.profile_path(&n),

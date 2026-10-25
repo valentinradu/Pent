@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use pent_profile::{guard_rules, WatchEvent};
+use pent_profile::{guard_rules_with, WatchEvent};
 use pent_proxy::ProxyPolicy;
 use pent_sandbox::{
     build_env, spawn_watched, SandboxConfig, SandboxError, SandboxPaths, WatchOptions,
@@ -102,8 +102,13 @@ pub(crate) async fn watch(args: WatchArgs, cwd: PathBuf) -> Result<(), CliError>
     )
     .with_network(proxy.network.clone())
     .with_env(build_env(&[]));
+    // The guard protects the files of pent at their real place, also when
+    // $XDG_CONFIG_HOME or $XDG_STATE_HOME points outside of the defaults.
     let options = WatchOptions {
-        guard: guard_rules(&home),
+        guard: guard_rules_with(
+            &home,
+            &[store.dirs().config.clone(), store.dirs().state.clone()],
+        ),
     };
 
     let mut signals = SignalRelay::install()?;

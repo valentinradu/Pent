@@ -443,18 +443,43 @@ fn repo_root(path: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-/// The paths of the context, checked once.
-/// Return the paths that the guard rules for `access` name.
-fn guard_paths(home: &Path, access: GuardAccess) -> Vec<PathBuf> {
-    guard_rules(home)
-        .into_iter()
-        .filter(|r| r.access == access)
-        .filter_map(|r| match r.target {
-            GuardTarget::Exact(p) | GuardTarget::Subtree(p) => Some(p),
-            GuardTarget::FilesInDir { dir, .. } => Some(dir),
-            GuardTarget::BinaryName(_) => None,
-        })
-        .collect()
+/// The paths that the guard rules for `access` protect: the directories
+/// (the root of a subtree, the directory of a file pattern) and the single
+/// files.
+fn guard_paths(home: &Path, access: GuardAccess) -> GuardPaths {
+    let mut paths = GuardPaths::default();
+    for rule in guard_rules(home) {
+        if rule.access != access {
+            continue;
+        }
+        match rule.target {
+            GuardTarget::Exact(p) => paths.files.push(p),
+            GuardTarget::Subtree(p) => paths.dirs.push(p),
+            GuardTarget::FilesInDir { dir, .. } => paths.dirs.push(dir),
+            GuardTarget::BinaryName(_) => {}
+        }
+    }
+    paths
+}
+
+/// The paths that the guard rules of one access protect.
+#[derive(Default)]
+struct GuardPaths {
+    /// The directories. A rule on such a directory, or on a parent of one,
+    /// is too wide: it gives access to the files that the guard protects.
+    dirs: Vec<PathBuf>,
+    /// The single files. A rule on a parent of such a file is too wide. A
+    /// rule on the file itself is not: it gives no more than the one file,
+    /// and the guard still stops the access that it covers.
+    files: Vec<PathBuf>,
+}
+
+impl GuardPaths {
+    /// Return true if a rule on `path` would include a protected path.
+    fn covered_by_a_rule_on(&self, path: &Path) -> bool {
+        self.dirs.iter().any(|g| g.starts_with(path))
+            || self.files.iter().any(|g| g.starts_with(path) && g != path)
+    }
 }
 
 struct Env {
@@ -463,12 +488,11 @@ struct Env {
     covered: Vec<PathBuf>,
     /// The guard rules for the home directory.
     guard: Vec<GuardRule>,
-    /// The paths of the read guard rules. No directory rule can contain one
-    /// of them.
-    guarded_read: Vec<PathBuf>,
-    /// The paths of the write guard rules. No read-write directory rule can
-    /// contain one of them.
-    guarded_write: Vec<PathBuf>,
+    /// The paths of the read guard rules. No rule can include one of them.
+    guarded_read: GuardPaths,
+    /// The paths of the write guard rules. No read-write rule can include
+    /// one of them.
+    guarded_write: GuardPaths,
 }
 
 impl Env {
@@ -504,7 +528,7 @@ impl Env {
     /// Return true if a directory is too broad for a rule.
     fn is_broad(&self, dir: &Path) -> bool {
         dir.components().count() <= 2
-            || self.guarded_read.iter().any(|g| g.starts_with(dir))
+            || self.guarded_read.covered_by_a_rule_on(dir)
             || self.home.as_ref().is_some_and(|home| {
                 home.starts_with(dir) || BROAD_HOME_DIRS.iter().any(|r| dir == home.join(r))
             })
@@ -518,7 +542,7 @@ impl Env {
     /// Return true if a directory is too broad for a read-write rule: it is
     /// broad, or it contains a path that the guard protects from writes.
     fn is_broad_for_write(&self, dir: &Path) -> bool {
-        self.is_broad(dir) || self.guarded_write.iter().any(|g| g.starts_with(dir))
+        self.is_broad(dir) || self.guarded_write.covered_by_a_rule_on(dir)
     }
 
     /// Return true if grouping can make a read-write rule on `dir`.

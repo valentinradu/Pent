@@ -26,7 +26,9 @@ pub mod summary;
 
 pub use doc::{DocError, FilesystemRules, NetworkRules, ProfileDoc};
 pub use event::{FsOp, GuardClass, NetProtocol, Outcome, ProcessInfo, WatchEvent};
-pub use guard::{classify, guard_rules, GuardAccess, GuardRule, GuardTarget};
+pub use guard::{
+    classify, guard_rules, guard_rules_with, name_matches, GuardAccess, GuardRule, GuardTarget,
+};
 pub use name::{ProfileName, ProfileNameError};
 pub use render::{
     render_draft, render_draft_with, render_header, render_profile, render_terminal, DraftSource,

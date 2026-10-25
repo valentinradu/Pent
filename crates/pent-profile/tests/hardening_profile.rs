@@ -1006,13 +1006,11 @@ fn p4_guard_covers_the_named_locations() {
 }
 
 #[test]
-#[ignore = "GAP G-1: ~/.config/git/credentials (XDG git credential store) is not guarded"]
 fn p4_gap_xdg_git_credentials() {
     assert_guard(&[(".config/git/credentials", R, Some(Cred))]);
 }
 
 #[test]
-#[ignore = "GAP G-2: Terraform and Vault tokens are not guarded"]
 fn p4_gap_terraform_and_vault_tokens() {
     assert_guard(&[
         (".terraform.d/credentials.tfrc.json", R, Some(Cred)),
@@ -1021,7 +1019,6 @@ fn p4_gap_terraform_and_vault_tokens() {
 }
 
 #[test]
-#[ignore = "GAP G-3: SSH private keys with a name that does not start with id_, or in a subdirectory, are not guarded"]
 fn p4_gap_ssh_keys_with_other_names() {
     assert_guard(&[
         (".ssh/github_rsa", R, Some(Cred)),
@@ -1032,7 +1029,6 @@ fn p4_gap_ssh_keys_with_other_names() {
 }
 
 #[test]
-#[ignore = "GAP G-4: password manager and cloud CLI stores are not guarded (1Password, podman, rclone, pgpass, s3cmd, OCI, age)"]
 fn p4_gap_other_credential_stores() {
     assert_guard(&[
         (".config/op/config", R, Some(Cred)),
@@ -1049,7 +1045,6 @@ fn p4_gap_other_credential_stores() {
 }
 
 #[test]
-#[ignore = "GAP G-5: shell history files (which often hold secrets) are not guarded for read"]
 fn p4_gap_shell_history() {
     assert_guard(&[
         (".bash_history", R, Some(Cred)),
@@ -1061,7 +1056,6 @@ fn p4_gap_shell_history() {
 }
 
 #[test]
-#[ignore = "GAP G-6: rc files of other shells, and ~/.bash_aliases, are not guarded for write"]
 fn p4_gap_other_shell_rc_files() {
     assert_guard(&[
         (".bash_aliases", W, Some(Pers)),
@@ -1077,7 +1071,6 @@ fn p4_gap_other_shell_rc_files() {
 }
 
 #[test]
-#[ignore = "GAP G-7: X session and PAM environment files are not guarded for write"]
 fn p4_gap_session_startup_files() {
     assert_guard(&[
         (".pam_environment", W, Some(Pers)),
@@ -1090,7 +1083,6 @@ fn p4_gap_session_startup_files() {
 }
 
 #[test]
-#[ignore = "GAP G-8: PATH directories other than ~/.local/bin are not guarded (binary planting)"]
 fn p4_gap_other_path_directories() {
     assert_guard(&[
         ("bin/git", W, Some(Pers)),
@@ -1101,7 +1093,6 @@ fn p4_gap_other_path_directories() {
 }
 
 #[test]
-#[ignore = "GAP G-9: config files that run code at the next start of a tool are not guarded (Python user site, editors, cargo, git templates, direnv)"]
 fn p4_gap_tool_configs_that_run_code() {
     assert_guard(&[
         (
@@ -1126,7 +1117,6 @@ fn p4_gap_tool_configs_that_run_code() {
 }
 
 #[test]
-#[ignore = "GAP G-10: schedulers without a file in the home directory (crontab, at, systemd-run) are not guarded"]
 fn p4_gap_schedulers() {
     assert_guard(&[
         ("/usr/bin/crontab", ExecName, Some(Pers)),
