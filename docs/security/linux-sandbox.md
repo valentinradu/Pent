@@ -234,8 +234,26 @@ What this changes, and how pent keeps it correct:
   supervisor closes every descriptor that it inherited, so the error pipe of
   `Command::spawn` ends and the spawn returns.
 
-Watch mode takes no PID namespace. It must not change how the program runs,
-and an orphan of the program must keep its events.
+Watch mode takes the PID namespace too. The first reason against it does
+not hold: the seccomp filter goes to each descendant, and
+`SECCOMP_IOCTL_NOTIF_RECV` names the task in the PID namespace of the
+reader, which is pent on the host. Thus an orphan that PID 1 of the
+sandbox adopts still makes events, and each event names the right
+process.
+
+The second reason does hold, and the fix is one line of policy. In run
+mode PID 1 exits with the command, and the kernel then ends every other
+process of the namespace. In watch mode that would end an orphan before
+it makes its events. Thus PID 1 of a watch run waits for the remaining
+processes before it exits, at most five seconds (`Orphans::Wait` in
+`linux.rs`). Five seconds is the limit that the CLI already gives to the
+last events of a watch run. A run without an orphan waits not at all: the
+first `waitpid` with `WNOHANG` gives `ECHILD`.
+
+The evidence for watch mode: `watch_proc_shows_only_the_sandbox` and
+`watch_keeps_the_events_of_a_double_forked_grandchild` in
+`crates/pent-sandbox/src/linux_watch.rs`, next to the older
+`watch_keeps_the_events_of_an_orphan`.
 
 **The evidence.** `test_proc_cmdline_of_host_process_denied`,
 `test_background_process_does_not_outlive_pent`,

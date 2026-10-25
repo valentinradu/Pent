@@ -28,11 +28,12 @@
 //! outlives the command. `unshare(CLONE_NEWPID)` does not move the caller,
 //! so the `pre_exec` hook forks twice; see [`fork_pid_namespace`].
 //!
-//! Watch mode (`SpawnMode::Watch`) creates a user namespace and a mount
-//! namespace, but no PID namespace: it must not change how the program
-//! runs, and an orphan of the program must keep its events. It applies no
-//! Landlock, no overlay and no masks. The mount namespace holds the private
-//! directories and the mounts of the watch guard (see `linux_watch.rs`).
+//! Watch mode (`SpawnMode::Watch`) creates the same three namespaces. It
+//! applies no Landlock, no overlay and no masks. The mount namespace holds
+//! the private directories and the mounts of the watch guard (see
+//! `linux_watch.rs`). The PID namespace of watch mode differs in one
+//! point: PID 1 waits for the orphans of the program before it exits, so
+//! that the recorder gets their events (see [`Orphans`]).
 //!
 //! # Landlock architecture
 //!
@@ -942,14 +943,66 @@ fn supervise_outer(init: libc::pid_t, status_fd: libc::c_int) -> ! {
     exit_like(status)
 }
 
+/// What PID 1 of the new namespace does with a process that outlives the
+/// command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Orphans {
+    /// End it. PID 1 exits with the command, and the kernel then ends
+    /// every other process of the namespace. `pent run` takes this: no
+    /// background process of the sandbox outlives the command.
+    End,
+    /// Wait for it, at most [`ORPHAN_GRACE_STEPS`] steps. `pent watch`
+    /// takes this: an orphan of the program must keep its events, and the
+    /// recorder reports an event only while the task runs.
+    Wait,
+}
+
+/// The length of one step of the wait for the orphans, in milliseconds.
+const ORPHAN_STEP_MS: libc::c_long = 50;
+
+/// The number of steps that PID 1 waits for the orphans in watch mode.
+/// 100 steps of 50 milliseconds are five seconds, the same limit that the
+/// CLI gives to the last events of a watch run.
+const ORPHAN_GRACE_STEPS: u32 = 100;
+
+/// Wait for the remaining children of this process, at most
+/// `ORPHAN_GRACE_STEPS` steps. Async-signal-safe: `waitpid` and
+/// `nanosleep` are both on the list.
+fn wait_for_orphans() {
+    let pause = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: ORPHAN_STEP_MS.saturating_mul(1_000_000),
+    };
+    for _ in 0..ORPHAN_GRACE_STEPS {
+        // SAFETY: waitpid(2) on the children of this process, with a null
+        // status pointer.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let done = unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) };
+        if done < 0 {
+            return; // ECHILD: no child is left.
+        }
+        if done > 0 {
+            continue; // Reap the next one at once.
+        }
+        // SAFETY: nanosleep(2) with a valid timespec and no remainder.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe { libc::nanosleep(&raw const pause, std::ptr::null_mut()) };
+    }
+}
+
 /// The supervisor that is PID 1 of the new PID namespace. It reaps the
 /// orphans of the session. When it exits, the kernel ends every other
-/// process of the namespace, so no background process of the sandbox
-/// outlives the command.
+/// process of the namespace.
+///
+/// With [`Orphans::Wait`] it first gives the orphans their time, so that
+/// the recorder of watch mode gets their events.
 ///
 /// Async-signal-safe; it never returns.
-fn supervise_init(command: libc::pid_t, status_fd: libc::c_int) -> ! {
+fn supervise_init(command: libc::pid_t, status_fd: libc::c_int, orphans: Orphans) -> ! {
     let status = wait_and_reap(command);
+    if orphans == Orphans::Wait {
+        wait_for_orphans();
+    }
     // The outer supervisor needs the real status; see `supervise_outer`.
     // Nothing can answer a failure here, and the exit code below still
     // carries the reason.
@@ -977,7 +1030,7 @@ fn supervise_init(command: libc::pid_t, status_fd: libc::c_int) -> ! {
 ///
 /// # Errors
 /// Returns the OS error of `pipe2(2)`, of `fork(2)` or of `prctl(2)`.
-fn fork_pid_namespace() -> std::io::Result<()> {
+fn fork_pid_namespace(orphans: Orphans) -> std::io::Result<()> {
     // The pipe that carries the wait status of the command from PID 1 of
     // the namespace to the stub; see `supervise_outer`.
     let mut pipe_fds = [-1 as libc::c_int; 2];
@@ -1012,7 +1065,7 @@ fn fork_pid_namespace() -> std::io::Result<()> {
     }
     if command > 0 {
         close_inherited_fds(write_fd);
-        supervise_init(command, write_fd);
+        supervise_init(command, write_fd, orphans);
     }
     // The command keeps no end of the status pipe.
     // SAFETY: close(2) on descriptors that `pipe2` made.
@@ -1832,6 +1885,8 @@ struct ChildPlan {
     bring_up_lo: bool,
     /// Set `PR_SET_NO_NEW_PRIVS` and install the TIOCSTI filter.
     no_new_privs: bool,
+    /// What PID 1 of the new namespace does with an orphan of the command.
+    orphans: Orphans,
     /// `None` when enforcement is off (`--no-sandbox`) and in watch mode.
     ruleset: Option<PreparedRuleset>,
     /// The seccomp recorder (watch mode and `--trace`).
@@ -1880,7 +1935,7 @@ impl ChildPlan {
             }
             if self.unshare_flags & libc::CLONE_NEWPID != 0 {
                 // Only the command returns here; see `fork_pid_namespace`.
-                fork_pid_namespace()?;
+                fork_pid_namespace(self.orphans)?;
             }
         }
 
@@ -2188,11 +2243,18 @@ pub(crate) fn spawn_linux(
         NetworkMode::Unrestricted => 0,
         _ => libc::CLONE_NEWNET,
     };
-    // A new PID namespace hides the processes of the host and ends the
-    // background processes of the session. Watch mode does not take it: it
-    // must not change how the program runs, and an orphan of the program
-    // must keep its events.
-    let pid_flag = if enforce { libc::CLONE_NEWPID } else { 0 };
+    // A new PID namespace hides the processes of the host, so the child
+    // cannot read `/proc/<pid>/cmdline` of another process of the user.
+    // Watch mode takes it too: the seccomp filter goes to each descendant,
+    // and `SECCOMP_IOCTL_NOTIF_RECV` names the task in the namespace of
+    // the reader, so an orphan that PID 1 of the sandbox adopts keeps its
+    // events. Only the end differs; see `Orphans`.
+    let pid_flag = if enforce || watch {
+        libc::CLONE_NEWPID
+    } else {
+        0
+    };
+    let orphans = if watch { Orphans::Wait } else { Orphans::End };
     let unshare_flags = if enforce || watch {
         libc::CLONE_NEWUSER | libc::CLONE_NEWNS | net_flag | pid_flag
     } else if net_flag != 0 {
@@ -2343,6 +2405,7 @@ pub(crate) fn spawn_linux(
             None
         },
         bring_up_lo: config.network == NetworkMode::LocalhostOnly || is_proxy,
+        orphans,
         no_new_privs: ruleset.is_some() || recorder.is_some(),
         ruleset,
         recorder: recorder.as_ref().map(|r| r.child.clone()),

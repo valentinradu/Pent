@@ -2431,6 +2431,73 @@ mod tests {
         Ok(())
     }
 
+    /// A grandchild of two forks keeps its events. PID 1 of the new PID
+    /// namespace adopts it, and `SECCOMP_IOCTL_NOTIF_RECV` names the task
+    /// in the namespace of the reader, which is pent on the host.
+    #[test]
+    #[serial]
+    fn watch_keeps_the_events_of_a_double_forked_grandchild() -> TestResult {
+        let Some(s) = setup()? else {
+            return Ok(());
+        };
+        let script = "( ( sleep 0.3; cat /etc/hostname >/dev/null ) & ) &";
+        let watched = crate::spawn_watched(
+            &s.config,
+            &WatchOptions {
+                guard: Vec::new(),
+                unix_sockets: Vec::new(),
+            },
+            &s.sh.to_string_lossy(),
+            &sh_args(script),
+        )?;
+        let (pid, events) = collect(watched)?;
+        assert!(
+            events.iter().any(
+                |e| matches!(e, WatchEvent::Fs { op: FsOp::Read, path, process, .. }
+                if path == Path::new("/etc/hostname") && process.pid != pid)
+            ),
+            "{events:#?}"
+        );
+        Ok(())
+    }
+
+    /// Watch mode gets the PID namespace and a private `proc`, so the
+    /// program sees only the processes of the sandbox.
+    #[test]
+    #[serial]
+    fn watch_proc_shows_only_the_sandbox() -> TestResult {
+        let Some(s) = setup()? else {
+            return Ok(());
+        };
+        let out = s.dir.join("procs");
+        let script = format!("ls /proc > {}", out.display());
+        let watched = crate::spawn_watched(
+            &s.config,
+            &WatchOptions {
+                guard: Vec::new(),
+                unix_sockets: Vec::new(),
+            },
+            &s.sh.to_string_lossy(),
+            &sh_args(&script),
+        )?;
+        collect(watched)?;
+        let text = std::fs::read_to_string(&out)?;
+        let pids: Vec<&str> = text
+            .lines()
+            .filter(|l| l.chars().all(|c| c.is_ascii_digit()) && !l.is_empty())
+            .collect();
+        let own = std::process::id().to_string();
+        assert!(
+            !pids.contains(&own.as_str()),
+            "the program sees the test process: {pids:?}"
+        );
+        assert!(
+            pids.len() < 16,
+            "the program sees the processes of the host: {pids:?}"
+        );
+        Ok(())
+    }
+
     #[test]
     #[serial]
     fn trace_predicts_the_policy() -> TestResult {
