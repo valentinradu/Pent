@@ -55,7 +55,7 @@ macOS has no network namespaces. In proxy mode, the profile denies outbound conn
 
 ### Linux: Landlock + overlayfs + network namespaces
 
-On Linux, Pent combines three kernel mechanisms. **Landlock LSM** restricts filesystem access at the kernel level. **Overlayfs shadowing** protects parent directories by mounting a temporary layer in a private namespace; writes to non-allowlisted paths disappear when the process exits. **Network namespaces** (`unshare(CLONE_NEWNET)`) isolate the network stack, with traffic bridged to Pent's proxy via a `veth` pair.
+On Linux, Pent combines three kernel mechanisms. **Landlock LSM** restricts filesystem access at the kernel level. **Overlayfs shadowing** protects parent directories by mounting a temporary layer in a private namespace; writes to non-allowlisted paths disappear when the process exits. **Network namespaces** (`unshare(CLONE_NEWNET)`) isolate the network stack. In proxy mode, the child can reach only its own loopback. Pent's proxy listens there on sockets that the child makes and gives to Pent. Pent needs no root and no capability.
 
 ### Built-in proxy
 
@@ -94,13 +94,21 @@ The macOS backend also ignores `[[sandbox.mounts]]`. Use `[sandbox.paths]` to gi
 
 Pent requires Landlock ABI v3 or later (Linux 6.2), and Landlock must be enabled at boot. Pent uses the highest ABI up to v6. On ABI v6, the sandboxed process cannot connect to abstract Unix sockets outside the sandbox and cannot send signals to processes outside the sandbox.
 
-Landlock does not control `connect(2)` on Unix sockets that have a path. A sandboxed process can connect to any socket file that it can find. To decrease this risk, Pent hides the well-known sockets in the private mount namespace of the child: an empty tmpfs covers `/run/user/<uid>` (session D-Bus, systemd user manager, rootless Docker), and `/dev/null` covers `/run/docker.sock` and `/run/podman/podman.sock`. If your configuration names one of these paths, Pent does not hide it. Other socket files (for example the system D-Bus socket or sockets in your home directory) stay reachable.
+Landlock does not control `connect(2)` on Unix sockets that have a path. A sandboxed process can connect to any socket file that it can find. To decrease this risk, Pent hides the well-known sockets in the private mount namespace of the child: an empty tmpfs covers `/run/user/<uid>` (session D-Bus, systemd user manager, rootless Docker), and `/dev/null` covers `/run/docker.sock` and `/run/podman/podman.sock`. When the network is not `unrestricted`, `/dev/null` also covers the sockets of the host resolvers (`/run/nscd/socket` and `/run/systemd/resolve/io.systemd.Resolve`), because a query through them goes past the proxy. If your configuration names one of these paths, Pent does not hide it. Other socket files (for example the system D-Bus socket or sockets in your home directory) stay reachable.
 
 The sandboxed process keeps the controlling terminal, because interactive tools need it. A seccomp filter blocks `ioctl(TIOCSTI)` and `ioctl(TIOCLINUX)`, so the process cannot push keystrokes into your shell. Pent makes `<workspace>/.pent` read-only inside the sandbox.
 
-Proxy mode needs `CAP_NET_ADMIN` on the host, and either nft or iptables, to install the host firewall. The host accepts only the proxy and DNS ports from the sandbox and drops all other traffic from it.
+### Linux: proxy mode without privileges
+
+Pent needs no root and no capability on Linux. It needs unprivileged user namespaces. `pent check` tells you if they are available. Some distributions turn them off (the sysctl `user.max_user_namespaces`, or `kernel.apparmor_restrict_unprivileged_userns` on Ubuntu 24.04 and later).
+
+In proxy mode, the child gets a new network namespace with only the loopback interface. Before the program starts, the child makes three sockets in this namespace: the proxy port `127.0.0.1:3128` (SOCKS5 and HTTP CONNECT) and the DNS port `127.0.0.1:53` (UDP and TCP). It gives them to Pent. Pent serves the proxy on these sockets and connects to the allowed hosts from the host network. The child has no route out of its namespace, so it cannot reach a host past the proxy. When IPv6 is available in the namespace, the proxy port also listens on `[::1]:3128`. The DNS port is IPv4 only.
+
+Inside the sandbox, `/etc/resolv.conf` contains `nameserver 127.0.0.1`. A program that uses a fixed resolver (for example `8.8.8.8`) cannot resolve names: the query fails, and the sandbox stays closed.
 
 ## Installation
+
+Pent needs no root and no capability. The packages do not run `setcap`.
 
 ### Homebrew (macOS / Linux)
 ```bash

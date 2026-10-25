@@ -8,21 +8,18 @@
 #   docker build -t pent-test -f e2e/Dockerfile .
 #
 # Run e2e tests:
-#   docker run --rm --cap-add NET_ADMIN pent-test
+#   docker run --rm --security-opt seccomp=unconfined \
+#     --security-opt apparmor=unconfined pent-test
 #
-# NET_ADMIN is required for pent's Linux network-namespace isolation
-# (ProxyOnly / LocalhostOnly modes call unshare(CLONE_NEWNET) + ip-link).
+# Pent needs no capability. It needs unprivileged user namespaces, and the
+# default seccomp and AppArmor profiles of Docker block unshare(2).
 
 FROM rust:1.87-slim-bookworm
 
-# iproute2       — ip rule / ip netns / ip link commands used by pent
 # curl           — network tests (proxy-aware HTTP client)
 # bash           — filesystem tests (sandboxed shell for write/read probes)
 # ca-certificates — TLS roots for HTTPS in curl tests
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    iproute2 \
-    nftables \
-    iptables \
     curl \
     bash \
     ca-certificates \

@@ -25,12 +25,13 @@ pent/
     │       ├── env.rs            # build_env, resolve_path_directories
     │       ├── macos.rs          # macOS Seatbelt (SBPL) backend
     │       ├── linux.rs          # Linux Landlock backend
-    │       └── linux_netns.rs    # Linux network-namespace helpers
+    │       ├── linux_proxynet.rs # Linux proxy network (listeners made in the child)
+    │       └── linux_fdpass.rs   # SCM_RIGHTS descriptor passing
     └── pent-proxy/               # DNS + TCP proxy with allowlist enforcement
         └── src/
             ├── lib.rs            # Public API surface
             ├── server.rs         # ProxyServer, ProxyHandle, ProxyConfig
-            ├── dns.rs            # DnsServer (UDP, recursive resolution)
+            ├── dns.rs            # DnsServer (UDP and TCP, recursive resolution)
             ├── proxy.rs          # TcpProxy (SOCKS5)
             └── …
 ```
@@ -127,9 +128,17 @@ These rules are non-negotiable. All code must comply before being committed.
 
 ## Platform notes
 
+### Linux — network containment without privileges
+
+Pent needs no root and no capability on Linux. It needs unprivileged user namespaces; `pent check` reports them. Do not add a step that needs `CAP_NET_ADMIN` or `setcap`.
+
+In `ProxyOnly` mode, the child unshares a user namespace and a network namespace and brings up `lo`. In the `pre_exec` hook, it still has all capabilities in its user namespace. It makes the proxy listeners in its network namespace: TCP `127.0.0.1:3128` (SOCKS5 and HTTP CONNECT on one port), and `127.0.0.1:53` for DNS (UDP and TCP). `[::1]:3128` is added when IPv6 works. The child sends the listeners to the parent with `SCM_RIGHTS` (`linux_fdpass.rs`), closes its copies and continues to `exec`. A socket keeps the network namespace of its creation, so the parent serves the proxy on them (`ProxyHandle::attach_listeners`) and connects upstream from the host network.
+
+The child can reach only its own loopback. `/etc/resolv.conf` is a read-only bind mount of a file with `nameserver 127.0.0.1`. DNS works only through `127.0.0.1:53`: a program with a fixed resolver (for example `8.8.8.8`) cannot resolve names, and the sandbox stays closed. The child also hides the sockets of the host resolvers (nscd, systemd-resolved), because a query through them goes past the proxy.
+
 ### macOS — network containment with Seatbelt
 
-macOS has no per-process network namespace. Pent cannot send all the traffic of the child through the proxy, as Linux does with a veth pair. Instead, the Seatbelt profile of proxy mode denies each outbound connection except these:
+macOS has no per-process network namespace. Pent cannot isolate the network of the child, as Linux does with a network namespace. Instead, the Seatbelt profile of proxy mode denies each outbound connection except these:
 
 - TCP to the proxy port on loopback: `(allow network-outbound (remote ip "localhost:<port>"))`.
 - The `mDNSResponder` socket (`/private/var/run/mDNSResponder`), for name resolution.

@@ -124,10 +124,14 @@ pub(crate) async fn watch(args: WatchArgs, cwd: PathBuf) -> Result<(), CliError>
         watched.child.child.id(),
         crate::commands::session::LinuxResources {
             overlay: watched.child.overlay,
-            netns: watched.child.netns,
             trace: false,
         },
     );
+    // The child made the proxy listeners in its network namespace. If the
+    // proxy cannot use them, the error drops `cleanup`, which stops the
+    // child.
+    #[cfg(target_os = "linux")]
+    proxy.attach(watched.child.proxy_listeners)?;
     #[cfg(not(target_os = "linux"))]
     let cleanup = SessionCleanup::new(watched.child.child.id(), ());
 

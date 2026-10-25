@@ -380,12 +380,11 @@ fn test_watch_without_yes_needs_a_terminal() -> TestResult {
     Ok(())
 }
 
-/// INTEGRATOR: update this test when the recorders land. Today
-/// `spawn_watched` returns `UnsupportedPlatform`, and on Linux without
-/// `CAP_NET_ADMIN` the proxy cannot start. The test checks that pent shows
-/// the banner, fails with a clear message, and writes no draft.
+/// `pent watch --yes` shows the banner. On Linux it needs no privilege: it
+/// records the run and writes a draft. Where pent has no recorder, it fails
+/// with a clear message and writes no draft.
 #[test]
-fn test_watch_yes_reports_the_missing_recorder() -> TestResult {
+fn test_watch_yes_records_a_draft() -> TestResult {
     let xdg = Xdg::new()?;
     let ws = tempfile::TempDir::new()?;
     let mut cmd = Command::new(PENT);
@@ -395,19 +394,24 @@ fn test_watch_yes_reports_the_missing_recorder() -> TestResult {
         .current_dir(ws.path())
         .stdin(Stdio::null())
         .output()?;
-    expect_failure(&out);
     let err = stderr(&out);
     assert!(
         err.starts_with("pent watch: true\n  Watch mode does not sandbox"),
         "{err}"
     );
-    assert!(
-        err.contains("✗ pent watch is not available on this platform yet")
-            || err.contains("CAP_NET_ADMIN"),
-        "{err}"
-    );
     assert!(!err.contains("panicked"), "{err}");
-    assert!(!xdg.draft_path("true").exists());
+    if out.status.success() {
+        assert!(xdg.draft_path("true").exists(), "{err}");
+    } else {
+        // A host without user namespaces cannot run the recorder.
+        assert!(
+            err.contains("✗ pent watch is not available on this platform yet")
+                || err.contains("user namespace")
+                || err.contains("unshare"),
+            "{err}"
+        );
+        assert!(!xdg.draft_path("true").exists());
+    }
     Ok(())
 }
 

@@ -140,7 +140,7 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
         .ok_or_else(|| CliError::Other("command list is empty".to_string()))?;
 
     // Print network mode hint BEFORE spawn so the user sees it even if spawn
-    // takes time (ProxyOnly veth setup) or stalls during namespace init.
+    // takes time or stalls during namespace init.
     if let Some(line) = network_status(&sandbox_cfg.network, decision.source) {
         ui::status("network", line);
     }
@@ -163,10 +163,16 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
         sandbox_child.child.id(),
         crate::commands::session::LinuxResources {
             overlay: sandbox_child.overlay,
-            netns: sandbox_child.netns,
             trace: args.trace,
         },
     );
+    // The child made the proxy listeners in its network namespace. If the
+    // proxy cannot use them, the error drops `cleanup`, which stops the
+    // child.
+    #[cfg(target_os = "linux")]
+    if let Some(proxy) = &proxy {
+        proxy.attach(sandbox_child.proxy_listeners)?;
+    }
     #[cfg(not(target_os = "linux"))]
     let cleanup = SessionCleanup::new(sandbox_child.child.id(), ());
     let child = sandbox_child.child;
@@ -199,11 +205,9 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
     };
     let (exit_status, rest) = wait_child(child, &mut signals, Some(event_rx), &mut sink).await;
 
-    // Flush overlayfs write-listed files back to real inodes, clean up
-    // staging directories and drop the netns handle (this removes the
-    // firewall and routing rules). This must happen after the wait, so the
-    // child's mount namespace is already destroyed and no writes are in
-    // flight.
+    // Flush overlayfs write-listed files back to real inodes and clean up
+    // staging directories. This must happen after the wait, so the child's
+    // mount namespace is already destroyed and no writes are in flight.
     cleanup.finish();
 
     // Read the late events, then stop the forwarders and read the rest.

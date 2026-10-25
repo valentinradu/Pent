@@ -5,13 +5,12 @@
 //!
 //! # Requirements
 //!
-//! Network namespace creation requires root or `CAP_NET_ADMIN`.  Run with:
+//! The tests need the agent binaries, Landlock and unprivileged user
+//! namespaces. They need no root and no capability. Run with:
 //!
 //! ```
-//! sudo -E cargo test --test e2e_linux -- --nocapture
+//! cargo test --test e2e_linux -- --ignored --nocapture
 //! ```
-//!
-//! Tests are skipped (not failed) when not running as root.
 
 mod common;
 
@@ -20,103 +19,12 @@ mod linux {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::{Command, ExitStatus, Stdio};
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::OnceLock;
     use tempfile::TempDir;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     const PENT_BIN: &str = env!("CARGO_BIN_EXE_pent");
-
-    // ── root check ───────────────────────────────────────────────────────────
-
-    fn is_root() -> bool {
-        Command::new("id")
-            .arg("-u")
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .and_then(|s| s.trim().parse::<u32>().ok())
-            .is_some_and(|uid| uid == 0)
-    }
-
-    // ── routing guard ────────────────────────────────────────────────────────
-
-    /// RAII guard: adds uid-restricted routing tables at priority 9990 on
-    /// construction, removes them on drop.
-    ///
-    /// On systems with uid-based policy routing (e.g. VPN or tunnel software
-    /// that installs routes only visible to the owning uid) those tables are
-    /// invisible to root.  We temporarily inject
-    /// `from all lookup <table> priority 9990` for each non-system table so
-    /// the pent proxy can reach the name servers.
-    struct RoutingGuard(Vec<u32>);
-
-    impl RoutingGuard {
-        #[allow(clippy::expect_used)] // infrastructure: ip rule show must succeed for routing tests
-        fn install() -> Self {
-            let out = Command::new("ip")
-                .args(["rule", "show"])
-                .output()
-                .expect("ip rule show");
-            let stdout = String::from_utf8_lossy(&out.stdout);
-
-            let mut added = Vec::new();
-            let mut seen = std::collections::HashSet::new();
-            for line in stdout.lines() {
-                // Lines look like: "5270:\tfrom all lookup 52"
-                if let Some(t_str) = line
-                    .split_whitespace()
-                    .skip_while(|&w| w != "lookup")
-                    .nth(1)
-                {
-                    if let Ok(table) = t_str.parse::<u32>() {
-                        // Skip system tables: local=255, main=254, default=253
-                        if table < 253 && seen.insert(table) {
-                            let ok = Command::new("ip")
-                                .args([
-                                    "rule",
-                                    "add",
-                                    "from",
-                                    "all",
-                                    "lookup",
-                                    &table.to_string(),
-                                    "priority",
-                                    "9990",
-                                ])
-                                .stderr(Stdio::null())
-                                .status()
-                                .map(|s| s.success())
-                                .unwrap_or(false);
-                            if ok {
-                                added.push(table);
-                            }
-                        }
-                    }
-                }
-            }
-            Self(added)
-        }
-    }
-
-    impl Drop for RoutingGuard {
-        fn drop(&mut self) {
-            for &table in &self.0 {
-                let _ = Command::new("ip")
-                    .args([
-                        "rule",
-                        "del",
-                        "from",
-                        "all",
-                        "lookup",
-                        &table.to_string(),
-                        "priority",
-                        "9990",
-                    ])
-                    .stderr(Stdio::null())
-                    .status();
-            }
-        }
-    }
 
     // ── sandbox availability probe ───────────────────────────────────────────
 
@@ -294,39 +202,24 @@ mod linux {
     }
 
     #[test]
-    #[ignore = "requires agent binary and CAP_NET_ADMIN"]
+    #[ignore = "requires agent binary"]
     fn filesystem_claude() -> TestResult {
         test_filesystem("claude")
     }
     #[test]
-    #[ignore = "requires agent binary and CAP_NET_ADMIN"]
+    #[ignore = "requires agent binary"]
     fn filesystem_codex() -> TestResult {
         test_filesystem("codex")
     }
     #[test]
-    #[ignore = "requires agent binary and CAP_NET_ADMIN"]
+    #[ignore = "requires agent binary"]
     fn filesystem_gemini() -> TestResult {
         test_filesystem("gemini")
     }
 
     // ── network tests ────────────────────────────────────────────────────────
 
-    // Serialize network tests so RoutingGuard add/del doesn't race across threads.
-    static NETWORK_MUTEX: Mutex<()> = Mutex::new(());
-
     fn test_network(agent: &str, allowed_domain: &str) -> TestResult {
-        if !is_root() {
-            println!(
-                "\nSKIP {agent} network: requires root (`sudo -E cargo test --test e2e_linux`)"
-            );
-            return Ok(());
-        }
-
-        let _lock = NETWORK_MUTEX
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _routing = RoutingGuard::install();
-
         let configs = TempDir::new()?;
         let home = agent_config(agent, configs.path());
 
@@ -379,17 +272,17 @@ mod linux {
     }
 
     #[test]
-    #[ignore = "requires agent binary and CAP_NET_ADMIN"]
+    #[ignore = "requires agent binary"]
     fn network_claude() -> TestResult {
         test_network("claude", "api.anthropic.com")
     }
     #[test]
-    #[ignore = "requires agent binary and CAP_NET_ADMIN"]
+    #[ignore = "requires agent binary"]
     fn network_codex() -> TestResult {
         test_network("codex", "api.openai.com")
     }
     #[test]
-    #[ignore = "requires agent binary and CAP_NET_ADMIN"]
+    #[ignore = "requires agent binary"]
     fn network_gemini() -> TestResult {
         test_network("gemini", "generativelanguage.googleapis.com")
     }

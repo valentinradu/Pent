@@ -109,12 +109,15 @@ pub enum NetworkMode {
     ///
     /// `proxy_addr` and `dns_port` are assigned at runtime when the proxy
     /// server starts; they are not read from or written to config files.
+    ///
+    /// On Linux, the sandbox ignores both values: the child makes the proxy
+    /// listeners on fixed loopback ports in its own network namespace
+    /// (`pent_sandbox::child_proxy_addr`).
     ProxyOnly {
+        /// The address of the proxy as the child sees it.
         #[serde(skip, default = "default_proxy_addr")]
         proxy_addr: std::net::SocketAddr,
-        /// Port the proxy's DNS server listens on (bound to 0.0.0.0).
-        /// Used to set up a PREROUTING REDIRECT rule that transparently
-        /// intercepts DNS queries from the child namespace.
+        /// The port of the DNS server of the proxy as the child sees it.
         #[serde(skip)]
         dns_port: u16,
     },
