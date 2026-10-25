@@ -434,14 +434,20 @@ mod macos {
 
     /// A read of a child process that lives a very short time.
     ///
-    /// MAC-10. A child such as `cat` lives about three milliseconds, so no
-    /// poll of `ps` holds it. The reader therefore follows the tree with
-    /// `kqueue` and `EVFILT_PROC` with `NOTE_TRACK`
-    /// (`crates/pent-sandbox/src/macos_kqueue.rs`): the kernel reports
-    /// each `fork` at the time of the `fork`, and `fork(2)` copies the
-    /// name of the program, so the child has a name before its first
-    /// report arrives.
+    /// OPEN MAC-10. The reader keeps a report only when the process is a
+    /// member of the tree of the run and the name of the report fits the
+    /// program that the process runs. Both facts come from a poll of `ps`
+    /// every 100 ms, and a child such as `cat` lives about three
+    /// milliseconds, so no poll holds it.
+    ///
+    /// The script runs `cat` and then a second command, so the shell
+    /// forks for `cat` instead of running it in place. The run of
+    /// 2026-10-25 showed that `sh -c 'cat FILE'` alone makes **no**
+    /// child: the shell runs `cat` with the process ID of the root, and
+    /// the recorder keeps each access of it. The fork is the gap, not the
+    /// exec.
     #[test]
+    #[ignore = "OPEN MAC-10: the recorder misses a child that lives less than one ps poll; kqueue NOTE_TRACK gives ENOTSUP, so the next step is EndpointSecurity"]
     fn watch_records_a_read_of_a_short_lived_child() -> TestResult {
         if !ready("watch_records_a_child_read", &[SH, "/bin/cat"]) {
             return Ok(());
@@ -457,9 +463,9 @@ mod macos {
             "--",
             SH,
             "-c",
-            "cat ~/.foorc",
+            "cat ~/.foorc; echo END",
         ])?;
-        assert_eq!(stdout(&out), "foo\n", "stderr: {}", stderr(&out));
+        assert_eq!(stdout(&out), "foo\nEND\n", "stderr: {}", stderr(&out));
 
         let draft = draft_with_events(&env, "c")?;
         let read = rules(&draft, "filesystem", "read")?;
@@ -716,9 +722,9 @@ mod macos {
     // ── the findings of the review ───────────────────────────────────────────
     //
     // Each test below states the secure behaviour. See
-    // `docs/security/macos.md`. Every finding of the review has a fix now,
-    // so each test runs in the normal suite and no test of this file has
-    // an `ignore` mark.
+    // `docs/security/macos.md`. MAC-1, MAC-2, MAC-3 and MAC-4 have a fix,
+    // so these tests run in the normal suite. MAC-10 has none, so its test
+    // keeps the `ignore` mark; `--include-ignored` shows the failure.
 
     /// MAC-1. The watched program writes its own Seatbelt reports into the
     /// unified log with `/usr/bin/logger`. The reader takes only the

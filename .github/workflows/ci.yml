@@ -78,45 +78,47 @@ jobs:
       - name: Build
         run: cargo build --workspace --tests
 
-      # TEMPORARY. MAC-10 still records nothing for a run whose root is a
-      # shell, also with the `kqueue` watcher. The step runs four watch
-      # commands by hand and prints the draft, the raw events and the
-      # reports that the kernel wrote, so that the cause is visible. The
-      # step never fails. Remove it when MAC-10 has a verdict.
+      # TEMPORARY. The last round showed that `sh -c 'cat FILE'` makes
+      # no child: the shell runs `cat` with the process ID of the root.
+      # This round holds the two cases apart. The step runs the test of
+      # MAC-10 alone and then two watch commands by hand: one that runs
+      # `cat` in place and one that forks for it. The step never fails.
+      # Remove it when MAC-10 has a verdict.
       - name: Probe the open macOS findings
         if: runner.os == 'macOS'
         run: |
           set +e
+          echo "=== PROBE the test of MAC-10 alone ==="
+          cargo test -p pent --test e2e_macos -- --include-ignored --exact \
+            macos::watch_records_a_read_of_a_short_lived_child \
+            --test-threads=1 --nocapture
+          echo "=== PROBE RESULT MAC-10 alone: exit=$? ==="
           PENTBIN=$(cargo build -p pent --message-format=json 2>/dev/null \
             | /usr/bin/sed -n 's/.*"executable":"\([^"]*\/pent\)".*/\1/p' | tail -1)
           echo "pent is [$PENTBIN]"
-          printf 'KNOWN\n' > /tmp/pent-probe-known.txt
           probe_run() {
             name=$1
             shift
-            H=$(mktemp -d)
+            H=$(cd "$(mktemp -d)" && pwd -P)
             mkdir -p "$H/home" "$H/ws"
             printf 'foo\n' > "$H/home/.foorc"
             echo "=== RUN $name: $* ==="
-            start=$(date -u +%Y-%m-%d\ %H:%M:%S)
             ( cd "$H/ws" && HOME="$H/home" XDG_CONFIG_HOME="$H/cfg" \
-              XDG_STATE_HOME="$H/state" "$PENTBIN" -v watch --yes \
-              --profile "$name" -- "$@" 2>&1 | cut -c1-200 | tail -30 )
+              XDG_STATE_HOME="$H/state" "$PENTBIN" watch --yes \
+              --profile "$name" -- "$@" 2>&1 | cut -c1-200 )
             echo "--- draft $name ---"
             cat "$H/state/pent/drafts/$name.toml" 2>&1
-            echo "--- raw events $name ---"
-            cat "$H/state/pent/watch/$name/"* 2>&1 | cut -c1-200 | head -25
-            sleep 3
-            echo "--- the reports that the kernel wrote ---"
-            /usr/bin/log show --style syslog --start "$start" \
-              --predicate 'processImagePath == "/kernel"' 2>/dev/null \
-              | grep -a 'Sandbox: ' | cut -c1-200 | tail -25
+            echo "--- the process IDs and the names of the raw events ---"
+            cat "$H/state/pent/watch/$name/"* 2>&1 \
+              | /usr/bin/sed -n 's/.*"pid":\([0-9]*\),"name":"\([^"]*\)".*/\1 \2/p' \
+              | sort | uniq -c
+            echo "--- the events that name .foorc ---"
+            cat "$H/state/pent/watch/$name/"* 2>&1 | grep -a foorc | cut -c1-200
             echo "=== END $name ==="
           }
-          probe_run r1 /bin/cat /tmp/pent-probe-known.txt
-          probe_run r2 /bin/sh -c 'cat ~/.foorc'
-          probe_run r3 /bin/sh -c 'cat ~/.foorc; sleep 3'
-          probe_run r4 /bin/sh -c 'read -r l < ~/.foorc; echo "$l"; sleep 3'
+          probe_run p1 /bin/sh -c 'cat ~/.foorc'
+          probe_run p2 /bin/sh -c 'cat ~/.foorc; echo END'
+          probe_run p3 /bin/sh -c 'read -r l < ~/.foorc; echo "$l"'
           exit 0
 
       # The whole workspace, in debug. The macOS suites (e2e_macos,

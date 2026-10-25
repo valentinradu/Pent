@@ -1,329 +1,150 @@
-//! Follow a process tree with `kqueue` and `EVFILT_PROC`.
+//! The measurement of `kqueue` for MAC-10.
 //!
-//! The reader of the Seatbelt reports needs two facts about each report:
-//! the process is a member of the tree of the run, and the name of the
-//! report fits the program that the process runs (see `macos_log.rs`).
-//! A poll of `ps` gives both, and it misses a process that lives less
-//! than one poll interval: a child such as `cat` lives about three
-//! milliseconds (MAC-10 in `docs/security/macos.md`).
+//! MAC-10 (`docs/security/macos.md`): the reader of the Seatbelt reports
+//! keeps a report only when the process is a member of the tree of the run
+//! and the name of the report fits the program that the process runs. Both
+//! facts come from a poll of `ps` every 100 ms, so a child that lives less
+//! than one poll leaves no name and the reader drops its reports.
 //!
-//! `kqueue` gives both facts without a poll. The kernel delivers an event
-//! at the time of the `fork`, so no process is too short:
+//! The recommended fix was `kqueue` with `EVFILT_PROC` and `NOTE_TRACK`:
 //!
 //! ```text
 //! EV_SET(&ev, pid, EVFILT_PROC, EV_ADD | EV_CLEAR,
 //!        NOTE_TRACK | NOTE_FORK | NOTE_EXEC | NOTE_EXIT, 0, NULL)
 //! ```
 //!
-//! `NOTE_TRACK` makes the kernel register the same filter on each child of
-//! the process, and on each child of that child. The event of a new child
-//! carries `NOTE_CHILD`, the process ID of the child in `ident` and the
-//! process ID of the parent in `data`.
+//! With `NOTE_TRACK` the kernel would register the same filter on each
+//! child of the process, and the event of a new child would carry
+//! `NOTE_CHILD`, the process ID of the child in `ident` and the process ID
+//! of the parent in `data`. The tree would then need no poll.
 //!
-//! # Why the watcher follows pent itself
+//! **macOS refuses `NOTE_TRACK`.** The run of 2026-10-25 on `macos-latest`
+//! measured the answer of the kernel: `kevent(2)` returns `ENOTSUP`
+//! ("Operation not supported", error 45) for a filter that asks for
+//! `NOTE_TRACK`. The flag is in `sys/event.h`, and the kernel of macOS
+//! does not implement it.
 //!
-//! A filter needs a process ID, and pent knows the process ID of the root
-//! only after the spawn. A `fork` between the spawn and the first
-//! `kevent` call would thus stay unseen. Pent therefore registers the
-//! filter on **itself**, before the spawn. The spawn of `sandbox-exec` is
-//! then a `NOTE_CHILD` event of pent, and `NOTE_TRACK` follows the whole
-//! tree below it. There is no race, because the filter is in place before
-//! the first `fork`.
+//! Without `NOTE_TRACK`, `EVFILT_PROC` gives this:
 //!
-//! Pent also forks for `ps` and for `log stream`, so those processes
-//! appear as children of pent too. The caller keeps only a child whose
-//! parent is already a member of the tree
-//! (`ProcessTree::learn_fork`), so they go.
+//! | What it gives | What it lacks |
+//! |---|---|
+//! | `NOTE_FORK`: the watched process forked. | The process ID of the child. The event names only the parent, so pent must ask the process table which children are new, and a child that is already gone is in no table. |
+//! | `NOTE_EXEC`: the watched process runs a new file. | The path of the new file. |
+//! | `NOTE_EXIT`: the watched process exited, with its status. | Nothing that pent needs; the poll already sees the exit. |
 //!
-//! # What the watcher gives and what it does not
+//! `kqueue` thus gives no fact that the poll of `ps` does not already
+//! give, so pent has no `kqueue` watcher. The test below holds the
+//! measurement: the day a macOS implements `NOTE_TRACK`, the test fails
+//! and names MAC-10.
 //!
-//! The kernel gives the process ID of each new process and the process ID
-//! of its parent. It gives **no name**: `NOTE_EXEC` says that the process
-//! runs a new file, and it does not say which file. The two name sources
-//! stay the ones of MAC-8, and both come from the kernel:
-//!
-//! - `fork(2)` copies `p_comm`, so a new child starts with the names of
-//!   its parent;
-//! - each `process-exec` report of the unified log holds the path that the
-//!   kernel wrote.
-//!
-//! The program chooses neither, so FUZZ-1 stays closed
-//! (`docs/security/fuzzing.md`).
-//!
-//! A `kqueue` descriptor is not inherited across `fork(2)`, so the watcher
-//! lives in pent and the child never sees it.
+//! The next option is the `EndpointSecurity` framework, which gives the
+//! parent and the child of each `fork` with no race. It needs the
+//! entitlement `com.apple.developer.endpoint-security.client`, a signed
+//! and notarized binary and root, so it is not open to a tool that each
+//! user builds. `docs/security/macos.md` holds the full list of the ways
+//! out.
 
-use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
-
-use crate::SandboxError;
-
-/// What the kernel says about one process of the tree.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ProcEvent {
-    /// `pid` is a new child of `parent`.
-    Fork { pid: u32, parent: u32 },
-    /// `pid` runs a new program file. The event has no path.
-    Exec { pid: u32 },
-    /// `pid` exited.
-    Exit { pid: u32 },
-    /// The kernel could not follow a new child of `pid`.
-    TrackError { pid: u32 },
-}
-
-/// The number of events that one `kevent` call reads.
-const BATCH: usize = 64;
-
-/// A `kqueue` that follows a process and each of its descendants.
-#[derive(Debug)]
-pub(crate) struct ProcWatcher {
-    kq: OwnedFd,
-}
-
-impl ProcWatcher {
-    /// Follow `root` and each process that `root` forks, at any depth.
-    ///
-    /// Register the filter before the first `fork` of `root`, else the
-    /// kernel reports no child of that `fork`.
-    ///
-    /// # Errors
-    /// Returns `SandboxUnavailable` if `kqueue(2)` fails, or if the kernel
-    /// refuses the filter (for example for a process of another user).
-    pub(crate) fn new(root: u32) -> Result<Self, SandboxError> {
-        let unavailable = |reason: String| SandboxError::SandboxUnavailable {
-            reason,
-            remediation: "The recorder falls back to the poll of the process \
-                          table, which misses a process that lives less than \
-                          100 ms"
-                .to_string(),
-        };
-        // SAFETY: `kqueue` takes no argument and returns a new descriptor
-        // or -1. The call cannot touch memory of this process.
-        let raw = unsafe { libc::kqueue() };
-        if raw < 0 {
-            return Err(unavailable(format!(
-                "kqueue failed: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-        // SAFETY: `raw` is a fresh descriptor that `kqueue` returned and
-        // that nothing else owns, so `OwnedFd` can close it.
-        let kq = unsafe { OwnedFd::from_raw_fd(raw) };
-        let change = libc::kevent {
-            ident: root as libc::uintptr_t,
-            filter: libc::EVFILT_PROC,
-            flags: libc::EV_ADD | libc::EV_ENABLE | libc::EV_CLEAR,
-            fflags: libc::NOTE_TRACK | libc::NOTE_FORK | libc::NOTE_EXEC | libc::NOTE_EXIT,
-            data: 0,
-            udata: std::ptr::null_mut(),
-        };
-        // SAFETY: `kq` is open for the whole call. The change list holds
-        // one initialised `kevent`, and the length says one. The event
-        // list is empty, and the length says zero, so the kernel writes
-        // nothing. The timeout is null, which the manual page allows for a
-        // call that only registers.
-        let rc = unsafe {
-            libc::kevent(
-                kq.as_raw_fd(),
-                &raw const change,
-                1,
-                std::ptr::null_mut(),
-                0,
-                std::ptr::null(),
-            )
-        };
-        if rc < 0 {
-            return Err(unavailable(format!(
-                "kevent could not follow the process {root}: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-        Ok(Self { kq })
-    }
-
-    /// Read each event that the kernel has ready, and return nothing when
-    /// it has none.
-    ///
-    /// The call never waits. The kernel keeps one filter for each process
-    /// of the tree, so an event waits until the caller reads it; a caller
-    /// that drains late loses no child.
-    pub(crate) fn drain(&self) -> Vec<ProcEvent> {
-        let mut out = Vec::new();
-        let no_wait = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
-        loop {
-            let mut events = [EMPTY_EVENT; BATCH];
-            // SAFETY: `self.kq` is open for the whole call. The change
-            // list is empty with the length zero. The event list is an
-            // array of `BATCH` initialised `kevent` values, and the
-            // length is `BATCH`, so the kernel writes inside the array.
-            // The timeout is a valid `timespec` of zero.
-            let rc = unsafe {
-                libc::kevent(
-                    self.kq.as_raw_fd(),
-                    std::ptr::null(),
-                    0,
-                    events.as_mut_ptr(),
-                    BATCH as libc::c_int,
-                    &raw const no_wait,
-                )
-            };
-            if rc < 0 {
-                let err = std::io::Error::last_os_error();
-                if err.kind() == std::io::ErrorKind::Interrupted {
-                    continue;
-                }
-                tracing::debug!(error = %err, "kevent failed");
-                return out;
-            }
-            // `rc` is not negative here, so the conversion holds.
-            let count = usize::try_from(rc).unwrap_or(0).min(BATCH);
-            for event in events.iter().take(count) {
-                push_events(event, &mut out);
-            }
-            if count < BATCH {
-                return out;
-            }
-        }
-    }
-}
-
-/// A `kevent` with each field at zero, for the event list of a read.
-const EMPTY_EVENT: libc::kevent = libc::kevent {
-    ident: 0,
-    filter: 0,
-    flags: 0,
-    fflags: 0,
-    data: 0,
-    udata: std::ptr::null_mut(),
-};
-
-/// Translate one `kevent` into the events of [`ProcEvent`].
+/// Register one `EVFILT_PROC` filter on this process and return the answer
+/// of the kernel.
 ///
-/// One `kevent` can carry more than one flag, so the function can push
-/// more than one event.
-fn push_events(event: &libc::kevent, out: &mut Vec<ProcEvent>) {
-    // `kevent` is a packed structure, so each field goes into a local
-    // variable: a reference to a field of it is not aligned.
-    let (flags, fflags, ident, data) = (event.flags, event.fflags, event.ident, event.data);
-    if flags & libc::EV_ERROR != 0 {
-        tracing::debug!(ident, data, "kevent reports an error");
-        return;
+/// `fflags` holds the `NOTE_*` flags of the filter. The function makes a
+/// new `kqueue` for each call and closes it again, so one call cannot see
+/// the filter of another.
+fn register(fflags: u32) -> std::io::Result<()> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+
+    // SAFETY: `kqueue` takes no argument and returns a new descriptor or
+    // -1. The call cannot touch the memory of this process.
+    let raw = unsafe { libc::kqueue() };
+    if raw < 0 {
+        return Err(std::io::Error::last_os_error());
     }
-    let Ok(pid) = u32::try_from(ident) else {
-        return;
+    // SAFETY: `raw` is a fresh descriptor that `kqueue` returned and that
+    // nothing else owns, so `OwnedFd` can close it.
+    let kq = unsafe { OwnedFd::from_raw_fd(raw) };
+    let change = libc::kevent {
+        ident: std::process::id() as libc::uintptr_t,
+        filter: libc::EVFILT_PROC,
+        flags: libc::EV_ADD | libc::EV_ENABLE | libc::EV_CLEAR | libc::EV_RECEIPT,
+        fflags,
+        data: 0,
+        udata: std::ptr::null_mut(),
     };
-    if fflags & libc::NOTE_CHILD != 0 {
-        // The kernel puts the process ID of the parent in `data`.
-        if let Ok(parent) = u32::try_from(data) {
-            out.push(ProcEvent::Fork { pid, parent });
-        }
-        return;
+    let mut answer = libc::kevent {
+        ident: 0,
+        filter: 0,
+        flags: 0,
+        fflags: 0,
+        data: 0,
+        udata: std::ptr::null_mut(),
+    };
+    // SAFETY: `kq` is open for the whole call. The change list holds one
+    // initialised `kevent` and the length says one. The event list holds
+    // one initialised `kevent` and the length says one, so the kernel
+    // writes inside it. `EV_RECEIPT` makes the kernel put the answer of
+    // the registration there. The timeout is null, which the manual page
+    // allows for a call that only registers.
+    let rc = unsafe {
+        libc::kevent(
+            kq.as_raw_fd(),
+            &raw const change,
+            1,
+            &raw mut answer,
+            1,
+            std::ptr::null(),
+        )
+    };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
     }
-    if fflags & libc::NOTE_TRACKERR != 0 {
-        out.push(ProcEvent::TrackError { pid });
+    // `EV_RECEIPT` always gives one event back. Its `data` holds the error
+    // of the registration, or zero.
+    let (flags, data) = (answer.flags, answer.data);
+    if flags & libc::EV_ERROR != 0 && data != 0 {
+        return Err(std::io::Error::from_raw_os_error(
+            i32::try_from(data).unwrap_or(libc::EINVAL),
+        ));
     }
-    if fflags & libc::NOTE_EXEC != 0 {
-        out.push(ProcEvent::Exec { pid });
-    }
-    if fflags & libc::NOTE_EXIT != 0 {
-        out.push(ProcEvent::Exit { pid });
-    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::register;
 
-    /// A `NOTE_CHILD` event gives the child and its parent.
+    /// MAC-10. The kernel refuses a filter that asks to follow a `fork`,
+    /// so `kqueue` cannot name the child of a `fork` and the recorder
+    /// still needs the poll of the process table.
+    ///
+    /// The three flags without `NOTE_TRACK` do register, which shows that
+    /// the filter itself is right and that only `NOTE_TRACK` is missing.
+    ///
+    /// When this test fails, macOS has `NOTE_TRACK` and MAC-10 has a fix:
+    /// follow the tree from the process of pent, give each new child the
+    /// names of its parent, and drop the poll. See the module comment.
     #[test]
-    fn a_child_event_gives_both_process_ids() {
-        let event = libc::kevent {
-            ident: 4242,
-            filter: libc::EVFILT_PROC,
-            flags: 0,
-            fflags: libc::NOTE_CHILD | libc::NOTE_FORK,
-            data: 17,
-            udata: std::ptr::null_mut(),
-        };
-        let mut out = Vec::new();
-        push_events(&event, &mut out);
-        assert_eq!(
-            out,
-            vec![ProcEvent::Fork {
-                pid: 4242,
-                parent: 17
-            }]
-        );
-    }
-
-    /// One event can carry an exec and an exit.
-    #[test]
-    fn one_event_can_carry_two_flags() {
-        let event = libc::kevent {
-            ident: 9,
-            filter: libc::EVFILT_PROC,
-            flags: 0,
-            fflags: libc::NOTE_EXEC | libc::NOTE_EXIT,
-            data: 0,
-            udata: std::ptr::null_mut(),
-        };
-        let mut out = Vec::new();
-        push_events(&event, &mut out);
-        assert_eq!(
-            out,
-            vec![ProcEvent::Exec { pid: 9 }, ProcEvent::Exit { pid: 9 }]
-        );
-    }
-
-    /// An error event gives no process event.
-    #[test]
-    fn an_error_event_gives_nothing() {
-        let event = libc::kevent {
-            ident: 5,
-            filter: libc::EVFILT_PROC,
-            flags: libc::EV_ERROR,
-            fflags: libc::NOTE_EXIT,
-            data: libc::ESRCH as libc::intptr_t,
-            udata: std::ptr::null_mut(),
-        };
-        let mut out = Vec::new();
-        push_events(&event, &mut out);
-        assert!(out.is_empty(), "an error event gave {out:?}");
-    }
-
-    /// The watcher follows this process, and the kernel reports each
-    /// child that it forks.
-    #[test]
-    fn the_watcher_reports_a_short_lived_child() {
-        let watcher = ProcWatcher::new(std::process::id());
+    fn the_kernel_refuses_to_follow_a_fork() {
+        let plain = libc::NOTE_FORK | libc::NOTE_EXEC | libc::NOTE_EXIT;
+        let answer = register(plain);
         assert!(
-            watcher.is_ok(),
-            "the watcher did not start: {:?}",
-            watcher.as_ref().err()
+            answer.is_ok(),
+            "the kernel refused a plain EVFILT_PROC filter: {:?}. \
+             Each verdict of MAC-10 rests on this filter.",
+            answer.err()
         );
-        let Ok(watcher) = watcher else { return };
-        let child = std::process::Command::new("/usr/bin/true").spawn();
-        let Ok(mut child) = child else {
-            eprintln!("SKIP the_watcher_reports_a_short_lived_child: no /usr/bin/true");
-            return;
-        };
-        let pid = child.id();
-        let status = child.wait();
-        assert!(status.is_ok(), "the child did not finish: {status:?}");
-        // The kernel keeps the event until a read, so one drain after the
-        // child is gone still holds its fork.
-        let events = watcher.drain();
+        let tracked = register(plain | libc::NOTE_TRACK);
         assert!(
-            events.iter().any(|e| matches!(
-                e,
-                ProcEvent::Fork {
-                    pid: forked,
-                    parent
-                } if *forked == pid && *parent == std::process::id()
-            )),
-            "the fork of the process {pid} is not in {events:?}"
+            tracked.is_err(),
+            "macOS now follows a fork with NOTE_TRACK. MAC-10 in \
+             docs/security/macos.md has a fix: see the comment of \
+             crates/pent-sandbox/src/macos_kqueue.rs"
+        );
+        let Err(error) = tracked else { return };
+        assert_eq!(
+            error.raw_os_error(),
+            Some(libc::ENOTSUP),
+            "the kernel refused NOTE_TRACK with another error than ENOTSUP: \
+             {error}. The reason of MAC-10 must name the real answer."
         );
     }
 }
