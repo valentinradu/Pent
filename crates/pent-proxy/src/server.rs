@@ -23,8 +23,8 @@
 //!
 
 use crate::{
-    DnsServer, DnsServerConfig, ProxyError, Result, SharedState, TcpProxy, TcpProxyConfig,
-    TraceEvent,
+    DnsServer, DnsServerConfig, PrivateDestinations, ProxyError, Result, SharedState, TcpProxy,
+    TcpProxyConfig, TraceEvent,
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -52,9 +52,21 @@ pub struct ProxyConfig {
     /// Supports exact matches and wildcards (`*.github.com`).
     pub domain_allowlist: Vec<String>,
 
-    /// DNS response TTL.
+    /// Maximum DNS TTL.
+    ///
+    /// The proxy uses the upstream TTL, but not more than this value, for
+    /// the TTL in the DNS response and for the expiry of the IP-to-domain
+    /// cache.
     /// Default: 5 minutes
     pub dns_ttl: std::time::Duration,
+
+    /// Minimum DNS TTL.
+    ///
+    /// The proxy increases a shorter upstream TTL to this value, so that the
+    /// cache does not change too frequently. `dns_ttl` has priority if it is
+    /// smaller.
+    /// Default: 30 seconds
+    pub dns_min_ttl: std::time::Duration,
 
     /// TCP connection timeout.
     /// Default: 30 seconds
@@ -63,6 +75,15 @@ pub struct ProxyConfig {
     /// TCP idle timeout (connection closed if no data flows).
     /// Default: 5 minutes
     pub tcp_idle_timeout: std::time::Duration,
+
+    /// Time limit for the SOCKS5 or HTTP CONNECT handshake of a client.
+    /// Default: 10 seconds
+    pub handshake_timeout: std::time::Duration,
+
+    /// Policy for destinations that are not public addresses (loopback,
+    /// private, link-local and similar ranges).
+    /// Default: [`PrivateDestinations::Deny`]
+    pub private_destinations: PrivateDestinations,
 
     /// Optional channel for reporting trace events (violations and granted access).
     /// When set, both blocked and allowed connections send a typed [`TraceEvent`].
@@ -80,8 +101,11 @@ impl Default for ProxyConfig {
             domain_allowlist: vec![], // Populated from settings per-assistant
             violation_tx: None,
             dns_ttl: std::time::Duration::from_secs(300),
+            dns_min_ttl: std::time::Duration::from_secs(30),
             tcp_connect_timeout: std::time::Duration::from_secs(30),
             tcp_idle_timeout: std::time::Duration::from_secs(300),
+            handshake_timeout: std::time::Duration::from_secs(10),
+            private_destinations: PrivateDestinations::Deny,
         }
     }
 }
@@ -104,6 +128,29 @@ impl ProxyConfig {
     pub fn with_allowlist(domains: Vec<String>) -> Self {
         Self {
             domain_allowlist: domains,
+            ..Default::default()
+        }
+    }
+
+    /// Make the DNS server configuration for the bind address `bind_addr`.
+    fn dns_config(&self, bind_addr: SocketAddr) -> DnsServerConfig {
+        DnsServerConfig {
+            bind_addr,
+            upstream: self.upstream_dns.clone(),
+            ttl: self.dns_ttl,
+            min_ttl: self.dns_min_ttl,
+            ..Default::default()
+        }
+    }
+
+    /// Make the TCP proxy configuration for the bind address `bind_addr`.
+    fn tcp_config(&self, bind_addr: SocketAddr) -> TcpProxyConfig {
+        TcpProxyConfig {
+            bind_addr,
+            connect_timeout: self.tcp_connect_timeout,
+            idle_timeout: self.tcp_idle_timeout,
+            handshake_timeout: self.handshake_timeout,
+            private_destinations: self.private_destinations,
             ..Default::default()
         }
     }
@@ -138,13 +185,14 @@ impl ProxyHandle {
 
     /// Shut down the proxy server gracefully.
     ///
-    /// Signals the server to stop via the shutdown channel. The server task
-    /// will complete when it receives the signal. If the shutdown signal
-    /// cannot be delivered (receiver dropped), the task is aborted.
+    /// Signals the server to stop via the shutdown channel. When the server
+    /// task stops, it cancels all the DNS query tasks and all the TCP
+    /// connection tasks, and the proxy closes the open connections. If the
+    /// shutdown signal cannot be delivered (receiver dropped), or if the task
+    /// does not stop in 2 seconds, the task is aborted.
     ///
     /// # Errors
-    /// Currently infallible; always returns `Ok`. If the task does not respond
-    /// within 2 seconds it is left to finish on its own (not aborted).
+    /// Currently infallible; always returns `Ok`.
     pub async fn shutdown(mut self) -> Result<()> {
         // Send shutdown signal - this triggers the tokio::select! in the server task
         let signal_sent = self
@@ -153,11 +201,16 @@ impl ProxyHandle {
             .is_some_and(|tx| tx.send(()).is_ok());
 
         // Wait for server task to complete
-        if let Some(handle) = self.join_handle.take() {
+        if let Some(mut handle) = self.join_handle.take() {
             if signal_sent {
-                // Give the task time to respond to shutdown signal
-                // Task completed, was cancelled, panicked, or timed out — all ok.
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+                // Give the task time to respond to shutdown signal. The result
+                // of the task is not important here: it completed, was
+                // cancelled, or panicked, and the proxy stops in all cases.
+                let stopped =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), &mut handle).await;
+                if stopped.is_err() {
+                    handle.abort();
+                }
             } else {
                 // Shutdown signal couldn't be sent, abort the task
                 handle.abort();
@@ -205,12 +258,21 @@ impl ProxyHandle {
         Arc::clone(&self.state.connections_accepted)
     }
 
+    /// The number of trace events that the proxy could not deliver, because
+    /// the receiver of the trace channel was closed.
+    #[must_use]
+    pub fn dropped_trace_events(&self) -> u64 {
+        self.state.dropped_trace_events()
+    }
+
     /// Add a domain to the allowlist at runtime.
     ///
-    /// Creates a new filter with the added domain and replaces the current one.
     /// The change takes effect immediately for new DNS queries.
-    pub fn add_domain(&self, domain: String) {
-        self.state.add_domain(domain);
+    ///
+    /// # Errors
+    /// Returns [`ProxyError::InvalidDomain`] if the pattern is not valid.
+    pub fn add_domain(&self, domain: String) -> Result<()> {
+        self.state.add_domain(domain)
     }
 }
 
@@ -232,8 +294,8 @@ impl ProxyServer {
     /// * `config` - Server configuration
     ///
     /// # Errors
-    /// Currently infallible; always returns `Ok`. The `Result` return type
-    /// is present for forward compatibility.
+    /// * `ProxyError::InvalidDomain` - If a pattern in the allowlist is not
+    ///   valid (for example, if it contains characters that are not ASCII).
     ///
     /// # Example
     /// ```ignore
@@ -243,10 +305,10 @@ impl ProxyServer {
     /// handle.shutdown().await?;
     /// ```
     pub fn new(config: ProxyConfig) -> Result<Self> {
-        let state = Arc::new(SharedState::with_violation_tx(
-            config.domain_allowlist.clone(),
+        let state = Arc::new(SharedState::try_with_violation_tx(
+            &config.domain_allowlist,
             config.violation_tx.clone(),
-        ));
+        )?);
         Ok(Self { config, state })
     }
 
@@ -291,23 +353,16 @@ impl ProxyServer {
 
         // Spawn server task using pre-bound sockets.
         let join_handle = tokio::spawn(async move {
-            let dns_config = DnsServerConfig {
-                bind_addr: actual_dns_addr,
-                upstream: config.upstream_dns.clone(),
-                ttl: config.dns_ttl,
-                ..Default::default()
-            };
-            let tcp_config = TcpProxyConfig {
-                bind_addr: actual_proxy_addr,
-                connect_timeout: config.tcp_connect_timeout,
-                idle_timeout: config.tcp_idle_timeout,
-                ..Default::default()
-            };
+            let dns_config = config.dns_config(actual_dns_addr);
+            let tcp_config = config.tcp_config(actual_proxy_addr);
 
             let dns_server = DnsServer::new(dns_config, Arc::clone(&state_for_task))?;
             let tcp_proxy = TcpProxy::new(tcp_config, Arc::clone(&state_for_task))?;
 
-            // Run both servers concurrently on pre-bound sockets.
+            // Run both servers concurrently on pre-bound sockets. When the
+            // shutdown signal arrives, select! drops the two server futures.
+            // Each of them owns a JoinSet of its tasks, and the drop of a
+            // JoinSet aborts all its tasks.
             tokio::select! {
                 result = dns_server.run_on(udp_socket) => result,
                 result = tcp_proxy.run_on(tcp_listener) => result,
@@ -334,18 +389,8 @@ impl ProxyServer {
     /// * `ProxyError::Internal` - If the DNS server or TCP proxy encounter
     ///   a fatal runtime error.
     pub async fn run(self) -> Result<()> {
-        let dns_config = DnsServerConfig {
-            bind_addr: self.config.dns_bind_addr,
-            upstream: self.config.upstream_dns.clone(),
-            ttl: self.config.dns_ttl,
-            ..Default::default()
-        };
-        let tcp_config = TcpProxyConfig {
-            bind_addr: self.config.proxy_bind_addr,
-            connect_timeout: self.config.tcp_connect_timeout,
-            idle_timeout: self.config.tcp_idle_timeout,
-            ..Default::default()
-        };
+        let dns_config = self.config.dns_config(self.config.dns_bind_addr);
+        let tcp_config = self.config.tcp_config(self.config.proxy_bind_addr);
 
         let dns_server = DnsServer::new(dns_config, Arc::clone(&self.state))?;
         let tcp_proxy = TcpProxy::new(tcp_config, Arc::clone(&self.state))?;
@@ -365,23 +410,40 @@ impl ProxyServer {
 
     /// Add a domain to the allowlist at runtime.
     ///
-    /// Creates a new filter with the added domain and replaces the current one.
     /// The change takes effect immediately for new DNS queries.
     ///
     /// Note: This does not persist the change to config - only updates the runtime state.
-    pub fn add_domain(&self, domain: String) {
-        self.state.add_domain(domain);
+    ///
+    /// # Errors
+    /// Returns [`ProxyError::InvalidDomain`] if the pattern is not valid.
+    pub fn add_domain(&self, domain: String) -> Result<()> {
+        self.state.add_domain(domain)
     }
+}
+
+/// An error in the conversion of `ProxySettings` into a [`ProxyConfig`].
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    /// An `upstream_dns` entry is not a valid socket address.
+    #[error("Invalid upstream_dns entry {entry:?}: {source}")]
+    InvalidUpstreamDns {
+        /// The entry from the settings.
+        entry: String,
+        /// The parse error.
+        #[source]
+        source: std::net::AddrParseError,
+    },
 }
 
 /// Convert a `ProxySettings` fragment (from `pent-settings`) into a `ProxyConfig`.
 ///
-/// Returns `Err(String)` if any `upstream_dns` entry cannot be parsed as a
-/// `SocketAddr`.  All other fields have infallible defaults.
+/// Returns [`ConfigError::InvalidUpstreamDns`] if any `upstream_dns` entry
+/// cannot be parsed as a `SocketAddr`.  All other fields have infallible
+/// defaults.
 impl TryFrom<&pent_settings::ProxySettings> for ProxyConfig {
-    type Error = String;
+    type Error = ConfigError;
 
-    fn try_from(settings: &pent_settings::ProxySettings) -> std::result::Result<Self, String> {
+    fn try_from(settings: &pent_settings::ProxySettings) -> std::result::Result<Self, ConfigError> {
         let mut config = Self {
             domain_allowlist: settings.domain_allowlist.clone(),
             ..Default::default()
@@ -396,10 +458,18 @@ impl TryFrom<&pent_settings::ProxySettings> for ProxyConfig {
             config.tcp_idle_timeout = std::time::Duration::from_secs(t);
         }
         if let Some(upstream) = &settings.upstream_dns {
-            let addrs: std::result::Result<Vec<std::net::SocketAddr>, _> =
-                upstream.iter().map(|s| s.parse()).collect();
-            config.upstream_dns =
-                Some(addrs.map_err(|e| format!("Invalid upstream_dns entry: {e}"))?);
+            let addrs = upstream
+                .iter()
+                .map(|entry| {
+                    entry
+                        .parse::<SocketAddr>()
+                        .map_err(|source| ConfigError::InvalidUpstreamDns {
+                            entry: entry.clone(),
+                            source,
+                        })
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            config.upstream_dns = Some(addrs);
         }
         Ok(config)
     }
@@ -988,7 +1058,7 @@ mod tests {
 
         assert!(!server.allowlist().contains(&"newdomain.com".to_string()));
 
-        server.add_domain("newdomain.com".to_string());
+        server.add_domain("newdomain.com".to_string())?;
 
         // After adding, should be in allowlist
         assert!(server.allowlist().contains(&"newdomain.com".to_string()));
@@ -1000,7 +1070,7 @@ mod tests {
         let config = ProxyConfig::default();
         let server = ProxyServer::new(config)?;
 
-        server.add_domain("*.newdomain.com".to_string());
+        server.add_domain("*.newdomain.com".to_string())?;
 
         assert!(server.allowlist().contains(&"*.newdomain.com".to_string()));
 
@@ -1255,5 +1325,93 @@ mod tests {
         query.extend_from_slice(&[0x00, 0x01]); // QCLASS: IN
 
         query
+    }
+
+    // ========================================================================
+    // Configuration Errors and Shutdown
+    // ========================================================================
+
+    #[test]
+    fn test_try_from_settings_reports_bad_upstream() {
+        let settings = pent_settings::ProxySettings {
+            upstream_dns: Some(vec!["1.1.1.1:53".to_string(), "not-an-addr".to_string()]),
+            ..Default::default()
+        };
+        let result = ProxyConfig::try_from(&settings);
+        assert!(
+            matches!(&result, Err(ConfigError::InvalidUpstreamDns { entry, .. }) if entry == "not-an-addr"),
+            "expected InvalidUpstreamDns, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_try_from_settings_defaults() -> TestResult {
+        let config = ProxyConfig::try_from(&pent_settings::ProxySettings::default())?;
+        assert_eq!(config.private_destinations, PrivateDestinations::Deny);
+        assert_eq!(config.handshake_timeout, std::time::Duration::from_secs(10));
+        assert_eq!(config.dns_min_ttl, std::time::Duration::from_secs(30));
+        Ok(())
+    }
+
+    #[test]
+    fn test_proxy_server_new_rejects_non_ascii_allowlist() {
+        let config = ProxyConfig::with_allowlist(vec!["b\u{fc}cher.example".to_string()]);
+        assert!(matches!(
+            ProxyServer::new(config),
+            Err(ProxyError::InvalidDomain(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_closes_open_relays() -> TestResult {
+        skip_if_no_bind!();
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+
+        // The destination keeps its side open and never sends data.
+        let dest_listener = TcpListener::bind("127.0.0.1:0").await?;
+        let dest = dest_listener.local_addr()?;
+        let _dest_task = tokio::spawn(async move {
+            if let Ok((mut socket, _)) = dest_listener.accept().await {
+                let mut buf = [0u8; 16];
+                while matches!(socket.read(&mut buf).await, Ok(n) if n > 0) {}
+            }
+        });
+
+        let config = ProxyConfig {
+            domain_allowlist: vec!["test.local".to_string()],
+            private_destinations: PrivateDestinations::Allow,
+            ..Default::default()
+        };
+        let server = ProxyServer::new(config)?;
+        server.state.cache.insert(crate::ResolvedAddress {
+            domain: "test.local".to_string(),
+            addresses: vec![dest.ip()],
+            expires_at: std::time::Instant::now() + std::time::Duration::from_secs(300),
+        });
+        let handle = server.start().await?;
+
+        let mut client = TcpStream::connect(handle.proxy_addr()).await?;
+        client.write_all(&[0x05, 0x01, 0x00]).await?;
+        let mut greeting = [0u8; 2];
+        client.read_exact(&mut greeting).await?;
+        let mut request = vec![0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1];
+        request.extend_from_slice(&dest.port().to_be_bytes());
+        client.write_all(&request).await?;
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).await?;
+        assert_eq!(reply[1], 0x00, "the relay must start");
+
+        handle.shutdown().await?;
+
+        // The proxy must close the relay of the open connection.
+        let mut buf = [0u8; 1];
+        let read =
+            tokio::time::timeout(std::time::Duration::from_secs(2), client.read(&mut buf)).await;
+        assert!(
+            matches!(read, Ok(Ok(0) | Err(_))),
+            "the relay is still open after shutdown: {read:?}"
+        );
+        Ok(())
     }
 }

@@ -17,6 +17,131 @@
 
 use std::collections::HashSet;
 
+/// The maximum length of a domain name in its text form, without the trailing dot.
+const MAX_NAME_LEN: usize = 253;
+
+/// The maximum length of one label in a domain name.
+const MAX_LABEL_LEN: usize = 63;
+
+/// An error for a domain name or a domain pattern that is not valid.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DomainNameError {
+    /// The name is empty.
+    #[error("the domain name is empty")]
+    Empty,
+
+    /// The name contains characters that are not ASCII.
+    ///
+    /// The proxy does not include an IDNA library. Write internationalized
+    /// names in their punycode (`xn--`) form.
+    #[error("the domain name {0:?} contains non-ASCII characters; use the punycode (xn--) form")]
+    NonAscii(String),
+
+    /// The name contains a character that is not permitted in a host name.
+    #[error("the domain name {name:?} contains the character {ch:?}, which is not permitted")]
+    InvalidCharacter {
+        /// The name that has the problem.
+        name: String,
+        /// The character that is not permitted.
+        ch: char,
+    },
+
+    /// The name contains an empty label (for example `a..b`).
+    #[error("the domain name {0:?} contains an empty label")]
+    EmptyLabel(String),
+
+    /// A label in the name is longer than 63 bytes.
+    #[error("the domain name {0:?} contains a label that is longer than 63 bytes")]
+    LabelTooLong(String),
+
+    /// The name is longer than 253 bytes.
+    #[error("the domain name {0:?} is longer than 253 bytes")]
+    TooLong(String),
+
+    /// A wildcard is in a position that is not permitted.
+    #[error("the pattern {0:?} has a wildcard in a position that is not permitted")]
+    InvalidWildcard(String),
+}
+
+/// Lowercase the ASCII name and remove one trailing dot.
+///
+/// Returns an error if the name contains characters that are not ASCII.
+fn fold_name(name: &str) -> Result<String, DomainNameError> {
+    if !name.is_ascii() {
+        return Err(DomainNameError::NonAscii(name.to_string()));
+    }
+    let lower = name.to_ascii_lowercase();
+    let folded = lower.strip_suffix('.').unwrap_or(&lower);
+    if folded.is_empty() {
+        return Err(DomainNameError::Empty);
+    }
+    if folded.len() > MAX_NAME_LEN {
+        return Err(DomainNameError::TooLong(folded.to_string()));
+    }
+    Ok(folded.to_string())
+}
+
+/// Validate one label of a host name that is already in lowercase.
+fn check_label(name: &str, label: &str) -> Result<(), DomainNameError> {
+    if label.is_empty() {
+        return Err(DomainNameError::EmptyLabel(name.to_string()));
+    }
+    if label.len() > MAX_LABEL_LEN {
+        return Err(DomainNameError::LabelTooLong(name.to_string()));
+    }
+    if let Some(ch) = label
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || *c == '-' || *c == '_'))
+    {
+        return Err(DomainNameError::InvalidCharacter {
+            name: name.to_string(),
+            ch,
+        });
+    }
+    Ok(())
+}
+
+/// Normalize a host name for the allowlist check and for resolution.
+///
+/// The function lowercases ASCII letters and removes one trailing dot.
+/// It rejects names that are not ASCII, empty labels, labels longer than
+/// 63 bytes, names longer than 253 bytes, and characters other than letters,
+/// digits, `-` and `_`.
+///
+/// The proxy checks and resolves the same normalized string. Thus the
+/// allowlist decision always applies to the name that the proxy resolves.
+///
+/// # Errors
+/// Returns a [`DomainNameError`] if the name is not a valid host name.
+pub fn normalize_hostname(name: &str) -> Result<String, DomainNameError> {
+    let folded = fold_name(name)?;
+    for label in folded.split('.') {
+        check_label(&folded, label)?;
+    }
+    Ok(folded)
+}
+
+/// Normalize an allowlist pattern.
+///
+/// The rules are the same as for [`normalize_hostname`], but the function also
+/// removes the whitespace at the two ends. The first label can be `*` or `**`.
+fn normalize_pattern(pattern: &str) -> Result<String, DomainNameError> {
+    let folded = fold_name(pattern.trim())?;
+    if folded == "*" {
+        return Ok(folded);
+    }
+    for (index, label) in folded.split('.').enumerate() {
+        if index == 0 && (label == "*" || label == "**") {
+            continue;
+        }
+        if label.contains('*') {
+            return Err(DomainNameError::InvalidWildcard(folded.clone()));
+        }
+        check_label(&folded, label)?;
+    }
+    Ok(folded)
+}
+
 /// Result of a domain match check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DomainMatch {
@@ -56,7 +181,7 @@ impl DomainMatch {
 /// Compiled domain pattern for efficient matching.
 #[derive(Debug, Clone)]
 pub struct DomainPattern {
-    /// Original pattern string.
+    /// Normalized pattern string.
     pattern: String,
 
     /// Pattern type for matching.
@@ -88,31 +213,29 @@ impl DomainPattern {
     /// # Arguments
     /// * `pattern` - Pattern string (e.g., `*.github.com`)
     ///
-    /// # Returns
-    /// Compiled pattern for matching
-    pub fn parse(pattern: &str) -> Self {
-        let normalized = normalize_domain(pattern);
+    /// # Errors
+    /// Returns a [`DomainNameError`] if the pattern is not a valid domain
+    /// pattern (for example, if it contains characters that are not ASCII).
+    pub fn parse(pattern: &str) -> Result<Self, DomainNameError> {
+        let normalized = normalize_pattern(pattern)?;
 
-        let kind = if normalized.starts_with("**.") {
+        let kind = if let Some(rest) = normalized.strip_prefix("**") {
             PatternKind::MultiWildcard {
-                suffix: normalized[2..].to_string(), // includes the leading dot
+                suffix: rest.to_string(), // includes the leading dot
             }
-        } else if normalized.starts_with("*.") {
+        } else if let Some(rest) = normalized.strip_prefix('*') {
+            // `rest` is empty for the "*" pattern.
             PatternKind::SingleWildcard {
-                suffix: normalized[1..].to_string(), // includes the leading dot
-            }
-        } else if normalized == "*" {
-            PatternKind::SingleWildcard {
-                suffix: String::new(),
+                suffix: rest.to_string(), // includes the leading dot
             }
         } else {
             PatternKind::Exact
         };
 
-        Self {
+        Ok(Self {
             pattern: normalized,
             kind,
-        }
+        })
     }
 
     /// Check if a domain matches this pattern.
@@ -122,12 +245,13 @@ impl DomainPattern {
     ///
     /// # Returns
     /// `true` if the domain matches the pattern
+    #[cfg(test)]
     pub fn matches(&self, domain: &str) -> bool {
-        let normalized = normalize_domain(domain);
-        if normalized.is_empty() {
-            return false;
-        }
+        normalize_hostname(domain).is_ok_and(|normalized| self.matches_normalized(&normalized))
+    }
 
+    /// Check a domain that [`normalize_hostname`] has normalized.
+    fn matches_normalized(&self, normalized: &str) -> bool {
         match &self.kind {
             PatternKind::Exact => normalized == self.pattern,
             PatternKind::SingleWildcard { suffix } => {
@@ -150,7 +274,7 @@ impl DomainPattern {
         }
     }
 
-    /// Get the original pattern string.
+    /// Get the normalized pattern string.
     #[must_use]
     pub fn pattern(&self) -> &str {
         &self.pattern
@@ -171,12 +295,15 @@ pub struct DomainFilter {
     /// Compiled patterns for matching.
     patterns: Vec<DomainPattern>,
 
-    /// Set of exact match domains for O(1) lookup.
+    /// Set of normalized exact match domains for O(1) lookup.
     exact_matches: HashSet<String>,
 }
 
 impl DomainFilter {
     /// Create a new domain filter from an allowlist.
+    ///
+    /// The filter skips patterns that are not valid and logs a warning for
+    /// each of them. Use [`DomainFilter::try_new`] to get an error instead.
     ///
     /// # Arguments
     /// * `allowlist` - List of allowed domain patterns
@@ -190,22 +317,40 @@ impl DomainFilter {
     /// ```
     #[must_use]
     pub fn new(allowlist: &[String]) -> Self {
-        let patterns: Vec<DomainPattern> =
-            allowlist.iter().map(|s| DomainPattern::parse(s)).collect();
+        let mut filter = Self::empty();
+        for entry in allowlist {
+            if let Err(e) = filter.push(entry.clone()) {
+                tracing::warn!(pattern = %entry, error = %e, "skip the allowlist pattern that is not valid");
+            }
+        }
+        filter
+    }
 
-        let exact_matches: HashSet<String> = patterns
-            .iter()
-            .filter(|p| p.is_exact())
-            .map(|p| p.pattern().to_string())
-            .collect();
+    /// Create a new domain filter from an allowlist, and reject patterns that
+    /// are not valid.
+    ///
+    /// # Errors
+    /// Returns the first [`DomainNameError`] if a pattern is not valid.
+    pub fn try_new(allowlist: &[String]) -> Result<Self, DomainNameError> {
+        let mut filter = Self::empty();
+        for entry in allowlist {
+            filter.push(entry.clone())?;
+        }
+        Ok(filter)
+    }
 
+    /// Create a filter with no patterns.
+    fn empty() -> Self {
         Self {
-            patterns,
-            exact_matches,
+            patterns: Vec::new(),
+            exact_matches: HashSet::new(),
         }
     }
 
     /// Check if a domain matches the allowlist.
+    ///
+    /// The filter normalizes the domain with the same rules as the patterns.
+    /// A domain that is not a valid host name is blocked.
     ///
     /// # Arguments
     /// * `domain` - Domain to check
@@ -216,10 +361,9 @@ impl DomainFilter {
     /// * `DomainMatch::Blocked` - Domain is not allowed
     #[must_use]
     pub fn matches(&self, domain: &str) -> DomainMatch {
-        let normalized = normalize_domain(domain);
-        if normalized.is_empty() {
+        let Ok(normalized) = normalize_hostname(domain) else {
             return DomainMatch::Blocked;
-        }
+        };
 
         // Check exact matches first (O(1) lookup)
         if self.exact_matches.contains(&normalized) {
@@ -228,7 +372,7 @@ impl DomainFilter {
 
         // Check wildcard patterns
         for pattern in &self.patterns {
-            if !pattern.is_exact() && pattern.matches(&normalized) {
+            if !pattern.is_exact() && pattern.matches_normalized(&normalized) {
                 return DomainMatch::Wildcard {
                     domain: normalized,
                     pattern: pattern.pattern().to_string(),
@@ -262,7 +406,8 @@ impl DomainFilter {
     /// Create a new filter with an additional domain.
     ///
     /// Returns a new `DomainFilter` with the domain added to the allowlist.
-    /// The original filter is unchanged.
+    /// The original filter is unchanged. If the domain is not a valid
+    /// pattern, the new filter does not contain it.
     #[must_use]
     pub fn with_domain(&self, domain: String) -> Self {
         let mut domains: Vec<String> = self
@@ -279,25 +424,20 @@ impl DomainFilter {
     /// More efficient than [`with_domain`](Self::with_domain) for runtime additions
     /// because it avoids cloning all existing patterns. The `HashSet` and `Vec` are
     /// updated directly in O(1) amortized time.
-    pub fn push(&mut self, domain: String) {
-        let pattern = DomainPattern::parse(&domain);
+    ///
+    /// # Errors
+    /// Returns a [`DomainNameError`] if the pattern is not valid. The filter
+    /// does not change in this case.
+    pub fn push(&mut self, domain: String) -> Result<(), DomainNameError> {
+        let pattern = DomainPattern::parse(&domain)?;
         if pattern.is_exact() {
-            // Index in exact_matches for O(1) lookup; the pattern also goes
-            // into self.patterns so patterns() and with_domain() see it.
-            self.exact_matches.insert(domain);
+            // Index the normalized form, because `matches` looks up the
+            // normalized form of the queried domain.
+            self.exact_matches.insert(pattern.pattern().to_string());
         }
         self.patterns.push(pattern);
+        Ok(())
     }
-}
-
-/// Normalize a domain for matching.
-///
-/// - Converts to lowercase
-/// - Removes trailing dot if present
-/// - Trims whitespace
-fn normalize_domain(domain: &str) -> String {
-    let trimmed = domain.trim().to_lowercase();
-    trimmed.strip_suffix('.').unwrap_or(&trimmed).to_string()
 }
 
 #[cfg(test)]
@@ -309,34 +449,38 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_pattern_parse_exact() {
-        let pattern = DomainPattern::parse("example.com");
+    fn test_pattern_parse_exact() -> Result<(), DomainNameError> {
+        let pattern = DomainPattern::parse("example.com")?;
         assert!(pattern.is_exact());
         assert_eq!(pattern.pattern(), "example.com");
+        Ok(())
     }
 
     #[test]
-    fn test_pattern_parse_single_wildcard() {
-        let pattern = DomainPattern::parse("*.example.com");
+    fn test_pattern_parse_single_wildcard() -> Result<(), DomainNameError> {
+        let pattern = DomainPattern::parse("*.example.com")?;
         assert!(!pattern.is_exact());
         assert!(pattern.matches("sub.example.com"));
         assert!(!pattern.matches("a.b.example.com"));
+        Ok(())
     }
 
     #[test]
-    fn test_pattern_parse_multi_wildcard() {
-        let pattern = DomainPattern::parse("**.example.com");
+    fn test_pattern_parse_multi_wildcard() -> Result<(), DomainNameError> {
+        let pattern = DomainPattern::parse("**.example.com")?;
         assert!(!pattern.is_exact());
         assert!(pattern.matches("a.b.example.com"));
         assert!(pattern.matches("sub.example.com"));
+        Ok(())
     }
 
     #[test]
-    fn test_pattern_parse_wildcard_only() {
-        let pattern = DomainPattern::parse("*");
+    fn test_pattern_parse_wildcard_only() -> Result<(), DomainNameError> {
+        let pattern = DomainPattern::parse("*")?;
         assert!(!pattern.is_exact());
         assert!(pattern.matches("localhost"));
         assert!(!pattern.matches("sub.domain"));
+        Ok(())
     }
 
     // ========================================================================
@@ -617,5 +761,97 @@ mod tests {
         assert!(filter.is_allowed("api.openai.com"));
         assert!(!filter.is_allowed("anthropic.com"));
         assert!(!filter.is_allowed("openai.com"));
+    }
+
+    // ========================================================================
+    // Normalization and Validation Tests
+    // ========================================================================
+
+    #[test]
+    fn test_push_normalizes_exact_pattern() -> Result<(), DomainNameError> {
+        let mut filter = DomainFilter::new(&[]);
+        filter.push("Example.COM.".to_string())?;
+        assert!(filter.is_allowed("example.com"));
+        assert!(filter.is_allowed("EXAMPLE.com."));
+        assert!(matches!(
+            filter.matches("example.com"),
+            DomainMatch::Exact(_)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_push_rejects_non_ascii_pattern() {
+        let mut filter = DomainFilter::new(&[]);
+        let result = filter.push("b\u{fc}cher.example".to_string());
+        assert!(matches!(result, Err(DomainNameError::NonAscii(_))));
+        assert_eq!(filter.pattern_count(), 0);
+    }
+
+    #[test]
+    fn test_push_rejects_bad_wildcard() {
+        let mut filter = DomainFilter::new(&[]);
+        assert!(matches!(
+            filter.push("api.*.example.com".to_string()),
+            Err(DomainNameError::InvalidWildcard(_))
+        ));
+    }
+
+    #[test]
+    fn test_try_new_rejects_invalid_pattern() {
+        let result = DomainFilter::try_new(&["ok.com".to_string(), "bad domain.com".to_string()]);
+        assert!(matches!(
+            result,
+            Err(DomainNameError::InvalidCharacter { ch: ' ', .. })
+        ));
+    }
+
+    #[test]
+    fn test_new_skips_invalid_pattern() {
+        let filter = DomainFilter::new(&["ok.com".to_string(), "\u{e9}.com".to_string()]);
+        assert_eq!(filter.pattern_count(), 1);
+        assert!(filter.is_allowed("ok.com"));
+    }
+
+    #[test]
+    fn test_lookup_rejects_unicode_case_folding() {
+        // The Kelvin sign (U+212A) lowercases to "k" with Unicode rules.
+        // The filter must not treat it as "k".
+        let filter = DomainFilter::new(&["kelvin.com".to_string()]);
+        assert!(!filter.is_allowed("\u{212a}elvin.com"));
+    }
+
+    #[test]
+    fn test_normalize_hostname_rules() {
+        assert_eq!(
+            normalize_hostname("API.GitHub.com."),
+            Ok("api.github.com".to_string())
+        );
+        assert_eq!(
+            normalize_hostname("_dmarc.example.com"),
+            Ok("_dmarc.example.com".to_string())
+        );
+        assert_eq!(normalize_hostname(""), Err(DomainNameError::Empty));
+        assert_eq!(normalize_hostname("."), Err(DomainNameError::Empty));
+        assert!(matches!(
+            normalize_hostname("a..b"),
+            Err(DomainNameError::EmptyLabel(_))
+        ));
+        assert!(matches!(
+            normalize_hostname(&"a".repeat(64)),
+            Err(DomainNameError::LabelTooLong(_))
+        ));
+        assert!(matches!(
+            normalize_hostname(&["a"; 130].join(".")),
+            Err(DomainNameError::TooLong(_))
+        ));
+        assert!(matches!(
+            normalize_hostname("evil.com\0.ok.com"),
+            Err(DomainNameError::InvalidCharacter { .. })
+        ));
+        assert!(matches!(
+            normalize_hostname("*.example.com"),
+            Err(DomainNameError::InvalidCharacter { ch: '*', .. })
+        ));
     }
 }

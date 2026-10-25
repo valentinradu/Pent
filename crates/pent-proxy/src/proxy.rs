@@ -1,7 +1,8 @@
 //! TCP proxy for forwarding allowed connections.
 //!
-//! Forwards TCP connections only to IP addresses that were resolved
-//! through the DNS server (i.e., to allowed domains).
+//! Forwards TCP connections only to allowed destinations: a domain on the
+//! allowlist, or an IP address that the DNS server resolved from an allowed
+//! domain.
 //!
 //! # Connection Flow
 //!
@@ -9,26 +10,38 @@
 //! Client connects to proxy
 //!         |
 //!         v
-//! Extract destination (CONNECT or transparent)
+//! Read the SOCKS5 or HTTP CONNECT handshake (with a time limit)
+//!         |
+//!         +-- domain target --> allowlist check, resolve, drop non-public IPs
+//!         |
+//!         +-- IP target -----> non-public check, ResolutionCache.lookup(ip)
 //!         |
 //!         v
-//! ResolutionCache.lookup(dest_ip)?
+//! Connect, reply success
 //!         |
-//!         +-- found --> Forward connection, relay data
+//!         v
+//! Port 443/80: read the TLS SNI or the HTTP Host header, check the allowlist
 //!         |
-//!         +-- not found --> Reject connection
+//!         v
+//! Relay data (idle timeout resets on each transfer)
 //! ```
 //!
 //! # Proxy Protocol
 //!
-//! - **SOCKS5**: Standard SOCKS5 proxy protocol
+//! - **SOCKS5**: Standard SOCKS5 proxy protocol (CONNECT command only)
+//! - **HTTP CONNECT**: `CONNECT host:port HTTP/1.1`
 //!
 
-use crate::{ProxyError, Result, SharedState};
-use std::net::SocketAddr;
+use crate::inspect::{self, Inspect};
+use crate::netaddr::{self, PrivateDestinations};
+use crate::{normalize_hostname, ProxyError, Result, SharedState};
+use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Configuration for the TCP proxy.
 #[derive(Debug, Clone)]
@@ -39,15 +52,26 @@ pub struct TcpProxyConfig {
 
     /// Connection timeout.
     /// Default: 30 seconds
-    pub connect_timeout: std::time::Duration,
+    pub connect_timeout: Duration,
 
-    /// Idle timeout (connection closed if no data flows).
+    /// Idle timeout. The proxy closes a connection when no data flows in
+    /// either direction for this time. Each transfer resets the timer.
     /// Default: 5 minutes
-    pub idle_timeout: std::time::Duration,
+    pub idle_timeout: Duration,
 
     /// Maximum concurrent connections.
     /// Default: 1000
     pub max_connections: usize,
+
+    /// Time limit for the SOCKS5 or HTTP CONNECT handshake of a client. The
+    /// same limit applies to the read of the TLS ClientHello or HTTP request
+    /// head that the proxy inspects.
+    /// Default: 10 seconds
+    pub handshake_timeout: Duration,
+
+    /// Policy for destinations that are not public addresses.
+    /// Default: [`PrivateDestinations::Deny`]
+    pub private_destinations: PrivateDestinations,
 }
 
 impl Default for TcpProxyConfig {
@@ -56,17 +80,141 @@ impl Default for TcpProxyConfig {
         const DEFAULT_BIND: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9300);
         Self {
             bind_addr: DEFAULT_BIND,
-            connect_timeout: std::time::Duration::from_secs(30),
-            idle_timeout: std::time::Duration::from_secs(300),
+            connect_timeout: Duration::from_secs(30),
+            idle_timeout: Duration::from_secs(300),
             max_connections: 1000,
+            handshake_timeout: Duration::from_secs(10),
+            private_destinations: PrivateDestinations::Deny,
         }
+    }
+}
+
+/// The proxy protocol of a client connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Protocol {
+    Socks5,
+    HttpConnect,
+}
+
+impl std::fmt::Display for Protocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Socks5 => "SOCKS5",
+            Self::HttpConnect => "CONNECT",
+        })
+    }
+}
+
+/// The destination that a client asks for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Target {
+    /// An IP address and a port.
+    Ip(SocketAddr),
+    /// A host name, as the client sent it, and a port.
+    Domain { host: String, port: u16 },
+}
+
+impl Target {
+    const fn port(&self) -> u16 {
+        match self {
+            Self::Ip(addr) => addr.port(),
+            Self::Domain { port, .. } => *port,
+        }
+    }
+}
+
+impl std::fmt::Display for Target {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ip(addr) => write!(f, "{} port {}", addr.ip(), addr.port()),
+            Self::Domain { host, port } => write!(f, "{host:?} port {port}"),
+        }
+    }
+}
+
+/// A parsed SOCKS5 request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Socks5Request {
+    /// The command (`0x01` CONNECT, `0x02` BIND, `0x03` UDP ASSOCIATE).
+    cmd: u8,
+    /// The destination.
+    target: Target,
+}
+
+/// A failure that the proxy reports to the client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Failure {
+    General,
+    NotAllowed,
+    Refused,
+    CommandNotSupported,
+    AddressTypeNotSupported,
+}
+
+impl Failure {
+    const fn socks5_code(self) -> u8 {
+        match self {
+            Self::General => socks5::GENERAL_FAILURE,
+            Self::NotAllowed => socks5::CONNECTION_NOT_ALLOWED,
+            Self::Refused => socks5::CONNECTION_REFUSED,
+            Self::CommandNotSupported => socks5::COMMAND_NOT_SUPPORTED,
+            Self::AddressTypeNotSupported => socks5::ADDRESS_TYPE_NOT_SUPPORTED,
+        }
+    }
+
+    const fn http_response(self) -> &'static [u8] {
+        match self {
+            Self::NotAllowed => b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n",
+            Self::Refused => b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n",
+            Self::General | Self::CommandNotSupported | Self::AddressTypeNotSupported => {
+                b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n"
+            }
+        }
+    }
+}
+
+/// The result of a successful handshake.
+#[derive(Debug)]
+struct Negotiated {
+    protocol: Protocol,
+    target: Target,
+    /// Bytes that the client sent after the handshake (for example after the
+    /// end of the HTTP CONNECT headers). The proxy forwards them.
+    initial: Vec<u8>,
+}
+
+/// A handshake error, with the failure to report to the client.
+struct HandshakeError {
+    protocol: Protocol,
+    failure: Option<Failure>,
+    error: ProxyError,
+}
+
+impl HandshakeError {
+    fn new(protocol: Protocol, failure: Option<Failure>, error: ProxyError) -> Self {
+        Self {
+            protocol,
+            failure,
+            error,
+        }
+    }
+}
+
+/// Decrements the connection count when a connection task ends, also if the
+/// task is aborted.
+struct ConnectionGuard(Arc<AtomicUsize>);
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
 /// TCP proxy that forwards connections to resolved (allowed) destinations.
 ///
 /// Only allows connections to IP addresses that were previously resolved
-/// through the DNS server (and thus are on the domain allowlist).
+/// through the DNS server (and thus are on the domain allowlist), or to
+/// domains on the allowlist.
 pub struct TcpProxy {
     /// Proxy configuration.
     config: TcpProxyConfig,
@@ -75,7 +223,7 @@ pub struct TcpProxy {
     state: Arc<SharedState>,
 
     /// Current connection count (Arc-wrapped to safely share with spawned tasks).
-    connection_count: Arc<std::sync::atomic::AtomicUsize>,
+    connection_count: Arc<AtomicUsize>,
 }
 
 impl TcpProxy {
@@ -92,15 +240,14 @@ impl TcpProxy {
         Ok(Self {
             config,
             state,
-            connection_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            connection_count: Arc::new(AtomicUsize::new(0)),
         })
     }
 
     /// Get current connection count.
     #[must_use]
     pub fn connection_count(&self) -> usize {
-        self.connection_count
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.connection_count.load(Ordering::Relaxed)
     }
 
     /// Start the TCP proxy.
@@ -129,22 +276,35 @@ impl TcpProxy {
     /// Used by [`crate::ProxyServer::start`] which pre-binds the listener to
     /// obtain the actual OS-assigned port before spawning the server task.
     ///
+    /// The connection tasks belong to this future. When the caller drops the
+    /// future (for example at shutdown), all the connection tasks stop and
+    /// the proxy closes their connections.
+    ///
     /// # Errors
     /// * `ProxyError::Internal` - Fatal proxy error during operation.
     pub async fn run_on(&self, listener: tokio::net::TcpListener) -> Result<()> {
+        let mut tasks = tokio::task::JoinSet::new();
         loop {
-            let (client, client_addr) = match listener.accept().await {
-                Ok(result) => result,
-                Err(e) => {
-                    warn!(error = %e, "TCP accept error");
+            let (client, client_addr) = tokio::select! {
+                accepted = listener.accept() => match accepted {
+                    Ok(result) => result,
+                    Err(e) => {
+                        warn!(error = %e, "TCP accept error");
+                        continue;
+                    }
+                },
+                Some(finished) = tasks.join_next(), if !tasks.is_empty() => {
+                    if let Err(e) = finished {
+                        if e.is_panic() {
+                            warn!(error = %e, "TCP connection task panicked");
+                        }
+                    }
                     continue;
                 }
             };
 
             // Check connection limit
-            let current = self
-                .connection_count
-                .load(std::sync::atomic::Ordering::Relaxed);
+            let current = self.connection_count.load(Ordering::Relaxed);
             if current >= self.config.max_connections {
                 warn!(client = %client_addr, "Connection limit reached, rejecting");
                 drop(client);
@@ -155,29 +315,25 @@ impl TcpProxy {
             // sandboxed process is routing traffic through the proxy at all.
             self.state
                 .connections_accepted
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                .fetch_add(1, Ordering::Relaxed);
 
-            // Increment connection count
-            self.connection_count
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // Increment connection count. The guard decrements it when the
+            // task ends or is aborted.
+            self.connection_count.fetch_add(1, Ordering::Relaxed);
+            let guard = ConnectionGuard(Arc::clone(&self.connection_count));
 
             // Handle connection in background task
-            let config = self.config.clone();
-            let state = Arc::clone(&self.state);
-            let connection_count = Arc::clone(&self.connection_count);
+            let proxy = Self {
+                config: self.config.clone(),
+                state: Arc::clone(&self.state),
+                connection_count: Arc::clone(&self.connection_count),
+            };
 
-            tokio::spawn(async move {
-                let proxy = Self {
-                    config,
-                    state,
-                    connection_count: Arc::clone(&connection_count),
-                };
-
+            tasks.spawn(async move {
+                let _guard = guard;
                 if let Err(e) = proxy.handle_connection(client, client_addr).await {
                     debug!(client = %client_addr, error = %e, "Connection error");
                 }
-
-                connection_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             });
         }
     }
@@ -190,295 +346,242 @@ impl TcpProxy {
     async fn handle_connection(
         &self,
         mut client: TcpStream,
-        _client_addr: SocketAddr,
+        client_addr: SocketAddr,
     ) -> Result<()> {
-        use tokio::io::AsyncReadExt;
-
-        // Peek at the first byte to determine the protocol.
-        let mut first = [0u8; 1];
-        client
-            .read_exact(&mut first)
-            .await
-            .map_err(|e| ProxyError::Internal(format!("Failed to peek protocol byte: {e}")))?;
-
-        if first[0] == 0x05 {
-            self.handle_socks5(client, first[0]).await
-        } else {
-            self.handle_http_connect(client, first[0]).await
-        }
+        let limit = self.config.handshake_timeout;
+        let negotiated = match tokio::time::timeout(limit, negotiate(&mut client)).await {
+            Ok(Ok(negotiated)) => negotiated,
+            Ok(Err(e)) => {
+                if let Some(failure) = e.failure {
+                    send_failure(&mut client, e.protocol, failure).await;
+                }
+                return Err(e.error);
+            }
+            Err(_) => {
+                debug!(client = %client_addr, "client did not complete the handshake in time");
+                return Err(ProxyError::HandshakeTimeout);
+            }
+        };
+        self.serve(client, negotiated).await
     }
 
-    /// Handle a SOCKS5 connection (first byte was already read).
-    async fn handle_socks5(&self, mut client: TcpStream, first_byte: u8) -> Result<()> {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    /// Check the target, connect to it, inspect the first client data, and
+    /// relay.
+    async fn serve(&self, mut client: TcpStream, negotiated: Negotiated) -> Result<()> {
+        let Negotiated {
+            protocol,
+            target,
+            mut initial,
+        } = negotiated;
 
-        // greeting[0] = first_byte (version = 0x05)
-        let _ = first_byte; // already verified == 0x05 by caller
-
-        // Read NMETHODS (exactly 1 byte).  Using read_exact here and below is
-        // critical: a plain read() with a large buffer can accidentally consume
-        // the CONNECT request when the greeting and CONNECT arrive in the same
-        // TCP segment (Nagle batching), leaving the second read() with 0 bytes
-        // and silently returning without ever reporting a violation.
-        let mut nmethods_buf = [0u8; 1];
-        client
-            .read_exact(&mut nmethods_buf)
-            .await
-            .map_err(|e| ProxyError::Internal(format!("Failed to read SOCKS5 nmethods: {e}")))?;
-        let nmethods = nmethods_buf[0] as usize;
-
-        // Read METHODS list (exactly nmethods bytes) — always use no-auth.
-        if nmethods > 0 {
-            let mut methods = vec![0u8; nmethods];
-            client
-                .read_exact(&mut methods)
-                .await
-                .map_err(|e| ProxyError::Internal(format!("Failed to read SOCKS5 methods: {e}")))?;
-        }
-
-        // Send greeting response: no authentication required
-        client.write_all(&[0x05, 0x00]).await.map_err(|e| {
-            ProxyError::Internal(format!("Failed to send SOCKS5 greeting response: {e}"))
-        })?;
-
-        // Read SOCKS5 CONNECT request
-        let mut request = [0u8; 262];
-        let n = client
-            .read(&mut request)
-            .await
-            .map_err(|e| ProxyError::Internal(format!("Failed to read SOCKS5 request: {e}")))?;
-
-        if n < 10 {
-            client
-                .write_all(&Self::build_socks5_error(socks5::GENERAL_FAILURE))
-                .await
-                .ok();
-            return Err(ProxyError::Internal("SOCKS5 request too short".to_string()));
-        }
-
-        // Resolve destination — for domain requests (ATYP=0x03) we check the
-        // allowlist and resolve internally instead of requiring prior DNS lookup.
-        let dest = match self.resolve_socks5_destination(&request[..n]).await {
-            Ok(d) => d,
+        let candidates = match self.check_target(protocol, &target).await {
+            Ok(c) => c,
             Err(e) => {
-                client
-                    .write_all(&Self::build_socks5_error(socks5::CONNECTION_NOT_ALLOWED))
-                    .await
-                    .ok();
+                send_failure(&mut client, protocol, Failure::NotAllowed).await;
                 return Err(e);
             }
         };
 
-        // For IP-based requests, verify the IP was resolved through our DNS.
-        if request[3] != 0x03 {
-            if let Err(e) = self.verify_destination(&dest) {
-                client
-                    .write_all(&Self::build_socks5_error(socks5::CONNECTION_NOT_ALLOWED))
-                    .await
-                    .ok();
-                return Err(e);
-            }
-        }
-
-        let destination = match self.connect_to_destination(dest).await {
+        let destination = match self.connect_any(&candidates).await {
             Ok(d) => d,
             Err(e) => {
-                let code = match &e {
-                    ProxyError::TcpConnection { .. } => socks5::CONNECTION_REFUSED,
-                    _ => socks5::GENERAL_FAILURE,
+                let failure = match &e {
+                    ProxyError::TcpConnection { .. } => Failure::Refused,
+                    _ => Failure::General,
                 };
-                client.write_all(&Self::build_socks5_error(code)).await.ok();
+                send_failure(&mut client, protocol, failure).await;
                 return Err(e);
             }
         };
 
-        let local_addr = destination.local_addr().unwrap_or_else(|_| {
-            use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
-        });
+        send_success(&mut client, protocol, &destination).await?;
 
-        client
-            .write_all(&Self::build_socks5_response(local_addr))
-            .await
-            .map_err(|e| ProxyError::Internal(format!("Failed to send SOCKS5 success: {e}")))?;
-
-        self.relay(client, destination).await
-    }
-
-    /// Handle an HTTP CONNECT connection (first byte was already read).
-    ///
-    /// Reads the full `CONNECT host:port HTTP/1.1\r\n…\r\n\r\n` request,
-    /// checks the target domain against the allowlist, then relays if allowed.
-    async fn handle_http_connect(&self, mut client: TcpStream, first_byte: u8) -> Result<()> {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        // Read the rest of the HTTP CONNECT request line (up to 4 KiB).
-        let mut buf = vec![first_byte];
-        let mut tmp = [0u8; 4096];
-        loop {
-            let n = client
-                .read(&mut tmp)
-                .await
-                .map_err(|e| ProxyError::Internal(format!("HTTP CONNECT read error: {e}")))?;
-            if n == 0 {
-                break;
-            }
-            buf.extend_from_slice(&tmp[..n]);
-            // Stop once we see the end of the HTTP headers (\r\n\r\n).
-            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                break;
-            }
-            if buf.len() > 8192 {
-                break;
-            }
+        if let Some(kind) = Inspect::for_port(target.port()) {
+            initial =
+                inspect::read_initial(&mut client, initial, kind, self.config.handshake_timeout)
+                    .await
+                    .map_err(|e| {
+                        ProxyError::Internal(format!("failed to read client data: {e}"))
+                    })?;
+            self.check_requested_host(protocol, &target, kind, &initial)?;
         }
 
-        // Parse the first line: "CONNECT host:port HTTP/1.x"
-        let header = std::str::from_utf8(&buf)
-            .map_err(|_| ProxyError::Internal("HTTP CONNECT: non-UTF8 request".to_string()))?;
-        let first_line = header.lines().next().unwrap_or("");
-
-        let (host, port) = Self::parse_http_connect_target(first_line)?;
-        let domain_lower = host.to_lowercase();
-
-        // Check allowlist.
-        if !self.state.is_allowed(&domain_lower) {
-            self.state.report_violation(format!(
-                "network: DNS query for \"{domain_lower}\" blocked — domain not in allowlist"
-            ));
-            let _ = client
-                .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
-                .await;
-            return Err(ProxyError::DomainBlocked {
-                domain: domain_lower,
-            });
-        }
-        self.state
-            .report_access(format!("network: connection to \"{domain_lower}\" allowed"));
-
-        // Resolve the host.
-        let addr_str = format!("{host}:{port}");
-        let dest = tokio::net::lookup_host(&addr_str)
-            .await
-            .map_err(|e| ProxyError::DnsResolution {
-                domain: host.to_string(),
-                message: e.to_string(),
-            })?
-            .next()
-            .ok_or_else(|| ProxyError::DnsResolution {
-                domain: host.to_string(),
-                message: "no addresses returned".to_string(),
+        let mut destination = destination;
+        if !initial.is_empty() {
+            destination.write_all(&initial).await.map_err(|e| {
+                ProxyError::Internal(format!("failed to forward initial client data: {e}"))
             })?;
-
-        let destination = self.connect_to_destination(dest).await.inspect_err(|_e| {
-            let _ = tokio::runtime::Handle::try_current().map(|_| {
-                // best-effort; we're in async context
-            });
-        })?;
-
-        // Send 200 Connection Established.
-        client
-            .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
-            .await
-            .map_err(|e| ProxyError::Internal(format!("HTTP CONNECT: write 200 failed: {e}")))?;
+        }
 
         self.relay(client, destination).await
     }
 
-    /// Parse "CONNECT host:port HTTP/1.x" into `(host, port)`.
-    fn parse_http_connect_target(line: &str) -> Result<(&str, u16)> {
-        // Format: CONNECT <host>:<port> HTTP/1.x
-        let mut parts = line.split_whitespace();
-        let method = parts.next().unwrap_or("");
-        let target = parts.next().unwrap_or("");
+    /// Check a target against the policy, and return the addresses that the
+    /// proxy can connect to.
+    async fn check_target(&self, protocol: Protocol, target: &Target) -> Result<Vec<SocketAddr>> {
+        match target {
+            Target::Ip(addr) => {
+                let domain = self.verify_destination_for(protocol, addr)?;
+                self.state.report_access(format!(
+                    "network: {protocol} connection to {target} (\"{domain}\") allowed"
+                ));
+                Ok(vec![*addr])
+            }
+            Target::Domain { host, port } => {
+                let name = match normalize_hostname(host) {
+                    Ok(name) => name,
+                    Err(e) => {
+                        self.state.report_violation(format!(
+                            "network: {protocol} connection to {target} blocked: {e}"
+                        ));
+                        return Err(e.into());
+                    }
+                };
+                if !self.state.is_allowed(&name) {
+                    self.state.report_violation(format!(
+                        "network: {protocol} connection to \"{name}\" port {port} blocked: \
+                         the domain is not in the allowlist"
+                    ));
+                    return Err(ProxyError::DomainBlocked { domain: name });
+                }
 
-        if !method.eq_ignore_ascii_case("CONNECT") {
-            return Err(ProxyError::Internal(format!(
-                "Expected CONNECT, got {method:?}"
-            )));
+                // Resolve the exact normalized name that the allowlist check used.
+                let resolved: Vec<SocketAddr> = tokio::net::lookup_host((name.as_str(), *port))
+                    .await
+                    .map_err(|e| ProxyError::DnsResolution {
+                        domain: name.clone(),
+                        message: e.to_string(),
+                    })?
+                    .collect();
+                if resolved.is_empty() {
+                    return Err(ProxyError::DnsResolution {
+                        domain: name,
+                        message: "no addresses returned".to_string(),
+                    });
+                }
+
+                let mut rejected = None;
+                let permitted: Vec<SocketAddr> = resolved
+                    .into_iter()
+                    .filter(|addr| match self.non_public_reason(addr.ip()) {
+                        Some(reason) => {
+                            rejected = Some((*addr, reason));
+                            false
+                        }
+                        None => true,
+                    })
+                    .collect();
+                if permitted.is_empty() {
+                    if let Some((addr, reason)) = rejected {
+                        self.state.report_violation(format!(
+                            "network: {protocol} connection to \"{name}\" port {port} blocked: \
+                             the domain resolves to the {reason} address {}",
+                            addr.ip()
+                        ));
+                        return Err(ProxyError::NonPublicDestination {
+                            addr,
+                            reason: reason.to_string(),
+                        });
+                    }
+                }
+                self.state.report_access(format!(
+                    "network: {protocol} connection to \"{name}\" port {port} allowed"
+                ));
+                Ok(permitted)
+            }
         }
-
-        let (host, port_str) = target.rsplit_once(':').ok_or_else(|| {
-            ProxyError::Internal(format!("HTTP CONNECT target missing port: {target:?}"))
-        })?;
-
-        let port = port_str.parse::<u16>().map_err(|_| {
-            ProxyError::Internal(format!("HTTP CONNECT invalid port: {port_str:?}"))
-        })?;
-
-        Ok((host, port))
     }
 
-    /// Resolve a SOCKS5 destination.
-    ///
-    /// For ATYP=0x03 (domain name), checks the allowlist and resolves via
-    /// the system resolver.  For ATYP=0x01/0x04 (IP), delegates to
-    /// `parse_socks5_request` (IP must be in the resolution cache).
-    async fn resolve_socks5_destination(&self, data: &[u8]) -> Result<SocketAddr> {
-        if data.len() < 5 {
-            return Err(ProxyError::Internal("SOCKS5 request too short".to_string()));
+    /// Return the reason why the policy rejects `ip` as a non-public address.
+    fn non_public_reason(&self, ip: IpAddr) -> Option<netaddr::NonPublic> {
+        match self.config.private_destinations {
+            PrivateDestinations::Allow => None,
+            PrivateDestinations::Deny => netaddr::classify(ip),
         }
-
-        if data[3] != 0x03 {
-            // IP-based: parse normally; caller will verify against resolution cache.
-            return self.parse_socks5_request(data);
-        }
-
-        // Domain-based (ATYP=0x03).
-        let domain_len = data[4] as usize;
-        if data.len() < 5 + domain_len + 2 {
-            return Err(ProxyError::Internal(
-                "SOCKS5 domain request too short".to_string(),
-            ));
-        }
-        let domain = std::str::from_utf8(&data[5..5 + domain_len])
-            .map_err(|_| ProxyError::Internal("Invalid domain encoding".to_string()))?;
-        let port = u16::from_be_bytes([data[5 + domain_len], data[5 + domain_len + 1]]);
-        let domain_lower = domain.to_lowercase();
-
-        if !self.state.is_allowed(&domain_lower) {
-            self.state.report_violation(format!(
-                "network: DNS query for \"{domain_lower}\" blocked — domain not in allowlist"
-            ));
-            return Err(ProxyError::DomainBlocked {
-                domain: domain_lower,
-            });
-        }
-        self.state
-            .report_access(format!("network: connection to \"{domain_lower}\" allowed"));
-
-        // Resolve via system resolver (domain is allowed).
-        let addr_str = format!("{domain}:{port}");
-        let domain_owned = domain.to_string();
-        let mut addrs =
-            tokio::net::lookup_host(addr_str)
-                .await
-                .map_err(|e| ProxyError::DnsResolution {
-                    domain: domain_owned.clone(),
-                    message: e.to_string(),
-                })?;
-        addrs.next().ok_or_else(|| ProxyError::DnsResolution {
-            domain: domain_owned,
-            message: "no addresses returned".to_string(),
-        })
     }
 
-    /// Verify that the destination is allowed (was resolved through DNS).
+    /// Verify that the destination is allowed: it must be a public address
+    /// (unless the configuration permits private destinations), and the DNS
+    /// server must have resolved it from an allowed domain.
     ///
     /// # Arguments
     /// * `dest` - Destination address
     ///
     /// # Returns
     /// * `Ok(domain)` - The domain this IP was resolved from
+    /// * `Err(ProxyError::NonPublicDestination)` - The address is not public
     /// * `Err(ProxyError::DomainBlocked)` - IP not in resolution cache
+    #[cfg(test)]
     fn verify_destination(&self, dest: &SocketAddr) -> Result<String> {
+        self.verify_destination_for(Protocol::Socks5, dest)
+    }
+
+    fn verify_destination_for(&self, protocol: Protocol, dest: &SocketAddr) -> Result<String> {
+        if let Some(reason) = self.non_public_reason(dest.ip()) {
+            self.state.report_violation(format!(
+                "network: {protocol} connection to {} port {} blocked: the address is {reason}",
+                dest.ip(),
+                dest.port()
+            ));
+            return Err(ProxyError::NonPublicDestination {
+                addr: *dest,
+                reason: reason.to_string(),
+            });
+        }
         self.state.lookup_resolved(&dest.ip()).ok_or_else(|| {
             let msg = format!(
-                "network: direct connection to {dest} blocked — IP not resolved through proxy DNS"
+                "network: {protocol} connection to {} port {} blocked: \
+                 the proxy DNS did not resolve this IP address",
+                dest.ip(),
+                dest.port()
             );
             self.state.report_violation(msg.clone());
             ProxyError::DomainBlocked { domain: msg }
         })
+    }
+
+    /// Check the host name in the TLS SNI or the HTTP `Host` header.
+    ///
+    /// If the client data contains a host name, the name must be on the
+    /// allowlist. If it contains no name (for example with ECH, or for a
+    /// protocol that the proxy cannot read), the checks before the connect
+    /// are the only checks.
+    fn check_requested_host(
+        &self,
+        protocol: Protocol,
+        target: &Target,
+        kind: Inspect,
+        data: &[u8],
+    ) -> Result<()> {
+        let Some(raw) = kind.host_name(data) else {
+            return Ok(());
+        };
+        let label = match kind {
+            Inspect::Tls => "TLS SNI",
+            Inspect::Http => "HTTP Host header",
+        };
+        let allowed = normalize_hostname(&raw).is_ok_and(|name| self.state.is_allowed(&name));
+        if allowed {
+            return Ok(());
+        }
+        self.state.report_violation(format!(
+            "network: {protocol} connection to {target} blocked: \
+             the {label} {raw:?} is not in the allowlist"
+        ));
+        Err(ProxyError::DomainBlocked { domain: raw })
+    }
+
+    /// Connect to the first address that accepts the connection.
+    async fn connect_any(&self, candidates: &[SocketAddr]) -> Result<TcpStream> {
+        let mut last_error = None;
+        for dest in candidates {
+            match self.connect_to_destination(*dest).await {
+                Ok(stream) => return Ok(stream),
+                Err(e) => last_error = Some(e),
+            }
+        }
+        Err(last_error
+            .unwrap_or_else(|| ProxyError::Internal("no destination address".to_string())))
     }
 
     /// Connect to the destination with timeout.
@@ -507,203 +610,517 @@ impl TcpProxy {
 
     /// Relay data between client and destination.
     ///
-    /// Copies data bidirectionally until both sides close or the idle timeout fires.
-    /// When one direction reaches EOF, it explicitly shuts down the corresponding
-    /// write half so the peer receives FIN and can finish sending its data.
+    /// Copies data bidirectionally until both sides close, an error occurs,
+    /// or no data flows in either direction for `idle_timeout`. Each
+    /// successful read or write in either direction resets the idle timer.
+    /// When one direction reaches EOF, it shuts down the corresponding write
+    /// half so the peer receives FIN and can finish sending its data.
     ///
     /// # Arguments
     /// * `client` - Client connection
     /// * `destination` - Destination connection
     async fn relay(&self, client: TcpStream, destination: TcpStream) -> Result<()> {
-        use tokio::io::AsyncWriteExt;
-
-        let idle_timeout = self.config.idle_timeout;
-
-        let (mut client_read, mut client_write) = client.into_split();
-        let (mut dest_read, mut dest_write) = destination.into_split();
-
-        let result = tokio::time::timeout(idle_timeout, async {
-            let client_to_dest = async {
-                let r = tokio::io::copy(&mut client_read, &mut dest_write).await;
-                // Best-effort half-close; if shutdown fails the peer will see a connection reset.
-                let _ = dest_write.shutdown().await;
-                r
-            };
-            let dest_to_client = async {
-                let r = tokio::io::copy(&mut dest_read, &mut client_write).await;
-                // Best-effort half-close; if shutdown fails the peer will see a connection reset.
-                let _ = client_write.shutdown().await;
-                r
-            };
-            tokio::join!(client_to_dest, dest_to_client)
-        })
-        .await;
-
-        match result {
-            Ok((r1, r2)) => {
-                #[allow(clippy::tuple_array_conversions)]
-                for r in [r1, r2] {
-                    match r {
-                        Ok(_) => {}
-                        Err(e)
-                            if e.kind() == std::io::ErrorKind::ConnectionReset
-                                || e.kind() == std::io::ErrorKind::BrokenPipe =>
-                        {
-                            // Normal connection close
-                        }
-                        Err(e) => return Err(ProxyError::Internal(format!("Relay error: {e}"))),
-                    }
-                }
+        let peer = destination.peer_addr().ok();
+        let (client_read, client_write) = client.into_split();
+        let (dest_read, dest_write) = destination.into_split();
+        match relay_streams(
+            client_read,
+            client_write,
+            dest_read,
+            dest_write,
+            self.config.idle_timeout,
+        )
+        .await
+        {
+            RelayEnd::Closed => Ok(()),
+            RelayEnd::Idle => {
+                info!(
+                    destination = ?peer,
+                    idle_timeout = ?self.config.idle_timeout,
+                    "close the proxied connection: no data flowed for the idle timeout"
+                );
                 Ok(())
             }
-            Err(_) => {
-                // Timeout - connection idle for too long
-                Ok(())
-            }
+            RelayEnd::Failed(e) => Err(ProxyError::Internal(format!("Relay error: {e}"))),
         }
-    }
-
-    /// Parse SOCKS5 connection request.
-    ///
-    /// # Arguments
-    /// * `data` - Request data
-    ///
-    /// # Returns
-    /// * `Ok(SocketAddr)` - Requested destination
-    /// * `Err` - Invalid request
-    fn parse_socks5_request(&self, data: &[u8]) -> Result<SocketAddr> {
-        // SOCKS5 request format:
-        // +----+-----+-------+------+----------+----------+
-        // |VER | CMD |  RSV  | ATYP | DST.ADDR | DST.PORT |
-        // +----+-----+-------+------+----------+----------+
-        // | 1  |  1  | X'00' |  1   | Variable |    2     |
-        // +----+-----+-------+------+----------+----------+
-
-        if data.len() < 10 {
-            return Err(ProxyError::Internal("SOCKS5 request too short".to_string()));
-        }
-
-        // Check version
-        if data[0] != 0x05 {
-            return Err(ProxyError::Internal(format!(
-                "Invalid SOCKS5 version: {}",
-                data[0]
-            )));
-        }
-
-        // Check command (only CONNECT supported)
-        if data[1] != 0x01 {
-            return Err(ProxyError::Internal(format!(
-                "Unsupported SOCKS5 command: {} (only CONNECT supported)",
-                data[1]
-            )));
-        }
-
-        // Parse address based on type
-        let atyp = data[3];
-        match atyp {
-            0x01 => {
-                // IPv4 address
-                if data.len() < 10 {
-                    return Err(ProxyError::Internal("IPv4 request too short".to_string()));
-                }
-                let ip = std::net::Ipv4Addr::new(data[4], data[5], data[6], data[7]);
-                let port = u16::from_be_bytes([data[8], data[9]]);
-                Ok(SocketAddr::new(std::net::IpAddr::V4(ip), port))
-            }
-            0x03 => {
-                // Domain name - not supported (client should resolve through our DNS)
-                let domain_len = data[4] as usize;
-                if data.len() < 5 + domain_len + 2 {
-                    return Err(ProxyError::Internal("Domain request too short".to_string()));
-                }
-                let domain = std::str::from_utf8(&data[5..5 + domain_len])
-                    .map_err(|_| ProxyError::Internal("Invalid domain encoding".to_string()))?;
-                {
-                    let msg = format!(
-                        "network: direct connection to domain \"{domain}\" blocked — must resolve through proxy DNS"
-                    );
-                    self.state.report_violation(msg.clone());
-                    Err(ProxyError::DomainBlocked { domain: msg })
-                }
-            }
-            0x04 => {
-                // IPv6 address
-                if data.len() < 22 {
-                    return Err(ProxyError::Internal("IPv6 request too short".to_string()));
-                }
-                let mut octets = [0u8; 16];
-                octets.copy_from_slice(&data[4..20]);
-                let ip = std::net::Ipv6Addr::from(octets);
-                let port = u16::from_be_bytes([data[20], data[21]]);
-                Ok(SocketAddr::new(std::net::IpAddr::V6(ip), port))
-            }
-            _ => Err(ProxyError::Internal(format!(
-                "Unknown address type: {atyp}"
-            ))),
-        }
-    }
-
-    /// Build SOCKS5 success response.
-    ///
-    /// # Arguments
-    /// * `bound_addr` - Local address bound for the connection
-    fn build_socks5_response(bound_addr: SocketAddr) -> Vec<u8> {
-        // SOCKS5 reply format:
-        // +----+-----+-------+------+----------+----------+
-        // |VER | REP |  RSV  | ATYP | BND.ADDR | BND.PORT |
-        // +----+-----+-------+------+----------+----------+
-
-        let mut response = Vec::with_capacity(22);
-        response.push(0x05); // Version
-        response.push(socks5::SUCCEEDED); // Reply
-        response.push(0x00); // Reserved
-
-        match bound_addr {
-            SocketAddr::V4(addr) => {
-                response.push(0x01); // IPv4
-                response.extend_from_slice(&addr.ip().octets());
-                response.extend_from_slice(&addr.port().to_be_bytes());
-            }
-            SocketAddr::V6(addr) => {
-                response.push(0x04); // IPv6
-                response.extend_from_slice(&addr.ip().octets());
-                response.extend_from_slice(&addr.port().to_be_bytes());
-            }
-        }
-
-        response
-    }
-
-    /// Build SOCKS5 error response.
-    ///
-    /// # Arguments
-    /// * `code` - SOCKS5 error code
-    fn build_socks5_error(code: u8) -> Vec<u8> {
-        // Reply with error code and dummy address (0.0.0.0:0)
-        vec![
-            0x05, // Version
-            code, // Reply code
-            0x00, // Reserved
-            0x01, // Address type: IPv4
-            0x00, 0x00, 0x00, 0x00, // Address: 0.0.0.0
-            0x00, 0x00, // Port: 0
-        ]
     }
 }
 
-/// SOCKS5 reply codes.
+/// How a relay ended.
+#[derive(Debug)]
+enum RelayEnd {
+    /// Both directions reached EOF, or a peer reset the connection.
+    Closed,
+    /// No data flowed for the idle timeout.
+    Idle,
+    /// An I/O error occurred.
+    Failed(std::io::Error),
+}
+
+/// The time of the most recent transfer, shared by the two directions.
+struct Activity {
+    start: tokio::time::Instant,
+    last_ms: AtomicU64,
+}
+
+impl Activity {
+    fn new() -> Self {
+        Self {
+            start: tokio::time::Instant::now(),
+            last_ms: AtomicU64::new(0),
+        }
+    }
+
+    fn touch(&self) {
+        let elapsed = u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.last_ms.store(elapsed, Ordering::Relaxed);
+    }
+
+    /// Complete when no transfer occurs for `idle`.
+    async fn idle_for(&self, idle: Duration) {
+        loop {
+            let last = Duration::from_millis(self.last_ms.load(Ordering::Relaxed));
+            let Some(deadline) = self
+                .start
+                .checked_add(last)
+                .and_then(|t| t.checked_add(idle))
+            else {
+                // The deadline is too far in the future to represent.
+                std::future::pending::<()>().await;
+                return;
+            };
+            if tokio::time::Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep_until(deadline).await;
+        }
+    }
+}
+
+/// Copy data from `reader` to `writer` until EOF, and record each transfer.
+async fn pump<R, W>(mut reader: R, mut writer: W, activity: &Activity) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buf = vec![0u8; 16 * 1024];
+    loop {
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        activity.touch();
+        writer.write_all(buf.get(..n).unwrap_or_default()).await?;
+        activity.touch();
+    }
+    // Best-effort half-close; if shutdown fails the peer will see a connection reset.
+    let _ = writer.shutdown().await;
+    Ok(())
+}
+
+/// Relay two connections in both directions with a real idle timeout.
+async fn relay_streams<CR, CW, DR, DW>(
+    client_read: CR,
+    client_write: CW,
+    dest_read: DR,
+    dest_write: DW,
+    idle: Duration,
+) -> RelayEnd
+where
+    CR: AsyncRead + Unpin,
+    CW: AsyncWrite + Unpin,
+    DR: AsyncRead + Unpin,
+    DW: AsyncWrite + Unpin,
+{
+    let activity = Activity::new();
+    let transfer = async {
+        tokio::try_join!(
+            pump(client_read, dest_write, &activity),
+            pump(dest_read, client_write, &activity),
+        )
+    };
+    tokio::select! {
+        result = transfer => match result {
+            Ok(((), ())) => RelayEnd::Closed,
+            Err(e) if matches!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+            ) => RelayEnd::Closed,
+            Err(e) => RelayEnd::Failed(e),
+        },
+        () = activity.idle_for(idle) => RelayEnd::Idle,
+    }
+}
+
+/// Send a failure reply to the client.
+async fn send_failure(client: &mut TcpStream, protocol: Protocol, failure: Failure) {
+    let result = match protocol {
+        Protocol::Socks5 => {
+            client
+                .write_all(&build_socks5_error(failure.socks5_code()))
+                .await
+        }
+        Protocol::HttpConnect => client.write_all(failure.http_response()).await,
+    };
+    // The proxy closes the connection after a failure. If the client does not
+    // get the reply, it sees the close, thus the write error is not important.
+    if let Err(e) = result {
+        debug!(error = %e, "failed to send the failure reply to the client");
+    }
+}
+
+/// Send the success reply to the client.
+async fn send_success(client: &mut TcpStream, protocol: Protocol, dest: &TcpStream) -> Result<()> {
+    let reply = match protocol {
+        Protocol::Socks5 => {
+            let local_addr = dest.local_addr().unwrap_or_else(|_| {
+                use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+            });
+            build_socks5_response(local_addr)
+        }
+        Protocol::HttpConnect => b"HTTP/1.1 200 Connection established\r\n\r\n".to_vec(),
+    };
+    client
+        .write_all(&reply)
+        .await
+        .map_err(|e| ProxyError::Internal(format!("Failed to send {protocol} success: {e}")))
+}
+
+/// Read the proxy handshake of a client.
+async fn negotiate<S>(client: &mut S) -> std::result::Result<Negotiated, HandshakeError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    // Peek at the first byte to determine the protocol.
+    let first = client.read_u8().await.map_err(|e| {
+        HandshakeError::new(
+            Protocol::HttpConnect,
+            None,
+            ProxyError::Internal(format!("Failed to read protocol byte: {e}")),
+        )
+    })?;
+
+    if first == socks5::VERSION {
+        negotiate_socks5(client).await
+    } else {
+        negotiate_http_connect(client, first).await
+    }
+}
+
+/// Read the SOCKS5 greeting and request (the version byte was already read).
+async fn negotiate_socks5<S>(client: &mut S) -> std::result::Result<Negotiated, HandshakeError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let io_error = |what: &str, e: std::io::Error| {
+        HandshakeError::new(
+            Protocol::Socks5,
+            None,
+            ProxyError::Internal(format!("Failed to {what}: {e}")),
+        )
+    };
+
+    // Read NMETHODS and the METHODS list with read_exact. A plain read()
+    // can consume the CONNECT request too when the greeting and the request
+    // arrive in the same TCP segment.
+    let nmethods = client
+        .read_u8()
+        .await
+        .map_err(|e| io_error("read SOCKS5 nmethods", e))?;
+    let mut methods = vec![0u8; usize::from(nmethods)];
+    client
+        .read_exact(&mut methods)
+        .await
+        .map_err(|e| io_error("read SOCKS5 methods", e))?;
+
+    if !methods.contains(&socks5::METHOD_NO_AUTH) {
+        // The write result is not important: the proxy closes the connection.
+        if let Err(e) = client
+            .write_all(&[socks5::VERSION, socks5::METHOD_NONE_ACCEPTABLE])
+            .await
+        {
+            debug!(error = %e, "failed to send the SOCKS5 method rejection");
+        }
+        return Err(HandshakeError::new(
+            Protocol::Socks5,
+            None,
+            ProxyError::Internal("SOCKS5 client does not offer the no-auth method".to_string()),
+        ));
+    }
+
+    client
+        .write_all(&[socks5::VERSION, socks5::METHOD_NO_AUTH])
+        .await
+        .map_err(|e| io_error("send SOCKS5 greeting response", e))?;
+
+    let request = read_socks5_request(client).await?;
+    if request.cmd != socks5::CMD_CONNECT {
+        return Err(HandshakeError::new(
+            Protocol::Socks5,
+            Some(Failure::CommandNotSupported),
+            ProxyError::Internal(format!(
+                "Unsupported SOCKS5 command: {} (only CONNECT supported)",
+                request.cmd
+            )),
+        ));
+    }
+
+    Ok(Negotiated {
+        protocol: Protocol::Socks5,
+        target: request.target,
+        initial: Vec::new(),
+    })
+}
+
+/// Read one SOCKS5 request with exact reads: first the fixed header, then
+/// the address fields that the address type requires.
+///
+/// ```text
+/// +----+-----+-------+------+----------+----------+
+/// |VER | CMD |  RSV  | ATYP | DST.ADDR | DST.PORT |
+/// +----+-----+-------+------+----------+----------+
+/// | 1  |  1  | X'00' |  1   | Variable |    2     |
+/// +----+-----+-------+------+----------+----------+
+/// ```
+async fn read_socks5_request<R>(
+    reader: &mut R,
+) -> std::result::Result<Socks5Request, HandshakeError>
+where
+    R: AsyncRead + Unpin,
+{
+    let short = |e: std::io::Error| {
+        HandshakeError::new(
+            Protocol::Socks5,
+            Some(Failure::General),
+            ProxyError::Internal(format!("Failed to read SOCKS5 request: {e}")),
+        )
+    };
+
+    let mut header = [0u8; 4];
+    reader.read_exact(&mut header).await.map_err(short)?;
+    let [version, cmd, _reserved, atyp] = header;
+    if version != socks5::VERSION {
+        return Err(HandshakeError::new(
+            Protocol::Socks5,
+            Some(Failure::General),
+            ProxyError::Internal(format!("Invalid SOCKS5 version: {version}")),
+        ));
+    }
+
+    let target = match atyp {
+        socks5::ATYP_IPV4 => {
+            let mut addr = [0u8; 4];
+            reader.read_exact(&mut addr).await.map_err(short)?;
+            let port = reader.read_u16().await.map_err(short)?;
+            Target::Ip(SocketAddr::new(IpAddr::from(addr), port))
+        }
+        socks5::ATYP_IPV6 => {
+            let mut addr = [0u8; 16];
+            reader.read_exact(&mut addr).await.map_err(short)?;
+            let port = reader.read_u16().await.map_err(short)?;
+            Target::Ip(SocketAddr::new(IpAddr::from(addr), port))
+        }
+        socks5::ATYP_DOMAIN => {
+            let len = reader.read_u8().await.map_err(short)?;
+            let mut name = vec![0u8; usize::from(len)];
+            reader.read_exact(&mut name).await.map_err(short)?;
+            let port = reader.read_u16().await.map_err(short)?;
+            let host = String::from_utf8(name).map_err(|_| {
+                HandshakeError::new(
+                    Protocol::Socks5,
+                    Some(Failure::NotAllowed),
+                    ProxyError::Internal("Invalid domain encoding".to_string()),
+                )
+            })?;
+            Target::Domain { host, port }
+        }
+        other => {
+            return Err(HandshakeError::new(
+                Protocol::Socks5,
+                Some(Failure::AddressTypeNotSupported),
+                ProxyError::Internal(format!("Unknown address type: {other}")),
+            ));
+        }
+    };
+
+    Ok(Socks5Request { cmd, target })
+}
+
+/// Read an HTTP CONNECT request (the first byte was already read).
+///
+/// Reads the full `CONNECT host:port HTTP/1.1\r\n…\r\n\r\n` request. The
+/// bytes after the end of the headers go into [`Negotiated::initial`].
+async fn negotiate_http_connect<S>(
+    client: &mut S,
+    first_byte: u8,
+) -> std::result::Result<Negotiated, HandshakeError>
+where
+    S: AsyncRead + Unpin,
+{
+    let fail = |failure, message: String| {
+        HandshakeError::new(
+            Protocol::HttpConnect,
+            Some(failure),
+            ProxyError::Internal(message),
+        )
+    };
+
+    let mut buf = vec![first_byte];
+    let mut tmp = [0u8; 4096];
+    let head_end = loop {
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos.saturating_add(4);
+        }
+        if buf.len() > inspect::MAX_HTTP_HEAD_LEN {
+            return Err(fail(
+                Failure::General,
+                "HTTP CONNECT request head is too long".to_string(),
+            ));
+        }
+        let n = client
+            .read(&mut tmp)
+            .await
+            .map_err(|e| fail(Failure::General, format!("HTTP CONNECT read error: {e}")))?;
+        if n == 0 {
+            return Err(HandshakeError::new(
+                Protocol::HttpConnect,
+                None,
+                ProxyError::Internal("HTTP CONNECT: the client closed the connection".to_string()),
+            ));
+        }
+        buf.extend_from_slice(tmp.get(..n).unwrap_or_default());
+    };
+
+    let initial = buf.split_off(head_end.min(buf.len()));
+    let header = std::str::from_utf8(&buf).map_err(|_| {
+        fail(
+            Failure::General,
+            "HTTP CONNECT: non-UTF8 request".to_string(),
+        )
+    })?;
+    let first_line = header.lines().next().unwrap_or("");
+    let target = parse_http_connect_target(first_line).map_err(|e| HandshakeError {
+        protocol: Protocol::HttpConnect,
+        failure: Some(Failure::General),
+        error: e,
+    })?;
+
+    Ok(Negotiated {
+        protocol: Protocol::HttpConnect,
+        target,
+        initial,
+    })
+}
+
+/// Parse "CONNECT host:port HTTP/1.x" into a [`Target`].
+///
+/// An IP literal (`1.2.3.4:443` or `[2001:db8::1]:443`) gives an IP target.
+fn parse_http_connect_target(line: &str) -> Result<Target> {
+    // Format: CONNECT <host>:<port> HTTP/1.x
+    let mut parts = line.split_whitespace();
+    let method = parts.next().unwrap_or("");
+    let target = parts.next().unwrap_or("");
+
+    if !method.eq_ignore_ascii_case("CONNECT") {
+        return Err(ProxyError::Internal(format!(
+            "Expected CONNECT, got {method:?}"
+        )));
+    }
+
+    let (host, port_str) = target.rsplit_once(':').ok_or_else(|| {
+        ProxyError::Internal(format!("HTTP CONNECT target missing port: {target:?}"))
+    })?;
+
+    let port = port_str
+        .parse::<u16>()
+        .map_err(|_| ProxyError::Internal(format!("HTTP CONNECT invalid port: {port_str:?}")))?;
+
+    let unbracketed = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(ip) = unbracketed.parse::<IpAddr>() {
+        return Ok(Target::Ip(SocketAddr::new(ip, port)));
+    }
+
+    Ok(Target::Domain {
+        host: host.to_string(),
+        port,
+    })
+}
+
+/// Build SOCKS5 success response.
+///
+/// # Arguments
+/// * `bound_addr` - Local address bound for the connection
+fn build_socks5_response(bound_addr: SocketAddr) -> Vec<u8> {
+    // SOCKS5 reply format:
+    // +----+-----+-------+------+----------+----------+
+    // |VER | REP |  RSV  | ATYP | BND.ADDR | BND.PORT |
+    // +----+-----+-------+------+----------+----------+
+
+    let mut response = Vec::with_capacity(22);
+    response.push(socks5::VERSION); // Version
+    response.push(socks5::SUCCEEDED); // Reply
+    response.push(0x00); // Reserved
+
+    match bound_addr {
+        SocketAddr::V4(addr) => {
+            response.push(socks5::ATYP_IPV4);
+            response.extend_from_slice(&addr.ip().octets());
+            response.extend_from_slice(&addr.port().to_be_bytes());
+        }
+        SocketAddr::V6(addr) => {
+            response.push(socks5::ATYP_IPV6);
+            response.extend_from_slice(&addr.ip().octets());
+            response.extend_from_slice(&addr.port().to_be_bytes());
+        }
+    }
+
+    response
+}
+
+/// Build SOCKS5 error response.
+///
+/// # Arguments
+/// * `code` - SOCKS5 error code
+fn build_socks5_error(code: u8) -> Vec<u8> {
+    // Reply with error code and dummy address (0.0.0.0:0)
+    vec![
+        socks5::VERSION,
+        code, // Reply code
+        0x00, // Reserved
+        socks5::ATYP_IPV4,
+        0x00,
+        0x00,
+        0x00,
+        0x00, // Address: 0.0.0.0
+        0x00,
+        0x00, // Port: 0
+    ]
+}
+
+/// SOCKS5 protocol constants.
 mod socks5 {
+    pub(super) const VERSION: u8 = 0x05;
+    pub(super) const METHOD_NO_AUTH: u8 = 0x00;
+    pub(super) const METHOD_NONE_ACCEPTABLE: u8 = 0xFF;
+    pub(super) const CMD_CONNECT: u8 = 0x01;
+    pub(super) const ATYP_IPV4: u8 = 0x01;
+    pub(super) const ATYP_DOMAIN: u8 = 0x03;
+    pub(super) const ATYP_IPV6: u8 = 0x04;
+
     pub(super) const SUCCEEDED: u8 = 0x00;
     pub(super) const GENERAL_FAILURE: u8 = 0x01;
     pub(super) const CONNECTION_NOT_ALLOWED: u8 = 0x02;
-    pub(super) const CONNECTION_REFUSED: u8 = 0x05;
     #[cfg(test)]
     pub(super) const NETWORK_UNREACHABLE: u8 = 0x03;
     #[cfg(test)]
     pub(super) const HOST_UNREACHABLE: u8 = 0x04;
-    #[cfg(test)]
+    pub(super) const CONNECTION_REFUSED: u8 = 0x05;
     pub(super) const COMMAND_NOT_SUPPORTED: u8 = 0x07;
+    pub(super) const ADDRESS_TYPE_NOT_SUPPORTED: u8 = 0x08;
 }
 
 #[cfg(test)]
@@ -770,6 +1187,21 @@ mod tests {
         };
         let mut buf = vec![0u8; remaining];
         stream.read_exact(&mut buf).await.unwrap();
+    }
+
+    /// Parse a SOCKS5 request from a byte slice.
+    async fn parse_request(data: &[u8]) -> Result<SocketAddr> {
+        let mut reader = data;
+        match read_socks5_request(&mut reader).await {
+            Ok(Socks5Request {
+                cmd: socks5::CMD_CONNECT,
+                target: Target::Ip(addr),
+            }) => Ok(addr),
+            Ok(other) => Err(ProxyError::Internal(format!(
+                "unexpected request {other:?}"
+            ))),
+            Err(e) => Err(e.error),
+        }
     }
 
     // ========================================================================
@@ -932,6 +1364,7 @@ mod tests {
         };
         let config = TcpProxyConfig {
             bind_addr,
+            private_destinations: PrivateDestinations::Allow,
             ..Default::default()
         };
         let proxy = TcpProxy::new(config.clone(), state).unwrap();
@@ -959,6 +1392,7 @@ mod tests {
         };
         let config = TcpProxyConfig {
             bind_addr,
+            private_destinations: PrivateDestinations::Allow,
             ..Default::default()
         };
         let proxy = TcpProxy::new(config.clone(), state).unwrap();
@@ -1012,6 +1446,7 @@ mod tests {
         let config = TcpProxyConfig {
             bind_addr,
             connect_timeout: std::time::Duration::from_secs(1), // Short timeout
+            private_destinations: PrivateDestinations::Allow,
             ..Default::default()
         };
         let proxy = TcpProxy::new(config.clone(), state).unwrap();
@@ -1068,6 +1503,7 @@ mod tests {
         };
         let config = TcpProxyConfig {
             bind_addr,
+            private_destinations: PrivateDestinations::Allow,
             ..Default::default()
         };
         let proxy = TcpProxy::new(config.clone(), state).unwrap();
@@ -1103,46 +1539,31 @@ mod tests {
     // SOCKS5 Protocol Tests
     // ========================================================================
 
-    #[test]
-
-    fn test_socks5_request_parsing_ipv4() {
-        use crate::SharedState;
-        let state = Arc::new(SharedState::new(vec![]));
-        let proxy = TcpProxy::new(TcpProxyConfig::default(), state).unwrap();
-
+    #[tokio::test]
+    async fn test_socks5_request_parsing_ipv4() {
         // SOCKS5 CONNECT request: VER=5, CMD=1, RSV=0, ATYP=1 (IPv4), IP, PORT
         let request = [0x05, 0x01, 0x00, 0x01, 192, 168, 1, 1, 0x00, 0x50]; // 192.168.1.1:80
-        let addr = proxy.parse_socks5_request(&request).unwrap();
+        let addr = parse_request(&request).await.unwrap();
 
         assert_eq!(addr.ip().to_string(), "192.168.1.1");
         assert_eq!(addr.port(), 80);
     }
 
-    #[test]
-
-    fn test_socks5_request_parsing_ipv6() {
-        use crate::SharedState;
-        let state = Arc::new(SharedState::new(vec![]));
-        let proxy = TcpProxy::new(TcpProxyConfig::default(), state).unwrap();
-
+    #[tokio::test]
+    async fn test_socks5_request_parsing_ipv6() {
         // SOCKS5 CONNECT request with IPv6: ATYP=4
         let mut request = vec![0x05, 0x01, 0x00, 0x04];
         // ::1 in 16 bytes
         request.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
         request.extend_from_slice(&[0x01, 0xBB]); // Port 443
 
-        let addr = proxy.parse_socks5_request(&request).unwrap();
+        let addr = parse_request(&request).await.unwrap();
         assert!(addr.ip().is_ipv6());
         assert_eq!(addr.port(), 443);
     }
 
-    #[test]
-
-    fn test_socks5_request_parsing_domain() {
-        use crate::SharedState;
-        let state = Arc::new(SharedState::new(vec![]));
-        let proxy = TcpProxy::new(TcpProxyConfig::default(), state).unwrap();
-
+    #[tokio::test]
+    async fn test_socks5_request_parsing_domain() {
         // SOCKS5 CONNECT request with domain: ATYP=3
         let mut request = vec![0x05, 0x01, 0x00, 0x03];
         let domain = b"example.com";
@@ -1153,49 +1574,34 @@ mod tests {
 
         // Domain requests need DNS resolution first
         // The parser might return the domain or error asking for resolution
-        let result = proxy.parse_socks5_request(&request);
+        let result = parse_request(&request).await;
         // Either succeeds with resolved IP or errors indicating domain needs resolution
         assert!(result.is_ok() || result.is_err());
     }
 
-    #[test]
-
-    fn test_socks5_request_parsing_invalid_version() {
-        use crate::SharedState;
-        let state = Arc::new(SharedState::new(vec![]));
-        let proxy = TcpProxy::new(TcpProxyConfig::default(), state).unwrap();
-
+    #[tokio::test]
+    async fn test_socks5_request_parsing_invalid_version() {
         // SOCKS4 request (version 4 instead of 5)
         let request = [0x04, 0x01, 0x00, 0x50, 192, 168, 1, 1, 0x00];
-        let result = proxy.parse_socks5_request(&request);
+        let result = parse_request(&request).await;
 
         assert!(result.is_err());
     }
 
-    #[test]
-
-    fn test_socks5_request_parsing_unsupported_command() {
-        use crate::SharedState;
-        let state = Arc::new(SharedState::new(vec![]));
-        let proxy = TcpProxy::new(TcpProxyConfig::default(), state).unwrap();
-
+    #[tokio::test]
+    async fn test_socks5_request_parsing_unsupported_command() {
         // SOCKS5 BIND request (CMD=2) - not supported
         let request = [0x05, 0x02, 0x00, 0x01, 192, 168, 1, 1, 0x00, 0x50];
-        let result = proxy.parse_socks5_request(&request);
+        let result = parse_request(&request).await;
 
         assert!(result.is_err());
     }
 
-    #[test]
-
-    fn test_socks5_request_parsing_truncated() {
-        use crate::SharedState;
-        let state = Arc::new(SharedState::new(vec![]));
-        let proxy = TcpProxy::new(TcpProxyConfig::default(), state).unwrap();
-
+    #[tokio::test]
+    async fn test_socks5_request_parsing_truncated() {
         // Truncated request (missing port)
         let request = [0x05, 0x01, 0x00, 0x01, 192, 168, 1, 1];
-        let result = proxy.parse_socks5_request(&request);
+        let result = parse_request(&request).await;
 
         assert!(result.is_err());
     }
@@ -1208,7 +1614,7 @@ mod tests {
         let _proxy = TcpProxy::new(TcpProxyConfig::default(), state).unwrap();
 
         let bound_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
-        let response = TcpProxy::build_socks5_response(bound_addr);
+        let response = build_socks5_response(bound_addr);
 
         // Check SOCKS5 response format
         assert_eq!(response[0], 0x05); // VER
@@ -1225,14 +1631,14 @@ mod tests {
         let state = Arc::new(SharedState::new(vec![]));
         let _proxy = TcpProxy::new(TcpProxyConfig::default(), state).unwrap();
 
-        let response = TcpProxy::build_socks5_error(socks5::CONNECTION_REFUSED);
+        let response = build_socks5_error(socks5::CONNECTION_REFUSED);
         assert_eq!(response[0], 0x05); // VER
         assert_eq!(response[1], socks5::CONNECTION_REFUSED); // REP
 
-        let response = TcpProxy::build_socks5_error(socks5::HOST_UNREACHABLE);
+        let response = build_socks5_error(socks5::HOST_UNREACHABLE);
         assert_eq!(response[1], socks5::HOST_UNREACHABLE);
 
-        let response = TcpProxy::build_socks5_error(socks5::COMMAND_NOT_SUPPORTED);
+        let response = build_socks5_error(socks5::COMMAND_NOT_SUPPORTED);
         assert_eq!(response[1], socks5::COMMAND_NOT_SUPPORTED);
     }
 
@@ -1276,6 +1682,7 @@ mod tests {
         };
         let config = TcpProxyConfig {
             bind_addr,
+            private_destinations: PrivateDestinations::Allow,
             ..Default::default()
         };
         let proxy = TcpProxy::new(config.clone(), state).unwrap();
@@ -1332,6 +1739,7 @@ mod tests {
         };
         let config = TcpProxyConfig {
             bind_addr,
+            private_destinations: PrivateDestinations::Allow,
             ..Default::default()
         };
         let proxy = TcpProxy::new(config.clone(), state).unwrap();
@@ -1393,6 +1801,7 @@ mod tests {
         };
         let config = TcpProxyConfig {
             bind_addr,
+            private_destinations: PrivateDestinations::Allow,
             ..Default::default()
         };
         let proxy = TcpProxy::new(config.clone(), state).unwrap();
@@ -1442,6 +1851,7 @@ mod tests {
         };
         let config = TcpProxyConfig {
             bind_addr,
+            private_destinations: PrivateDestinations::Allow,
             ..Default::default()
         };
         let proxy = TcpProxy::new(config.clone(), state).unwrap();
@@ -1495,6 +1905,7 @@ mod tests {
         let config = TcpProxyConfig {
             bind_addr,
             idle_timeout: std::time::Duration::from_secs(1), // 1 second idle timeout
+            private_destinations: PrivateDestinations::Allow,
             ..Default::default()
         };
         let proxy = TcpProxy::new(config.clone(), state).unwrap();
@@ -1582,6 +1993,7 @@ mod tests {
         };
         let config = TcpProxyConfig {
             bind_addr,
+            private_destinations: PrivateDestinations::Allow,
             ..Default::default()
         };
         let proxy = Arc::new(TcpProxy::new(config.clone(), state).unwrap());
@@ -1614,6 +2026,7 @@ mod tests {
         };
         let config = TcpProxyConfig {
             bind_addr,
+            private_destinations: PrivateDestinations::Allow,
             ..Default::default()
         };
         let proxy = Arc::new(TcpProxy::new(config.clone(), state).unwrap());
@@ -1651,6 +2064,7 @@ mod tests {
         };
         let config = TcpProxyConfig {
             bind_addr,
+            private_destinations: PrivateDestinations::Allow,
             ..Default::default()
         };
         let proxy = TcpProxy::new(config.clone(), state).unwrap();
@@ -1677,6 +2091,7 @@ mod tests {
         };
         let config = TcpProxyConfig {
             bind_addr,
+            private_destinations: PrivateDestinations::Allow,
             ..Default::default()
         };
         let proxy = TcpProxy::new(config.clone(), state).unwrap();
@@ -1716,6 +2131,7 @@ mod tests {
         };
         let config = TcpProxyConfig {
             bind_addr,
+            private_destinations: PrivateDestinations::Allow,
             ..Default::default()
         };
         let proxy = TcpProxy::new(config, state).unwrap();
@@ -1772,7 +2188,11 @@ mod tests {
         };
         state.cache.insert(resolved);
 
-        let proxy = TcpProxy::new(TcpProxyConfig::default(), state).unwrap();
+        let config = TcpProxyConfig {
+            private_destinations: PrivateDestinations::Allow,
+            ..Default::default()
+        };
+        let proxy = TcpProxy::new(config, state).unwrap();
         let dest: SocketAddr = "[::1]:80".parse().unwrap();
 
         // Should be able to verify IPv6 destination
@@ -1791,6 +2211,7 @@ mod tests {
         };
         let config = TcpProxyConfig {
             bind_addr,
+            private_destinations: PrivateDestinations::Allow,
             ..Default::default()
         };
         let proxy = TcpProxy::new(config.clone(), state).unwrap();
@@ -1822,6 +2243,7 @@ mod tests {
         };
         let config = TcpProxyConfig {
             bind_addr,
+            private_destinations: PrivateDestinations::Allow,
             ..Default::default()
         };
         let proxy = TcpProxy::new(config.clone(), state).unwrap();
@@ -1852,6 +2274,7 @@ mod tests {
         };
         let config = TcpProxyConfig {
             bind_addr,
+            private_destinations: PrivateDestinations::Allow,
             ..Default::default()
         };
         let proxy = TcpProxy::new(config.clone(), state).unwrap();
@@ -1893,6 +2316,7 @@ mod tests {
         };
         let config = TcpProxyConfig {
             bind_addr,
+            private_destinations: PrivateDestinations::Allow,
             ..Default::default()
         };
 
@@ -1930,5 +2354,547 @@ mod tests {
 
         // If we got here, the Arc-based implementation is working correctly
         // No crashes, no undefined behavior
+    }
+
+    // ========================================================================
+    // Hardening Tests
+    // ========================================================================
+
+    /// Start a proxy on a free port. Returns `None` if the test cannot bind.
+    async fn start_proxy(
+        state: Arc<crate::SharedState>,
+        config: TcpProxyConfig,
+    ) -> Option<(SocketAddr, tokio::task::JoinHandle<Result<()>>)> {
+        let listener = tcp_listener_or_skip("127.0.0.1:0").await?;
+        let addr = listener.local_addr().unwrap();
+        let proxy = TcpProxy::new(config, state).unwrap();
+        let handle = tokio::spawn(async move { proxy.run_on(listener).await });
+        Some((addr, handle))
+    }
+
+    /// A state with a trace channel.
+    fn traced_state(
+        allowlist: &[&str],
+    ) -> (
+        Arc<crate::SharedState>,
+        tokio::sync::mpsc::UnboundedReceiver<crate::TraceEvent>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = Arc::new(crate::SharedState::with_violation_tx(
+            allowlist.iter().map(|s| (*s).to_string()).collect(),
+            Some(tx),
+        ));
+        (state, rx)
+    }
+
+    fn cache(state: &crate::SharedState, domain: &str, ip: IpAddr) {
+        state.cache.insert(crate::ResolvedAddress {
+            domain: domain.to_string(),
+            addresses: vec![ip],
+            expires_at: std::time::Instant::now() + Duration::from_secs(300),
+        });
+    }
+
+    /// Send a SOCKS5 greeting and a raw request, and return the reply code.
+    async fn socks5_reply_code(proxy: SocketAddr, request: &[u8]) -> u8 {
+        let mut client = TcpStream::connect(proxy).await.unwrap();
+        client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut greeting = [0u8; 2];
+        client.read_exact(&mut greeting).await.unwrap();
+        client.write_all(request).await.unwrap();
+        let mut reply = [0u8; 10];
+        tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        reply[1]
+    }
+
+    /// Collect the trace messages that are in the channel now.
+    fn drain(rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::TraceEvent>) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            out.push(match event {
+                crate::TraceEvent::Access(m) => format!("access {m}"),
+                crate::TraceEvent::Violation(m) => format!("violation {m}"),
+            });
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn test_private_ip_rejected_even_if_cached() {
+        let (state, mut rx) = traced_state(&["test.local"]);
+        cache(&state, "test.local", "127.0.0.1".parse().unwrap());
+        let Some((proxy, handle)) = start_proxy(state, TcpProxyConfig::default()).await else {
+            return;
+        };
+
+        let code =
+            socks5_reply_code(proxy, &[0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1, 0x00, 22]).await;
+        assert_eq!(code, socks5::CONNECTION_NOT_ALLOWED);
+
+        let messages = drain(&mut rx);
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.starts_with("violation network: SOCKS5")
+                    && m.contains("127.0.0.1 port 22")
+                    && m.contains("loopback")),
+            "{messages:?}"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_private_ipv4_mapped_ipv6_rejected() {
+        let (state, _rx) = traced_state(&["test.local"]);
+        let mapped: IpAddr = "::ffff:10.0.0.1".parse().unwrap();
+        cache(&state, "test.local", mapped);
+        let proxy = TcpProxy::new(TcpProxyConfig::default(), state).unwrap();
+        let result = proxy.verify_destination(&SocketAddr::new(mapped, 443));
+        assert!(matches!(
+            result,
+            Err(ProxyError::NonPublicDestination { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_domain_resolving_to_loopback_rejected() {
+        // "localhost" resolves to a loopback address without network access.
+        // This is the DNS rebinding case: an allowed name points at the host.
+        let (state, mut rx) = traced_state(&["localhost"]);
+        let Some((proxy, handle)) = start_proxy(state, TcpProxyConfig::default()).await else {
+            return;
+        };
+
+        let mut request = vec![0x05, 0x01, 0x00, 0x03, 9];
+        request.extend_from_slice(b"localhost");
+        request.extend_from_slice(&80u16.to_be_bytes());
+        let code = socks5_reply_code(proxy, &request).await;
+        assert_eq!(code, socks5::CONNECTION_NOT_ALLOWED);
+
+        let messages = drain(&mut rx);
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("\"localhost\" port 80 blocked") && m.contains("loopback")),
+            "{messages:?}"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_socks5_bind_and_udp_associate_rejected() {
+        let (state, _rx) = traced_state(&["example.com"]);
+        let Some((proxy, handle)) = start_proxy(state, TcpProxyConfig::default()).await else {
+            return;
+        };
+
+        // BIND on the domain path.
+        let mut bind = vec![0x05, 0x02, 0x00, 0x03, 11];
+        bind.extend_from_slice(b"example.com");
+        bind.extend_from_slice(&443u16.to_be_bytes());
+        assert_eq!(
+            socks5_reply_code(proxy, &bind).await,
+            socks5::COMMAND_NOT_SUPPORTED
+        );
+
+        // UDP ASSOCIATE on the IP path.
+        let udp = [0x05, 0x03, 0x00, 0x01, 1, 2, 3, 4, 0x00, 0x35];
+        assert_eq!(
+            socks5_reply_code(proxy, &udp).await,
+            socks5::COMMAND_NOT_SUPPORTED
+        );
+
+        // An unknown address type.
+        let bad_atyp = [0x05, 0x01, 0x00, 0x09, 0, 0];
+        assert_eq!(
+            socks5_reply_code(proxy, &bad_atyp).await,
+            socks5::ADDRESS_TYPE_NOT_SUPPORTED
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_socks5_no_acceptable_method() {
+        let (state, _rx) = traced_state(&[]);
+        let Some((proxy, handle)) = start_proxy(state, TcpProxyConfig::default()).await else {
+            return;
+        };
+        let mut client = TcpStream::connect(proxy).await.unwrap();
+        // Offer only username/password authentication (0x02).
+        client.write_all(&[0x05, 0x01, 0x02]).await.unwrap();
+        let mut reply = [0u8; 2];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply, [0x05, 0xFF]);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_read_socks5_request_from_split_reads() {
+        // The request arrives in many small pieces.
+        let mut request = vec![0x05, 0x01, 0x00, 0x03, 11];
+        request.extend_from_slice(b"example.com");
+        request.extend_from_slice(&443u16.to_be_bytes());
+
+        let (mut writer, mut reader) = tokio::io::duplex(8);
+        let bytes = request.clone();
+        let feeder = tokio::spawn(async move {
+            for byte in bytes {
+                writer.write_all(&[byte]).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            writer
+        });
+        let Ok(parsed) = read_socks5_request(&mut reader).await else {
+            panic!("split request did not parse");
+        };
+        assert_eq!(
+            parsed,
+            Socks5Request {
+                cmd: socks5::CMD_CONNECT,
+                target: Target::Domain {
+                    host: "example.com".to_string(),
+                    port: 443
+                },
+            }
+        );
+        drop(feeder.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_split_socks5_request_through_proxy() {
+        let Some(listener) = tcp_listener_or_skip("127.0.0.1:0").await else {
+            return;
+        };
+        let dest = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4];
+            socket.read_exact(&mut buf).await.unwrap();
+            socket.write_all(&buf).await.unwrap();
+        });
+
+        let (state, _rx) = traced_state(&["test.local"]);
+        cache(&state, "test.local", dest.ip());
+        let config = TcpProxyConfig {
+            private_destinations: PrivateDestinations::Allow,
+            ..Default::default()
+        };
+        let Some((proxy, handle)) = start_proxy(state, config).await else {
+            return;
+        };
+
+        let mut client = TcpStream::connect(proxy).await.unwrap();
+        client.set_nodelay(true).unwrap();
+        client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut greeting = [0u8; 2];
+        client.read_exact(&mut greeting).await.unwrap();
+
+        let mut request = vec![0x05, 0x01, 0x00, 0x01];
+        if let IpAddr::V4(ip) = dest.ip() {
+            request.extend_from_slice(&ip.octets());
+        }
+        request.extend_from_slice(&dest.port().to_be_bytes());
+        for byte in request {
+            client.write_all(&[byte]).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[1], socks5::SUCCEEDED);
+
+        client.write_all(b"ping").await.unwrap();
+        let mut echo = [0u8; 4];
+        client.read_exact(&mut echo).await.unwrap();
+        assert_eq!(&echo, b"ping");
+
+        handle.abort();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_handshake_timeout_closes_silent_client() {
+        let (state, _rx) = traced_state(&[]);
+        let config = TcpProxyConfig {
+            handshake_timeout: Duration::from_millis(200),
+            ..Default::default()
+        };
+        let Some(listener) = tcp_listener_or_skip("127.0.0.1:0").await else {
+            return;
+        };
+        let addr = listener.local_addr().unwrap();
+        let proxy = Arc::new(TcpProxy::new(config, state).unwrap());
+        let runner = Arc::clone(&proxy);
+        let handle = tokio::spawn(async move { runner.run_on(listener).await });
+
+        // A slowloris client: it sends one byte and then nothing.
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(&[0x05]).await.unwrap();
+        let mut buf = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(3), client.read(&mut buf)).await;
+        assert!(matches!(read, Ok(Ok(0)) | Ok(Err(_))), "{read:?}");
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(proxy.connection_count(), 0);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_http_connect_forwards_trailing_bytes() {
+        let Some(listener) = tcp_listener_or_skip("127.0.0.1:0").await else {
+            return;
+        };
+        let dest = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 5];
+            socket.read_exact(&mut buf).await.unwrap();
+            buf
+        });
+
+        let (state, mut rx) = traced_state(&["localhost"]);
+        let config = TcpProxyConfig {
+            private_destinations: PrivateDestinations::Allow,
+            ..Default::default()
+        };
+        let Some((proxy, handle)) = start_proxy(state, config).await else {
+            return;
+        };
+
+        let mut client = TcpStream::connect(proxy).await.unwrap();
+        let request = format!(
+            "CONNECT localhost:{port} HTTP/1.1\r\nHost: localhost:{port}\r\n\r\nHELLO",
+            port = dest.port()
+        );
+        client.write_all(request.as_bytes()).await.unwrap();
+
+        let mut response = vec![0u8; 39];
+        client.read_exact(&mut response).await.unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
+
+        let received = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&received, b"HELLO");
+
+        let messages = drain(&mut rx);
+        assert!(
+            messages.iter().any(|m| m
+                == &format!(
+                    "access network: CONNECT connection to \"localhost\" port {} allowed",
+                    dest.port()
+                )),
+            "{messages:?}"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_http_connect_blocked_domain_reports_port_and_protocol() {
+        let (state, mut rx) = traced_state(&["allowed.com"]);
+        let Some((proxy, handle)) = start_proxy(state, TcpProxyConfig::default()).await else {
+            return;
+        };
+        let mut client = TcpStream::connect(proxy).await.unwrap();
+        client
+            .write_all(b"CONNECT evil.com:8443 HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 403"));
+        let messages = drain(&mut rx);
+        assert!(
+            messages.iter().any(|m| m.starts_with(
+                "violation network: CONNECT connection to \"evil.com\" port 8443 blocked"
+            )),
+            "{messages:?}"
+        );
+        handle.abort();
+    }
+
+    #[test]
+    fn test_parse_http_connect_target_ip_literal() {
+        let target = parse_http_connect_target("CONNECT [2001:db8::1]:443 HTTP/1.1").unwrap();
+        assert_eq!(target, Target::Ip("[2001:db8::1]:443".parse().unwrap()));
+        let target = parse_http_connect_target("CONNECT 1.2.3.4:80 HTTP/1.1").unwrap();
+        assert_eq!(target, Target::Ip("1.2.3.4:80".parse().unwrap()));
+        let target = parse_http_connect_target("CONNECT Example.com:443 HTTP/1.1").unwrap();
+        assert_eq!(
+            target,
+            Target::Domain {
+                host: "Example.com".to_string(),
+                port: 443
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_non_ascii_socks5_domain_rejected() {
+        // The Kelvin sign lowercases to "k" with Unicode rules.
+        let (state, mut rx) = traced_state(&["kelvin.com"]);
+        let Some((proxy, handle)) = start_proxy(state, TcpProxyConfig::default()).await else {
+            return;
+        };
+        let name = "\u{212a}elvin.com".as_bytes();
+        let mut request = vec![0x05, 0x01, 0x00, 0x03, u8::try_from(name.len()).unwrap()];
+        request.extend_from_slice(name);
+        request.extend_from_slice(&443u16.to_be_bytes());
+        assert_eq!(
+            socks5_reply_code(proxy, &request).await,
+            socks5::CONNECTION_NOT_ALLOWED
+        );
+        let messages = drain(&mut rx);
+        assert!(
+            messages.iter().any(|m| m.contains("non-ASCII")),
+            "{messages:?}"
+        );
+        handle.abort();
+    }
+
+    #[test]
+    fn test_check_requested_host_sni() {
+        use crate::inspect::tests::client_hello;
+        let (state, mut rx) = traced_state(&["allowed.com", "cdn.allowed.com"]);
+        let proxy = TcpProxy::new(TcpProxyConfig::default(), state).unwrap();
+        let target = Target::Ip("93.184.216.34:443".parse().unwrap());
+
+        let ok = client_hello(Some("cdn.allowed.com"));
+        assert!(proxy
+            .check_requested_host(Protocol::Socks5, &target, Inspect::Tls, &ok)
+            .is_ok());
+
+        // No SNI (for example ECH): only the IP-cache check applies.
+        let none = client_hello(None);
+        assert!(proxy
+            .check_requested_host(Protocol::Socks5, &target, Inspect::Tls, &none)
+            .is_ok());
+
+        // Domain fronting: an allowed IP with a SNI that is not allowed.
+        let fronted = client_hello(Some("evil.example"));
+        assert!(proxy
+            .check_requested_host(Protocol::Socks5, &target, Inspect::Tls, &fronted)
+            .is_err());
+        let messages = drain(&mut rx);
+        assert!(
+            messages.iter().any(
+                |m| m.contains("TLS SNI \"evil.example\" is not in the allowlist")
+                    && m.contains("93.184.216.34 port 443")
+            ),
+            "{messages:?}"
+        );
+    }
+
+    #[test]
+    fn test_check_requested_host_http() {
+        let (state, _rx) = traced_state(&["allowed.com"]);
+        let proxy = TcpProxy::new(TcpProxyConfig::default(), state).unwrap();
+        let target = Target::Ip("93.184.216.34:80".parse().unwrap());
+        let ok = b"GET / HTTP/1.1\r\nHost: Allowed.com\r\n\r\n";
+        let bad = b"GET / HTTP/1.1\r\nHost: evil.com\r\n\r\n";
+        assert!(proxy
+            .check_requested_host(Protocol::HttpConnect, &target, Inspect::Http, ok)
+            .is_ok());
+        assert!(proxy
+            .check_requested_host(Protocol::HttpConnect, &target, Inspect::Http, bad)
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn test_idle_timeout_resets_on_activity() {
+        // The connection lives longer than the idle timeout while data flows,
+        // and closes when the data stops.
+        let Some(listener) = tcp_listener_or_skip("127.0.0.1:0").await else {
+            return;
+        };
+        let dest = listener.local_addr().unwrap();
+        let _server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 64];
+            loop {
+                match socket.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if socket.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        let (state, _rx) = traced_state(&["test.local"]);
+        cache(&state, "test.local", dest.ip());
+        let config = TcpProxyConfig {
+            idle_timeout: Duration::from_millis(400),
+            private_destinations: PrivateDestinations::Allow,
+            ..Default::default()
+        };
+        let Some((proxy, handle)) = start_proxy(state, config).await else {
+            return;
+        };
+        let mut client = TcpStream::connect(proxy).await.unwrap();
+        socks5_connect(&mut client, dest).await;
+
+        // 8 x 150 ms = 1.2 s, three times the idle timeout.
+        for _ in 0..8 {
+            client.write_all(b"x").await.unwrap();
+            let mut echo = [0u8; 1];
+            client.read_exact(&mut echo).await.unwrap();
+            assert_eq!(&echo, b"x");
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+
+        // Now stay silent: the proxy must close the connection.
+        let mut buf = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buf)).await;
+        assert!(matches!(read, Ok(Ok(0)) | Ok(Err(_))), "{read:?}");
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_relay_streams_reports_idle() {
+        let (client_a, _client_b) = tokio::io::duplex(64);
+        let (dest_a, _dest_b) = tokio::io::duplex(64);
+        let (cr, cw) = tokio::io::split(client_a);
+        let (dr, dw) = tokio::io::split(dest_a);
+        let start = std::time::Instant::now();
+        let end = relay_streams(cr, cw, dr, dw, Duration::from_millis(100)).await;
+        assert!(matches!(end, RelayEnd::Idle), "{end:?}");
+        assert!(start.elapsed() >= Duration::from_millis(100));
+    }
+
+    #[tokio::test]
+    async fn test_ip_path_access_event_names_domain() {
+        let Some(listener) = tcp_listener_or_skip("127.0.0.1:0").await else {
+            return;
+        };
+        let dest = listener.local_addr().unwrap();
+        let _server = tokio::spawn(async move {
+            let _accepted = listener.accept().await;
+        });
+        let (state, mut rx) = traced_state(&["test.local"]);
+        cache(&state, "test.local", dest.ip());
+        let config = TcpProxyConfig {
+            private_destinations: PrivateDestinations::Allow,
+            ..Default::default()
+        };
+        let Some((proxy, handle)) = start_proxy(state, config).await else {
+            return;
+        };
+        let mut client = TcpStream::connect(proxy).await.unwrap();
+        socks5_connect(&mut client, dest).await;
+        let messages = drain(&mut rx);
+        assert!(
+            messages.iter().any(|m| m == &format!(
+                "access network: SOCKS5 connection to 127.0.0.1 port {} (\"test.local\") allowed",
+                dest.port()
+            )),
+            "{messages:?}"
+        );
+        handle.abort();
     }
 }
