@@ -77,12 +77,14 @@ pub(crate) async fn start_proxy(
         config.dns_bind_addr = bind_addr;
     }
     let handle = ProxyServer::new(config)?.start().await?;
-    let proxy_addr = handle.proxy_addr();
-    let dns_port = handle.dns_addr().port();
+    let (Some(proxy_addr), Some(dns_addr)) = (handle.proxy_addr(), handle.dns_addr()) else {
+        return Err(CliError::Other("the proxy has no listener".to_string()));
+    };
+    let dns_port = dns_addr.port();
     tracing::debug!(
         http_proxy = %format!("http://127.0.0.1:{}", proxy_addr.port()),
         socks5_proxy = %format!("socks5h://127.0.0.1:{}", proxy_addr.port()),
-        dns = %handle.dns_addr(),
+        dns = %dns_addr,
         "proxy started (HTTP CONNECT + SOCKS5h on same port); DNS resolved server-side"
     );
     Ok(ProxySession {

@@ -28,7 +28,8 @@ use crate::{
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::oneshot;
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
 
 /// Configuration for the combined proxy server.
 #[derive(Debug, Clone)]
@@ -179,21 +180,51 @@ impl ProxyConfig {
     }
 }
 
+/// Listeners that another process made, for example the sandboxed child in
+/// its own network namespace.
+///
+/// A socket keeps the network namespace of its creation. Thus the proxy can
+/// accept connections on these listeners and connect upstream from its own
+/// network namespace. See [`ProxyHandle::attach_listeners`].
+#[derive(Debug)]
+pub struct ExternalListeners {
+    /// The TCP listeners of the proxy (SOCKS5 and HTTP CONNECT on the same
+    /// port).
+    pub tcp: Vec<std::net::TcpListener>,
+    /// The UDP socket of the DNS server.
+    pub dns_udp: std::net::UdpSocket,
+    /// The TCP listener of the DNS server, if there is one.
+    pub dns_tcp: Option<std::net::TcpListener>,
+}
+
+/// The time that [`ProxyHandle::shutdown`] waits for the server tasks.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Handle for controlling a running proxy server.
 ///
 /// Allows shutting down the server gracefully and modifying the domain allowlist at runtime.
+/// When the handle drops without [`ProxyHandle::shutdown`], the server tasks
+/// stop too.
 pub struct ProxyHandle {
-    /// Shutdown signal sender.
-    shutdown_tx: Option<oneshot::Sender<()>>,
+    /// The stop signal for all server tasks. The tasks also stop when the
+    /// sender drops.
+    stop_tx: watch::Sender<bool>,
 
-    /// Join handle for the server task.
-    join_handle: Option<tokio::task::JoinHandle<Result<()>>>,
+    /// The server tasks: one task for each listener.
+    tasks: std::sync::Mutex<Vec<JoinHandle<Result<()>>>>,
 
-    /// DNS server bind address.
-    dns_bind_addr: SocketAddr,
+    /// The DNS server. All listeners share it.
+    dns_server: Arc<DnsServer>,
 
-    /// TCP proxy bind address.
-    proxy_bind_addr: SocketAddr,
+    /// The TCP proxy. All listeners share it, and with it the connection
+    /// limit.
+    tcp_proxy: Arc<TcpProxy>,
+
+    /// DNS server bind address (`None` without a host listener).
+    dns_bind_addr: Option<SocketAddr>,
+
+    /// TCP proxy bind address (`None` without a host listener).
+    proxy_bind_addr: Option<SocketAddr>,
 
     /// Shared state for runtime domain management.
     state: Arc<SharedState>,
@@ -201,57 +232,119 @@ pub struct ProxyHandle {
 
 impl ProxyHandle {
     /// Check if the server is still running.
+    ///
+    /// Returns false after a server task stopped (for example on a fatal
+    /// error).
     #[must_use]
     pub fn is_running(&self) -> bool {
-        self.join_handle.as_ref().is_some_and(|h| !h.is_finished())
+        !*self.stop_tx.borrow() && lock(&self.tasks).iter().all(|task| !task.is_finished())
     }
 
     /// Shut down the proxy server gracefully.
     ///
-    /// Signals the server to stop via the shutdown channel. When the server
-    /// task stops, it cancels all the DNS query tasks and all the TCP
-    /// connection tasks, and the proxy closes the open connections. If the
-    /// shutdown signal cannot be delivered (receiver dropped), or if the task
-    /// does not stop in 2 seconds, the task is aborted.
+    /// Signals the server tasks to stop. When a task stops, it cancels all
+    /// its DNS query tasks and TCP connection tasks, and the proxy closes the
+    /// open connections. The function aborts each task that does not stop in
+    /// 2 seconds.
     ///
     /// # Errors
     /// Currently infallible; always returns `Ok`.
-    pub async fn shutdown(mut self) -> Result<()> {
-        // Send shutdown signal - this triggers the tokio::select! in the server task
-        let signal_sent = self
-            .shutdown_tx
-            .take()
-            .is_some_and(|tx| tx.send(()).is_ok());
-
-        // Wait for server task to complete
-        if let Some(mut handle) = self.join_handle.take() {
-            if signal_sent {
-                // Give the task time to respond to shutdown signal. The result
-                // of the task is not important here: it completed, was
-                // cancelled, or panicked, and the proxy stops in all cases.
-                let stopped =
-                    tokio::time::timeout(std::time::Duration::from_secs(2), &mut handle).await;
-                if stopped.is_err() {
-                    handle.abort();
-                }
-            } else {
-                // Shutdown signal couldn't be sent, abort the task
-                handle.abort();
+    pub async fn shutdown(self) -> Result<()> {
+        self.stop_tx.send_replace(true);
+        let tasks = std::mem::take(&mut *lock(&self.tasks));
+        let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
+        for mut task in tasks {
+            // The result of the task is not important here: it completed,
+            // was cancelled, or panicked, and the proxy stops in all cases.
+            if tokio::time::timeout_at(deadline, &mut task).await.is_err() {
+                task.abort();
             }
         }
-
         Ok(())
     }
 
+    /// Serve on listeners that another process made.
+    ///
+    /// The function sets each socket to nonblocking mode, converts it to a
+    /// tokio type and starts the same accept loops as for the own listeners,
+    /// with the same policy, event channels and limits. Call it in the tokio
+    /// runtime of the proxy. Connections that arrive before the call wait in
+    /// the queue of the listener.
+    ///
+    /// # Errors
+    /// * [`ProxyError::Shutdown`] if the proxy is stopped.
+    /// * [`ProxyError::Listener`] if a socket cannot change to nonblocking
+    ///   mode or cannot register with the tokio runtime.
+    pub fn attach_listeners(&self, listeners: ExternalListeners) -> Result<()> {
+        if *self.stop_tx.borrow() {
+            return Err(ProxyError::Shutdown("the proxy is stopped".to_string()));
+        }
+        let ExternalListeners {
+            tcp,
+            dns_udp,
+            dns_tcp,
+        } = listeners;
+        // Convert all sockets first, so that an error starts no task.
+        let tcp = tcp
+            .into_iter()
+            .map(to_tokio_listener)
+            .collect::<std::io::Result<Vec<_>>>()
+            .map_err(ProxyError::Listener)?;
+        dns_udp
+            .set_nonblocking(true)
+            .map_err(ProxyError::Listener)?;
+        let dns_udp = tokio::net::UdpSocket::from_std(dns_udp).map_err(ProxyError::Listener)?;
+        let dns_tcp = dns_tcp
+            .map(to_tokio_listener)
+            .transpose()
+            .map_err(ProxyError::Listener)?;
+
+        let mut tasks = lock(&self.tasks);
+        for listener in tcp {
+            let proxy = Arc::clone(&self.tcp_proxy);
+            tasks.push(self.spawn_until_stop(async move { proxy.run_on(listener).await }));
+        }
+        let dns = Arc::clone(&self.dns_server);
+        tasks.push(self.spawn_until_stop(async move { dns.run_on(dns_udp).await }));
+        if let Some(listener) = dns_tcp {
+            let dns = Arc::clone(&self.dns_server);
+            tasks.push(self.spawn_until_stop(async move { dns.run_tcp_on(listener).await }));
+        }
+        Ok(())
+    }
+
+    /// Spawn `serve` as a task that ends at the stop signal. The drop of the
+    /// future at the stop also drops the `JoinSet` of its connection tasks,
+    /// and so aborts them.
+    fn spawn_until_stop<F>(&self, serve: F) -> JoinHandle<Result<()>>
+    where
+        F: std::future::Future<Output = Result<()>> + Send + 'static,
+    {
+        let mut stop_rx = self.stop_tx.subscribe();
+        tokio::spawn(async move {
+            tokio::select! {
+                result = serve => result,
+                // An error means that the handle dropped; stop also then.
+                _ = stop_rx.wait_for(|stop| *stop) => Ok(()),
+            }
+        })
+    }
+
     /// Get the DNS server bind address.
+    ///
+    /// Returns `None` when the proxy has no host listener (see
+    /// [`ProxyServer::start_unbound`]).
     #[must_use]
-    pub const fn dns_addr(&self) -> SocketAddr {
+    pub const fn dns_addr(&self) -> Option<SocketAddr> {
         self.dns_bind_addr
     }
 
     /// Get the TCP proxy bind address.
+    ///
+    /// Returns `None` when the proxy has no host listener (see
+    /// [`ProxyServer::start_unbound`]).
     #[must_use]
-    pub const fn proxy_addr(&self) -> SocketAddr {
+    pub const fn proxy_addr(&self) -> Option<SocketAddr> {
         self.proxy_bind_addr
     }
 
@@ -299,6 +392,19 @@ impl ProxyHandle {
     }
 }
 
+/// Set `listener` to nonblocking mode and register it with tokio.
+fn to_tokio_listener(listener: std::net::TcpListener) -> std::io::Result<tokio::net::TcpListener> {
+    listener.set_nonblocking(true)?;
+    tokio::net::TcpListener::from_std(listener)
+}
+
+/// Lock the task list. A poisoned lock still holds a valid list.
+fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Combined DNS + TCP proxy server.
 ///
 /// Manages the lifecycle of both servers and provides unified configuration.
@@ -341,7 +447,8 @@ impl ProxyServer {
 
     /// Start the proxy server.
     ///
-    /// Spawns the DNS server and TCP proxy as concurrent tasks.
+    /// Binds the DNS UDP socket and the TCP proxy listener on the host, and
+    /// spawns the DNS server and TCP proxy as concurrent tasks.
     /// Returns a handle for controlling the running server.
     ///
     /// # Errors
@@ -373,36 +480,61 @@ impl ProxyServer {
             source: e,
         })?;
 
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let state_for_task = Arc::clone(&self.state);
-        let state_for_handle = Arc::clone(&self.state);
-        let config = self.config.clone();
-
-        // Spawn server task using pre-bound sockets.
-        let join_handle = tokio::spawn(async move {
-            let dns_config = config.dns_config(actual_dns_addr);
-            let tcp_config = config.tcp_config(actual_proxy_addr);
-
-            let dns_server = DnsServer::new(dns_config, Arc::clone(&state_for_task))?;
-            let tcp_proxy = TcpProxy::new(tcp_config, Arc::clone(&state_for_task))?;
-
-            // Run both servers concurrently on pre-bound sockets. When the
-            // shutdown signal arrives, select! drops the two server futures.
-            // Each of them owns a JoinSet of its tasks, and the drop of a
-            // JoinSet aborts all its tasks.
+        let handle = self.into_handle(Some(actual_dns_addr), Some(actual_proxy_addr))?;
+        let dns = Arc::clone(&handle.dns_server);
+        let proxy = Arc::clone(&handle.tcp_proxy);
+        // Run both servers on the pre-bound sockets. At the stop signal the
+        // task drops the two server futures. Each of them owns a JoinSet of
+        // its tasks, and the drop of a JoinSet aborts all its tasks.
+        let task = handle.spawn_until_stop(async move {
             tokio::select! {
-                result = dns_server.run_on(udp_socket) => result,
-                result = tcp_proxy.run_on(tcp_listener) => result,
-                _ = shutdown_rx => Ok(()),
+                result = dns.run_on(udp_socket) => result,
+                result = proxy.run_on(tcp_listener) => result,
             }
         });
+        lock(&handle.tasks).push(task);
+        Ok(handle)
+    }
 
+    /// Start the proxy server without host listeners.
+    ///
+    /// The server serves only on the listeners that the caller gives to
+    /// [`ProxyHandle::attach_listeners`]. On Linux, the sandboxed child makes
+    /// these listeners in its own network namespace, so the proxy needs no
+    /// port on the host.
+    ///
+    /// # Errors
+    /// Currently infallible; the `Result` type matches
+    /// [`ProxyServer::start`].
+    pub fn start_unbound(self) -> Result<ProxyHandle> {
+        self.into_handle(None, None)
+    }
+
+    /// Make the handle with the DNS server and the TCP proxy, and no tasks.
+    fn into_handle(
+        self,
+        dns_addr: Option<SocketAddr>,
+        proxy_addr: Option<SocketAddr>,
+    ) -> Result<ProxyHandle> {
+        // The servers use the listeners that they get. The bind addresses in
+        // their configurations are used only by `DnsServer::run` and
+        // `TcpProxy::run`, which the handle does not call.
+        let dns_config = self
+            .config
+            .dns_config(dns_addr.unwrap_or(self.config.dns_bind_addr));
+        let tcp_config = self
+            .config
+            .tcp_config(proxy_addr.unwrap_or(self.config.proxy_bind_addr));
+        let dns_server = Arc::new(DnsServer::new(dns_config, Arc::clone(&self.state))?);
+        let tcp_proxy = Arc::new(TcpProxy::new(tcp_config, Arc::clone(&self.state))?);
         Ok(ProxyHandle {
-            shutdown_tx: Some(shutdown_tx),
-            join_handle: Some(join_handle),
-            dns_bind_addr: actual_dns_addr,
-            proxy_bind_addr: actual_proxy_addr,
-            state: state_for_handle,
+            stop_tx: watch::Sender::new(false),
+            tasks: std::sync::Mutex::new(Vec::new()),
+            dns_server,
+            tcp_proxy,
+            dns_bind_addr: dns_addr,
+            proxy_bind_addr: proxy_addr,
+            state: self.state,
         })
     }
 
@@ -694,7 +826,7 @@ mod tests {
         let server = ProxyServer::new(config)?;
         let handle = server.start().await?;
 
-        let dns_addr = handle.dns_addr();
+        let dns_addr = handle.dns_addr().ok_or("no DNS address")?;
         assert_eq!(dns_addr.port(), 25355);
         assert_eq!(dns_addr.ip().to_string(), "127.0.0.1");
 
@@ -714,7 +846,7 @@ mod tests {
         let server = ProxyServer::new(config)?;
         let handle = server.start().await?;
 
-        let proxy_addr = handle.proxy_addr();
+        let proxy_addr = handle.proxy_addr().ok_or("no proxy address")?;
         assert_eq!(proxy_addr.port(), 29303);
         assert_eq!(proxy_addr.ip().to_string(), "127.0.0.1");
 
@@ -960,6 +1092,87 @@ mod tests {
         assert_eq!(rcode, 3, "Expected NXDOMAIN RCODE");
 
         handle.shutdown().await?;
+        Ok(())
+    }
+
+    /// An unbound proxy serves DNS (UDP and TCP) and the proxy port on
+    /// listeners that the caller attaches after the start.
+    #[tokio::test]
+    async fn test_attach_listeners_serves_dns_and_proxy() -> TestResult {
+        skip_if_no_bind!();
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let config = ProxyConfig::with_allowlist(vec!["allowed.com".to_string()]);
+        let handle = ProxyServer::new(config)?.start_unbound()?;
+        assert!(handle.proxy_addr().is_none());
+        assert!(handle.dns_addr().is_none());
+        assert!(handle.is_running());
+
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let dns_udp = std::net::UdpSocket::bind("127.0.0.1:0")?;
+        let dns_tcp = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let proxy_addr = tcp.local_addr()?;
+        let udp_addr = dns_udp.local_addr()?;
+        let dns_tcp_addr = dns_tcp.local_addr()?;
+        handle.attach_listeners(ExternalListeners {
+            tcp: vec![tcp],
+            dns_udp,
+            dns_tcp: Some(dns_tcp),
+        })?;
+        let timeout = std::time::Duration::from_secs(2);
+
+        // DNS over UDP: a blocked name gets NXDOMAIN.
+        let query = build_test_dns_query("blocked.com", 1);
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+        socket.send_to(&query, udp_addr).await?;
+        let mut buf = [0u8; 512];
+        let (len, _) = tokio::time::timeout(timeout, socket.recv_from(&mut buf)).await??;
+        assert!(len > 12);
+        assert_eq!(buf[3] & 0x0F, 3, "Expected NXDOMAIN over UDP");
+
+        // DNS over TCP: the same answer with a length prefix. Two queries on
+        // one connection.
+        let mut stream = tokio::net::TcpStream::connect(dns_tcp_addr).await?;
+        for _ in 0..2 {
+            let len = u16::try_from(query.len())?;
+            stream.write_all(&len.to_be_bytes()).await?;
+            stream.write_all(&query).await?;
+            let mut len_buf = [0u8; 2];
+            tokio::time::timeout(timeout, stream.read_exact(&mut len_buf)).await??;
+            let mut reply = vec![0u8; usize::from(u16::from_be_bytes(len_buf))];
+            tokio::time::timeout(timeout, stream.read_exact(&mut reply)).await??;
+            assert!(reply.len() > 12);
+            assert_eq!(reply[3] & 0x0F, 3, "Expected NXDOMAIN over TCP");
+        }
+
+        // The proxy port: a SOCKS5 greeting gets the SOCKS5 answer.
+        let mut client = tokio::net::TcpStream::connect(proxy_addr).await?;
+        client.write_all(&[0x05, 0x01, 0x00]).await?;
+        let mut greeting = [0u8; 2];
+        tokio::time::timeout(timeout, client.read_exact(&mut greeting)).await??;
+        assert_eq!(greeting, [0x05, 0x00]);
+        assert_eq!(handle.connections_accepted(), 1);
+
+        handle.shutdown().await?;
+        Ok(())
+    }
+
+    /// The listeners of a stopped proxy do not answer, and the attached tasks
+    /// end at the shutdown.
+    #[tokio::test]
+    async fn test_attach_listeners_stop_at_shutdown() -> TestResult {
+        skip_if_no_bind!();
+        let handle = ProxyServer::new(ProxyConfig::default())?.start_unbound()?;
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let addr = tcp.local_addr()?;
+        handle.attach_listeners(ExternalListeners {
+            tcp: vec![tcp],
+            dns_udp: std::net::UdpSocket::bind("127.0.0.1:0")?,
+            dns_tcp: None,
+        })?;
+        handle.shutdown().await?;
+        // The listener closed with its task, so the port refuses.
+        assert!(tokio::net::TcpStream::connect(addr).await.is_err());
         Ok(())
     }
 
@@ -1423,7 +1636,7 @@ mod tests {
         });
         let handle = server.start().await?;
 
-        let mut client = TcpStream::connect(handle.proxy_addr()).await?;
+        let mut client = TcpStream::connect(handle.proxy_addr().ok_or("no proxy address")?).await?;
         client.write_all(&[0x05, 0x01, 0x00]).await?;
         let mut greeting = [0u8; 2];
         client.read_exact(&mut greeting).await?;

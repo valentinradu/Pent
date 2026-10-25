@@ -75,7 +75,9 @@ pub use dns::{DnsServer, DnsServerConfig};
 pub use filter::{normalize_hostname, DomainFilter, DomainMatch, DomainNameError};
 pub use netaddr::PrivateDestinations;
 pub use proxy::{TcpProxy, TcpProxyConfig};
-pub use server::{ConfigError, ProxyConfig, ProxyHandle, ProxyPolicy, ProxyServer};
+pub use server::{
+    ConfigError, ExternalListeners, ProxyConfig, ProxyHandle, ProxyPolicy, ProxyServer,
+};
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -179,6 +181,10 @@ pub enum ProxyError {
     /// Server shutdown error.
     #[error("Server shutdown error: {0}")]
     Shutdown(String),
+
+    /// A listener from another process cannot be used.
+    #[error("Cannot use the listener: {0}")]
+    Listener(#[source] std::io::Error),
 
     /// Internal error.
     #[error("Internal error: {0}")]

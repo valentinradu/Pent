@@ -45,6 +45,9 @@ const HEADER_LEN: usize = 12;
 /// The receive buffer size for client queries and upstream responses.
 const UDP_BUFFER_LEN: usize = 4096;
 
+/// The time after which the server closes an idle DNS TCP connection.
+const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// The maximum length of a domain name in wire format.
 const MAX_WIRE_NAME_LEN: usize = 255;
 
@@ -632,6 +635,103 @@ impl DnsServer {
                     warn!(error = %e, "DNS send error");
                 }
             });
+        }
+    }
+
+    /// Run the DNS server over TCP on a listener that the caller made.
+    ///
+    /// Each message has a two-byte length prefix (RFC 1035, section 4.2.2).
+    /// One connection can send more than one query. The server closes a
+    /// connection that is idle for 10 seconds. At most
+    /// `max_concurrent_queries` connections are open at the same time; the
+    /// server closes a new connection above this limit. The connection tasks
+    /// belong to this future: when the caller drops the future, the tasks
+    /// stop.
+    ///
+    /// # Errors
+    /// Currently infallible: the loop runs until the caller drops the
+    /// future. The `Result` return type matches [`DnsServer::run_on`].
+    pub async fn run_tcp_on(&self, listener: tokio::net::TcpListener) -> Result<()> {
+        let worker = Arc::new(Self {
+            config: self.config.clone(),
+            state: Arc::clone(&self.state),
+            upstreams: Arc::clone(&self.upstreams),
+        });
+        let limit = Arc::new(tokio::sync::Semaphore::new(
+            self.config.max_concurrent_queries.max(1),
+        ));
+        let mut tasks = tokio::task::JoinSet::new();
+        loop {
+            let (stream, peer) = tokio::select! {
+                accepted = listener.accept() => match accepted {
+                    Ok(result) => result,
+                    Err(e) => {
+                        warn!(error = %e, "DNS TCP accept error");
+                        continue;
+                    }
+                },
+                Some(finished) = tasks.join_next(), if !tasks.is_empty() => {
+                    if let Err(e) = finished {
+                        if e.is_panic() {
+                            warn!(error = %e, "DNS TCP task panicked");
+                        }
+                    }
+                    continue;
+                }
+            };
+            let Ok(permit) = Arc::clone(&limit).try_acquire_owned() else {
+                debug!(client = %peer, "DNS TCP connection limit reached; closing");
+                continue;
+            };
+            let worker = Arc::clone(&worker);
+            tasks.spawn(async move {
+                let _permit = permit;
+                if let Err(e) = worker.serve_tcp(stream).await {
+                    debug!(client = %peer, error = %e, "DNS TCP connection error");
+                }
+            });
+        }
+    }
+
+    /// Answer the queries of one DNS TCP connection until the client closes
+    /// it or it is idle for `TCP_IDLE_TIMEOUT`.
+    async fn serve_tcp(&self, mut stream: tokio::net::TcpStream) -> std::io::Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        loop {
+            let mut len_buf = [0u8; 2];
+            match tokio::time::timeout(TCP_IDLE_TIMEOUT, stream.read_exact(&mut len_buf)).await {
+                Ok(Ok(_)) => {}
+                // EOF or a read error: the client is gone.
+                Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+                Ok(Err(e)) => return Err(e),
+                Err(_) => return Ok(()),
+            }
+            let len = usize::from(u16::from_be_bytes(len_buf));
+            let mut query = vec![0u8; len];
+            match tokio::time::timeout(TCP_IDLE_TIMEOUT, stream.read_exact(&mut query)).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => return Err(e),
+                Err(_) => return Ok(()),
+            }
+            // Ignore responses: an answer to a response can cause a loop.
+            if query.get(2).is_some_and(|flags| flags & FLAG_QR != 0) {
+                return Ok(());
+            }
+            let response = match self.handle_query(&query).await {
+                Ok(response) => response,
+                Err(e) => {
+                    debug!(error = %e, "DNS query handling error");
+                    Self::build_servfail_response(&query)
+                }
+            };
+            let Ok(response_len) = u16::try_from(response.len()) else {
+                debug!(len = response.len(), "DNS response too long for TCP");
+                return Ok(());
+            };
+            let mut out = Vec::with_capacity(response.len().saturating_add(2));
+            out.extend_from_slice(&response_len.to_be_bytes());
+            out.extend_from_slice(&response);
+            stream.write_all(&out).await?;
         }
     }
 
