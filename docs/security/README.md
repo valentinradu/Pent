@@ -46,8 +46,23 @@ cannot stay green while the sandbox never ran.
 
 ## The state of the findings
 
-The reports hold the full list. The high items that are open need a change in
-the kernel backend, and the notes in each report give the fix.
+The reports hold the full list. Each finding that is open has a test in the
+tree that states the secure behaviour and fails, so `--include-ignored`
+names every one of them. Three are open today:
+
+| Finding | Report | Why it is open |
+|---------|--------|----------------|
+| MAC-10 | [macos.md](macos.md) | The macOS recorder learns the name of a process from a poll, so it loses a child that lives less than one poll. The way out is `kqueue` with `EVFILT_PROC`. |
+| MAC-4 (in part) | [macos.md](macos.md) | `process-exec` is denied now, so an `execute` rule means something. A lookup of a Mach service, and launchd with it, stays open. |
+| DIFF-9 | [differential.md](differential.md) | A guard pattern with a leading `*` on macOS. |
+
+Each one is macOS. Every finding of the Linux sandbox, of the network and of
+the profile pipeline has a fix and a regression test.
+
+The tests run on Linux and on macOS in the pipeline, with
+`PENT_REQUIRE_ALL_TESTS=1`, so a skip is a failure. One job stays red: `pent
+run` cannot mount a private `/proc` inside a container, because a container
+runtime masks paths below `/proc`.
 
 ## The limits that pent cannot remove
 
