@@ -26,6 +26,17 @@
 //! Relay data (idle timeout resets on each transfer)
 //! ```
 //!
+//! # Observe mode and watch events
+//!
+//! With [`crate::ProxyPolicy::Observe`], the proxy permits each domain and
+//! each IP address. The rule for destinations that are not public still
+//! applies. The TLS SNI and the HTTP `Host` header only name the connection.
+//!
+//! In both policies, the proxy sends one [`WatchEvent::Connect`] for each
+//! connection attempt, if the configuration has an event channel. A domain
+//! that does not resolve gets the outcome `Allowed`, because the policy
+//! permitted it.
+//!
 //! # Proxy Protocol
 //!
 //! - **SOCKS5**: Standard SOCKS5 proxy protocol (CONNECT command only)
@@ -34,7 +45,8 @@
 
 use crate::inspect::{self, Inspect};
 use crate::netaddr::{self, PrivateDestinations};
-use crate::{normalize_hostname, ProxyError, Result, SharedState};
+use crate::{normalize_hostname, ProxyError, ProxyPolicy, Result, SharedState};
+use pent_profile::{NetProtocol, Outcome, WatchEvent};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -102,6 +114,97 @@ impl std::fmt::Display for Protocol {
             Self::Socks5 => "SOCKS5",
             Self::HttpConnect => "CONNECT",
         })
+    }
+}
+
+impl Protocol {
+    /// The protocol as it appears in a watch event.
+    const fn net_protocol(self) -> NetProtocol {
+        match self {
+            Self::Socks5 => NetProtocol::Socks5,
+            Self::HttpConnect => NetProtocol::HttpConnect,
+        }
+    }
+}
+
+/// The data for the watch event of one connection attempt.
+///
+/// The proxy sends exactly one [`WatchEvent::Connect`] for each connection
+/// attempt. It sends the event when it knows the outcome. If the task ends
+/// before that (for example on an I/O error), the drop sends the event with
+/// [`Outcome::Allowed`], because the policy did not reject the connection.
+struct ConnectRecord<'a> {
+    state: &'a SharedState,
+    protocol: Protocol,
+    port: u16,
+    /// The domain that the client asked for (SOCKS5 ATYP=3 or a CONNECT
+    /// host), normalized.
+    requested: Option<String>,
+    /// The name in the TLS SNI or in the HTTP `Host` header, normalized.
+    peeked: Option<String>,
+    /// A domain from the DNS cache for the destination IP address.
+    cached: Option<String>,
+    /// The destination IP address that the client asked for.
+    ip: Option<IpAddr>,
+    /// True after the proxy sent the event.
+    sent: bool,
+}
+
+impl<'a> ConnectRecord<'a> {
+    fn new(state: &'a SharedState, protocol: Protocol, target: &Target) -> Self {
+        let (requested, ip) = match target {
+            Target::Ip(addr) => (None, Some(addr.ip())),
+            Target::Domain { host, .. } => {
+                // A name that is not valid has no normalized form. The event
+                // then uses the lowercase name without the trailing dot.
+                let name = normalize_hostname(host)
+                    .unwrap_or_else(|_| host.trim_end_matches('.').to_ascii_lowercase());
+                (Some(name), None)
+            }
+        };
+        Self {
+            state,
+            protocol,
+            port: target.port(),
+            requested,
+            peeked: None,
+            cached: None,
+            ip,
+            sent: false,
+        }
+    }
+
+    /// The best name that the proxy knows for the destination: the requested
+    /// domain, else the SNI or `Host` name, else the cached domain, else the
+    /// IP address as text.
+    fn host(&self) -> String {
+        self.requested
+            .as_ref()
+            .or(self.peeked.as_ref())
+            .or(self.cached.as_ref())
+            .cloned()
+            .or_else(|| self.ip.map(|ip| ip.to_string()))
+            .unwrap_or_default()
+    }
+
+    /// Send the event with `outcome`, if the proxy did not send it before.
+    fn finish(&mut self, outcome: Outcome) {
+        if self.sent {
+            return;
+        }
+        self.sent = true;
+        self.state.emit(WatchEvent::Connect {
+            host: self.host(),
+            port: self.port,
+            protocol: self.protocol.net_protocol(),
+            outcome,
+        });
+    }
+}
+
+impl Drop for ConnectRecord<'_> {
+    fn drop(&mut self) {
+        self.finish(Outcome::Allowed);
     }
 }
 
@@ -374,9 +477,18 @@ impl TcpProxy {
             mut initial,
         } = negotiated;
 
-        let candidates = match self.check_target(protocol, &target).await {
+        let mut record = ConnectRecord::new(&self.state, protocol, &target);
+        let candidates = match self.check_target(protocol, &target, &mut record).await {
             Ok(c) => c,
             Err(e) => {
+                // A name that does not resolve is not a policy decision: the
+                // policy permitted the name, thus the event has the outcome
+                // `Allowed`. The summary needs only the name.
+                let outcome = match &e {
+                    ProxyError::DnsResolution { .. } => Outcome::Allowed,
+                    _ => Outcome::Denied,
+                };
+                record.finish(outcome);
                 send_failure(&mut client, protocol, Failure::NotAllowed).await;
                 return Err(e);
             }
@@ -403,8 +515,18 @@ impl TcpProxy {
                     .map_err(|e| {
                         ProxyError::Internal(format!("failed to read client data: {e}"))
                     })?;
-            self.check_requested_host(protocol, &target, kind, &initial)?;
+            match self.check_requested_host(protocol, &target, kind, &initial) {
+                Ok(peeked) => record.peeked = peeked,
+                Err(e) => {
+                    if let ProxyError::DomainBlocked { domain } = &e {
+                        record.peeked = normalize_hostname(domain).ok();
+                    }
+                    record.finish(Outcome::Denied);
+                    return Err(e);
+                }
+            }
         }
+        record.finish(Outcome::Allowed);
 
         let mut destination = destination;
         if !initial.is_empty() {
@@ -418,13 +540,34 @@ impl TcpProxy {
 
     /// Check a target against the policy, and return the addresses that the
     /// proxy can connect to.
-    async fn check_target(&self, protocol: Protocol, target: &Target) -> Result<Vec<SocketAddr>> {
+    ///
+    /// The function puts the names that it finds in `record`. In observe
+    /// mode, the policy permits each domain and each IP address, but it still
+    /// rejects destinations that are not public.
+    async fn check_target(
+        &self,
+        protocol: Protocol,
+        target: &Target,
+        record: &mut ConnectRecord<'_>,
+    ) -> Result<Vec<SocketAddr>> {
         match target {
             Target::Ip(addr) => {
-                let domain = self.verify_destination_for(protocol, addr)?;
-                self.state.report_access(format!(
-                    "network: {protocol} connection to {target} (\"{domain}\") allowed"
-                ));
+                record.cached = self.state.lookup_resolved(&addr.ip());
+                let domain = match self.state.policy() {
+                    ProxyPolicy::Enforce => Some(self.verify_destination_for(protocol, addr)?),
+                    ProxyPolicy::Observe => {
+                        self.check_public(protocol, addr)?;
+                        record.cached.clone()
+                    }
+                };
+                match domain {
+                    Some(domain) => self.state.report_access(format!(
+                        "network: {protocol} connection to {target} (\"{domain}\") allowed"
+                    )),
+                    None => self.state.report_access(format!(
+                        "network: {protocol} connection to {target} allowed"
+                    )),
+                }
                 Ok(vec![*addr])
             }
             Target::Domain { host, port } => {
@@ -437,7 +580,7 @@ impl TcpProxy {
                         return Err(e.into());
                     }
                 };
-                if !self.state.is_allowed(&name) {
+                if !self.state.is_permitted(&name) {
                     self.state.report_violation(format!(
                         "network: {protocol} connection to \"{name}\" port {port} blocked: \
                          the domain is not in the allowlist"
@@ -517,17 +660,7 @@ impl TcpProxy {
     }
 
     fn verify_destination_for(&self, protocol: Protocol, dest: &SocketAddr) -> Result<String> {
-        if let Some(reason) = self.non_public_reason(dest.ip()) {
-            self.state.report_violation(format!(
-                "network: {protocol} connection to {} port {} blocked: the address is {reason}",
-                dest.ip(),
-                dest.port()
-            ));
-            return Err(ProxyError::NonPublicDestination {
-                addr: *dest,
-                reason: reason.to_string(),
-            });
-        }
+        self.check_public(protocol, dest)?;
         self.state.lookup_resolved(&dest.ip()).ok_or_else(|| {
             let msg = format!(
                 "network: {protocol} connection to {} port {} blocked: \
@@ -540,29 +673,53 @@ impl TcpProxy {
         })
     }
 
+    /// Reject a destination that is not a public address, unless the
+    /// configuration permits private destinations.
+    fn check_public(&self, protocol: Protocol, dest: &SocketAddr) -> Result<()> {
+        if let Some(reason) = self.non_public_reason(dest.ip()) {
+            self.state.report_violation(format!(
+                "network: {protocol} connection to {} port {} blocked: the address is {reason}",
+                dest.ip(),
+                dest.port()
+            ));
+            return Err(ProxyError::NonPublicDestination {
+                addr: *dest,
+                reason: reason.to_string(),
+            });
+        }
+        Ok(())
+    }
+
     /// Check the host name in the TLS SNI or the HTTP `Host` header.
     ///
     /// If the client data contains a host name, the name must be on the
     /// allowlist. If it contains no name (for example with ECH, or for a
     /// protocol that the proxy cannot read), the checks before the connect
-    /// are the only checks.
+    /// are the only checks. In observe mode, the name does not block the
+    /// connection.
+    ///
+    /// Returns the normalized host name, if the data contains a valid name.
     fn check_requested_host(
         &self,
         protocol: Protocol,
         target: &Target,
         kind: Inspect,
         data: &[u8],
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         let Some(raw) = kind.host_name(data) else {
-            return Ok(());
+            return Ok(None);
         };
+        let name = normalize_hostname(&raw).ok();
         let label = match kind {
             Inspect::Tls => "TLS SNI",
             Inspect::Http => "HTTP Host header",
         };
-        let allowed = normalize_hostname(&raw).is_ok_and(|name| self.state.is_allowed(&name));
+        let allowed = match self.state.policy() {
+            ProxyPolicy::Observe => true,
+            ProxyPolicy::Enforce => name.as_ref().is_some_and(|n| self.state.is_allowed(n)),
+        };
         if allowed {
-            return Ok(());
+            return Ok(name);
         }
         self.state.report_violation(format!(
             "network: {protocol} connection to {target} blocked: \
@@ -2897,5 +3054,349 @@ mod tests {
             "{messages:?}"
         );
         handle.abort();
+    }
+
+    // ========================================================================
+    // Watch Event Tests
+    // ========================================================================
+
+    /// A state with a watch event channel and the policy `policy`.
+    fn watched_state(
+        allowlist: &[&str],
+        policy: ProxyPolicy,
+    ) -> (
+        Arc<crate::SharedState>,
+        tokio::sync::mpsc::UnboundedReceiver<WatchEvent>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = crate::SharedState::new(allowlist.iter().map(|s| (*s).to_string()).collect())
+            .with_policy(policy)
+            .with_event_tx(Some(tx));
+        (Arc::new(state), rx)
+    }
+
+    /// A proxy configuration that permits private destinations, so that the
+    /// tests can use a local listener as the destination.
+    fn private_allowed() -> TcpProxyConfig {
+        TcpProxyConfig {
+            private_destinations: PrivateDestinations::Allow,
+            ..Default::default()
+        }
+    }
+
+    /// Start a local destination that accepts connections and keeps them
+    /// open. Returns `None` if the test cannot bind.
+    async fn local_destination() -> Option<(SocketAddr, tokio::task::JoinHandle<()>)> {
+        let listener = tcp_listener_or_skip("127.0.0.1:0").await?;
+        let addr = listener.local_addr().ok()?;
+        let handle = tokio::spawn(async move {
+            let mut open = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                open.push(stream);
+            }
+        });
+        Some((addr, handle))
+    }
+
+    /// True if the system resolver resolves "localhost" without the network.
+    async fn localhost_resolves() -> bool {
+        tokio::net::lookup_host(("localhost", 0))
+            .await
+            .is_ok_and(|mut addrs| addrs.next().is_some())
+    }
+
+    /// A SOCKS5 CONNECT request for a domain (ATYP=3).
+    fn socks5_domain_request(host: &str, port: u16) -> Vec<u8> {
+        let mut request = vec![0x05, 0x01, 0x00, 0x03, u8::try_from(host.len()).unwrap()];
+        request.extend_from_slice(host.as_bytes());
+        request.extend_from_slice(&port.to_be_bytes());
+        request
+    }
+
+    /// A SOCKS5 CONNECT request for an IPv4 address.
+    fn socks5_ipv4_request(addr: SocketAddr) -> Vec<u8> {
+        let IpAddr::V4(ip) = addr.ip() else {
+            panic!("the test needs an IPv4 address");
+        };
+        let mut request = vec![0x05, 0x01, 0x00, 0x01];
+        request.extend_from_slice(&ip.octets());
+        request.extend_from_slice(&addr.port().to_be_bytes());
+        request
+    }
+
+    /// Send an HTTP CONNECT request and return the status line.
+    async fn http_connect_status(proxy: SocketAddr, authority: &str) -> String {
+        let mut client = TcpStream::connect(proxy).await.unwrap();
+        client
+            .write_all(format!("CONNECT {authority} HTTP/1.1\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 256];
+        let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        String::from_utf8_lossy(&buf[..n])
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// Wait for the next watch event.
+    async fn next_event(rx: &mut tokio::sync::mpsc::UnboundedReceiver<WatchEvent>) -> WatchEvent {
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("no watch event in time")
+            .expect("the watch channel closed")
+    }
+
+    fn connect_event(host: &str, port: u16, protocol: NetProtocol, outcome: Outcome) -> WatchEvent {
+        WatchEvent::Connect {
+            host: host.to_string(),
+            port,
+            protocol,
+            outcome,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_observe_allows_unlisted_domain_over_socks5() {
+        if !localhost_resolves().await {
+            return;
+        }
+        let Some((dest, _server)) = local_destination().await else {
+            return;
+        };
+        let (state, mut rx) = watched_state(&[], ProxyPolicy::Observe);
+        let Some((proxy, handle)) = start_proxy(state, private_allowed()).await else {
+            return;
+        };
+        let request = socks5_domain_request("LocalHost", dest.port());
+        assert_eq!(socks5_reply_code(proxy, &request).await, socks5::SUCCEEDED);
+        assert_eq!(
+            next_event(&mut rx).await,
+            connect_event(
+                "localhost",
+                dest.port(),
+                NetProtocol::Socks5,
+                Outcome::Allowed
+            )
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_observe_allows_unlisted_domain_over_http_connect() {
+        if !localhost_resolves().await {
+            return;
+        }
+        let Some((dest, _server)) = local_destination().await else {
+            return;
+        };
+        let (state, mut rx) = watched_state(&["other.example"], ProxyPolicy::Observe);
+        let Some((proxy, handle)) = start_proxy(state, private_allowed()).await else {
+            return;
+        };
+        let status = http_connect_status(proxy, &format!("localhost:{}", dest.port())).await;
+        assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+        assert_eq!(
+            next_event(&mut rx).await,
+            connect_event(
+                "localhost",
+                dest.port(),
+                NetProtocol::HttpConnect,
+                Outcome::Allowed
+            )
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_observe_still_denies_private_destination() {
+        let Some((dest, _server)) = local_destination().await else {
+            return;
+        };
+        let (state, mut rx) = watched_state(&[], ProxyPolicy::Observe);
+        let Some((proxy, handle)) = start_proxy(state, TcpProxyConfig::default()).await else {
+            return;
+        };
+        assert_eq!(
+            socks5_reply_code(proxy, &socks5_ipv4_request(dest)).await,
+            socks5::CONNECTION_NOT_ALLOWED
+        );
+        assert_eq!(
+            next_event(&mut rx).await,
+            connect_event(
+                "127.0.0.1",
+                dest.port(),
+                NetProtocol::Socks5,
+                Outcome::Denied
+            )
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_enforce_emits_denied_and_allowed() {
+        if !localhost_resolves().await {
+            return;
+        }
+        let Some((dest, _server)) = local_destination().await else {
+            return;
+        };
+        let (state, mut rx) = watched_state(&["localhost"], ProxyPolicy::Enforce);
+        let Some((proxy, handle)) = start_proxy(state, private_allowed()).await else {
+            return;
+        };
+
+        let status = http_connect_status(proxy, "evil.example:443").await;
+        assert!(status.starts_with("HTTP/1.1 403"), "{status}");
+        assert_eq!(
+            next_event(&mut rx).await,
+            connect_event(
+                "evil.example",
+                443,
+                NetProtocol::HttpConnect,
+                Outcome::Denied
+            )
+        );
+
+        let request = socks5_domain_request("localhost", dest.port());
+        assert_eq!(socks5_reply_code(proxy, &request).await, socks5::SUCCEEDED);
+        assert_eq!(
+            next_event(&mut rx).await,
+            connect_event(
+                "localhost",
+                dest.port(),
+                NetProtocol::Socks5,
+                Outcome::Allowed
+            )
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_ip_path_event_uses_cache_domain_or_ip() {
+        let Some((dest, _server)) = local_destination().await else {
+            return;
+        };
+        let (state, mut rx) = watched_state(&[], ProxyPolicy::Observe);
+        let Some((proxy, handle)) = start_proxy(Arc::clone(&state), private_allowed()).await else {
+            return;
+        };
+
+        // No cache entry: the event names the IP address.
+        assert_eq!(
+            socks5_reply_code(proxy, &socks5_ipv4_request(dest)).await,
+            socks5::SUCCEEDED
+        );
+        assert_eq!(
+            next_event(&mut rx).await,
+            connect_event(
+                "127.0.0.1",
+                dest.port(),
+                NetProtocol::Socks5,
+                Outcome::Allowed
+            )
+        );
+
+        // A cache entry: the event names the domain.
+        cache(&state, "api.example", dest.ip());
+        assert_eq!(
+            socks5_reply_code(proxy, &socks5_ipv4_request(dest)).await,
+            socks5::SUCCEEDED
+        );
+        assert_eq!(
+            next_event(&mut rx).await,
+            connect_event(
+                "api.example",
+                dest.port(),
+                NetProtocol::Socks5,
+                Outcome::Allowed
+            )
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_enforce_ip_path_denied_event_uses_cache_domain() {
+        let Some((dest, _server)) = local_destination().await else {
+            return;
+        };
+        let (state, mut rx) = watched_state(&[], ProxyPolicy::Enforce);
+        cache(&state, "test.local", dest.ip());
+        let Some((proxy, handle)) = start_proxy(state, TcpProxyConfig::default()).await else {
+            return;
+        };
+        assert_eq!(
+            socks5_reply_code(proxy, &socks5_ipv4_request(dest)).await,
+            socks5::CONNECTION_NOT_ALLOWED
+        );
+        assert_eq!(
+            next_event(&mut rx).await,
+            connect_event(
+                "test.local",
+                dest.port(),
+                NetProtocol::Socks5,
+                Outcome::Denied
+            )
+        );
+        handle.abort();
+    }
+
+    #[test]
+    fn test_sni_names_ip_connection() {
+        use crate::inspect::tests::client_hello;
+        let target = Target::Ip("93.184.216.34:443".parse().unwrap());
+        let hello = client_hello(Some("Evil.Example"));
+
+        // Observe: the SNI does not block, and it names the connection.
+        let (state, mut rx) = watched_state(&["allowed.com"], ProxyPolicy::Observe);
+        let proxy = TcpProxy::new(TcpProxyConfig::default(), Arc::clone(&state)).unwrap();
+        let peeked = proxy
+            .check_requested_host(Protocol::Socks5, &target, Inspect::Tls, &hello)
+            .unwrap();
+        assert_eq!(peeked.as_deref(), Some("evil.example"));
+        let mut record = ConnectRecord::new(&state, Protocol::Socks5, &target);
+        record.cached = Some("cached.example".to_string());
+        record.peeked = peeked;
+        assert_eq!(record.host(), "evil.example");
+        drop(record);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            connect_event("evil.example", 443, NetProtocol::Socks5, Outcome::Allowed)
+        );
+        assert!(rx.try_recv().is_err(), "exactly one event");
+
+        // Enforce: the same SNI blocks the connection.
+        let (state, _rx) = watched_state(&["allowed.com"], ProxyPolicy::Enforce);
+        let proxy = TcpProxy::new(TcpProxyConfig::default(), state).unwrap();
+        assert!(proxy
+            .check_requested_host(Protocol::Socks5, &target, Inspect::Tls, &hello)
+            .is_err());
+    }
+
+    #[test]
+    fn test_connect_record_sends_one_event() {
+        let (state, mut rx) = watched_state(&[], ProxyPolicy::Enforce);
+        let target = Target::Domain {
+            host: "Blocked.Example.".to_string(),
+            port: 8443,
+        };
+        let mut record = ConnectRecord::new(&state, Protocol::HttpConnect, &target);
+        record.finish(Outcome::Denied);
+        record.finish(Outcome::Allowed);
+        drop(record);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            connect_event(
+                "blocked.example",
+                8443,
+                NetProtocol::HttpConnect,
+                Outcome::Denied
+            )
+        );
+        assert!(rx.try_recv().is_err(), "exactly one event");
     }
 }

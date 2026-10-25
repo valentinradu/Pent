@@ -105,9 +105,9 @@ pub enum ProxyPolicy {
     #[default]
     Enforce,
     /// Allow each domain and emit an event for each request (watch mode).
-    /// The rule for destinations that are not public still applies.
-    ///
-    /// CONTRACT STUB: the proxy does not use this value yet.
+    /// The rule for destinations that are not public still applies. The TLS
+    /// SNI and the HTTP `Host` header do not block a connection; the proxy
+    /// uses them only to name it.
     Observe,
 }
 
@@ -281,8 +281,8 @@ impl ProxyHandle {
         Arc::clone(&self.state.connections_accepted)
     }
 
-    /// The number of trace events that the proxy could not deliver, because
-    /// the receiver of the trace channel was closed.
+    /// The number of trace events and watch events that the proxy could not
+    /// deliver, because the receiver of the channel was closed.
     #[must_use]
     pub fn dropped_trace_events(&self) -> u64 {
         self.state.dropped_trace_events()
@@ -328,10 +328,14 @@ impl ProxyServer {
     /// handle.shutdown().await?;
     /// ```
     pub fn new(config: ProxyConfig) -> Result<Self> {
-        let state = Arc::new(SharedState::try_with_violation_tx(
-            &config.domain_allowlist,
-            config.violation_tx.clone(),
-        )?);
+        let state = Arc::new(
+            SharedState::try_with_violation_tx(
+                &config.domain_allowlist,
+                config.violation_tx.clone(),
+            )?
+            .with_policy(config.policy)
+            .with_event_tx(config.event_tx.clone()),
+        );
         Ok(Self { config, state })
     }
 
