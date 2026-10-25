@@ -43,6 +43,8 @@ Pent launches a child process inside a sandbox with two complementary controls.
 
 **Pent is not a security tool.** It is designed to catch accidental misbehaviour, not to stop a determined adversary. Use Pent to add a reasonable guard-rail around untrusted processes operating on your workstation, not as a substitute for proper network segmentation.
 
+[docs/security](docs/security/) holds the audit: the attacks that we tried, the defenses that hold, the findings that are open, and a test for each one.
+
 ## How it works
 
 ### macOS: Seatbelt (sandbox-exec + SBPL)
