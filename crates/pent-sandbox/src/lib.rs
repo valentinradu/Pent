@@ -517,9 +517,28 @@ mod tests {
 
     #[test]
     fn test_check_availability() {
-        // On macOS and Linux this should succeed; on other platforms it errors.
-        let _result = check_availability();
-        // We don't assert success/failure since it depends on kernel version.
+        // The result depends on the kernel, so the test asserts the two
+        // things that do not: the function answers for the platform that
+        // pent supports, and a refusal names the reason.
+        let result = check_availability();
+        if cfg!(not(any(target_os = "linux", target_os = "macos"))) {
+            assert!(
+                matches!(result, Err(SandboxError::UnsupportedPlatform)),
+                "an unsupported platform must say so: {result:?}"
+            );
+            return;
+        }
+        if let Err(e) = result {
+            let message = e.to_string();
+            assert!(
+                !message.is_empty(),
+                "a refusal must tell the user what is missing"
+            );
+            assert!(
+                !matches!(e, SandboxError::UnsupportedPlatform),
+                "Linux and macOS are supported platforms: {message}"
+            );
+        }
     }
 
     struct TestDirs {

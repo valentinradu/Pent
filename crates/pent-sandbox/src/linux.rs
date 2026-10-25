@@ -2521,12 +2521,23 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_check_available_returns_result() {
-        // Should return Ok if Landlock ABI v4 available, Err otherwise
-        // Either result is valid depending on kernel version
-        let result = check_available();
-        // Just ensure it doesn't panic
-        let _ = result;
+    fn test_check_available_matches_the_abi_of_the_kernel() {
+        // The function says that Landlock is available exactly when the
+        // kernel reports an ABI version. An earlier version of this test
+        // asserted nothing.
+        let abi = crate::linux_landlock::abi_version();
+        assert_eq!(
+            check_available().is_ok(),
+            abi.is_ok(),
+            "check_available and abi_version disagree: {abi:?}"
+        );
+        if let Ok(abi) = abi {
+            assert!(
+                abi >= crate::linux_landlock::MIN_ABI,
+                "pent requires ABI {} or later, and the kernel reports {abi}",
+                crate::linux_landlock::MIN_ABI
+            );
+        }
     }
 
     // ========================================================================
