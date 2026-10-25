@@ -51,7 +51,7 @@ On macOS, Pent generates a [Sandbox Profile Language (SBPL)](https://reverse.put
 
 The profile starts from `(allow default)`. It denies file reads (file content) and file writes, and then allows the configured paths and the workspace. The last matching rule wins, so the profile ends with a rule that denies writes to `<workspace>/.pent`. The sandboxed process cannot change the project config. See [Platform limitations](#platform-limitations) for the operations that the profile does not limit.
 
-Network containment is not yet available on macOS. macOS does not expose network namespaces or a programmable packet filter API accessible without root, so the veth+proxy approach used on Linux has no direct equivalent. See [Platform limitations](#platform-limitations) below.
+macOS has no network namespaces. In proxy mode, the profile denies outbound connections and allows only the proxy port on loopback, the system name resolver socket and the Unix sockets in the writable paths. See [Platform limitations](#platform-limitations) below.
 
 ### Linux: Landlock + overlayfs + network namespaces
 
@@ -81,9 +81,9 @@ Pent sends SIGTERM, SIGHUP, SIGUSR1 and SIGUSR2 to the child. Pent ignores SIGIN
 
 ## Platform limitations
 
-### macOS: network containment not yet available
+### macOS: proxy mode with Seatbelt
 
-`--allow`, `--network proxy` and a `domain_allowlist` in the config are accepted on macOS, but they do not restrict the network. In proxy mode, Pent shows a warning and runs the process with unrestricted network access. `--network blocked` and `--network localhost` work on macOS. On Linux, network policy is enforced at the kernel level via network namespaces.
+On macOS, the Seatbelt profile enforces proxy mode. The process can connect only to the proxy port on loopback. Pent sets `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY`, so a proxy-aware program sends its traffic through the proxy. A program that ignores these variables cannot connect to a remote host. There are two differences from Linux. DNS queries go to the system resolver, not to the Pent DNS server, so the process can resolve names that the allowlist does not have (it cannot connect to them). The process also cannot connect to the other loopback ports of the host.
 
 ### macOS: the profile starts from `(allow default)`
 

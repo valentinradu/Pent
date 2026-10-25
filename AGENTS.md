@@ -127,12 +127,19 @@ These rules are non-negotiable. All code must comply before being committed.
 
 ## Platform notes
 
-### macOS — network containment not enforced
+### macOS — network containment with Seatbelt
 
-Proxy-based network enforcement (`--allow`, `--network proxy`) is accepted by the CLI but has **no effect on macOS**. The reasons:
+macOS has no per-process network namespace. Pent cannot send all the traffic of the child through the proxy, as Linux does with a veth pair. Instead, the Seatbelt profile of proxy mode denies each outbound connection except these:
 
-- macOS has no per-process network namespaces. On Linux, `unshare(CLONE_NEWNET)` isolates the child's network stack entirely; all traffic is forced through the proxy via a veth pair regardless of what the process does. No equivalent exists on macOS for unprivileged processes.
-- `DYLD_INSERT_LIBRARIES` interposition (the proxychains approach) only hooks libc's `connect()`. Go binaries make raw syscalls and bypass it entirely. Binaries built with hardened runtime (`com.apple.security.cs.disable-library-validation` absent) strip `DYLD_INSERT_LIBRARIES` before loading.
-- `pf` packet-filter redirection requires root and is system-wide — it cannot be scoped to a single process without also injecting a source-address bind, which circles back to the DYLD limitation.
+- TCP to the proxy port on loopback: `(allow network-outbound (remote ip "localhost:<port>"))`.
+- The `mDNSResponder` socket (`/private/var/run/mDNSResponder`), for name resolution.
+- The Unix sockets in the writable paths (workspace, `TMPDIR`, `read_write` paths).
 
-On macOS, pent provides **filesystem isolation only** (via Seatbelt/SBPL). Network access is unrestricted. For network containment use the Linux e2e environment (`make e2e-linux`) or run pent on a Linux host.
+Pent sets `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and `NO_PROXY` as on Linux. A program that ignores these variables cannot connect to a remote host.
+
+The differences from Linux:
+
+- DNS does not go through the pent DNS server. The system resolver answers each query, so the child can resolve names that the allowlist does not have. It cannot connect to them. The proxy resolves the names for proxy-aware clients.
+- The child cannot connect to the other loopback ports of the host.
+
+Watch mode uses a Seatbelt profile that allows each operation with `(with report)` and denies the guard accesses. `macos_log.rs` reads the reports from `log stream`. Nobody tested the SBPL forms of `macos.rs` on a Mac yet; the code comments give the source and the uncertain points of each form.
