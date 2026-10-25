@@ -228,6 +228,14 @@ pub fn generate_sbpl_profile(config: &SandboxConfig) -> Result<String, SandboxEr
     profile.push_str("(allow default)\n");
     profile.push_str("(deny file-read-data)\n");
     profile.push_str("(deny file-write*)\n");
+    // The child runs only a program in a system directory or in an
+    // `execute` path (MAC-4). Without this deny, `(allow default)` lets the
+    // child run every program on the machine, and the `execute` list of a
+    // profile means nothing. The run of 2026-10-25 on a Mac proved both
+    // halves: `(deny process-exec)` after `(allow default)` stops a
+    // program, and an `(allow process-exec (subpath ...))` after it lets
+    // the programs of that directory run.
+    profile.push_str("(deny process-exec)\n");
 
     // Expand paths from config
     let (traversal, read, execute, read_write) = config.paths.expand_paths();
@@ -307,6 +315,11 @@ pub fn generate_sbpl_profile(config: &SandboxConfig) -> Result<String, SandboxEr
     }
 
     // =========================================================================
+    // SYSTEM EXECUTE PATHS - the programs that every command needs
+    // =========================================================================
+    add_system_exec_allows(&mut profile)?;
+
+    // =========================================================================
     // READ-WRITE PATHS - subpath content and write access
     // =========================================================================
     for (path, is_glob) in &read_write {
@@ -365,6 +378,52 @@ pub fn generate_sbpl_profile(config: &SandboxConfig) -> Result<String, SandboxEr
     }
 
     Ok(profile)
+}
+
+/// The directories of the programs that a command needs, beside the
+/// `execute` paths of the profile.
+///
+/// `(deny process-exec)` stops each program that no rule allows, so the
+/// profile must name the directories of the system. The list holds the
+/// system program directories, the two Homebrew prefixes, the helper
+/// programs of Apple (`/usr/libexec`, among them Rosetta), the programs
+/// inside the system frameworks and the developer tools. It is the macOS
+/// form of `SYSTEM_PATHS` of the Linux backend, which gets
+/// `READ_EXECUTE` there.
+///
+/// The workspace is not in the list, as on Linux: a program in the
+/// workspace runs only with `--execute`.
+const SYSTEM_EXEC_PATHS: &[&str] = &[
+    "/bin",
+    "/sbin",
+    "/usr/bin",
+    "/usr/sbin",
+    "/usr/libexec",
+    "/usr/local/bin",
+    "/usr/local/sbin",
+    "/usr/local/libexec",
+    "/opt/homebrew",
+    "/opt/local",
+    "/System",
+    "/Library/Apple",
+    "/Library/Developer",
+    "/Applications/Xcode.app",
+];
+
+/// Allow the child to run the programs of the system directories.
+///
+/// The rules come after `(deny process-exec)`, and the last matching rule
+/// wins.
+///
+/// # Errors
+/// Returns `SandboxError::InvalidConfig` if a path contains NUL or a
+/// newline. Each path of [`SYSTEM_EXEC_PATHS`] is a literal, so the error
+/// cannot occur.
+fn add_system_exec_allows(profile: &mut String) -> Result<(), SandboxError> {
+    for dir in SYSTEM_EXEC_PATHS {
+        push_rule(profile, RuleAction::Allow, "process-exec", "subpath", dir)?;
+    }
+    Ok(())
 }
 
 /// Allow connections to the Unix sockets in the paths that the process can
@@ -2352,10 +2411,35 @@ mod tests {
         #[test]
         fn a_very_long_path_gives_a_profile_that_compiles() {
             let (_dir, ws) = workspace();
-            let long = format!("/nonexistent/{}", "x".repeat(3000));
+            // MAC-9. The reader of `sandbox-exec` has a length limit: the
+            // run of 2026-10-25 on a Mac accepted a string of 512 bytes
+            // and refused one of 1023 bytes with "Error reading string".
+            // `PATH_MAX` is 1024 on macOS, so a path of the system never
+            // reaches the limit. The test uses the longest path that the
+            // kernel can give.
+            let long = format!("/nonexistent/{}", "x".repeat(500));
             let config = SandboxConfig::new(ws.clone(), paths_with(&long), ws);
             let profile = generate_sbpl_profile(&config).unwrap();
             assert_compiles("very long", &profile);
+        }
+
+        /// MAC-9. A string over the limit of the reader gives a profile
+        /// that `sandbox-exec` refuses. Such a path cannot come from the
+        /// kernel, because `PATH_MAX` is 1024 on macOS, but the test holds
+        /// the limit, so a later change of it is visible.
+        #[test]
+        fn a_path_over_the_limit_of_the_reader_gives_a_profile_that_it_refuses() {
+            let (_dir, ws) = workspace();
+            let long = format!("/nonexistent/{}", "x".repeat(3000));
+            let config = SandboxConfig::new(ws.clone(), paths_with(&long), ws);
+            let profile = generate_sbpl_profile(&config).unwrap();
+            let (code, stderr) = compile(&profile);
+            assert_ne!(
+                code,
+                Some(0),
+                "sandbox-exec accepts a string of 3000 bytes now; MAC-9 is \
+                 closed and this test must go\n--- stderr ---\n{stderr}"
+            );
         }
 
         #[test]

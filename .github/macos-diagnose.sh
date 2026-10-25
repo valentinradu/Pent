@@ -51,6 +51,25 @@ cat >"$D/deny.sb" <<'EOF'
 (deny file-read-data (literal "/tmp/pent-diag/secret.txt"))
 EOF
 
+# The reader of pent uses `log stream`, not `log show`. The two styles can
+# differ, so capture the lines that the reader really sees.
+say "B0 the lines of `log stream`, the source of the reader"
+PRED='processImagePath == "/kernel" AND (sender == "Sandbox" OR eventMessage BEGINSWITH "Sandbox: ")'
+/usr/bin/log stream --predicate "$PRED" --style syslog >"$D/stream.log" 2>&1 &
+stream_pid=$!
+sleep 3
+/usr/bin/sandbox-exec -f "$D/report.sb" /bin/cat "$D/known.txt"
+/usr/bin/sandbox-exec -f "$D/report.sb" /bin/sh -c "sleep 1; cat $D/known.txt"
+sleep 3
+kill "$stream_pid" 2>/dev/null
+wait "$stream_pid" 2>/dev/null
+echo "--- the first lines, as the reader gets them ---"
+head -5 "$D/stream.log"
+echo "--- the lines of the two programs above ---"
+grep -E "Sandbox: (cat|sh|sandbox-exec)\(" "$D/stream.log" | head -25
+echo "--- the count of the lines ---"
+grep -c . "$D/stream.log"
+
 say "B1 a read under an allow-with-report profile"
 /usr/bin/sandbox-exec -f "$D/report.sb" /bin/cat "$D/known.txt"
 echo "exit=$?"
@@ -65,16 +84,11 @@ echo "exit=$?"
 sleep 3
 
 PRED='processImagePath == "/kernel" AND (sender == "Sandbox" OR eventMessage BEGINSWITH "Sandbox: ")'
-say "B4 log show with the predicate of pent"
-/usr/bin/log show --last 60s --style syslog --predicate "$PRED" 2>&1 | head -60
-say "B5 log show with the predicate of pent and --info --debug"
-/usr/bin/log show --last 60s --info --debug --style syslog --predicate "$PRED" 2>&1 | head -40
-say "B6 log show, every message of the kernel that names Sandbox"
-/usr/bin/log show --last 60s --info --debug --style syslog \
-  --predicate 'eventMessage CONTAINS "Sandbox"' 2>&1 | head -60
-say "B7 the same lines, with the style that log stream uses"
-/usr/bin/log show --last 60s --style syslog --predicate \
-  'processImagePath == "/kernel"' 2>&1 | grep -c .
+say "B4 log show with the predicate of pent, the lines of the probes"
+/usr/bin/log show --last 90s --style syslog --predicate "$PRED" 2>&1 \
+  | grep -E "Sandbox: (cat|sh|sandbox-exec)\(" | head -25
+say "B5 the head of the same output, to see the shape of a line"
+/usr/bin/log show --last 90s --style syslog --predicate "$PRED" 2>&1 | head -4
 say "B8 ps -A -o pid=,ppid=,stat=,comm= (the source of the name check)"
 /bin/ps -A -o pid=,ppid=,stat=,comm= | head -5
 
@@ -103,7 +117,7 @@ echo "exit=$?"
 
 # ── D. the longest path in a profile ──────────────────────────────────────
 say "D1 the longest string that a literal accepts"
-for n in 64 128 255 256 511 512 1023 1024 2047 2048 4096; do
+for n in 512 600 700 800 900 1000 1010 1018 1019 1020 1021 1022 1023; do
   p="/$(/usr/bin/printf 'x%.0s' $(seq 1 "$n"))"
   printf '(version 1)\n(allow default)\n(allow file-read-data (literal "%s"))\n' "$p" >"$D/len.sb"
   if /usr/bin/sandbox-exec -f "$D/len.sb" /usr/bin/true 2>"$D/len.err"; then

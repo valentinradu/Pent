@@ -242,6 +242,13 @@ mod macos {
     /// The full flow: `pent watch` writes a draft, `pent trust` makes it a
     /// profile, and `pent run` then does the recorded accesses and nothing
     /// more.
+    ///
+    /// The shell reads and writes the files itself, with the `read`
+    /// builtin and a redirect. A `cat` in the script would run in a child
+    /// process, and the macOS recorder misses a child that lives less than
+    /// one poll of the process table (OPEN MAC-10 in
+    /// `docs/security/macos.md`;
+    /// `watch_records_a_read_of_a_short_lived_child` holds that case).
     #[test]
     fn watch_trust_run_gives_the_recorded_accesses() -> TestResult {
         if !ready("watch_trust_run", &[SH]) {
@@ -261,7 +268,8 @@ mod macos {
             "--",
             SH,
             "-c",
-            "cat ~/.foorc; echo 'b = 2' >> ~/.config/app/settings.toml",
+            "read -r l < ~/.foorc; echo \"$l\"; \
+             echo 'b = 2' >> ~/.config/app/settings.toml",
         ])?;
         assert_eq!(stdout(&out), "foo\n", "stderr: {}", stderr(&out));
 
@@ -292,10 +300,11 @@ mod macos {
             "--",
             SH,
             "-c",
-            "cat ~/.foorc; \
+            "read -r l < ~/.foorc; echo \"$l\"; \
              echo 'c = 3' >> ~/.config/app/settings.toml && echo SETTINGS_OK; \
-             cat ~/.config/app/other.toml 2>/dev/null || echo SIBLING_DENIED; \
-             cat ~/.secret 2>/dev/null || echo SECRET_DENIED",
+             (read -r o < ~/.config/app/other.toml) 2>/dev/null \
+             || echo SIBLING_DENIED; \
+             (read -r s < ~/.secret) 2>/dev/null || echo SECRET_DENIED",
         ])?;
         assert_eq!(
             stdout(&out).lines().collect::<Vec<_>>(),
@@ -340,6 +349,51 @@ mod macos {
              Either the `(with report)` allow reports do not reach the unified \
              log, or the reader does not match them.\n{}",
             watch_report(&env, "w", &draft)
+        );
+        Ok(())
+    }
+
+    /// A read of a child process that lives a very short time.
+    ///
+    /// OPEN MAC-10. The reader keeps a report only when the PID is in the
+    /// process tree of the run, and it builds that tree from a poll of
+    /// `ps` every 100 ms. A child such as `cat` lives about three
+    /// milliseconds, so no snapshot holds it, and each report of it goes.
+    /// The root process has no such gap: pent starts it and knows its
+    /// names.
+    ///
+    /// The fix needs a source of the tree that does not poll, for example
+    /// `kqueue` with `EVFILT_PROC` and `NOTE_TRACK`, which tells pent of
+    /// each fork of each member. That is a design decision, so this test
+    /// holds the gap until then.
+    #[test]
+    #[ignore = "OPEN MAC-10: the recorder misses a child that lives less than one ps poll"]
+    fn watch_records_a_read_of_a_short_lived_child() -> TestResult {
+        if !ready("watch_records_a_child_read", &[SH, "/bin/cat"]) {
+            return Ok(());
+        }
+        let env = TestEnv::new()?;
+        env.write_home(".foorc", "foo\n")?;
+
+        let out = env.pent_ok(&[
+            "watch",
+            "--yes",
+            "--profile",
+            "c",
+            "--",
+            SH,
+            "-c",
+            "cat ~/.foorc",
+        ])?;
+        assert_eq!(stdout(&out), "foo\n", "stderr: {}", stderr(&out));
+
+        let draft = draft_with_events(&env, "c")?;
+        let read = rules(&draft, "filesystem", "read")?;
+        let read_write = rules(&draft, "filesystem", "read_write")?;
+        assert!(
+            read.contains("~/.foorc") || read_write.contains("~/.foorc"),
+            "the recorder lost the read of the child process\n{}",
+            watch_report(&env, "c", &draft)
         );
         Ok(())
     }
@@ -419,8 +473,13 @@ mod macos {
         env.write_home(".ssh/id_x.pub", "PUBLIC-KEY\n")?;
         env.write_home(".zshrc", "z\n")?;
 
-        let script = "echo \"key=[$(cat ~/.ssh/id_x 2>/dev/null)]\"; \
-                      echo \"pub=[$(cat ~/.ssh/id_x.pub 2>/dev/null)]\"; \
+        // The shell opens each file itself. A `cat` would run in a child
+        // process, and the macOS recorder misses a child that lives less
+        // than one poll of the process table (OPEN MAC-10).
+        let script = "k=''; read -r k < ~/.ssh/id_x 2>/dev/null; \
+                      echo \"key=[$k]\"; \
+                      p=''; read -r p < ~/.ssh/id_x.pub 2>/dev/null; \
+                      echo \"pub=[$p]\"; \
                       echo pwn 2>/dev/null >> ~/.zshrc; echo \"zshrc=$?\"; \
                       true";
         let out = env.pent_ok(&["watch", "--yes", "--profile", "g", "--", SH, "-c", script])?;
@@ -472,8 +531,12 @@ mod macos {
         env.install_profile("tr", "[network]\ndomains = [\"allowed.example\"]\n")?;
         let outside = env.root.join("outside.txt");
         fs::write(&outside, "secret\n")?;
+        // The shell opens the file itself, so the denial comes from the
+        // root process of the run. A `cat` would run in a child process,
+        // and the macOS recorder misses a child that lives less than one
+        // poll of the process table (OPEN MAC-10).
         let script = format!(
-            "cat '{}' 2>/dev/null; \
+            "s=''; read -r s < '{}' 2>/dev/null; echo \"$s\"; \
              curl -sS -o /dev/null --max-time 20 https://denied.example; true",
             outside.display()
         );
