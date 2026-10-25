@@ -1,14 +1,28 @@
-//! End-to-end tests for macOS agents.
+//! End-to-end tests on macOS: the real `pent` binary, the real Seatbelt
+//! sandbox.
 //!
-//! Ports `e2e/test-macos-agents.sh` to native Rust so the tests always run
-//! against the freshly-built binary without a separate bash step.
+//! Each test has its own directories below `CARGO_TARGET_TMPDIR` (see
+//! `common::e2e::TestEnv`): its own `HOME`, `XDG_CONFIG_HOME`,
+//! `XDG_STATE_HOME` and workspace. The tests share no state and run in
+//! parallel.
 //!
-//! No root required.
+//! # What these tests prove
 //!
-//! Run with:
+//! The macOS backend of pent never ran before this suite. Each test holds
+//! one claim that the README or `docs/design/watch.md` makes about macOS.
+//! A test that passes keeps the claim honest. A test that fails tells us
+//! that the claim is wrong. `docs/security/macos.md` lists the claims and
+//! the test of each one.
 //!
-//! ```
-//! cargo test --test e2e_macos -- --nocapture
+//! # Requirements
+//!
+//! `/usr/bin/sandbox-exec`, `/usr/bin/log` and `/usr/bin/logger`, which
+//! every macOS has. The network tests need the internet. A test skips (it
+//! prints `SKIP` and passes) when the sandbox or a tool is absent. Set
+//! `PENT_REQUIRE_ALL_TESTS=1` to make each skip a failure.
+//!
+//! ```text
+//! cargo test -p pent --test e2e_macos -- --nocapture
 //! ```
 
 mod common;
@@ -16,174 +30,689 @@ mod common;
 #[cfg(target_os = "macos")]
 mod macos {
     use std::fs;
-    use std::path::{Path, PathBuf};
-    use std::process::{Command, ExitStatus, Stdio};
-    use tempfile::TempDir;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
 
-    type TestResult = Result<(), Box<dyn std::error::Error>>;
+    use super::common::e2e::{
+        have_tools, rules, sandbox_ready, set, skip, stderr, stdout, wait_timeout, BoxError,
+        TestEnv, TestResult,
+    };
+    use super::common::macos::{
+        deny_reads_profile, have_files, log_write, sandbox_exec_spawn, wait_for_log_line, LOGGER,
+        SANDBOX_EXEC,
+    };
 
-    const PENT_BIN: &str = env!("CARGO_BIN_EXE_pent");
+    /// The time limit for one pent command.
+    const TIMEOUT: Duration = Duration::from_secs(120);
 
-    // ── config setup ─────────────────────────────────────────────────────────
+    /// The time to wait for a line of the unified log.
+    const LOG_TIMEOUT: Duration = Duration::from_secs(30);
 
-    /// Create a temp $HOME with the trusted `{agent}` profile
-    /// (`common::agent_profile`), and return the home directory.
+    /// The shell of each test. The sandbox allows `/bin` by default.
+    const SH: &str = "/bin/sh";
+
+    /// Return true if the test can run: the sandbox works and each tool is
+    /// an executable file at its fixed path.
+    fn ready(test: &str, tools: &[&str]) -> bool {
+        have_files(test, tools) && sandbox_ready(test)
+    }
+
+    /// Return true if the test can run and each name of `in_path` is in
+    /// `PATH`.
+    fn ready_with_path(test: &str, tools: &[&str], in_path: &[&str]) -> bool {
+        ready(test, tools) && have_tools(test, in_path)
+    }
+
+    /// The draft of `name`, with the raw events in the message of an error.
     ///
-    /// Pent uses the XDG paths on macOS too, so the profile lands at
-    /// `$HOME/.config/pent/profiles/{agent}.toml`.
-    fn agent_config(
-        agent: &str,
-        configs_root: &Path,
-    ) -> Result<PathBuf, Box<dyn std::error::Error>> {
-        let home = configs_root.join(format!("{agent}_home"));
-        let drafts = home.join(".local/state/pent/drafts");
-        fs::create_dir_all(&drafts)?;
-        fs::write(
-            drafts.join(format!("{agent}.toml")),
-            super::common::agent_profile(agent),
-        )?;
-        let status = Command::new(PENT_BIN)
-            .args(["trust", agent, "--yes"])
-            .env("HOME", &home)
-            .env_remove("XDG_CONFIG_HOME")
-            .env_remove("XDG_STATE_HOME")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()?;
-        if !status.success() {
-            return Err(format!("pent trust {agent} --yes failed").into());
+    /// The macOS recorder reads the Seatbelt reports from the unified log.
+    /// When the draft is empty, the raw events tell whether the reader saw
+    /// the access at all. That difference is the first thing to look at.
+    fn draft_with_events(env: &TestEnv, name: &str) -> Result<String, BoxError> {
+        let path = env.draft_path(name);
+        let draft = fs::read_to_string(&path).map_err(|e| {
+            format!(
+                "no draft at {}: {e}\n--- raw watch events ---\n{}",
+                path.display(),
+                env.watch_events(name)
+            )
+        })?;
+        Ok(draft)
+    }
+
+    /// The text that a failed assertion of a watch test prints.
+    fn watch_report(env: &TestEnv, name: &str, draft: &str) -> String {
+        format!(
+            "--- draft {} ---\n{draft}\n--- raw watch events ---\n{}",
+            env.draft_path(name).display(),
+            env.watch_events(name)
+        )
+    }
+
+    // ── B. the filesystem sandbox of `pent run` ──────────────────────────────
+
+    /// A path in the profile is readable. A sibling that the profile does
+    /// not name is not. (README: the profile denies file content reads and
+    /// allows only the configured paths.)
+    #[test]
+    fn profile_path_is_readable_and_a_sibling_is_not() -> TestResult {
+        if !ready("profile_path_readable", &[SH]) {
+            return Ok(());
         }
-        Ok(home)
-    }
+        let env = TestEnv::new()?;
+        env.write_home("data/named.txt", "NAMED\n")?;
+        env.write_home("data/sibling.txt", "SIBLING\n")?;
+        env.install_profile("p", "[filesystem]\nread = [\"~/data/named.txt\"]\n")?;
 
-    // ── run_pent helper ──────────────────────────────────────────────────────
-
-    /// Run `pent run --profile {agent}` with the profile in `home`. The
-    /// sandboxed command still sees the real `$HOME` of the test process
-    /// only through the paths of the profile.
-    fn run_pent(
-        home: &Path,
-        agent: &str,
-        cwd: &Path,
-        cmd: &[&str],
-    ) -> Result<(ExitStatus, String), Box<dyn std::error::Error>> {
-        let out = Command::new(PENT_BIN)
-            .env("XDG_CONFIG_HOME", home.join(".config"))
-            .env("XDG_STATE_HOME", home.join(".local/state"))
-            .args(["run", "--profile", agent, "--"])
-            .args(cmd)
-            .current_dir(cwd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .output()?;
-        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-        Ok((out.status, stderr))
-    }
-
-    fn path_str(path: &Path) -> Result<&str, Box<dyn std::error::Error>> {
-        path.to_str()
-            .ok_or_else(|| format!("path is not UTF-8: {}", path.display()).into())
-    }
-
-    // ── filesystem test ──────────────────────────────────────────────────────
-
-    fn test_filesystem(agent: &str) -> TestResult {
-        let configs = TempDir::new()?;
-        let ws = TempDir::new()?;
-        let home = agent_config(agent, configs.path())?;
-        let sentinel = ws.path().join(format!("sentinel-{agent}.txt"));
-        let sentinel_s = path_str(&sentinel)?;
-
-        // 1. Workspace write must succeed.
-        let (status, stderr) = run_pent(
-            &home,
-            agent,
-            ws.path(),
-            &["/bin/sh", "-c", &format!("echo ok > '{sentinel_s}'")],
-        )?;
-        assert!(
-            status.success() && sentinel.exists(),
-            "{agent}: workspace write failed (exit {:?})\nstderr: {stderr}",
-            status.code()
-        );
-
-        // 2. Workspace read must succeed.
-        let (status, stderr) = run_pent(&home, agent, ws.path(), &["/bin/cat", sentinel_s])?;
-        assert!(
-            status.success(),
-            "{agent}: workspace read failed\nstderr: {stderr}"
-        );
-
-        // 3. Write to $HOME (outside workspace) must be blocked by Seatbelt.
-        //    Use the real $HOME of the test process — not the fake agent_home —
-        //    so we target a path the SBPL sandbox does not allow.
-        //    PID suffix mirrors bash's $$ to avoid collisions between parallel runs.
-        let real_home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-        let blocked = PathBuf::from(&real_home).join(format!(
-            "pent-test-blocked-{agent}-{}.tmp",
-            std::process::id()
-        ));
-        let blocked_s = path_str(&blocked)?;
-        // The file usually does not exist; NotFound is the expected result.
-        let _ = fs::remove_file(&blocked);
-
-        // The exit status is not important: the check is the file below.
-        let _ = run_pent(
-            &home,
-            agent,
-            ws.path(),
-            &[
-                "/bin/sh",
-                "-c",
-                &format!("echo x > '{blocked_s}' 2>/dev/null; exit 0"),
-            ],
-        )?;
-        assert!(
-            !blocked.exists(),
-            "{agent}: write to $HOME was NOT blocked — Seatbelt not enforcing"
-        );
-        // Cleanup only; the file must not exist.
-        let _ = fs::remove_file(&blocked);
-
-        // 4. Write to <workspace>/.pent must be blocked: pent writes its
-        //    trace log there.
-        let pent_dir = ws.path().join(".pent");
-        fs::create_dir_all(&pent_dir)?;
-        let pent_file = pent_dir.join("pent.toml");
-        let pent_file_s = path_str(&pent_file)?;
-        // The exit status is not important: the check is the file below.
-        let _ = run_pent(
-            &home,
-            agent,
-            ws.path(),
-            &[
-                "/bin/sh",
-                "-c",
-                &format!("echo x > '{pent_file_s}' 2>/dev/null; exit 0"),
-            ],
-        )?;
-        assert!(
-            !pent_file.exists(),
-            "{agent}: write to .pent/pent.toml was NOT blocked"
+        let out = env.pent(&[
+            "run",
+            "--profile",
+            "p",
+            "--",
+            SH,
+            "-c",
+            "cat ~/data/named.txt 2>/dev/null || echo NAMED_DENIED; \
+             cat ~/data/sibling.txt 2>/dev/null || echo SIBLING_DENIED",
+        ])?;
+        assert_eq!(
+            stdout(&out).lines().collect::<Vec<_>>(),
+            vec!["NAMED", "SIBLING_DENIED"],
+            "the profile path must be readable and the sibling must not\nstderr: {}",
+            stderr(&out)
         );
         Ok(())
     }
 
+    /// A write to a path with only a read rule fails. A write to a
+    /// `read_write` path reaches the real file.
     #[test]
-    #[ignore = "requires agent binary installed"]
-    fn filesystem_claude() -> TestResult {
-        test_filesystem("claude")
+    fn read_rule_denies_a_write_and_read_write_reaches_the_file() -> TestResult {
+        if !ready("read_vs_read_write", &[SH]) {
+            return Ok(());
+        }
+        let env = TestEnv::new()?;
+        env.write_home("data/ro.txt", "RO\n")?;
+        env.write_home("data/rw.txt", "RW\n")?;
+        env.install_profile(
+            "p",
+            "[filesystem]\nread = [\"~/data/ro.txt\"]\nread_write = [\"~/data/rw.txt\"]\n",
+        )?;
+
+        let out = env.pent(&[
+            "run",
+            "--profile",
+            "p",
+            "--",
+            SH,
+            "-c",
+            "echo CHANGED > ~/data/ro.txt 2>/dev/null || echo RO_WRITE_DENIED; \
+             echo CHANGED > ~/data/rw.txt 2>/dev/null && echo RW_WRITE_OK",
+        ])?;
+        assert_eq!(
+            stdout(&out).lines().collect::<Vec<_>>(),
+            vec!["RO_WRITE_DENIED", "RW_WRITE_OK"],
+            "stderr: {}",
+            stderr(&out)
+        );
+        assert_eq!(
+            fs::read_to_string(env.home_path("data/ro.txt"))?,
+            "RO\n",
+            "the read-only file changed"
+        );
+        assert_eq!(
+            fs::read_to_string(env.home_path("data/rw.txt"))?,
+            "CHANGED\n",
+            "the write did not reach the real file"
+        );
+        Ok(())
     }
+
+    /// `--execute` lets the named binary run. Without the flag, the same
+    /// binary does not run.
     #[test]
-    #[ignore = "requires agent binary installed"]
-    fn filesystem_codex() -> TestResult {
-        test_filesystem("codex")
+    fn execute_flag_runs_the_named_binary() -> TestResult {
+        if !ready("execute_flag", &[SH]) {
+            return Ok(());
+        }
+        let env = TestEnv::new()?;
+        let tools = env.root.join("tools");
+        fs::create_dir_all(&tools)?;
+        let script = tools.join("hello");
+        fs::write(&script, "#!/bin/sh\necho HELLO_FROM_TOOL\n")?;
+        let mut perms = fs::metadata(&script)?.permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        fs::set_permissions(&script, perms)?;
+        let script = script.to_str().ok_or("the path is not UTF-8")?;
+        let tools = tools.to_str().ok_or("the path is not UTF-8")?;
+        env.install_profile("p", "")?;
+
+        let out = env.pent(&["run", "--profile", "p", "--execute", tools, "--", script])?;
+        assert!(
+            stdout(&out).contains("HELLO_FROM_TOOL"),
+            "--execute must let the binary run\nstdout: {}\nstderr: {}",
+            stdout(&out),
+            stderr(&out)
+        );
+
+        let out = env.pent(&["run", "--profile", "p", "--", script])?;
+        assert!(
+            !stdout(&out).contains("HELLO_FROM_TOOL"),
+            "without --execute the binary must not run\nstderr: {}",
+            stderr(&out)
+        );
+        Ok(())
     }
+
+    /// The README says that the profile limits the file content reads, not
+    /// the metadata reads. This test keeps that claim honest: `stat` works
+    /// on a path that the profile does not name, and `cat` does not.
     #[test]
-    #[ignore = "requires agent binary installed"]
-    fn filesystem_gemini() -> TestResult {
-        test_filesystem("gemini")
+    fn metadata_read_is_not_limited_but_content_read_is() -> TestResult {
+        if !ready("metadata_read", &[SH]) {
+            return Ok(());
+        }
+        let env = TestEnv::new()?;
+        let secret = env.root.join("outside.txt");
+        fs::write(&secret, "SECRET\n")?;
+        let secret = secret.to_str().ok_or("the path is not UTF-8")?;
+        env.install_profile("p", "")?;
+
+        let out = env.pent(&[
+            "run",
+            "--profile",
+            "p",
+            "--",
+            SH,
+            "-c",
+            &format!(
+                "test -f '{secret}' && echo STAT_OK; \
+                 cat '{secret}' 2>/dev/null || echo READ_DENIED"
+            ),
+        ])?;
+        assert_eq!(
+            stdout(&out).lines().collect::<Vec<_>>(),
+            vec!["STAT_OK", "READ_DENIED"],
+            "the README claims that only the content read is limited\nstderr: {}",
+            stderr(&out)
+        );
+        Ok(())
+    }
+
+    /// The full flow: `pent watch` writes a draft, `pent trust` makes it a
+    /// profile, and `pent run` then does the recorded accesses and nothing
+    /// more.
+    #[test]
+    fn watch_trust_run_gives_the_recorded_accesses() -> TestResult {
+        if !ready("watch_trust_run", &[SH]) {
+            return Ok(());
+        }
+        let env = TestEnv::new()?;
+        env.write_home(".foorc", "foo\n")?;
+        env.write_home(".config/app/settings.toml", "a = 1\n")?;
+        env.write_home(".config/app/other.toml", "other\n")?;
+        env.write_home(".secret", "secret\n")?;
+
+        let out = env.pent_ok(&[
+            "watch",
+            "--yes",
+            "--profile",
+            "t",
+            "--",
+            SH,
+            "-c",
+            "cat ~/.foorc; echo 'b = 2' >> ~/.config/app/settings.toml",
+        ])?;
+        assert_eq!(stdout(&out), "foo\n", "stderr: {}", stderr(&out));
+
+        let draft = draft_with_events(&env, "t")?;
+        let read = rules(&draft, "filesystem", "read")?;
+        let read_write = rules(&draft, "filesystem", "read_write")?;
+        let report = watch_report(&env, "t", &draft);
+        assert!(
+            read.contains("~/.foorc") || read_write.contains("~/.foorc"),
+            "the draft has no rule for the file that the program read\n{report}"
+        );
+        assert!(
+            read_write.contains("~/.config/app/settings.toml"),
+            "the draft has no read-write rule for the file that the program changed\n{report}"
+        );
+        assert!(
+            !draft.contains(".secret"),
+            "the draft names a file that the program never used\n{report}"
+        );
+
+        env.pent_ok(&["trust", "t", "--yes"])?;
+        assert!(env.profile_path("t").exists());
+
+        let out = env.pent(&[
+            "run",
+            "--profile",
+            "t",
+            "--",
+            SH,
+            "-c",
+            "cat ~/.foorc; \
+             echo 'c = 3' >> ~/.config/app/settings.toml && echo SETTINGS_OK; \
+             cat ~/.config/app/other.toml 2>/dev/null || echo SIBLING_DENIED; \
+             cat ~/.secret 2>/dev/null || echo SECRET_DENIED",
+        ])?;
+        assert_eq!(
+            stdout(&out).lines().collect::<Vec<_>>(),
+            vec!["foo", "SETTINGS_OK", "SIBLING_DENIED", "SECRET_DENIED"],
+            "the trusted profile must give exactly the recorded accesses\nstderr: {}\n{report}",
+            stderr(&out)
+        );
+        assert_eq!(
+            fs::read_to_string(env.home_path(".config/app/settings.toml"))?,
+            "a = 1\nb = 2\nc = 3\n"
+        );
+        Ok(())
+    }
+
+    // ── D. the watch recorder ────────────────────────────────────────────────
+
+    /// A watch run produces events at all.
+    ///
+    /// This is the single most important unknown of the macOS backend. The
+    /// watch profile allows each operation with `(with report)` and the
+    /// reader takes the reports from `log stream`. Nobody saw an allow
+    /// report on a Mac. If the reports do not arrive, this test fails and
+    /// every other watch test on macOS fails with it.
+    #[test]
+    fn watch_records_a_read_of_a_known_file() -> TestResult {
+        if !ready("watch_records_a_read", &["/bin/cat"]) {
+            return Ok(());
+        }
+        let env = TestEnv::new()?;
+        let known = env.write_home("known.txt", "KNOWN\n")?;
+        let known = known.to_str().ok_or("the path is not UTF-8")?;
+
+        let out = env.pent_ok(&["watch", "--yes", "--profile", "w", "--", "/bin/cat", known])?;
+        assert_eq!(stdout(&out), "KNOWN\n", "stderr: {}", stderr(&out));
+
+        let draft = draft_with_events(&env, "w")?;
+        let read = rules(&draft, "filesystem", "read")?;
+        let read_write = rules(&draft, "filesystem", "read_write")?;
+        assert!(
+            read.contains("~/known.txt") || read_write.contains("~/known.txt"),
+            "the recorder produced no rule for the file that the program read. \
+             Either the `(with report)` allow reports do not reach the unified \
+             log, or the reader does not match them.\n{}",
+            watch_report(&env, "w", &draft)
+        );
+        Ok(())
+    }
+
+    /// The reader keeps only the processes of the run.
+    ///
+    /// A second, unrelated sandboxed process writes its own Seatbelt
+    /// denials into the same unified log while pent records. Those denials
+    /// must not reach the draft, the raw events or the trace log.
+    #[test]
+    fn watch_keeps_only_the_processes_of_the_run() -> TestResult {
+        if !ready("watch_only_own_processes", &[SH, SANDBOX_EXEC]) {
+            return Ok(());
+        }
+        let env = TestEnv::new()?;
+        let noise_dir = env.root.join("noise");
+        fs::create_dir_all(&noise_dir)?;
+        // The marker is unique, so the test never reads the noise of
+        // another test that runs at the same time.
+        let marker = format!("pent-noise-{}", std::process::id());
+        let bait = noise_dir.join(&marker);
+        fs::write(&bait, "NOISE\n")?;
+        let profile = deny_reads_profile(&noise_dir);
+        let script = format!(
+            "i=0; while [ $i -lt 120 ]; do cat '{}' >/dev/null 2>&1; sleep 0.1; i=$((i+1)); done",
+            bait.display()
+        );
+        let mut noise = sandbox_exec_spawn(&noise_dir, &profile, &[SH, "-c", &script])?;
+
+        let known = env.write_home("known.txt", "KNOWN\n")?;
+        let known = known.to_str().ok_or("the path is not UTF-8")?;
+        // Record, trust and run, all while the unrelated process writes
+        // its denials into the same unified log.
+        let watched = env.pent(&["watch", "--yes", "--profile", "w", "--", "/bin/cat", known]);
+        let trusted = env.pent(&["trust", "w", "--yes"]);
+        let traced = env.pent(&["run", "--profile", "w", "--trace", "--", "/bin/cat", known]);
+        // The noise process must stop in every case, also after an error.
+        let kill = noise.kill();
+        let reap = noise.wait();
+        let watched = watched?;
+        let trusted = trusted?;
+        let traced = traced?;
+        kill?;
+        reap?;
+        assert!(watched.status.success(), "watch: {}", stderr(&watched));
+        assert!(trusted.status.success(), "trust: {}", stderr(&trusted));
+        assert!(traced.status.success(), "run: {}", stderr(&traced));
+
+        let events = env.watch_events("w");
+        assert!(
+            !events.contains(&marker),
+            "the recorder took the denial of an unrelated process:\n{events}"
+        );
+        let draft = fs::read_to_string(env.draft_path("w")).unwrap_or_default();
+        assert!(
+            !draft.contains(&marker),
+            "the draft has the denial of an unrelated process:\n{draft}"
+        );
+        let trace = fs::read_to_string(env.trace_log("w")).unwrap_or_default();
+        assert!(
+            !trace.contains(&marker),
+            "the trace log has the denial of an unrelated process:\n{trace}"
+        );
+        Ok(())
+    }
+
+    /// The guard of `pent watch` blocks a credential read and a write to a
+    /// shell start file, and lets the public key through. Each blocked
+    /// attempt is in the Blocked section of the summary.
+    #[test]
+    fn watch_guard_blocks_dangerous_accesses() -> TestResult {
+        if !ready("watch_guard", &[SH]) {
+            return Ok(());
+        }
+        let env = TestEnv::new()?;
+        env.write_home(".ssh/id_x", "SECRET-KEY\n")?;
+        env.write_home(".ssh/id_x.pub", "PUBLIC-KEY\n")?;
+        env.write_home(".zshrc", "z\n")?;
+
+        let script = "echo \"key=[$(cat ~/.ssh/id_x 2>/dev/null)]\"; \
+                      echo \"pub=[$(cat ~/.ssh/id_x.pub 2>/dev/null)]\"; \
+                      echo pwn 2>/dev/null >> ~/.zshrc; echo \"zshrc=$?\"; \
+                      true";
+        let out = env.pent_ok(&["watch", "--yes", "--profile", "g", "--", SH, "-c", script])?;
+        let text = stdout(&out);
+        let err = stderr(&out);
+        assert!(
+            text.contains("key=[]\n"),
+            "the guard did not hide the private key:\n{text}"
+        );
+        assert!(
+            text.contains("pub=[PUBLIC-KEY]\n"),
+            "the public key beside the private key must stay readable:\n{text}"
+        );
+        let status = text
+            .lines()
+            .find_map(|l| l.strip_prefix("zshrc="))
+            .ok_or_else(|| format!("no status for the write to ~/.zshrc:\n{text}"))?;
+        assert_ne!(status, "0", "the write to ~/.zshrc worked:\n{text}");
+        assert_eq!(
+            fs::read_to_string(env.home_path(".zshrc"))?,
+            "z\n",
+            "the guard let the write through"
+        );
+
+        let blocked = err
+            .split("Blocked by the guard")
+            .nth(1)
+            .ok_or_else(|| format!("no Blocked section:\n{err}"))?;
+        for item in ["read ~/.ssh/id_x", "write ~/.zshrc"] {
+            assert!(blocked.contains(item), "{item} is not blocked:\n{err}");
+        }
+        let draft = fs::read_to_string(env.draft_path("g")).unwrap_or_default();
+        assert!(
+            !draft.contains("id_x\"") && !draft.contains("zshrc"),
+            "the draft has a guarded path:\n{draft}"
+        );
+        Ok(())
+    }
+
+    /// `pent run --trace` writes the trace log to
+    /// `$XDG_STATE_HOME/pent/trace/<profile>.log`, with one entry for a
+    /// denied file access and one for a denied domain.
+    #[test]
+    fn trace_logs_filesystem_and_network_denials() -> TestResult {
+        if !ready_with_path("trace", &[SH], &["curl"]) {
+            return Ok(());
+        }
+        let env = TestEnv::new()?;
+        env.install_profile("tr", "[network]\ndomains = [\"allowed.example\"]\n")?;
+        let outside = env.root.join("outside.txt");
+        fs::write(&outside, "secret\n")?;
+        let script = format!(
+            "cat '{}' 2>/dev/null; \
+             curl -sS -o /dev/null --max-time 20 https://denied.example; true",
+            outside.display()
+        );
+        let out = env.pent(&["run", "--profile", "tr", "--trace", "--", SH, "-c", &script])?;
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert!(
+            !stdout(&out).contains("secret"),
+            "the read was not denied:\n{}",
+            stdout(&out)
+        );
+
+        let path = env.trace_log("tr");
+        let log = fs::read_to_string(&path)
+            .map_err(|e| format!("no trace log at {}: {e}", path.display()))?;
+        assert!(
+            log.contains("[denied] network:") && log.contains("denied.example"),
+            "the trace log has no denied domain:\n{log}"
+        );
+        assert!(
+            log.contains("[denied] filesystem:") && log.contains(&outside.display().to_string()),
+            "the trace log has no denied file access. On macOS these lines \
+             come from the Seatbelt reports in the unified log.\n{log}"
+        );
+        let denied = fs::read_to_string(env.denied_log("tr")).unwrap_or_default();
+        assert!(
+            denied.contains("denied.example"),
+            "the denied log has no domain:\n{denied}"
+        );
+        Ok(())
+    }
+
+    // ── E. the event log cannot be forged ────────────────────────────────────
+
+    /// A Seatbelt report that another process writes does not become an
+    /// event of the pent run.
+    ///
+    /// The reader parses lines of the unified log, and any process can
+    /// write to that log. The reader keeps only the PIDs of its own process
+    /// tree, so a line of another process must not reach the draft or the
+    /// trace log.
+    #[test]
+    fn a_forged_log_line_of_another_process_is_not_an_event() -> TestResult {
+        if !ready("forged_log_line", &["/bin/cat", LOGGER]) {
+            return Ok(());
+        }
+        let env = TestEnv::new()?;
+        let marker = format!("/pent-forged-{}/secret", std::process::id());
+        // The PID of this test process is not in the process tree of the
+        // pent run, so the reader must drop the line.
+        let line = format!(
+            "Sandbox: forger({}) allow(1) file-read-data {marker}",
+            std::process::id()
+        );
+        log_write(&line)?;
+        let seen = wait_for_log_line("2m", &marker, LOG_TIMEOUT)?;
+        if seen.trim().is_empty() {
+            skip(
+                "forged_log_line",
+                "the unified log did not keep the line of /usr/bin/logger, \
+                 so the test cannot prove anything",
+            );
+            return Ok(());
+        }
+
+        // `log stream` delivers only the lines that arrive after its start,
+        // so the forger must write while pent records.
+        let stop = Arc::new(AtomicBool::new(false));
+        let forger = {
+            let stop = Arc::clone(&stop);
+            let line = line.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    // A failure of `logger` only means fewer forged lines.
+                    let _ = log_write(&line);
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            })
+        };
+
+        let known = env.write_home("known.txt", "KNOWN\n")?;
+        let known = known.to_str().ok_or("the path is not UTF-8")?;
+        let out = env.pent(&["watch", "--yes", "--profile", "f", "--", "/bin/cat", known]);
+        stop.store(true, Ordering::Relaxed);
+        let joined = forger.join();
+        let out = out?;
+        assert!(joined.is_ok(), "the forger thread panicked");
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert_eq!(stdout(&out), "KNOWN\n", "stderr: {}", stderr(&out));
+
+        let events = env.watch_events("f");
+        let draft = fs::read_to_string(env.draft_path("f")).unwrap_or_default();
+        assert!(
+            !events.contains(&marker),
+            "a forged log line became a raw event:\n{events}"
+        );
+        assert!(
+            !draft.contains(&marker),
+            "a forged log line became a rule of the draft:\n{draft}"
+        );
+        Ok(())
+    }
+
+    // ── the open findings ────────────────────────────────────────────────────
+    //
+    // Each test below states the secure behaviour and fails today. See
+    // `docs/security/macos.md`. Run them with `--include-ignored`.
+
+    /// MAC-1. The watched program writes its own Seatbelt reports into the
+    /// unified log. The reader filters by PID only, and the PID of the
+    /// program is in the tree, so the program adds any rule it wants to its
+    /// own draft.
+    #[test]
+    #[ignore = "OPEN MAC-1: the watched program forges its own events with /usr/bin/logger"]
+    fn a_program_cannot_forge_its_own_events() -> TestResult {
+        if !ready("forged_by_the_program", &[SH, LOGGER]) {
+            return Ok(());
+        }
+        let env = TestEnv::new()?;
+        let marker = format!("/pent-selfforged-{}/secret", std::process::id());
+        let script =
+            format!("{LOGGER} -- \"Sandbox: evil($$) allow(1) file-read-data {marker}\"; sleep 2");
+        env.pent_ok(&["watch", "--yes", "--profile", "s", "--", SH, "-c", &script])?;
+        let draft = fs::read_to_string(env.draft_path("s")).unwrap_or_default();
+        let events = env.watch_events("s");
+        assert!(
+            !events.contains(&marker) && !draft.contains(&marker),
+            "the program put a path of its choice into its own draft:\n{draft}\n{events}"
+        );
+        Ok(())
+    }
+
+    /// MAC-2. The guard rule for an SSH key uses a file name pattern. A
+    /// pattern with a leading `*` is a name suffix (`*_rsa` matches
+    /// `github_rsa`). `add_guard_rules` escapes the `*` instead of
+    /// translating it, so the deny rule matches only a file whose name
+    /// starts with `*_rsa`.
+    #[test]
+    #[ignore = "OPEN MAC-2: the macOS guard does not translate the suffix key patterns"]
+    fn watch_guard_blocks_a_key_with_a_suffix_name() -> TestResult {
+        if !ready("guard_suffix_key", &[SH]) {
+            return Ok(());
+        }
+        let env = TestEnv::new()?;
+        env.write_home(".ssh/github_rsa", "SUFFIX-KEY\n")?;
+        let out = env.pent_ok(&[
+            "watch",
+            "--yes",
+            "--profile",
+            "k",
+            "--",
+            SH,
+            "-c",
+            "echo \"key=[$(cat ~/.ssh/github_rsa 2>/dev/null)]\"",
+        ])?;
+        assert!(
+            stdout(&out).contains("key=[]\n"),
+            "the guard must hide a key whose name ends with _rsa:\n{}",
+            stdout(&out)
+        );
+        let draft = fs::read_to_string(env.draft_path("k")).unwrap_or_default();
+        assert!(
+            !draft.contains("github_rsa"),
+            "the key went into the draft:\n{draft}"
+        );
+        Ok(())
+    }
+
+    /// MAC-3. The macOS guard rule for a directory of keys is the regex
+    /// `^<dir>/<prefix>[^/]*$`, which matches only the direct children. The
+    /// Linux backend walks the tree (see H-13 in
+    /// `docs/security/linux-sandbox.md`).
+    #[test]
+    #[ignore = "OPEN MAC-3: the macOS guard covers only the direct children of a guarded directory"]
+    fn watch_guard_blocks_a_key_in_a_subdirectory() -> TestResult {
+        if !ready("guard_subdirectory_key", &[SH]) {
+            return Ok(());
+        }
+        let env = TestEnv::new()?;
+        env.write_home(".ssh/work/id_x", "NESTED-KEY\n")?;
+        let out = env.pent_ok(&[
+            "watch",
+            "--yes",
+            "--profile",
+            "n",
+            "--",
+            SH,
+            "-c",
+            "echo \"key=[$(cat ~/.ssh/work/id_x 2>/dev/null)]\"",
+        ])?;
+        assert!(
+            stdout(&out).contains("key=[]\n"),
+            "the guard must hide a key in a subdirectory of ~/.ssh:\n{}",
+            stdout(&out)
+        );
+        Ok(())
+    }
+
+    /// MAC-4. The profile starts from `(allow default)`, so it does not
+    /// limit a Mach service lookup. The child asks `launchd` to run a
+    /// program, and that program runs outside the sandbox.
+    #[test]
+    #[ignore = "OPEN MAC-4: the profile starts from (allow default); launchd runs a program for the child"]
+    fn the_child_cannot_start_a_program_through_launchd() -> TestResult {
+        if !ready("launchd_escape", &[SH, "/bin/launchctl"]) {
+            return Ok(());
+        }
+        let env = TestEnv::new()?;
+        env.install_profile("p", "")?;
+        let escaped = env.root.join("escaped");
+        let label = format!("pent-test-{}", std::process::id());
+        let script = format!(
+            "/bin/launchctl submit -l {label} -- /bin/sh -c \"touch '{}'\" 2>/dev/null; \
+             sleep 3; /bin/launchctl remove {label} 2>/dev/null; true",
+            escaped.display()
+        );
+        let mut child = env
+            .command(&["run", "--profile", "p", "--", SH, "-c", &script])
+            .spawn()?;
+        wait_timeout(&mut child, TIMEOUT)?;
+        assert!(
+            !escaped.exists(),
+            "launchd ran a program for the sandboxed child, and that program \
+             wrote {} outside the profile",
+            escaped.display()
+        );
+        Ok(())
+    }
+
+    // ── a guard against a silent change of the test set ──────────────────────
+
+    /// The set helper and the rule parser work on the draft format that the
+    /// other tests read. A change of the format must not make the other
+    /// assertions pass without a reason.
+    #[test]
+    fn the_rule_parser_reads_a_draft() -> TestResult {
+        let draft = "[filesystem]\nread = [\"~/a\"]\nread_write = []\n";
+        assert_eq!(rules(draft, "filesystem", "read")?, set(&["~/a"]));
+        assert_eq!(rules(draft, "filesystem", "read_write")?, set(&[]));
+        assert_eq!(rules(draft, "network", "domains")?, set(&[]));
+        Ok(())
     }
 }
