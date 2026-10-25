@@ -1,14 +1,13 @@
-//! Trust store for project config files.
+//! Trust store for profiles.
 //!
-//! A project config (`<workspace>/.pent/pent.toml`) comes with the repository.
-//! Thus a person other than the user can write it. Pent applies a project
-//! config only when the user approved its exact content, as `direnv allow`
-//! does.
+//! A profile gives a program access to files and domains. Pent applies a
+//! profile only when the user approved its exact content, as `direnv allow`
+//! does. `pent trust NAME` records the approval.
 //!
-//! The trust store is the file `<config dir>/pent/trusted.toml`. Each entry
-//! holds the canonical absolute path of an approved project config and the
-//! SHA-256 digest of its bytes. A change to the file changes the digest, and
-//! then pent does not apply the file until the user trusts it again.
+//! The trust store is the file `<pent config dir>/trusted.toml`. Each entry
+//! holds the canonical absolute path of an approved profile and the SHA-256
+//! digest of its bytes. A change to the file changes the digest, and then
+//! pent does not apply the file until the user trusts it again.
 //!
 //! Pent writes the trust store atomically (a temporary file and a rename) with
 //! the mode `0600`.
@@ -28,7 +27,7 @@ const TRUST_FILE_NAME: &str = "trusted.toml";
 #[derive(Error, Debug)]
 pub enum TrustError {
     /// The trust store location is not known (for example, `$HOME` is unset).
-    #[error("Cannot find the trust store: the user config directory is not available")]
+    #[error("Cannot find the trust store: the home directory is not available")]
     NoConfigDir,
 
     /// The trust store file is not valid.
@@ -44,7 +43,7 @@ pub enum TrustError {
     #[error("Failed to serialize the trust store: {0}")]
     Serialize(#[from] toml::ser::Error),
 
-    /// An I/O operation on the trust store or on a config file failed.
+    /// An I/O operation on the trust store failed.
     #[error("I/O error on {}: {source}", path.display())]
     Io {
         /// The file that pent tried to read or write.
@@ -54,7 +53,7 @@ pub enum TrustError {
     },
 }
 
-/// The trust state of a project config file.
+/// The trust state of a file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrustStatus {
     /// The user approved this exact content.
@@ -65,7 +64,7 @@ pub enum TrustStatus {
     Changed,
 }
 
-/// SHA-256 digest of a config file.
+/// SHA-256 digest of a trusted file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ConfigDigest([u8; 32]);
 
@@ -111,11 +110,11 @@ impl<'de> Deserialize<'de> for ConfigDigest {
     }
 }
 
-/// One approved project config.
+/// One approved file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TrustEntry {
-    /// Canonical absolute path of the project config file.
+    /// Canonical absolute path of the file.
     path: PathBuf,
     /// SHA-256 digest of the approved file content.
     sha256: ConfigDigest,
@@ -129,7 +128,7 @@ struct TrustFile {
     trusted: Vec<TrustEntry>,
 }
 
-/// The set of project config files that the user approved.
+/// The set of files (profiles) that the user approved.
 #[derive(Debug)]
 pub struct TrustStore {
     path: PathBuf,
@@ -137,12 +136,13 @@ pub struct TrustStore {
 }
 
 impl TrustStore {
-    /// Default location of the trust store: `<config dir>/pent/trusted.toml`.
+    /// Default location of the trust store: `<pent config dir>/trusted.toml`
+    /// (see [`crate::PentDirs`]).
     ///
-    /// Returns `None` when the user config directory is not known.
+    /// Returns `None` when the pent config directory is not known.
     #[must_use]
     pub fn default_path() -> Option<PathBuf> {
-        dirs::config_dir().map(|d| d.join("pent").join(TRUST_FILE_NAME))
+        crate::PentDirs::from_env().map(|d| d.config.join(TRUST_FILE_NAME))
     }
 
     /// Open the trust store at the default location.
@@ -231,7 +231,10 @@ impl TrustStore {
     /// `TrustError::Io` when pent cannot write the file.
     pub fn save(&self) -> Result<(), TrustError> {
         let text = toml::to_string_pretty(&self.file)?;
-        write_atomic_private(&self.path, text.as_bytes())
+        write_atomic_private(&self.path, text.as_bytes()).map_err(|source| TrustError::Io {
+            path: self.path.clone(),
+            source,
+        })
     }
 }
 
@@ -247,19 +250,19 @@ fn canonical_key(config_path: &Path) -> PathBuf {
 /// Write `contents` to `path` through a temporary file and a rename.
 ///
 /// The temporary file is in the same directory, thus the rename is atomic. On
-/// Unix the file gets the mode `0600` when pent creates it.
-fn write_atomic_private(path: &Path, contents: &[u8]) -> Result<(), TrustError> {
-    let io_err = |source| TrustError::Io {
-        path: path.to_path_buf(),
-        source,
-    };
+/// Unix the file gets the mode `0600`. Pent creates the missing parent
+/// directories.
+///
+/// # Errors
+/// Returns the I/O error of the first step that fails.
+pub(crate) fn write_atomic_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     let dir = path.parent().ok_or_else(|| {
-        io_err(std::io::Error::new(
+        std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "the trust store path has no parent directory",
-        ))
+            "the path has no parent directory",
+        )
     })?;
-    std::fs::create_dir_all(dir).map_err(io_err)?;
+    std::fs::create_dir_all(dir)?;
 
     let file_name = path
         .file_name()
@@ -291,7 +294,7 @@ fn write_atomic_private(path: &Path, contents: &[u8]) -> Result<(), TrustError> 
         // important, because the original error is the one to report.
         let _ = std::fs::remove_file(&tmp);
     }
-    result.map_err(io_err)
+    result
 }
 
 #[cfg(test)]

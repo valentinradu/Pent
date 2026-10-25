@@ -7,10 +7,10 @@ pub(crate) enum CliError {
     Settings(#[from] pent_settings::SettingsError),
 
     #[error("{0}")]
-    Trust(#[from] pent_settings::TrustError),
+    Store(#[from] pent_settings::StoreError),
 
     #[error("{0}")]
-    Profile(#[from] pent_settings::ProfileParseError),
+    ProfileName(#[from] pent_profile::ProfileNameError),
 
     #[error("{0}")]
     RwGlob(#[from] pent_settings::RwGlobError),

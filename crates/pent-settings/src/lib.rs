@@ -1,13 +1,16 @@
-//! Layered TOML configuration for the pent sandbox.
+//! TOML configuration and the profile store of pent.
 //!
-//! Provides structured configuration types for all pent components,
-//! loading from:
-//! - Global config: `~/.config/pent/pent.toml`
-//! - Project config: `<workspace>/.pent/pent.toml`
+//! This crate provides:
+//! - The global settings `pent.toml` ([`PentConfig`]): the `[proxy]` tunables
+//!   and the `[[sandbox.mounts]]`. The file has no paths and no domains.
+//! - The profile store ([`ProfileStore`]): the recorded profiles, the drafts,
+//!   the raw watch logs, the logs of denied accesses and the trust of each
+//!   profile.
+//! - The shared sandbox types ([`SandboxPaths`], [`NetworkMode`], [`Mount`]).
 //!
-//! The global config always applies. The project config applies only when
-//! the user trusts it (see [`TrustStore`]). Project values take precedence for
-//! scalar fields; list fields are merged.
+//! Pent finds its files with the XDG rules (see [`PentDirs`]):
+//! `$XDG_CONFIG_HOME/pent` (default `~/.config/pent`) and
+//! `$XDG_STATE_HOME/pent` (default `~/.local/state/pent`).
 //!
 //! # Example
 //!
@@ -15,17 +18,17 @@
 //! use pent_settings::ConfigLoader;
 //!
 //! let config = ConfigLoader::load(std::path::Path::new(".")).unwrap();
-//! println!("{:?}", config.sandbox.network);
+//! println!("{:?}", config.proxy.upstream_dns);
 //! ```
 
 mod loader;
-mod profiles;
+mod store;
 mod trust;
 
-pub use loader::{ConfigLoader, LoadedConfig, ProjectConfigStatus};
-pub use profiles::{
-    build_profiles_config, is_profile_likely_active, profile_deps_transitive, profile_requires,
-    Profile, ProfileParseError,
+pub use loader::ConfigLoader;
+pub use store::{
+    EventLog, LoadedProfile, PentDirs, ProfileEntry, ProfileStatus, ProfileStore, StoreError,
+    WatchRunMode,
 };
 pub use trust::{TrustError, TrustStatus, TrustStore};
 
@@ -67,6 +70,16 @@ pub enum SettingsError {
     /// A trust store operation failed.
     #[error(transparent)]
     Trust(#[from] TrustError),
+
+    /// The config file has a key that pent does not use now. The message
+    /// tells the user where the setting went.
+    #[error("{}: {message}", path.display())]
+    MovedKey {
+        /// The config file with the old key.
+        path: PathBuf,
+        /// What changed and what to do.
+        message: &'static str,
+    },
 }
 
 /// A `read_write` entry uses a glob, which the Linux backend does not support.
@@ -157,8 +170,8 @@ type ExpandedPathLists = (
 ///
 /// Each entry is a string. Pent expands a leading `~` or `~/` to the home
 /// directory. Pent does not expand environment variables such as `$HOME`.
-/// The loader resolves a relative entry against the workspace (see
-/// [`PentConfig::resolve_relative_paths`]).
+/// [`SandboxPaths::resolve_relative`] resolves a relative entry against the
+/// workspace.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SandboxPaths {
@@ -308,17 +321,11 @@ const fn default_mount_readonly() -> bool {
 }
 
 /// TOML `[sandbox]` section.
+///
+/// The section has only the mounts. The paths are in the profiles.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SandboxSettings {
-    /// Network isolation mode.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub network: Option<NetworkMode>,
-
-    /// Filesystem paths made available to the sandbox.
-    #[serde(default)]
-    pub paths: SandboxPaths,
-
     /// Additional mount points.
     #[serde(default)]
     pub mounts: Vec<Mount>,
@@ -338,15 +345,12 @@ pub enum PrivateDestinations {
     Allow,
 }
 
-/// TOML `[proxy]` section.
+/// TOML `[proxy]` section: the tunables of the proxy.
+///
+/// The section has no domains. The domains are in the profiles.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProxySettings {
-    /// Domains allowed through the proxy.
-    /// Supports exact matches (`example.com`) and wildcards (`*.github.com`).
-    #[serde(default)]
-    pub domain_allowlist: Vec<String>,
-
     /// Upstream DNS servers (e.g. `["8.8.8.8:53"]`).
     /// If absent, system resolvers from `/etc/resolv.conf` are used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -371,18 +375,55 @@ pub struct ProxySettings {
     pub private_destinations: Option<PrivateDestinations>,
 }
 
-/// Top-level pent configuration, corresponding to `pent.toml`.
+/// The keys that older versions of pent used, and where each setting went.
+///
+/// Each entry is `(table, key, message)`. An empty table is the top level.
+const MOVED_KEYS: &[(&str, &str, &str)] = &[
+    (
+        "",
+        "profiles",
+        "`profiles` was removed: the @profiles do not exist now; record a profile with `pent watch`",
+    ),
+    (
+        "sandbox",
+        "paths",
+        "`sandbox.paths` moved to profiles; record one with `pent watch`",
+    ),
+    (
+        "proxy",
+        "domain_allowlist",
+        "`domain_allowlist` moved to profiles; record one with `pent watch`",
+    ),
+    (
+        "sandbox",
+        "network",
+        "`sandbox.network` was removed; the profile sets the network mode, \
+         and `pent run --network` changes it",
+    ),
+];
+
+/// Find the first old key in the TOML text.
+///
+/// Returns `None` when the text has no old key, or when the text is not valid
+/// TOML. The typed parse then reports the syntax error.
+fn find_moved_key(text: &str) -> Option<&'static str> {
+    let table: toml::Table = text.parse().ok()?;
+    MOVED_KEYS.iter().find_map(|&(section, key, message)| {
+        let scope = if section.is_empty() {
+            Some(&table)
+        } else {
+            table.get(section).and_then(toml::Value::as_table)
+        };
+        scope
+            .is_some_and(|t| t.contains_key(key))
+            .then_some(message)
+    })
+}
+
+/// Top-level pent configuration, corresponding to the global `pent.toml`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PentConfig {
-    /// Profiles that `pent config add` wrote into this file.
-    ///
-    /// `pent config rm` uses this list to find the entries that other
-    /// profiles still need. `pent config rm` never removes an entry that no
-    /// listed profile gives, because the user added that entry.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub profiles: Vec<Profile>,
-
     /// Sandbox configuration.
     #[serde(default)]
     pub sandbox: SandboxSettings,
@@ -396,9 +437,16 @@ impl PentConfig {
     /// Parse a `PentConfig` from a TOML string.
     ///
     /// # Errors
-    /// Returns `SettingsError::ParseError` if the TOML is malformed or
-    /// contains unrecognised keys for this schema.
+    /// Returns `SettingsError::MovedKey` if the TOML has a key of an older
+    /// version of pent, and `SettingsError::ParseError` if the TOML is
+    /// malformed or contains unrecognised keys for this schema.
     pub fn parse(toml: &str) -> Result<Self, SettingsError> {
+        if let Some(message) = find_moved_key(toml) {
+            return Err(SettingsError::MovedKey {
+                path: PathBuf::from("pent.toml"),
+                message,
+            });
+        }
         toml::from_str(toml).map_err(SettingsError::ParseError)
     }
 
@@ -408,13 +456,20 @@ impl PentConfig {
     /// message.
     ///
     /// # Errors
-    /// Returns `SettingsError::NotUtf8` if the bytes are not UTF-8, or
-    /// `SettingsError::ParseFile` if the TOML is malformed or contains
-    /// unrecognised keys.
+    /// Returns `SettingsError::NotUtf8` if the bytes are not UTF-8,
+    /// `SettingsError::MovedKey` if the file has a key of an older version of
+    /// pent, or `SettingsError::ParseFile` if the TOML is malformed or
+    /// contains unrecognised keys.
     pub fn parse_file_contents(path: &Path, contents: &[u8]) -> Result<Self, SettingsError> {
         let text = std::str::from_utf8(contents).map_err(|_| SettingsError::NotUtf8 {
             path: path.to_path_buf(),
         })?;
+        if let Some(message) = find_moved_key(text) {
+            return Err(SettingsError::MovedKey {
+                path: path.to_path_buf(),
+                message,
+            });
+        }
         toml::from_str(text).map_err(|source| SettingsError::ParseFile {
             path: path.to_path_buf(),
             source: Box::new(source),
@@ -424,23 +479,19 @@ impl PentConfig {
     /// Load a `PentConfig` from a file on disk.
     ///
     /// # Errors
-    /// Returns `SettingsError::Io` on read failure, `SettingsError::NotUtf8`
-    /// if the file is not UTF-8, or `SettingsError::ParseFile` if the file
-    /// content is not valid TOML or contains unrecognised keys.
+    /// Returns `SettingsError::Io` on read failure, and the errors of
+    /// [`PentConfig::parse_file_contents`].
     pub fn load(path: &Path) -> Result<Self, SettingsError> {
         let contents = std::fs::read(path)?;
         Self::parse_file_contents(path, &contents)
     }
 
-    /// Resolve relative paths against `base`, and expand `~` in mount paths.
+    /// Expand `~` in mount paths, and resolve relative mount paths against
+    /// `base`.
     ///
-    /// The loader calls this function with the workspace as `base`. Thus a
-    /// relative entry in a config file names a path in the workspace, not a
-    /// path in the current directory of the process. Pent does not normalize
-    /// `..`, thus an entry such as `../other` names a directory outside the
-    /// workspace.
+    /// The loader calls this function with the workspace as `base`. Pent does
+    /// not normalize `..`.
     pub fn resolve_relative_paths(&mut self, base: &Path) {
-        self.sandbox.paths.resolve_relative(base);
         let home = dirs::home_dir();
         for mount in &mut self.sandbox.mounts {
             let expanded = expand_tilde(&mount.path, home.as_deref());
@@ -473,51 +524,6 @@ impl PentConfig {
         std::fs::write(path, contents)?;
         Ok(())
     }
-
-    /// Merge `other` (project-level) on top of `self` (global-level).
-    ///
-    /// - Scalar fields: `other` wins when explicitly set (`Some`).
-    /// - List fields (`domain_allowlist`, `paths.*`, `mounts`): extended with
-    ///   `other`'s values so both global and project entries contribute.
-    #[must_use]
-    pub fn merge(mut self, other: Self) -> Self {
-        // recorded profiles: union, without duplicates
-        for p in other.profiles {
-            if !self.profiles.contains(&p) {
-                self.profiles.push(p);
-            }
-        }
-        // sandbox scalars: project wins if set
-        if other.sandbox.network.is_some() {
-            self.sandbox.network = other.sandbox.network;
-        }
-        // sandbox lists: global + project (deduplicated)
-        self.sandbox.paths = self.sandbox.paths.merge(other.sandbox.paths);
-        self.sandbox.mounts.extend(other.sandbox.mounts);
-
-        // proxy lists: global + project (deduplicated)
-        self.proxy
-            .domain_allowlist
-            .extend(other.proxy.domain_allowlist);
-        dedup_preserve_order(&mut self.proxy.domain_allowlist);
-        // proxy scalars: project wins if set
-        if other.proxy.upstream_dns.is_some() {
-            self.proxy.upstream_dns = other.proxy.upstream_dns;
-        }
-        if other.proxy.dns_ttl_seconds.is_some() {
-            self.proxy.dns_ttl_seconds = other.proxy.dns_ttl_seconds;
-        }
-        if other.proxy.tcp_connect_timeout_secs.is_some() {
-            self.proxy.tcp_connect_timeout_secs = other.proxy.tcp_connect_timeout_secs;
-        }
-        if other.proxy.tcp_idle_timeout_secs.is_some() {
-            self.proxy.tcp_idle_timeout_secs = other.proxy.tcp_idle_timeout_secs;
-        }
-        if other.proxy.private_destinations.is_some() {
-            self.proxy.private_destinations = other.proxy.private_destinations;
-        }
-        self
-    }
 }
 
 /// Remove duplicates from a `Vec<String>` while preserving insertion order.
@@ -534,52 +540,28 @@ mod tests {
     #[test]
     fn test_parse_empty_config() {
         let config = PentConfig::parse("").unwrap();
-        assert!(config.sandbox.network.is_none());
-        assert!(config.proxy.domain_allowlist.is_empty());
+        assert!(config.sandbox.mounts.is_empty());
+        assert!(config.proxy.upstream_dns.is_none());
     }
 
     #[test]
-    fn test_parse_proxy_allowlist() {
-        let toml = "[proxy]\ndomain_allowlist = [\"example.com\", \"*.github.com\"]";
-        let config = PentConfig::parse(toml).unwrap();
-        assert_eq!(config.proxy.domain_allowlist.len(), 2);
-        assert!(config
-            .proxy
-            .domain_allowlist
-            .contains(&"example.com".to_string()));
-    }
-
-    #[test]
-    fn test_parse_network_localhost_only() {
-        let toml = "[sandbox.network]\nmode = \"localhost_only\"";
-        let config = PentConfig::parse(toml).unwrap();
-        assert_eq!(config.sandbox.network, Some(NetworkMode::LocalhostOnly));
-    }
-
-    #[test]
-    fn test_parse_network_proxy_only() {
-        // proxy_addr is a runtime detail — not read from config files.
-        let toml = "[sandbox.network]\nmode = \"proxy_only\"";
-        let config = PentConfig::parse(toml).unwrap();
-        assert!(
-            matches!(config.sandbox.network, Some(NetworkMode::ProxyOnly { .. })),
-            "Expected ProxyOnly variant"
+    fn test_parse_proxy_tunables() {
+        let config = PentConfig::parse(
+            "[proxy]\nupstream_dns = [\"1.1.1.1:53\"]\ndns_ttl_seconds = 60\n\
+             tcp_connect_timeout_secs = 5\ntcp_idle_timeout_secs = 9\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.proxy.upstream_dns,
+            Some(vec!["1.1.1.1:53".to_string()])
         );
+        assert_eq!(config.proxy.dns_ttl_seconds, Some(60));
+        assert_eq!(config.proxy.tcp_connect_timeout_secs, Some(5));
+        assert_eq!(config.proxy.tcp_idle_timeout_secs, Some(9));
     }
 
     #[test]
-    fn test_parse_sandbox_paths() {
-        let toml =
-            "[sandbox.paths]\ntraversal = [\"/\"]\nread = [\"/usr/lib\"]\nexecute = [\"/usr/bin\"]\nread_write = [\"/tmp\"]";
-        let config = PentConfig::parse(toml).unwrap();
-        assert_eq!(config.sandbox.paths.traversal, vec!["/"]);
-        assert_eq!(config.sandbox.paths.read, vec!["/usr/lib"]);
-        assert_eq!(config.sandbox.paths.execute, vec!["/usr/bin"]);
-        assert_eq!(config.sandbox.paths.read_write, vec!["/tmp"]);
-    }
-
-    #[test]
-    fn test_private_destinations_parse_and_merge() {
+    fn test_private_destinations_parse() {
         let global = PentConfig::parse("[proxy]\nprivate_destinations = \"allow\"\n");
         assert!(global.is_ok(), "{global:?}");
         let Ok(global) = global else { return };
@@ -587,58 +569,54 @@ mod tests {
             global.proxy.private_destinations,
             Some(PrivateDestinations::Allow)
         );
-        let merged = global.merge(PentConfig::default());
-        assert_eq!(
-            merged.proxy.private_destinations,
-            Some(PrivateDestinations::Allow)
-        );
         assert!(PentConfig::parse("[proxy]\nprivate_destinations = \"maybe\"\n").is_err());
     }
 
     #[test]
-    fn test_merge_scalar_project_wins() {
-        let global =
-            PentConfig::parse("[sandbox]\nnetwork = { mode = \"localhost_only\" }").unwrap();
-        let project = PentConfig::parse("[sandbox]\nnetwork = { mode = \"blocked\" }").unwrap();
-        let merged = global.merge(project);
-        assert_eq!(merged.sandbox.network, Some(NetworkMode::Blocked));
+    fn test_old_keys_name_the_new_flow() {
+        for (toml, key) in [
+            (
+                "[proxy]\ndomain_allowlist = [\"a.com\"]\n",
+                "`domain_allowlist`",
+            ),
+            ("[sandbox.paths]\nread = [\"/x\"]\n", "`sandbox.paths`"),
+            ("profiles = [\"@npm\"]\n", "`profiles`"),
+            (
+                "[sandbox.network]\nmode = \"blocked\"\n",
+                "`sandbox.network`",
+            ),
+        ] {
+            let err = PentConfig::parse(toml).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains(key), "{toml:?}: {msg}");
+            assert!(msg.starts_with("pent.toml: "), "{toml:?}: {msg}");
+            if key != "`sandbox.network`" {
+                assert!(msg.contains("pent watch"), "{toml:?}: {msg}");
+            }
+        }
     }
 
     #[test]
-    fn test_merge_scalar_global_wins_when_project_absent() {
-        let global =
-            PentConfig::parse("[sandbox]\nnetwork = { mode = \"localhost_only\" }").unwrap();
-        let project = PentConfig::parse("").unwrap();
-        let merged = global.merge(project);
-        assert_eq!(merged.sandbox.network, Some(NetworkMode::LocalhostOnly));
-    }
-
-    #[test]
-    fn test_merge_lists_extend() {
-        let global = PentConfig::parse("[proxy]\ndomain_allowlist = [\"example.com\"]").unwrap();
-        let project = PentConfig::parse("[proxy]\ndomain_allowlist = [\"*.github.com\"]").unwrap();
-        let merged = global.merge(project);
-        assert_eq!(merged.proxy.domain_allowlist.len(), 2);
-        assert!(merged
-            .proxy
-            .domain_allowlist
-            .contains(&"example.com".to_string()));
-        assert!(merged
-            .proxy
-            .domain_allowlist
-            .contains(&"*.github.com".to_string()));
+    fn test_old_key_error_names_the_file() {
+        let err = PentConfig::parse_file_contents(
+            Path::new("/x/pent.toml"),
+            b"[proxy]\ndomain_allowlist = []\n",
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "/x/pent.toml: `domain_allowlist` moved to profiles; record one with `pent watch`"
+        );
     }
 
     #[test]
     fn test_roundtrip_toml() {
-        let toml = "[proxy]\ndomain_allowlist = [\"example.com\"]\n";
+        let toml = "[proxy]\nupstream_dns = [\"8.8.8.8:53\"]\n[[sandbox.mounts]]\npath = \"/m\"\n";
         let config = PentConfig::parse(toml).unwrap();
         let serialized = config.to_toml().unwrap();
         let reparsed = PentConfig::parse(&serialized).unwrap();
-        assert_eq!(
-            reparsed.proxy.domain_allowlist,
-            vec!["example.com".to_string()]
-        );
+        assert_eq!(reparsed.proxy.upstream_dns, config.proxy.upstream_dns);
+        assert_eq!(reparsed.sandbox.mounts.len(), 1);
     }
 
     #[test]
@@ -647,15 +625,12 @@ mod tests {
         let path = dir.path().join("pent.toml");
 
         let mut config = PentConfig::default();
-        config.proxy.domain_allowlist = vec!["test.local".to_string()];
+        config.proxy.dns_ttl_seconds = Some(42);
 
         config.save(&path).unwrap();
 
         let loaded = PentConfig::load(&path).unwrap();
-        assert_eq!(
-            loaded.proxy.domain_allowlist,
-            vec!["test.local".to_string()]
-        );
+        assert_eq!(loaded.proxy.dns_ttl_seconds, Some(42));
     }
 
     #[test]
@@ -701,19 +676,10 @@ mod tests {
         for (toml, key) in [
             ("typo = 1\n", "typo"),
             ("[sandbox]\nnetwrk = 1\n", "netwrk"),
-            ("[sandbox.paths]\nreadwrite = []\n", "readwrite"),
             ("[proxy]\ndomain_alowlist = []\n", "domain_alowlist"),
             (
                 "[[sandbox.mounts]]\npath = \"/x\"\nread_only = true\n",
                 "read_only",
-            ),
-            (
-                "[sandbox.network]\nmode = \"blocked\"\nproxy = 1\n",
-                "proxy",
-            ),
-            (
-                "[sandbox.network]\nmode = \"proxy_only\"\ndns_port = 53\n",
-                "dns_port",
             ),
         ] {
             let result = PentConfig::parse(toml);
@@ -722,6 +688,22 @@ mod tests {
                 assert!(err.to_string().contains(key), "{toml:?}: {err}");
             }
         }
+    }
+
+    #[test]
+    fn test_network_mode_repr_rejects_unknown_keys() {
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[allow(dead_code)] // the test checks only the parse result
+            network: NetworkMode,
+        }
+        for toml in [
+            "[network]\nmode = \"blocked\"\nproxy = 1\n",
+            "[network]\nmode = \"proxy_only\"\ndns_port = 53\n",
+        ] {
+            assert!(toml::from_str::<Wrapper>(toml).is_err(), "{toml:?}");
+        }
+        assert!(toml::from_str::<Wrapper>("[network]\nmode = \"proxy_only\"\n").is_ok());
     }
 
     #[test]
@@ -778,16 +760,26 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_relative_paths() {
-        let mut config = PentConfig::parse(
-            "[sandbox.paths]\nread_write = [\"out\", \"../up\", \"/abs\", \"~/h\", \"g*\"]\n",
-        )
-        .unwrap();
-        config.resolve_relative_paths(Path::new("/ws"));
+    fn test_resolve_relative() {
+        let mut paths = SandboxPaths {
+            read_write: ["out", "../up", "/abs", "~/h", "g*"]
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            ..Default::default()
+        };
+        paths.resolve_relative(Path::new("/ws"));
         assert_eq!(
-            config.sandbox.paths.read_write,
+            paths.read_write,
             vec!["/ws/out", "/ws/../up", "/abs", "~/h", "/ws/g*"]
         );
+    }
+
+    #[test]
+    fn test_resolve_relative_mount_paths() {
+        let mut config = PentConfig::parse("[[sandbox.mounts]]\npath = \"mnt\"\n").unwrap();
+        config.resolve_relative_paths(Path::new("/ws"));
+        assert_eq!(config.sandbox.mounts[0].path, PathBuf::from("/ws/mnt"));
     }
 
     #[test]

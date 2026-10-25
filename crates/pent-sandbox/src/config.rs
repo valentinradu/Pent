@@ -155,18 +155,17 @@ impl SandboxConfig {
         self
     }
 
-    /// Build a `SandboxConfig` from a `SandboxSettings` fragment, merging
-    /// the settings' paths on top of [`system_default_paths()`].
-    ///
-    /// This is the canonical way to construct a `SandboxConfig` from loaded
-    /// config files; it avoids the manual path-extension boilerplate in callers.
+    /// Build a `SandboxConfig` from the global `SandboxSettings` (the
+    /// mounts) and the paths of a profile. The profile paths merge on top of
+    /// [`system_default_paths()`].
     #[must_use]
     pub fn from_sandbox_settings(
         settings: SandboxSettings,
+        profile_paths: SandboxPaths,
         workspace: PathBuf,
         cwd: PathBuf,
     ) -> Self {
-        let paths = system_default_paths().merge(settings.paths);
+        let paths = system_default_paths().merge(profile_paths);
         let mut cfg = Self::new(workspace, paths, cwd);
         for mount in settings.mounts {
             cfg.mounts.push(mount);

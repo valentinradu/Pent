@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use pent_proxy::{ProxyConfig, ProxyServer};
 use pent_sandbox::check_availability;
-use pent_settings::ConfigLoader;
+use pent_settings::{ConfigLoader, ProfileStore};
 
 use crate::error::CliError;
 use crate::ui;
@@ -47,22 +47,24 @@ pub(crate) async fn check(cwd: PathBuf) -> Result<(), CliError> {
         }
     }
 
-    // 4. Config paths
-    let global_path = ConfigLoader::global_config_path();
-    let project_path = ConfigLoader::project_config_path(&cwd);
-
-    if let Some(ref path) = global_path {
-        let found = if path.exists() { "found" } else { "not found" };
-        ui::status("global", format!("{} ({})", path.display(), found));
-    } else {
-        ui::status("global", "n/a (home directory not available)");
+    // 4. Config and profile paths
+    match ConfigLoader::global_config_path() {
+        Some(path) => {
+            let found = if path.exists() { "found" } else { "not found" };
+            ui::status("global", format!("{} ({found})", path.display()));
+        }
+        None => ui::status("global", "n/a (home directory not available)"),
     }
-    let found = if project_path.exists() {
-        "found"
-    } else {
-        "not found"
-    };
-    ui::status("project", format!("{} ({})", project_path.display(), found));
+    match ProfileStore::open_default() {
+        Ok(store) => {
+            ui::status("profiles", store.dirs().config.join("profiles").display());
+            ui::status("state", store.dirs().state.display());
+        }
+        Err(e) => {
+            ui::error(format!("profiles: {e}"));
+            all_ok = false;
+        }
+    }
 
     match ConfigLoader::load(&cwd) {
         Ok(_) => ui::ok("config"),

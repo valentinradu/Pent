@@ -1,24 +1,34 @@
-#[cfg(unix)]
-extern crate libc;
+//! `pent run`: run a command in the sandbox with its trusted profile.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-#[cfg(not(target_os = "macos"))]
-use pent_proxy::TraceEvent;
-#[cfg(not(target_os = "macos"))]
-use pent_proxy::{ProxyConfig, ProxyHandle, ProxyServer};
-#[cfg(target_os = "linux")]
-use pent_sandbox::teardown_overlay;
+use pent_profile::{Outcome, ProfileName, WatchEvent};
+use pent_proxy::{ProxyPolicy, TraceEvent};
 use pent_sandbox::{build_env, check_availability, spawn_sandboxed, NetworkMode, SandboxConfig};
-use pent_settings::{ConfigLoader, PentConfig};
-use tokio::signal::unix::{signal, Signal, SignalKind};
+use pent_settings::{ConfigLoader, EventLog, ProfileStore};
 
 use crate::cli::{NetworkModeArg, RunArgs};
+use crate::commands::select::{generic_warning, load_trusted, profile_paths, select_profile};
+use crate::commands::session::{
+    drain, exit_like_child, forward_std, forward_tokio, is_broad_workspace, start_proxy,
+    wait_child, ForwardStop, ProxyChannels, SessionCleanup, SignalRelay,
+};
 use crate::error::CliError;
 use crate::ui;
+
+/// The longest time to wait for the last events after the child exits and
+/// the forwarders stop.
+const FINAL_DRAIN: Duration = Duration::from_secs(2);
+
+/// One event of the run: a line for the trace log, or a structured access
+/// event for the log of denied accesses.
+enum RunEvent {
+    Trace(TraceLine),
+    Access(WatchEvent),
+}
 
 // The function is long because it lists the steps of one run in order, with
 // platform-specific steps under `cfg`. To split it would hide this order.
@@ -31,34 +41,70 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
         ));
     }
 
-    let mut config = load_config(&args, &cwd)?;
-    // Decide the network mode before the CLI overrides merge `--allow` into
-    // the config allowlist, so that the two sources stay separate.
-    let decision = resolve_network(
-        args.network,
-        &args.allow,
-        config.sandbox.network.as_ref(),
-        &config.proxy.domain_allowlist,
-    );
-    apply_cli_overrides(&mut config, &args)?;
+    // ── Profile ──────────────────────────────────────────────────────────────
+    let selected = select_profile(args.profile.as_deref(), &args.command)?;
+    if let Some(warning) = generic_warning(&selected) {
+        ui::warn(warning);
+    }
+    let store = ProfileStore::open_default()?;
+    let profile = load_trusted(&store, &selected, &args.command)?;
+    let name = selected.name;
+    let settings = ConfigLoader::load(&cwd)?;
+
+    let mut paths = profile_paths(&profile);
+    add_cli_paths(&mut paths, &args);
+    paths.resolve_relative(&cwd);
+    // On Linux, read_write paths must be exact filenames — glob ('*') patterns
+    // are not supported because overlayfs requires specific paths to mount over.
+    #[cfg(target_os = "linux")]
+    paths.validate_no_rw_globs()?;
+
+    // Decide the network mode before `--allow` merges into the profile
+    // domains, so that the two sources stay separate.
+    let decision = resolve_network(args.network, &args.allow, &profile.network.domains);
+    let domains = merge_domains(&profile.network.domains, &args.allow);
     let env_map = build_run_env(&args.env);
     let trace_log_path = open_trace_log(args.trace, &cwd);
 
-    for warning in network_warnings(decision, &args.allow, args.trace, Platform::CURRENT) {
+    for warning in network_warnings(decision, &args.allow, args.trace) {
         ui::warn(warning);
     }
 
-    // ── macOS path ────────────────────────────────────────────────────────────
-    #[cfg(target_os = "macos")]
-    let resolved_network: NetworkMode = macos_network_mode(decision.choice);
+    // ── Events ───────────────────────────────────────────────────────────────
+    // All event sources send into one channel: the proxy (trace lines and
+    // structured events), the recorder of the sandbox (`--trace`), and on
+    // macOS the Seatbelt log.
+    let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<RunEvent>();
+    let stop = ForwardStop::default();
 
-    // ── non-macOS path ────────────────────────────────────────────────────────
-    #[cfg(not(target_os = "macos"))]
-    let ProxySetup {
-        network: resolved_network,
-        handle: proxy_handle,
-        event_rx,
-    } = setup_proxy(&config, decision.choice, args.trace).await?;
+    // ── Proxy ────────────────────────────────────────────────────────────────
+    let proxy = if decision.choice == NetworkChoice::Proxy {
+        let (access_tx, access_rx) = tokio::sync::mpsc::unbounded_channel::<WatchEvent>();
+        forward_tokio(access_rx, event_tx.clone(), RunEvent::Access, &stop);
+        let trace_tx = if args.trace {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<TraceEvent>();
+            let profile_name = name.clone();
+            forward_tokio(
+                rx,
+                event_tx.clone(),
+                move |e| RunEvent::Trace(proxy_trace_line(e, &profile_name)),
+                &stop,
+            );
+            Some(tx)
+        } else {
+            None
+        };
+        let channels = ProxyChannels {
+            trace: trace_tx,
+            events: Some(access_tx),
+        };
+        Some(start_proxy(&settings.proxy, domains, ProxyPolicy::Enforce, channels).await?)
+    } else {
+        None
+    };
+    let resolved_network = proxy
+        .as_ref()
+        .map_or_else(|| base_network_mode(decision.choice), |p| p.network.clone());
 
     // The workspace is always read-write. If it is `/` or the home directory,
     // the sandbox gives write access to almost all user files.
@@ -69,12 +115,11 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
         ));
     }
 
-    // Build SandboxConfig.
-    // from_sandbox_settings merges user paths on top of system defaults and
-    // handles mounts, replacing the previous manual path-extension loop.
-    let mut sandbox_cfg = SandboxConfig::from_sandbox_settings(config.sandbox, cwd.clone(), cwd)
-        .with_network(resolved_network)
-        .with_env(env_map);
+    let mut sandbox_cfg =
+        SandboxConfig::from_sandbox_settings(settings.sandbox, paths, cwd.clone(), cwd)
+            .with_network(resolved_network)
+            .with_env(env_map);
+    sandbox_cfg.record_events = args.trace;
 
     if let Some(data_dir) = args.data_dir {
         sandbox_cfg = sandbox_cfg.with_data_dir(data_dir);
@@ -100,9 +145,6 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
         ui::status("network", line);
     }
 
-    // Install the signal handlers before the spawn. A signal that comes
-    // between the spawn and the wait then goes to the child and does not
-    // kill pent before the cleanup.
     let mut signals = SignalRelay::install()?;
 
     // macOS: start `log stream` before the spawn, so that the first denials
@@ -119,7 +161,7 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
     #[cfg(target_os = "linux")]
     let cleanup = SessionCleanup::new(
         sandbox_child.child.id(),
-        LinuxResources {
+        crate::commands::session::LinuxResources {
             overlay: sandbox_child.overlay,
             netns: sandbox_child.netns,
             trace: args.trace,
@@ -128,25 +170,34 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
     #[cfg(not(target_os = "linux"))]
     let cleanup = SessionCleanup::new(sandbox_child.child.id(), ());
     let child = sandbox_child.child;
+    if let Some(rx) = sandbox_child.events {
+        forward_std(rx, event_tx.clone(), RunEvent::Access);
+    }
 
     // macOS: in trace mode, stream the Seatbelt denials of the child and its
-    // descendants. Other platforms: in trace mode, stream proxy events.
+    // descendants. The unified log delivers them with a delay.
     #[cfg(target_os = "macos")]
-    let (event_rx, drain_grace) = match tracer.as_mut() {
-        Some(t) => (t.attach(child.id()), macos_trace::DRAIN_GRACE),
-        None => (None, Duration::ZERO),
+    let drain_grace = match tracer
+        .as_mut()
+        .and_then(|t| t.attach(child.id(), name.to_string()))
+    {
+        Some(rx) => {
+            forward_tokio(rx, event_tx.clone(), RunEvent::Trace, &stop);
+            macos_trace::DRAIN_GRACE
+        }
+        None => Duration::ZERO,
     };
     #[cfg(not(target_os = "macos"))]
-    let (event_rx, drain_grace) = (event_rx.map(proxy_trace_lines), Duration::ZERO);
+    let drain_grace = Duration::ZERO;
+    // Only the forwarders keep senders. When they stop, the channel closes.
+    drop(event_tx);
 
-    let exit_status = wait_child(
-        child,
-        &mut signals,
-        event_rx,
-        trace_log_path.as_deref(),
-        drain_grace,
-    )
-    .await;
+    let mut denied = DeniedRecorder::new(&store, &name);
+    let mut sink = |event: RunEvent| match event {
+        RunEvent::Trace(line) => write_trace_line(trace_log_path.as_deref(), &line),
+        RunEvent::Access(event) => denied.record(&event),
+    };
+    let (exit_status, rest) = wait_child(child, &mut signals, Some(event_rx), &mut sink).await;
 
     // Flush overlayfs write-listed files back to real inodes, clean up
     // staging directories and drop the netns handle (this removes the
@@ -155,74 +206,46 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
     // flight.
     cleanup.finish();
 
+    // Read the late events, then stop the forwarders and read the rest.
+    let rest = drain(rest, drain_grace, &mut sink).await;
+    stop.stop();
+    if let Some(proxy) = proxy {
+        proxy.shutdown().await;
+    }
+    drain(rest, FINAL_DRAIN, &mut sink).await;
+
     #[cfg(target_os = "macos")]
     drop(tracer);
 
-    #[cfg(not(target_os = "macos"))]
-    if let Some(handle) = proxy_handle {
-        if let Err(e) = handle.shutdown().await {
-            ui::warn(format!("proxy shutdown failed: {e}"));
-        }
+    if let Some(message) = denied.summary() {
+        ui::warn(message);
     }
 
     exit_like_child(exit_status)
 }
 
-/// Load and merge config.
-/// `--no-config` skips global/project config files but `--config <extra>` still applies.
-///
-/// An untrusted or changed project config does not apply. Pent prints a
-/// warning and continues with the global config only.
-fn load_config(args: &RunArgs, cwd: &Path) -> Result<PentConfig, CliError> {
-    let mut config = if args.no_config {
-        PentConfig::default()
-    } else {
-        let loaded = ConfigLoader::load_with_status(cwd)?;
-        crate::commands::config::warn_if_project_ignored(&loaded);
-        loaded.config
+/// Add the paths of the CLI flags to the profile paths.
+fn add_cli_paths(paths: &mut pent_settings::SandboxPaths, args: &RunArgs) {
+    let strings = |list: &[PathBuf]| -> Vec<String> {
+        list.iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect()
     };
-    if let Some(ref extra) = args.extra_config {
-        let mut extra_cfg = PentConfig::load(extra)?;
-        // Relative paths in the extra file also resolve against the workspace.
-        extra_cfg.resolve_relative_paths(cwd);
-        config = config.merge(extra_cfg);
-    }
-    Ok(config)
+    paths.traversal.extend(strings(&args.traverse));
+    paths.read.extend(strings(&args.read));
+    paths.read_write.extend(strings(&args.write));
+    paths.execute.extend(strings(&args.execute));
 }
 
-/// Merge CLI flag overrides into the loaded config.
-fn apply_cli_overrides(config: &mut PentConfig, args: &RunArgs) -> Result<(), CliError> {
-    config.sandbox.paths.traversal.extend(
-        args.traverse
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned()),
-    );
-    config
-        .sandbox
-        .paths
-        .read
-        .extend(args.read.iter().map(|p| p.to_string_lossy().into_owned()));
-    config
-        .sandbox
-        .paths
-        .read_write
-        .extend(args.write.iter().map(|p| p.to_string_lossy().into_owned()));
-    config.sandbox.paths.execute.extend(
-        args.execute
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned()),
-    );
-    config
-        .proxy
-        .domain_allowlist
-        .extend(args.allow.iter().cloned());
-
-    // On Linux, read_write paths must be exact filenames — glob ('*') patterns
-    // are not supported because overlayfs requires specific paths to mount over.
-    #[cfg(target_os = "linux")]
-    config.sandbox.paths.validate_no_rw_globs()?;
-
-    Ok(())
+/// The profile domains and the `--allow` domains, without duplicates.
+fn merge_domains(profile: &[String], allow: &[String]) -> Vec<String> {
+    let mut domains = profile.to_vec();
+    for d in allow {
+        if !domains.contains(d) {
+            domains.push(d.clone());
+        }
+    }
+    domains
 }
 
 /// Parse `KEY=VALUE` and bare `KEY` env entries; return a merged env map.
@@ -242,44 +265,6 @@ fn build_run_env(args_env: &[String]) -> HashMap<String, String> {
         env_map.insert(k, v);
     }
     env_map
-}
-
-/// Return true if `workspace` is `/` or the home directory of the user.
-fn is_broad_workspace(workspace: &Path) -> bool {
-    if workspace.parent().is_none() {
-        return true;
-    }
-    std::env::var_os("HOME").is_some_and(|home| {
-        let home = PathBuf::from(home);
-        workspace == home || std::fs::canonicalize(&home).is_ok_and(|h| workspace == h)
-    })
-}
-
-/// Tell the user about edits that pent could not save, and (in trace mode)
-/// about writes that the overlay discards.
-#[cfg(target_os = "linux")]
-fn show_overlay_report(report: &pent_sandbox::OverlayTeardownReport, trace: bool) {
-    for failure in &report.failures {
-        ui::error(format!(
-            "edit not saved: {}: {}",
-            failure.path.display(),
-            failure.error
-        ));
-    }
-    for dir in &report.kept_staging {
-        ui::warn(format!("pent keeps the unsaved edits in {}", dir.display()));
-    }
-    if report.killed_descendants > 0 {
-        ui::warn(format!(
-            "pent stopped {} sandbox processes that still ran after the command exited",
-            report.killed_descendants
-        ));
-    }
-    if trace {
-        for discarded in &report.discarded {
-            ui::warn(discarded);
-        }
-    }
 }
 
 /// Create `.pent/trace.log` when `trace` is true; emit warnings on failure.
@@ -306,6 +291,79 @@ fn open_trace_log(trace: bool, cwd: &Path) -> Option<PathBuf> {
             ui::warn(format!("could not create .pent directory: {e}"));
             None
         }
+    }
+}
+
+// ── Denied accesses ──────────────────────────────────────────────────────────
+
+/// Writes the denied accesses of this run to the denied log of the profile.
+///
+/// The recorder writes each distinct event one time, and opens the log only
+/// at the first denial.
+struct DeniedRecorder<'a> {
+    store: &'a ProfileStore,
+    name: &'a ProfileName,
+    log: Option<EventLog>,
+    seen: HashSet<String>,
+    /// True after the first write error; pent then shows no more warnings.
+    failed: bool,
+}
+
+impl<'a> DeniedRecorder<'a> {
+    fn new(store: &'a ProfileStore, name: &'a ProfileName) -> Self {
+        Self {
+            store,
+            name,
+            log: None,
+            seen: HashSet::new(),
+            failed: false,
+        }
+    }
+
+    /// Record `event` if the policy denied it.
+    fn record(&mut self, event: &WatchEvent) {
+        if event.outcome() != Outcome::Denied {
+            return;
+        }
+        let Ok(key) = event.to_json_line() else {
+            return;
+        };
+        if !self.seen.insert(key) {
+            return;
+        }
+        if self.failed {
+            return;
+        }
+        let result = match &mut self.log {
+            Some(log) => log.append(event),
+            None => self.store.denied_log(self.name).and_then(|mut log| {
+                let result = log.append(event);
+                self.log = Some(log);
+                result
+            }),
+        };
+        if let Err(e) = result {
+            self.failed = true;
+            ui::warn(format!("cannot record a denied access: {e}"));
+        }
+    }
+
+    /// The message for the end of the run, if the run had denied accesses.
+    fn summary(&self) -> Option<String> {
+        denied_message(self.seen.len(), self.name)
+    }
+}
+
+/// The message for `count` denied accesses of the profile `name`.
+fn denied_message(count: usize, name: &ProfileName) -> Option<String> {
+    match count {
+        0 => None,
+        1 => Some(format!(
+            "1 access denied; review it: pent trust {name} --review"
+        )),
+        n => Some(format!(
+            "{n} accesses denied; review them: pent trust {name} --review"
+        )),
     }
 }
 
@@ -339,10 +397,8 @@ enum NetworkSource {
     NetworkFlag,
     /// One or more `--allow` flags.
     AllowFlag,
-    /// `[sandbox.network] mode` in the merged config.
-    ConfigMode,
-    /// A non-empty `[proxy] domain_allowlist` in the merged config.
-    ConfigAllowlist,
+    /// The profile has domains.
+    ProfileDomains,
     /// No input; pent uses the default.
     Default,
 }
@@ -359,18 +415,15 @@ struct NetworkDecision {
 /// The precedence, from high to low:
 /// 1. An explicit `--network` flag.
 /// 2. `--allow` (this implies proxy mode).
-/// 3. `[sandbox.network] mode` in the config.
-/// 4. A non-empty `[proxy] domain_allowlist` in the config (this implies
-///    proxy mode, so a config with only profiles enables the proxy).
-/// 5. The default: blocked.
+/// 3. Domains in the profile (this implies proxy mode).
+/// 4. The default: blocked.
 ///
 /// `--trace` is not an input: tracing never changes the network mode.
-/// `config_allowlist` must not contain the `--allow` values.
+/// `profile_domains` must not contain the `--allow` values.
 fn resolve_network(
     network_flag: Option<NetworkModeArg>,
     allow_flags: &[String],
-    config_mode: Option<&NetworkMode>,
-    config_allowlist: &[String],
+    profile_domains: &[String],
 ) -> NetworkDecision {
     let decide = |choice, source| NetworkDecision { choice, source };
     if let Some(flag) = network_flag {
@@ -385,42 +438,26 @@ fn resolve_network(
     if !allow_flags.is_empty() {
         return decide(NetworkChoice::Proxy, NetworkSource::AllowFlag);
     }
-    if let Some(mode) = config_mode {
-        let choice = match mode {
-            NetworkMode::Unrestricted => NetworkChoice::Unrestricted,
-            NetworkMode::LocalhostOnly => NetworkChoice::Localhost,
-            NetworkMode::ProxyOnly { .. } => NetworkChoice::Proxy,
-            NetworkMode::Blocked => NetworkChoice::Blocked,
-        };
-        return decide(choice, NetworkSource::ConfigMode);
-    }
-    if !config_allowlist.is_empty() {
-        return decide(NetworkChoice::Proxy, NetworkSource::ConfigAllowlist);
+    if !profile_domains.is_empty() {
+        return decide(NetworkChoice::Proxy, NetworkSource::ProfileDomains);
     }
     decide(NetworkChoice::Blocked, NetworkSource::Default)
 }
 
-/// The platform that pent runs on, for the platform-specific warnings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Platform {
-    Linux,
-    MacOs,
-}
-
-impl Platform {
-    #[cfg(target_os = "macos")]
-    const CURRENT: Self = Self::MacOs;
-    #[cfg(not(target_os = "macos"))]
-    const CURRENT: Self = Self::Linux;
+/// The network mode for a choice without a proxy.
+const fn base_network_mode(choice: NetworkChoice) -> NetworkMode {
+    match choice {
+        NetworkChoice::Unrestricted => NetworkMode::Unrestricted,
+        NetworkChoice::Localhost => NetworkMode::LocalhostOnly,
+        NetworkChoice::Blocked => NetworkMode::Blocked,
+        // Pent starts the proxy for this choice; the proxy gives the mode.
+        // Without a proxy, nothing may go out.
+        NetworkChoice::Proxy => NetworkMode::Blocked,
+    }
 }
 
 /// Return the warnings to show for a network decision.
-fn network_warnings(
-    decision: NetworkDecision,
-    allow_flags: &[String],
-    trace: bool,
-    platform: Platform,
-) -> Vec<String> {
+fn network_warnings(decision: NetworkDecision, allow_flags: &[String], trace: bool) -> Vec<String> {
     let mut warnings = Vec::new();
     if decision.source == NetworkSource::NetworkFlag
         && decision.choice != NetworkChoice::Proxy
@@ -431,14 +468,7 @@ fn network_warnings(
             decision.choice.flag_value()
         ));
     }
-    if decision.choice == NetworkChoice::Proxy && platform == Platform::MacOs {
-        warnings.push(
-            "network is unrestricted: pent cannot enforce the domain allowlist on macOS \
-             (see \"Platform limitations\" in the README)"
-                .to_string(),
-        );
-    }
-    if trace && decision.choice != NetworkChoice::Proxy && platform == Platform::Linux {
+    if trace && decision.choice != NetworkChoice::Proxy {
         warnings.push(format!(
             "--trace records network events only in proxy mode; the network mode is {}, \
              so this run records no network events",
@@ -451,291 +481,14 @@ fn network_warnings(
 /// Return the status line for the network mode, if there is one.
 fn network_status(mode: &NetworkMode, source: NetworkSource) -> Option<&'static str> {
     match mode {
-        // On Linux, the proxy is the expected mode. On macOS, the warning
-        // from `network_warnings` already tells the user about the proxy.
+        // The proxy is the expected mode.
         NetworkMode::ProxyOnly { .. } => None,
         NetworkMode::Blocked if source == NetworkSource::Default => {
-            Some("blocked — add domains to [proxy] domain_allowlist in pent.toml to enable")
+            Some("blocked (the profile has no domains)")
         }
         NetworkMode::Blocked => Some("blocked"),
         NetworkMode::LocalhostOnly => Some("localhost only"),
         NetworkMode::Unrestricted => Some("unrestricted"),
-    }
-}
-
-/// macOS cannot enforce proxy mode, so proxy mode becomes `Unrestricted`.
-///
-/// Proxy-based network enforcement is not available on macOS (no per-process
-/// network namespaces; `DYLD_INSERT_LIBRARIES` is unreliable across Go binaries
-/// and hardened-runtime binaries). `network_warnings` tells the user about this.
-#[cfg(target_os = "macos")]
-const fn macos_network_mode(choice: NetworkChoice) -> NetworkMode {
-    match choice {
-        NetworkChoice::Unrestricted | NetworkChoice::Proxy => NetworkMode::Unrestricted,
-        NetworkChoice::Localhost => NetworkMode::LocalhostOnly,
-        NetworkChoice::Blocked => NetworkMode::Blocked,
-    }
-}
-
-// ── Signals, wait and exit ───────────────────────────────────────────────────
-
-/// Receives the signals that pent handles while the child runs.
-///
-/// - SIGTERM, SIGHUP, SIGUSR1 and SIGUSR2 go to the child.
-/// - SIGINT and SIGQUIT do not go to the child. When they come from the
-///   terminal, the kernel sends them to all of the foreground process group,
-///   which includes the child. To send them again would deliver them two
-///   times. Pent itself ignores them, like `time` and `sudo` do, and waits
-///   for the child.
-/// - SIGWINCH is not handled. The kernel sends it to the foreground process
-///   group, so the child gets it directly.
-///
-/// The handlers keep pent alive, so pent always runs its cleanup after the
-/// child exits.
-struct SignalRelay {
-    interrupt: Signal,
-    quit: Signal,
-    terminate: Signal,
-    hangup: Signal,
-    user1: Signal,
-    user2: Signal,
-}
-
-/// What pent does with a signal that it receives.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SignalAction {
-    /// Send the signal to the child.
-    Forward(libc::c_int),
-    /// Do nothing; the child gets the signal from the terminal.
-    Ignore,
-}
-
-impl SignalRelay {
-    /// Install the signal handlers.
-    ///
-    /// # Errors
-    /// Returns an I/O error if tokio cannot install a handler.
-    fn install() -> Result<Self, CliError> {
-        Ok(Self {
-            interrupt: signal(SignalKind::interrupt())?,
-            quit: signal(SignalKind::quit())?,
-            terminate: signal(SignalKind::terminate())?,
-            hangup: signal(SignalKind::hangup())?,
-            user1: signal(SignalKind::user_defined1())?,
-            user2: signal(SignalKind::user_defined2())?,
-        })
-    }
-
-    /// Wait for the next signal and return what to do with it.
-    async fn recv(&mut self) -> SignalAction {
-        tokio::select! {
-            Some(()) = self.interrupt.recv() => SignalAction::Ignore,
-            Some(()) = self.quit.recv() => SignalAction::Ignore,
-            Some(()) = self.terminate.recv() => SignalAction::Forward(libc::SIGTERM),
-            Some(()) = self.hangup.recv() => SignalAction::Forward(libc::SIGHUP),
-            Some(()) = self.user1.recv() => SignalAction::Forward(libc::SIGUSR1),
-            Some(()) = self.user2.recv() => SignalAction::Forward(libc::SIGUSR2),
-            // All streams are closed. This occurs only when the tokio runtime
-            // stops. Wait forever; the child wait ends the loop.
-            else => std::future::pending().await,
-        }
-    }
-}
-
-/// Send `sig` to the process `pid`.
-fn send_signal(pid: u32, sig: libc::c_int) {
-    let Ok(pid) = libc::pid_t::try_from(pid) else {
-        tracing::warn!(pid, "child PID does not fit in pid_t; signal not sent");
-        return;
-    };
-    // SAFETY: kill() has no memory-safety preconditions. `pid` is the PID of
-    // our child. The wait thread can reap the child just before this call;
-    // then, in theory, a new process can get the same PID. This window is
-    // very small, and all tools that forward signals have the same race.
-    let rc = unsafe { libc::kill(pid, sig) };
-    if rc != 0 {
-        // ESRCH: the child exited between the signal and the kill. The wait
-        // ends soon, so there is nothing to do.
-        tracing::debug!(
-            pid,
-            sig,
-            error = %std::io::Error::last_os_error(),
-            "could not send the signal to the child"
-        );
-    }
-}
-
-/// Synthesize exit code 1 for a `wait()` that failed.
-fn failed_wait_status() -> std::process::ExitStatus {
-    // wait() can only fail if the child was already waited on.
-    std::os::unix::process::ExitStatusExt::from_raw(1 << 8)
-}
-
-/// Wait for `child` to exit. While it runs, send signals to it and write
-/// trace lines to the log.
-///
-/// After the child exits, the function reads the remaining trace lines for
-/// at most `drain_grace`. Use a non-zero value when the lines come with a
-/// delay (the macOS unified log).
-async fn wait_child(
-    mut child: std::process::Child,
-    signals: &mut SignalRelay,
-    mut events: Option<tokio::sync::mpsc::UnboundedReceiver<TraceLine>>,
-    trace_log_path: Option<&Path>,
-    drain_grace: Duration,
-) -> std::process::ExitStatus {
-    let pid = child.id();
-    let (done_tx, mut done_rx) = tokio::sync::oneshot::channel::<std::process::ExitStatus>();
-    // Wait in a thread so that tokio can handle the signals and the trace
-    // events at the same time.
-    std::thread::spawn(move || {
-        let status = child.wait().unwrap_or_else(|_| failed_wait_status());
-        if done_tx.send(status).is_err() {
-            // The receiver is gone: pent is about to exit. Nothing to report.
-            tracing::debug!("child exit status not delivered; pent is exiting");
-        }
-    });
-
-    let status = loop {
-        tokio::select! {
-            biased;
-            result = &mut done_rx => {
-                break result.unwrap_or_else(|_| failed_wait_status());
-            }
-            action = signals.recv() => {
-                if let SignalAction::Forward(sig) = action {
-                    send_signal(pid, sig);
-                }
-            }
-            event = next_event(&mut events) => match event {
-                Some(line) => write_trace_line(trace_log_path, &line),
-                // The sender is gone; stop the poll of this channel.
-                None => events = None,
-            },
-        }
-    };
-
-    if let Some(mut rx) = events {
-        let deadline = tokio::time::Instant::now() + drain_grace;
-        loop {
-            match rx.try_recv() {
-                Ok(line) => write_trace_line(trace_log_path, &line),
-                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
-                    match tokio::time::timeout_at(deadline, rx.recv()).await {
-                        Ok(Some(line)) => write_trace_line(trace_log_path, &line),
-                        Ok(None) | Err(_) => break,
-                    }
-                }
-            }
-        }
-    }
-    status
-}
-
-/// Receive the next trace line, or wait forever if there is no channel.
-async fn next_event(
-    events: &mut Option<tokio::sync::mpsc::UnboundedReceiver<TraceLine>>,
-) -> Option<TraceLine> {
-    match events {
-        Some(rx) => rx.recv().await,
-        None => std::future::pending().await,
-    }
-}
-
-/// Exit pent with the same status as the child.
-///
-/// If a signal killed the child, pent sends the same signal to itself, so the
-/// parent shell or CI system sees the correct reason for the termination.
-fn exit_like_child(status: std::process::ExitStatus) -> ! {
-    use std::os::unix::process::ExitStatusExt;
-    if let Some(sig) = status.signal() {
-        // SAFETY: signal() and raise() have no memory-safety preconditions.
-        // We are past all cleanup and about to exit. The Rust runtime sets
-        // SIGPIPE to SIG_IGN and tokio installs handlers for other signals,
-        // so we set the default action first; otherwise raise() has no
-        // effect.
-        unsafe {
-            if libc::signal(sig, libc::SIG_DFL) != libc::SIG_ERR {
-                libc::raise(sig);
-            }
-        }
-        // raise() returned: the default action of the signal does not end
-        // the process, or the signal is blocked. Use the shell convention.
-        std::process::exit(128_i32.saturating_add(sig));
-    }
-    std::process::exit(status.code().unwrap_or(1));
-}
-
-// ── Cleanup ──────────────────────────────────────────────────────────────────
-
-/// Platform resources that pent must release after the child exits.
-trait Teardown {
-    /// Release the resources.
-    fn teardown(self);
-}
-
-impl Teardown for () {
-    fn teardown(self) {}
-}
-
-/// The Linux resources of one sandboxed run.
-///
-/// `N` is the network namespace handle type of `pent-sandbox`. Dropping it
-/// removes the firewall and routing rules.
-#[cfg(target_os = "linux")]
-struct LinuxResources<N> {
-    overlay: Option<pent_sandbox::OverlayHandle>,
-    netns: Option<N>,
-    /// Show the writes that the overlay discards (trace mode).
-    trace: bool,
-}
-
-#[cfg(target_os = "linux")]
-impl<N> Teardown for LinuxResources<N> {
-    fn teardown(self) {
-        if let Some(handle) = self.overlay {
-            let report = teardown_overlay(handle);
-            show_overlay_report(&report, self.trace);
-        }
-        drop(self.netns);
-    }
-}
-
-/// Releases the sandbox resources when the run ends.
-///
-/// Call [`SessionCleanup::finish`] after the child exits. If the value drops
-/// before `finish` (for example during a panic), the drop kills the child
-/// first, so the teardown does not race with the writes of the child.
-struct SessionCleanup<R: Teardown> {
-    /// The child PID while the child can still run.
-    running_child: Option<u32>,
-    resources: Option<R>,
-}
-
-impl<R: Teardown> SessionCleanup<R> {
-    const fn new(child_pid: u32, resources: R) -> Self {
-        Self {
-            running_child: Some(child_pid),
-            resources: Some(resources),
-        }
-    }
-
-    /// Mark the child as exited and release the resources.
-    fn finish(mut self) {
-        self.running_child = None;
-        // The drop releases the resources.
-    }
-}
-
-impl<R: Teardown> Drop for SessionCleanup<R> {
-    fn drop(&mut self) {
-        if let Some(pid) = self.running_child.take() {
-            send_signal(pid, libc::SIGKILL);
-        }
-        if let Some(resources) = self.resources.take() {
-            resources.teardown();
-        }
     }
 }
 
@@ -744,9 +497,7 @@ impl<R: Teardown> Drop for SessionCleanup<R> {
 /// One entry in the trace log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TraceLine {
-    /// The sandbox or the proxy allowed an access. Only the proxy reports
-    /// these, and the proxy does not run on macOS.
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    /// The proxy allowed an access.
     Allowed(String),
     /// The sandbox or the proxy denied an access, with an optional fix hint.
     Denied {
@@ -781,40 +532,22 @@ fn write_trace_line(log_path: Option<&Path>, line: &TraceLine) {
     }
 }
 
-/// Convert the proxy event channel into a trace line channel.
-#[cfg(not(target_os = "macos"))]
-fn proxy_trace_lines(
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<TraceEvent>,
-) -> tokio::sync::mpsc::UnboundedReceiver<TraceLine> {
-    let (tx, out) = tokio::sync::mpsc::unbounded_channel();
-    tokio::spawn(async move {
-        while let Some(event) = rx.recv().await {
-            if tx.send(proxy_trace_line(event)).is_err() {
-                // The wait loop is gone; stop the conversion.
-                break;
-            }
-        }
-    });
-    out
-}
-
 /// Convert one proxy event into a trace line with a fix hint.
-#[cfg(not(target_os = "macos"))]
-fn proxy_trace_line(event: TraceEvent) -> TraceLine {
+fn proxy_trace_line(event: TraceEvent, profile: &ProfileName) -> TraceLine {
     match event {
         TraceEvent::Access(msg) => TraceLine::Allowed(msg),
         TraceEvent::Violation(msg) => TraceLine::Denied {
-            fix: Some(proxy_violation_fix(&msg)),
+            fix: Some(proxy_violation_fix(&msg, profile)),
             message: msg,
         },
     }
 }
 
 /// Compute a fix hint for a proxy violation message.
-#[cfg(any(test, not(target_os = "macos")))]
-fn proxy_violation_fix(violation: &str) -> String {
+fn proxy_violation_fix(violation: &str, profile: &ProfileName) -> String {
+    let review = format!("pent trust {profile} --review");
     let Some(rest) = violation.strip_prefix("network: ") else {
-        return "review your pent config".to_string();
+        return format!("review the denied accesses: {review}");
     };
     // The message names the domain in quotes, for example:
     //   DNS query for "x.com" (A) blocked: the domain is not in the allowlist
@@ -826,18 +559,18 @@ fn proxy_violation_fix(violation: &str) -> String {
     if rest.contains("the domain is not in the allowlist") {
         if let Some(domain) = quoted_domain {
             return format!(
-                "add \"{domain}\" to domain_allowlist in the [proxy] section of your pent config"
+                "allow it for one run with --allow {domain}, or add it to the profile: {review}"
             );
         }
     }
     if rest.contains("the domain resolves to the") || rest.contains("blocked: the address is") {
         return "the destination address is not public; if you trust it, set \
-                private_destinations = \"allow\" in the [proxy] section of your pent config"
+                private_destinations = \"allow\" in the [proxy] section of pent.toml"
             .to_string();
     }
-    "make sure that the process uses DNS names and that the domain is in \
-     domain_allowlist in the [proxy] section of your pent config"
-        .to_string()
+    format!(
+        "make sure that the process uses DNS names, and add the domain to the profile: {review}"
+    )
 }
 
 // ── macOS trace ──────────────────────────────────────────────────────────────
@@ -971,29 +704,34 @@ mod macos_trace {
         }
     }
 
-    /// Return a fix hint for a denial, if the config can allow it.
+    /// Return a fix hint for a denial, if a profile can allow it.
     ///
-    /// Only filesystem operations on an absolute path get a hint. The config
+    /// Only filesystem operations on an absolute path get a hint. A profile
     /// cannot allow network or other operations per path.
-    pub(super) fn denial_fix(denial: &SandboxDenial, kind: PathKind) -> Option<String> {
+    pub(super) fn denial_fix(
+        denial: &SandboxDenial,
+        kind: PathKind,
+        profile: &str,
+    ) -> Option<String> {
         let path = denial.target.as_str();
         if !path.starts_with('/') {
             return None;
         }
-        let key = match OperationKind::of(&denial.operation) {
+        let review = format!("or add it to the profile: pent trust {profile} --review");
+        let flag = match OperationKind::of(&denial.operation) {
             OperationKind::FileRead if kind == PathKind::Directory => {
                 return Some(format!(
-                    "add \"{path}\" to traversal (to list the directory) or to read \
-                     (to read the files in it) in the [sandbox.paths] section of your pent config"
+                    "allow it for one run with --traverse \"{path}\" (to list the directory) \
+                     or --read \"{path}\" (to read the files in it), {review}"
                 ));
             }
-            OperationKind::FileRead => "read",
-            OperationKind::FileWrite => "read_write",
-            OperationKind::ProcessExec => "execute",
+            OperationKind::FileRead => "--read",
+            OperationKind::FileWrite => "--write",
+            OperationKind::ProcessExec => "--execute",
             OperationKind::Network | OperationKind::Other => return None,
         };
         Some(format!(
-            "add \"{path}\" to {key} in the [sandbox.paths] section of your pent config"
+            "allow it for one run with {flag} \"{path}\", {review}"
         ))
     }
 
@@ -1200,6 +938,7 @@ mod macos_trace {
             pub(in crate::commands::run) fn attach(
                 &mut self,
                 root_pid: u32,
+                profile: String,
             ) -> Option<tokio::sync::mpsc::UnboundedReceiver<TraceLine>> {
                 let lines = self.lines.take()?;
                 let tree = Arc::new(Mutex::new(ProcessTree::new(root_pid)));
@@ -1228,7 +967,8 @@ mod macos_trace {
                         if !lock(&tree).contains(denial.pid) {
                             continue;
                         }
-                        let fix = denial_fix(&denial, path_kind(Path::new(&denial.target)));
+                        let fix =
+                            denial_fix(&denial, path_kind(Path::new(&denial.target)), &profile);
                         let message = denial_message(&denial);
                         if tx.send(TraceLine::Denied { message, fix }).is_err() {
                             // The wait loop is gone; stop the filter.
@@ -1259,83 +999,6 @@ mod macos_trace {
     }
 }
 
-// ── Proxy setup ──────────────────────────────────────────────────────────────
-
-/// Non-macOS: start the proxy (if needed) and return the resolved network mode,
-/// optional proxy handle, and optional event receiver for trace mode.
-#[cfg(not(target_os = "macos"))]
-struct ProxySetup {
-    network: NetworkMode,
-    handle: Option<ProxyHandle>,
-    event_rx: Option<tokio::sync::mpsc::UnboundedReceiver<TraceEvent>>,
-}
-
-#[cfg(not(target_os = "macos"))]
-async fn setup_proxy(
-    config: &PentConfig,
-    choice: NetworkChoice,
-    trace: bool,
-) -> Result<ProxySetup, CliError> {
-    let base_network = match choice {
-        NetworkChoice::Unrestricted => NetworkMode::Unrestricted,
-        NetworkChoice::Localhost => NetworkMode::LocalhostOnly,
-        NetworkChoice::Blocked => NetworkMode::Blocked,
-        NetworkChoice::Proxy => {
-            // Handled below: the proxy starts and gives the address.
-            NetworkMode::LocalhostOnly
-        }
-    };
-
-    if choice == NetworkChoice::Proxy {
-        let (violation_tx, event_rx) = if trace {
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<TraceEvent>();
-            (Some(tx), Some(rx))
-        } else {
-            (None, None)
-        };
-        let mut proxy_config =
-            ProxyConfig::try_from(&config.proxy).map_err(|e| CliError::Other(e.to_string()))?;
-        proxy_config.violation_tx = violation_tx;
-        // On Linux, ProxyOnly routes child traffic from a separate network
-        // namespace through a veth pair. The child's loopback is isolated, so
-        // the TCP proxy and the DNS server listen on the host side of the
-        // veth. Create the veth first, then bind to its outer address only.
-        // Other hosts on the LAN cannot reach this address (the host firewall
-        // drops packets to it from other interfaces). spawn_sandboxed uses the
-        // prepared veth because proxy_addr is on its outer address.
-        #[cfg(target_os = "linux")]
-        {
-            let outer_ip = pent_sandbox::prepare_proxy_network()?;
-            let bind_addr = std::net::SocketAddr::new(std::net::IpAddr::V4(outer_ip), 0);
-            proxy_config.proxy_bind_addr = bind_addr;
-            proxy_config.dns_bind_addr = bind_addr;
-        }
-        let handle = ProxyServer::new(proxy_config)?.start().await?;
-        let proxy_addr = handle.proxy_addr();
-        let dns_port = handle.dns_addr().port();
-        tracing::debug!(
-            http_proxy = %format!("http://127.0.0.1:{}", proxy_addr.port()),
-            socks5_proxy = %format!("socks5h://127.0.0.1:{}", proxy_addr.port()),
-            dns = %handle.dns_addr(),
-            "proxy started (HTTP CONNECT + SOCKS5h on same port); DNS resolved server-side"
-        );
-        Ok(ProxySetup {
-            network: NetworkMode::ProxyOnly {
-                proxy_addr,
-                dns_port,
-            },
-            handle: Some(handle),
-            event_rx,
-        })
-    } else {
-        Ok(ProxySetup {
-            network: base_network,
-            handle: None,
-            event_rx: None,
-        })
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -1343,15 +1006,12 @@ mod tests {
 
     // ── resolve_network ──────────────────────────────────────────────────────
 
-    fn proxy_mode() -> NetworkMode {
-        NetworkMode::ProxyOnly {
-            proxy_addr: "127.0.0.1:0".parse().unwrap(),
-            dns_port: 0,
-        }
-    }
-
     fn domains() -> Vec<String> {
         vec!["example.com".to_string()]
+    }
+
+    fn profile_name() -> ProfileName {
+        "claude".parse().unwrap()
     }
 
     #[test]
@@ -1362,75 +1022,57 @@ mod tests {
             (NetworkModeArg::Proxy, NetworkChoice::Proxy),
             (NetworkModeArg::Blocked, NetworkChoice::Blocked),
         ];
-        let config_modes = [
-            None,
-            Some(NetworkMode::Unrestricted),
-            Some(NetworkMode::LocalhostOnly),
-            Some(proxy_mode()),
-            Some(NetworkMode::Blocked),
-        ];
         for (flag, expected) in flags {
-            for mode in &config_modes {
-                for allow in [vec![], domains()] {
-                    for config_allow in [vec![], domains()] {
-                        let d = resolve_network(Some(flag), &allow, mode.as_ref(), &config_allow);
-                        assert_eq!(
-                            d,
-                            NetworkDecision {
-                                choice: expected,
-                                source: NetworkSource::NetworkFlag
-                            },
-                            "flag {expected:?}, config {mode:?}, allow {allow:?}"
-                        );
-                    }
+            for allow in [vec![], domains()] {
+                for profile in [vec![], domains()] {
+                    let d = resolve_network(Some(flag), &allow, &profile);
+                    assert_eq!(
+                        d,
+                        NetworkDecision {
+                            choice: expected,
+                            source: NetworkSource::NetworkFlag
+                        },
+                        "flag {expected:?}, allow {allow:?}, profile {profile:?}"
+                    );
                 }
             }
         }
     }
 
     #[test]
-    fn allow_flag_wins_over_config() {
-        for mode in [
-            None,
-            Some(NetworkMode::Unrestricted),
-            Some(NetworkMode::LocalhostOnly),
-            Some(NetworkMode::Blocked),
-        ] {
-            let d = resolve_network(None, &domains(), mode.as_ref(), &[]);
-            assert_eq!(d.choice, NetworkChoice::Proxy, "config {mode:?}");
+    fn allow_flag_wins_over_profile() {
+        for profile in [vec![], domains()] {
+            let d = resolve_network(None, &domains(), &profile);
+            assert_eq!(d.choice, NetworkChoice::Proxy);
             assert_eq!(d.source, NetworkSource::AllowFlag);
         }
     }
 
     #[test]
-    fn config_mode_wins_over_config_allowlist() {
-        let cases = [
-            (NetworkMode::Unrestricted, NetworkChoice::Unrestricted),
-            (NetworkMode::LocalhostOnly, NetworkChoice::Localhost),
-            (proxy_mode(), NetworkChoice::Proxy),
-            (NetworkMode::Blocked, NetworkChoice::Blocked),
-        ];
-        for (mode, expected) in cases {
-            for config_allow in [vec![], domains()] {
-                let d = resolve_network(None, &[], Some(&mode), &config_allow);
-                assert_eq!(d.choice, expected, "config {mode:?}");
-                assert_eq!(d.source, NetworkSource::ConfigMode);
-            }
-        }
-    }
-
-    #[test]
-    fn config_allowlist_implies_proxy() {
-        let d = resolve_network(None, &[], None, &domains());
+    fn profile_domains_imply_proxy() {
+        let d = resolve_network(None, &[], &domains());
         assert_eq!(d.choice, NetworkChoice::Proxy);
-        assert_eq!(d.source, NetworkSource::ConfigAllowlist);
+        assert_eq!(d.source, NetworkSource::ProfileDomains);
     }
 
     #[test]
     fn default_is_blocked() {
-        let d = resolve_network(None, &[], None, &[]);
+        let d = resolve_network(None, &[], &[]);
         assert_eq!(d.choice, NetworkChoice::Blocked);
         assert_eq!(d.source, NetworkSource::Default);
+        assert_eq!(
+            base_network_mode(NetworkChoice::Proxy),
+            NetworkMode::Blocked
+        );
+    }
+
+    #[test]
+    fn merge_domains_keeps_order_without_duplicates() {
+        let merged = merge_domains(
+            &["a.com".to_string(), "b.com".to_string()],
+            &["b.com".to_string(), "c.com".to_string()],
+        );
+        assert_eq!(merged, vec!["a.com", "b.com", "c.com"]);
     }
 
     // ── network_warnings ─────────────────────────────────────────────────────
@@ -1442,57 +1084,91 @@ mod tests {
     #[test]
     fn warns_when_allow_is_ignored() {
         let d = decision(NetworkChoice::Blocked, NetworkSource::NetworkFlag);
-        let w = network_warnings(d, &domains(), false, Platform::Linux);
+        let w = network_warnings(d, &domains(), false);
         assert_eq!(w.len(), 1);
         assert!(w.iter().any(|m| m.contains("--allow has no effect")));
     }
 
     #[test]
-    fn warns_about_proxy_on_macos_only() {
-        let d = decision(NetworkChoice::Proxy, NetworkSource::ConfigAllowlist);
-        let mac = network_warnings(d, &[], false, Platform::MacOs);
-        assert!(mac.iter().any(|m| m.contains("unrestricted")), "{mac:?}");
-        let linux = network_warnings(d, &[], false, Platform::Linux);
-        assert!(linux.is_empty(), "{linux:?}");
+    fn no_warning_for_proxy_mode() {
+        let d = decision(NetworkChoice::Proxy, NetworkSource::ProfileDomains);
+        assert!(network_warnings(d, &[], false).is_empty());
+        assert!(network_warnings(d, &[], true).is_empty());
     }
 
     #[test]
-    fn trace_note_on_linux_without_proxy() {
+    fn trace_note_without_proxy() {
         let d = decision(NetworkChoice::Blocked, NetworkSource::Default);
-        let w = network_warnings(d, &[], true, Platform::Linux);
+        let w = network_warnings(d, &[], true);
         assert!(w.iter().any(|m| m.contains("only in proxy mode")), "{w:?}");
-        let proxy = decision(NetworkChoice::Proxy, NetworkSource::AllowFlag);
-        assert!(network_warnings(proxy, &domains(), true, Platform::Linux).is_empty());
-        assert!(network_warnings(d, &[], true, Platform::MacOs).is_empty());
     }
 
     #[test]
     fn blocked_hint_only_for_default() {
         let hint = network_status(&NetworkMode::Blocked, NetworkSource::Default);
-        assert!(hint.is_some_and(|h| h.contains("domain_allowlist")));
+        assert!(hint.is_some_and(|h| h.contains("no domains")));
         let explicit = network_status(&NetworkMode::Blocked, NetworkSource::NetworkFlag);
         assert_eq!(explicit, Some("blocked"));
     }
 
-    // ── trace log ────────────────────────────────────────────────────────────
+    // ── denied accesses ──────────────────────────────────────────────────────
 
     #[test]
-    fn root_is_a_broad_workspace() {
-        assert!(is_broad_workspace(Path::new("/")));
-        assert!(!is_broad_workspace(Path::new(
-            "/definitely/not/home/pent-test"
-        )));
+    fn denied_message_names_the_review_command() {
+        let n = profile_name();
+        assert_eq!(denied_message(0, &n), None);
+        assert_eq!(
+            denied_message(3, &n).as_deref(),
+            Some("3 accesses denied; review them: pent trust claude --review")
+        );
+        assert_eq!(
+            denied_message(1, &n).as_deref(),
+            Some("1 access denied; review it: pent trust claude --review")
+        );
     }
+
+    #[test]
+    fn denied_recorder_writes_distinct_denials_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore::new(pent_settings::PentDirs {
+            config: dir.path().join("c"),
+            state: dir.path().join("s"),
+        });
+        let n = profile_name();
+        let connect = |host: &str, outcome| WatchEvent::Connect {
+            host: host.to_string(),
+            port: 443,
+            protocol: pent_profile::NetProtocol::HttpConnect,
+            outcome,
+        };
+        {
+            let mut rec = DeniedRecorder::new(&store, &n);
+            rec.record(&connect("ok.com", Outcome::Allowed));
+            assert!(rec.summary().is_none());
+            assert!(!store.denied_path(&n).exists(), "no log without a denial");
+            rec.record(&connect("evil.com", Outcome::Denied));
+            rec.record(&connect("evil.com", Outcome::Denied));
+            rec.record(&connect("bad.com", Outcome::Denied));
+            assert!(rec
+                .summary()
+                .is_some_and(|m| m.starts_with("2 accesses denied")));
+        }
+        assert_eq!(store.read_denied(&n).unwrap().len(), 2);
+    }
+
+    // ── trace log ────────────────────────────────────────────────────────────
 
     #[test]
     fn proxy_fix_names_the_domain_for_connect() {
         let fix = proxy_violation_fix(
             "network: SOCKS5 connection to \"evil.example\" port 443 blocked: \
              the domain is not in the allowlist",
+            &profile_name(),
         );
-        assert!(
-            fix.contains("add \"evil.example\" to domain_allowlist"),
-            "{fix}"
+        assert_eq!(
+            fix,
+            "allow it for one run with --allow evil.example, or add it to the profile: \
+             pent trust claude --review"
         );
     }
 
@@ -1501,19 +1177,9 @@ mod tests {
         let fix = proxy_violation_fix(
             "network: CONNECT connection to \"intra.example\" port 443 blocked: \
              the domain resolves to the private address 10.0.0.5",
+            &profile_name(),
         );
         assert!(fix.contains("private_destinations"), "{fix}");
-    }
-
-    #[test]
-    fn proxy_fix_names_the_domain() {
-        let fix = proxy_violation_fix(
-            "network: DNS query for \"evil.example\" (A) blocked: the domain is not in the allowlist",
-        );
-        assert_eq!(
-            fix,
-            "add \"evil.example\" to domain_allowlist in the [proxy] section of your pent config"
-        );
     }
 
     #[test]
@@ -1533,12 +1199,7 @@ mod tests {
         );
     }
 
-    // ── exit status ──────────────────────────────────────────────────────────
-
-    #[test]
-    fn failed_wait_is_exit_code_one() {
-        assert_eq!(failed_wait_status().code(), Some(1));
-    }
+    // ── macOS log parsing ────────────────────────────────────────────────────
 
     // ── macOS log parsing ────────────────────────────────────────────────────
 
@@ -1633,25 +1294,42 @@ mod tests {
 
         #[test]
         fn fix_only_for_filesystem_operations() {
-            let read = denial_fix(&denial("file-read-data", "/a/f"), PathKind::NotDirectory);
+            let read = denial_fix(
+                &denial("file-read-data", "/a/f"),
+                PathKind::NotDirectory,
+                "claude",
+            );
             assert_eq!(
                 read.as_deref(),
-                Some("add \"/a/f\" to read in the [sandbox.paths] section of your pent config")
+                Some(
+                    "allow it for one run with --read \"/a/f\", \
+                     or add it to the profile: pent trust claude --review"
+                )
             );
-            let dir = denial_fix(&denial("file-read-data", "/a"), PathKind::Directory);
-            assert!(dir.is_some_and(|f| f.contains("traversal")));
-            let write = denial_fix(&denial("file-write-create", "/a/f"), PathKind::NotDirectory);
-            assert!(write.is_some_and(|f| f.contains(" read_write ")));
-            let exec = denial_fix(&denial("process-exec*", "/bin/x"), PathKind::NotDirectory);
-            assert!(exec.is_some_and(|f| f.contains(" execute ")));
+            let dir = denial_fix(&denial("file-read-data", "/a"), PathKind::Directory, "c");
+            assert!(dir.is_some_and(|f| f.contains("--traverse")));
+            let write = denial_fix(
+                &denial("file-write-create", "/a/f"),
+                PathKind::NotDirectory,
+                "c",
+            );
+            assert!(write.is_some_and(|f| f.contains(" --write ")));
+            let exec = denial_fix(
+                &denial("process-exec*", "/bin/x"),
+                PathKind::NotDirectory,
+                "c",
+            );
+            assert!(exec.is_some_and(|f| f.contains(" --execute ")));
             let net = denial_fix(
                 &denial("network-outbound", "/var/run/x.sock"),
                 PathKind::NotDirectory,
+                "c",
             );
             assert!(net.is_none());
             let mach = denial_fix(
                 &denial("mach-lookup", "com.apple.x"),
                 PathKind::NotDirectory,
+                "c",
             );
             assert!(mach.is_none());
         }

@@ -467,10 +467,9 @@ impl TryFrom<&pent_settings::ProxySettings> for ProxyConfig {
     type Error = ConfigError;
 
     fn try_from(settings: &pent_settings::ProxySettings) -> std::result::Result<Self, ConfigError> {
-        let mut config = Self {
-            domain_allowlist: settings.domain_allowlist.clone(),
-            ..Default::default()
-        };
+        // The domains come from the profile, not from the settings. The
+        // caller sets `domain_allowlist`.
+        let mut config = Self::default();
         if let Some(ttl) = settings.dns_ttl_seconds {
             config.dns_ttl = std::time::Duration::from_secs(u64::from(ttl));
         }

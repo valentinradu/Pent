@@ -499,7 +499,9 @@ dependencies = [
  "clap",
  "clap_mangen",
  "console",
+ "dirs",
  "libc",
+ "pent-profile",
  "pent-proxy",
  "pent-sandbox",
  "pent-settings",
@@ -554,7 +556,9 @@ name = "pent-settings"
 version = "0.0.5"
 dependencies = [
  "dirs",
+ "pent-profile",
  "serde",
+ "serde_json",
  "sha2",
  "tempfile",
  "thiserror 2.0.18",
