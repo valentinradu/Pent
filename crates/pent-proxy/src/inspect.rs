@@ -18,6 +18,7 @@
 //!   read, gets only the IP-cache check.
 
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
@@ -39,6 +40,59 @@ const TLS_MAX_RECORD_LEN: usize = 16_384 + 2_048;
 /// The maximum length of an HTTP request head that the proxy reads.
 pub(crate) const MAX_HTTP_HEAD_LEN: usize = 8_192;
 
+/// The usual port of TLS.
+const TLS_PORT_DEFAULT: u16 = 443;
+
+/// The usual port of HTTP.
+const HTTP_PORT_DEFAULT: u16 = 80;
+
+/// The ports where the proxy inspects the first bytes of the client.
+///
+/// The usual ports are the default. A test gives other ports, because an
+/// unprivileged process cannot bind a port below 1024.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct InspectPorts {
+    /// The port of TLS. The proxy reads the first TLS record there and
+    /// takes the host name from the SNI extension.
+    pub(crate) tls: u16,
+    /// The port of HTTP. The proxy reads the request head there and takes
+    /// the host name from the `Host` header.
+    pub(crate) http: u16,
+}
+
+impl Default for InspectPorts {
+    fn default() -> Self {
+        Self {
+            tls: TLS_PORT_DEFAULT,
+            http: HTTP_PORT_DEFAULT,
+        }
+    }
+}
+
+/// The port of TLS of this process.
+static TLS_PORT: AtomicU16 = AtomicU16::new(TLS_PORT_DEFAULT);
+
+/// The port of HTTP of this process.
+static HTTP_PORT: AtomicU16 = AtomicU16::new(HTTP_PORT_DEFAULT);
+
+/// The ports that the proxy inspects in this process.
+fn inspect_ports() -> InspectPorts {
+    InspectPorts {
+        tls: TLS_PORT.load(Ordering::Relaxed),
+        http: HTTP_PORT.load(Ordering::Relaxed),
+    }
+}
+
+/// Set the ports that the proxy inspects in this process.
+///
+/// Only a test calls this function. The proxy of a session keeps the usual
+/// ports, because [`crate::ProxyConfig`] has no setting for them yet.
+#[cfg(test)]
+fn set_inspect_ports(ports: InspectPorts) {
+    TLS_PORT.store(ports.tls, Ordering::Relaxed);
+    HTTP_PORT.store(ports.http, Ordering::Relaxed);
+}
+
 /// The protocol that the proxy expects on a tunnel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Inspect {
@@ -54,11 +108,21 @@ impl Inspect {
     /// The proxy inspects only ports where the client always sends data
     /// first. On other ports the proxy must not wait for client data,
     /// because the server can speak first.
-    pub(crate) const fn for_port(port: u16) -> Option<Self> {
-        match port {
-            443 => Some(Self::Tls),
-            80 => Some(Self::Http),
-            _ => None,
+    pub(crate) fn for_port(port: u16) -> Option<Self> {
+        Self::for_port_in(port, inspect_ports())
+    }
+
+    /// Select the inspection for a destination port and a set of ports.
+    ///
+    /// The port of TLS comes first: when the two ports of `ports` are the
+    /// same, the proxy reads a TLS record.
+    pub(crate) const fn for_port_in(port: u16, ports: InspectPorts) -> Option<Self> {
+        if port == ports.tls {
+            Some(Self::Tls)
+        } else if port == ports.http {
+            Some(Self::Http)
+        } else {
+            None
         }
     }
 
@@ -422,15 +486,160 @@ pub(crate) mod tests {
         drop(writer.await.unwrap());
     }
 
+    /// The lock of the ports of the process. A test that changes the ports
+    /// holds it, so that two tests do not see the ports of each other.
+    static PORT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The ports of the process, for one test. The drop gives the usual
+    /// ports back.
+    ///
+    /// The field holds the lock for the life of the guard. Nothing reads
+    /// it, thus the `allow`.
+    pub(crate) struct PortGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+    impl PortGuard {
+        /// Take the lock and set `ports`.
+        pub(crate) fn set(ports: InspectPorts) -> Self {
+            let lock = PORT_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            set_inspect_ports(ports);
+            Self(lock)
+        }
+    }
+
+    impl Drop for PortGuard {
+        fn drop(&mut self) {
+            set_inspect_ports(InspectPorts::default());
+        }
+    }
+
     /// The proxy inspects the host name on port 443 and on port 80. If this
     /// selection gives `None`, the proxy relays without any check of the SNI
     /// or of the `Host` header, and domain fronting works.
     #[test]
     fn inspection_runs_on_port_443_and_on_port_80() {
+        let _guard = PortGuard::set(InspectPorts::default());
         assert_eq!(Inspect::for_port(443), Some(Inspect::Tls));
         assert_eq!(Inspect::for_port(80), Some(Inspect::Http));
         assert_eq!(Inspect::for_port(8443), None);
         assert_eq!(Inspect::for_port(22), None);
+    }
+
+    /// The end-to-end proof against domain fronting: the client asks for a
+    /// host that the allowlist permits, and then it names another host in
+    /// the TLS record. The proxy must not relay the connection, and the
+    /// destination must get no byte of the client.
+    ///
+    /// The test needs a server on the port that the proxy inspects. An
+    /// unprivileged process cannot bind the port 443, thus the test sets
+    /// the port of the inspection to the port of its own server.
+    #[test]
+    fn the_proxy_does_not_relay_a_fronted_host() {
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let Ok(destination) = std::net::TcpListener::bind("127.0.0.1:0") else {
+            crate::test_support::skip("this machine cannot bind a TCP socket on the loopback");
+            return;
+        };
+        let Ok(dest_addr) = destination.local_addr() else {
+            crate::test_support::skip("this machine gives no address for a TCP listener");
+            return;
+        };
+        let _guard = PortGuard::set(InspectPorts {
+            tls: dest_addr.port(),
+            ..InspectPorts::default()
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a current thread runtime");
+
+        runtime.block_on(async move {
+            destination.set_nonblocking(true).unwrap();
+            let destination = tokio::net::TcpListener::from_std(destination).unwrap();
+
+            // The destination server: it sends what each connection gave it.
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let server = tokio::spawn(async move {
+                while let Ok((mut socket, _)) = destination.accept().await {
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        let mut got = Vec::new();
+                        let _ = socket.read_to_end(&mut got).await;
+                        let _ = tx.send(got);
+                    });
+                }
+            });
+
+            // The proxy: "localhost" is the only name of the allowlist.
+            let state = Arc::new(crate::SharedState::new(vec!["localhost".to_string()]));
+            let config = crate::TcpProxyConfig {
+                private_destinations: crate::PrivateDestinations::Allow,
+                ..crate::TcpProxyConfig::default()
+            };
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_addr = listener.local_addr().unwrap();
+            let proxy = crate::TcpProxy::new(config, state).unwrap();
+            let proxy_task = tokio::spawn(async move { proxy.run_on(listener).await });
+
+            // Ask for "localhost", then send the first TLS record.
+            async fn tunnel(proxy: SocketAddr, port: u16, hello: &[u8]) {
+                let mut client = tokio::net::TcpStream::connect(proxy).await.unwrap();
+                let request = format!("CONNECT localhost:{port} HTTP/1.1\r\n\r\n");
+                client.write_all(request.as_bytes()).await.unwrap();
+                let mut head = [0u8; 12];
+                client.read_exact(&mut head).await.unwrap();
+                assert_eq!(&head, b"HTTP/1.1 200", "the proxy refused the tunnel");
+                client.write_all(hello).await.unwrap();
+                // The client goes away. The destination then reads the end
+                // of its connection, also when the proxy relayed the data.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+
+            async fn next(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>) -> Vec<u8> {
+                tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                    .await
+                    .expect("the destination got no connection")
+                    .expect("the destination server ended")
+            }
+
+            // The fronted host: the destination must get nothing.
+            let fronted = client_hello(Some("evil.example"));
+            tunnel(proxy_addr, dest_addr.port(), &fronted).await;
+            assert_eq!(
+                next(&mut rx).await,
+                Vec::<u8>::new(),
+                "the proxy relayed a fronted host"
+            );
+
+            // The same path with the host of the allowlist: the data goes
+            // through. Without this the test would also pass with a proxy
+            // that relays nothing.
+            let allowed = client_hello(Some("localhost"));
+            tunnel(proxy_addr, dest_addr.port(), &allowed).await;
+            assert_eq!(next(&mut rx).await, allowed);
+
+            proxy_task.abort();
+            server.abort();
+        });
+    }
+
+    /// The ports come from a value, thus a test can inspect another port.
+    /// The usual ports stay the default.
+    #[test]
+    fn the_ports_of_the_inspection_come_from_a_value() {
+        assert_eq!(InspectPorts::default(), InspectPorts { tls: 443, http: 80 });
+        let ports = InspectPorts {
+            tls: 18_443,
+            http: 18_080,
+        };
+        assert_eq!(Inspect::for_port_in(18_443, ports), Some(Inspect::Tls));
+        assert_eq!(Inspect::for_port_in(18_080, ports), Some(Inspect::Http));
+        assert_eq!(Inspect::for_port_in(443, ports), None);
+        assert_eq!(Inspect::for_port_in(80, ports), None);
     }
 
     /// A real ClientHello is longer than 255 bytes, so the 24-bit length of
