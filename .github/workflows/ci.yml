@@ -152,11 +152,29 @@ jobs:
       # seccomp and AppArmor profiles of Docker block unshare(2). The
       # overlay upper layers of pent are in /tmp, which must not be on
       # overlayfs: thus /tmp is a tmpfs.
-      - name: Run e2e tests
+      # Run 1: the masks of the container runtime stay. The kernel then
+      # refuses a private /proc, and pent gives up the PID namespace with a
+      # warning. This run proves that pent works in an ordinary container.
+      - name: Run e2e tests (the masks of the runtime stay)
         run: |
           docker run --rm \
             --security-opt seccomp=unconfined \
             --security-opt apparmor=unconfined \
+            --tmpfs /tmp:exec,mode=1777 \
+            --env PENT_REQUIRE_ALL_TESTS=1 \
+            pent-test
+
+      # Run 2: the same image with no mask below /proc. The kernel then
+      # permits a private /proc, so pent keeps the PID namespace and the
+      # containment of LS-3 holds inside a container too. Without this run
+      # the pipeline would only prove that pent gives up gracefully, never
+      # that the protection works where the kernel allows it.
+      - name: Run e2e tests (no mask below /proc)
+        run: |
+          docker run --rm \
+            --security-opt seccomp=unconfined \
+            --security-opt apparmor=unconfined \
+            --security-opt systempaths=unconfined \
             --tmpfs /tmp:exec,mode=1777 \
             --env PENT_REQUIRE_ALL_TESTS=1 \
             pent-test
