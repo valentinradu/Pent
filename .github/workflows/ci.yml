@@ -62,6 +62,392 @@ jobs:
           clang --version | head -1 || true
           ls -l /usr/bin/sandbox-exec /usr/bin/log /usr/bin/logger || true
 
+      # TEMPORARY. The measurement of MAC-10 and MAC-12 on a runner.
+      # It must come before every other step that touches the unified
+      # log, because MAC-12 shows only on the first `log stream` of a
+      # machine. Remove this step with the fix.
+      - name: Measure MAC-10 and MAC-12 (temporary)
+        if: runner.os == 'macOS'
+        run: |
+          cat > "$RUNNER_TEMP/measure.c" <<'PENT_MEASURE_EOF'
+          /* The measurement of MAC-10 and MAC-12 on a macOS runner.
+           *
+           * It must be the FIRST step of the job that touches the unified log,
+           * because MAC-12 shows only on the first `log stream` of a machine.
+           */
+          #include <errno.h>
+          #include <fcntl.h>
+          #include <signal.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <time.h>
+          #include <unistd.h>
+
+          #include <sys/proc.h>
+          #include <sys/resource.h>
+          #include <sys/select.h>
+          #include <sys/stat.h>
+          #include <sys/sysctl.h>
+          #include <sys/types.h>
+          #include <sys/wait.h>
+
+          /* Declared here, so that the build does not depend on the SDK
+           * header that holds it. */
+          extern int proc_listchildpids(pid_t ppid, void *buffer, int buffersize);
+          
+          #define PREDICATE                                                              \
+            "processImagePath == \"/kernel\" AND (sender == \"Sandbox\" OR "             \
+            "eventMessage BEGINSWITH \"Sandbox: \")"
+
+          static double now_ms(void) {
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+          }
+
+          static double cpu_ms(const struct rusage *a, const struct rusage *b) {
+            double u = (double)(a->ru_utime.tv_sec - b->ru_utime.tv_sec) * 1000.0 +
+                       (double)(a->ru_utime.tv_usec - b->ru_utime.tv_usec) / 1000.0;
+            double s = (double)(a->ru_stime.tv_sec - b->ru_stime.tv_sec) * 1000.0 +
+                       (double)(a->ru_stime.tv_usec - b->ru_stime.tv_usec) / 1000.0;
+            return u + s;
+          }
+
+          static struct kinfo_proc *snap(size_t *count) {
+            int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
+            size_t len = 0;
+            if (sysctl(mib, 4, NULL, &len, NULL, 0) < 0)
+              return NULL;
+            len += len / 8 + 65536;
+            struct kinfo_proc *buf = (struct kinfo_proc *)malloc(len);
+            if (!buf)
+              return NULL;
+            if (sysctl(mib, 4, buf, &len, NULL, 0) < 0) {
+              free(buf);
+              return NULL;
+            }
+            *count = len / sizeof(struct kinfo_proc);
+            return buf;
+          }
+
+          typedef struct {
+            int fd;
+            pid_t pid;
+            char buf[262144];
+            size_t used;
+          } LineReader;
+
+          static int spawn_log(LineReader *r) {
+            int p[2];
+            if (pipe(p) < 0)
+              return -1;
+            pid_t pid = fork();
+            if (pid < 0) {
+              close(p[0]);
+              close(p[1]);
+              return -1;
+            }
+            if (pid == 0) {
+              close(p[0]);
+              dup2(p[1], 1);
+              int devnull = open("/dev/null", O_RDWR);
+              dup2(devnull, 0);
+              dup2(devnull, 2);
+              close(p[1]);
+              execl("/usr/bin/log", "log", "stream", "--predicate", PREDICATE, "--style",
+                    "syslog", (char *)NULL);
+              _exit(127);
+            }
+            close(p[1]);
+            r->fd = p[0];
+            r->pid = pid;
+            r->used = 0;
+            return 0;
+          }
+
+          static void stop_log(LineReader *r) {
+            kill(r->pid, SIGKILL);
+            waitpid(r->pid, NULL, 0);
+            close(r->fd);
+          }
+
+          /* Return 1 and fill out when a whole line arrives before deadline. */
+          static int next_line(LineReader *r, char *out, size_t outn, double deadline) {
+            for (;;) {
+              char *nl = (char *)memchr(r->buf, '\n', r->used);
+              if (nl) {
+                size_t n = (size_t)(nl - r->buf);
+                size_t copy = n < outn - 1 ? n : outn - 1;
+                memcpy(out, r->buf, copy);
+                out[copy] = 0;
+                memmove(r->buf, nl + 1, r->used - n - 1);
+                r->used -= n + 1;
+                return 1;
+              }
+              double left = deadline - now_ms();
+              if (left <= 0)
+                return 0;
+              struct timeval tv;
+              tv.tv_sec = (time_t)(left / 1000.0);
+              tv.tv_usec = (suseconds_t)((left - (double)tv.tv_sec * 1000.0) * 1000.0);
+              fd_set set;
+              FD_ZERO(&set);
+              FD_SET(r->fd, &set);
+              int rc = select(r->fd + 1, &set, NULL, NULL, &tv);
+              if (rc <= 0)
+                return 0;
+              if (r->used >= sizeof r->buf - 1)
+                r->used = 0;
+              ssize_t got = read(r->fd, r->buf + r->used, sizeof r->buf - r->used);
+              if (got <= 0)
+                return 0;
+              r->used += (size_t)got;
+            }
+          }
+
+          static void write_file(const char *path, const char *text) {
+            FILE *f = fopen(path, "w");
+            if (f) {
+              fputs(text, f);
+              fclose(f);
+            }
+          }
+
+          /* One round of MAC-12: start a log stream, then make one allow report and
+           * one deny report, and measure when each arrives. */
+          static void warm_round(int round) {
+            char marker[64], dir[192], adir[256], ddir[256];
+            char afile[320], dfile[320], prof[320], line[8192];
+            snprintf(marker, sizeof marker, "pentwarm-%d-%d", (int)getpid(), round);
+            snprintf(dir, sizeof dir, "/private/tmp/%s", marker);
+            snprintf(adir, sizeof adir, "%s/a", dir);
+            snprintf(ddir, sizeof ddir, "%s/d", dir);
+            mkdir(dir, 0755);
+            mkdir(adir, 0755);
+            mkdir(ddir, 0755);
+            snprintf(afile, sizeof afile, "%s/probe.txt", adir);
+            snprintf(dfile, sizeof dfile, "%s/probe.txt", ddir);
+            write_file(afile, "a\n");
+            write_file(dfile, "d\n");
+            snprintf(prof, sizeof prof, "%s/p.sb", dir);
+            {
+              FILE *f = fopen(prof, "w");
+              if (f) {
+                fprintf(f,
+                        "(version 1)\n(allow default)\n"
+                        "(allow file-read-data (subpath \"%s\") (with report))\n"
+                        "(deny file-read-data (subpath \"%s\"))\n",
+                        adir, ddir);
+                fclose(f);
+              }
+            }
+
+            LineReader r;
+            double t0 = now_ms();
+            if (spawn_log(&r) < 0) {
+              printf("round %d: log stream did not start\n", round);
+              return;
+            }
+            double t_header = -1;
+            if (next_line(&r, line, sizeof line, t0 + 15000))
+              t_header = now_ms() - t0;
+
+            double t_spawn = now_ms();
+            char shell[1200];
+            snprintf(shell, sizeof shell, "cat %s >/dev/null 2>&1; cat %s >/dev/null 2>&1",
+                     afile, dfile);
+            pid_t pid = fork();
+            if (pid == 0) {
+              int devnull = open("/dev/null", O_WRONLY);
+              dup2(devnull, 1);
+              dup2(devnull, 2);
+              execl("/usr/bin/sandbox-exec", "sandbox-exec", "-f", prof, "/bin/sh", "-c",
+                    shell, (char *)NULL);
+              _exit(127);
+            }
+            int st = 0;
+            if (pid > 0)
+              waitpid(pid, &st, 0);
+            double t_done = now_ms() - t_spawn;
+
+            char amark[256], dmark[256];
+            snprintf(amark, sizeof amark, "%s/a/probe.txt", marker);
+            snprintf(dmark, sizeof dmark, "%s/d/probe.txt", marker);
+            double a_at = -1, d_at = -1;
+            double deadline = t_spawn + 30000;
+            int lines = 0;
+            while ((a_at < 0 || d_at < 0) && next_line(&r, line, sizeof line, deadline)) {
+              lines++;
+              if (a_at < 0 && strstr(line, amark))
+                a_at = now_ms() - t_spawn;
+              if (d_at < 0 && strstr(line, dmark))
+                d_at = now_ms() - t_spawn;
+            }
+            printf("MAC12 round %d: header %.0f ms, probe exit %d after %.0f ms, "
+                   "allow report %.0f ms, deny report %.0f ms, %d lines\n",
+                   round, t_header, st, t_done, a_at, d_at, lines);
+            fflush(stdout);
+            stop_log(&r);
+          }
+
+          static void sysctl_cost(int rounds) {
+            size_t n = 0;
+            struct kinfo_proc *b = snap(&n);
+            size_t procs = n;
+            free(b);
+            struct rusage before, after;
+            getrusage(RUSAGE_SELF, &before);
+            double t = now_ms();
+            for (int i = 0; i < rounds; i++) {
+              b = snap(&n);
+              free(b);
+            }
+            double wall = (now_ms() - t) / rounds;
+            getrusage(RUSAGE_SELF, &after);
+            printf("sysctl KERN_PROC_ALL: %zu processes, %.3f ms wall, %.3f ms cpu "
+                   "per call\n",
+                   procs, wall, cpu_ms(&after, &before) / rounds);
+            fflush(stdout);
+          }
+
+          static void listchildren_cost(int rounds) {
+            pid_t kids[512];
+            struct rusage before, after;
+            getrusage(RUSAGE_SELF, &before);
+            double t = now_ms();
+            int last = 0;
+            for (int i = 0; i < rounds; i++)
+              last = proc_listchildpids(getpid(), kids, (int)sizeof kids);
+            double wall = (now_ms() - t) / rounds;
+            getrusage(RUSAGE_SELF, &after);
+            printf("proc_listchildpids: answer %d, %.4f ms wall, %.4f ms cpu per call\n",
+                   last, wall, cpu_ms(&after, &before) / rounds);
+            fflush(stdout);
+          }
+
+          static void ps_cost(int rounds) {
+            struct rusage before, after;
+            getrusage(RUSAGE_CHILDREN, &before);
+            double t = now_ms();
+            for (int i = 0; i < rounds; i++) {
+              pid_t pid = fork();
+              if (pid == 0) {
+                int devnull = open("/dev/null", O_WRONLY);
+                dup2(devnull, 1);
+                dup2(devnull, 2);
+                execl("/bin/ps", "ps", "-A", "-o", "pid=,ppid=,stat=,comm=",
+                      (char *)NULL);
+                _exit(127);
+              }
+              waitpid(pid, NULL, 0);
+            }
+            double wall = (now_ms() - t) / rounds;
+            getrusage(RUSAGE_CHILDREN, &after);
+            printf("fork of ps: %.3f ms wall, %.3f ms child cpu per call\n", wall,
+                   cpu_ms(&after, &before) / rounds);
+            fflush(stdout);
+          }
+
+          static void poll_cost(int interval_ms, int seconds) {
+            struct rusage before, after;
+            getrusage(RUSAGE_SELF, &before);
+            double end = now_ms() + seconds * 1000.0;
+            int polls = 0;
+            while (now_ms() < end) {
+              size_t n = 0;
+              struct kinfo_proc *b = snap(&n);
+              free(b);
+              polls++;
+              struct timespec ts = {0, (long)interval_ms * 1000000L};
+              nanosleep(&ts, NULL);
+            }
+            getrusage(RUSAGE_SELF, &after);
+            double cpu = cpu_ms(&after, &before);
+            printf("a poll of %d ms for %d s: %d polls, %.0f ms cpu (%.1f%% of one "
+                   "core)\n",
+                   interval_ms, seconds, polls, cpu, cpu / (seconds * 1000.0) * 100.0);
+            fflush(stdout);
+          }
+
+          /* How often a poll of `interval_ms` sees the short-lived child of
+           * `sh -c 'cat FILE; echo END'`. */
+          static void catch_rate(int interval_ms, int rounds) {
+            char file[256];
+            snprintf(file, sizeof file, "/private/tmp/pentcatch-%d.txt", (int)getpid());
+            write_file(file, "x\n");
+            char shell[512];
+            snprintf(shell, sizeof shell, "cat %s >/dev/null; echo END >/dev/null", file);
+            int seen = 0, named = 0;
+            for (int i = 0; i < rounds; i++) {
+              pid_t pid = fork();
+              if (pid == 0) {
+                int devnull = open("/dev/null", O_WRONLY);
+                dup2(devnull, 1);
+                dup2(devnull, 2);
+                execl("/bin/sh", "sh", "-c", shell, (char *)NULL);
+                _exit(127);
+              }
+              /* A real poll is not synchronised with the fork: start at a random
+               * phase of the interval. */
+              usleep((useconds_t)(rand() % (interval_ms * 1000)));
+              int found = 0, found_named = 0;
+              for (;;) {
+                size_t n = 0;
+                struct kinfo_proc *b = snap(&n);
+                if (b) {
+                  for (size_t k = 0; k < n; k++) {
+                    if (b[k].kp_eproc.e_ppid == pid) {
+                      found = 1;
+                      if (strncmp(b[k].kp_proc.p_comm, "cat", 4) == 0)
+                        found_named = 1;
+                    }
+                  }
+                  free(b);
+                }
+                if (waitpid(pid, NULL, WNOHANG) == pid)
+                  break;
+                struct timespec ts = {interval_ms / 1000,
+                                      (long)(interval_ms % 1000) * 1000000L};
+                nanosleep(&ts, NULL);
+              }
+              if (found)
+                seen++;
+              if (found_named)
+                named++;
+            }
+            printf("a poll of %3d ms: the table held the forked child in %2d of %d "
+                   "runs, with the name cat in %2d\n",
+                   interval_ms, seen, rounds, named);
+            fflush(stdout);
+          }
+
+          int main(void) {
+            srand(1);
+            printf("=== MAC-12: the first log stream of this machine ===\n");
+            fflush(stdout);
+            for (int round = 0; round < 3; round++)
+              warm_round(round);
+            printf("=== MAC-10: the cost of a snapshot ===\n");
+            fflush(stdout);
+            sysctl_cost(200);
+            listchildren_cost(2000);
+            ps_cost(20);
+            poll_cost(100, 2);
+            poll_cost(10, 2);
+            poll_cost(5, 2);
+            printf("=== MAC-10: the window of the fork ===\n");
+            fflush(stdout);
+            catch_rate(100, 40);
+            catch_rate(10, 40);
+            catch_rate(5, 40);
+            catch_rate(2, 40);
+            return 0;
+          }
+          PENT_MEASURE_EOF
+          clang -O2 -o "$RUNNER_TEMP/measure" "$RUNNER_TEMP/measure.c"
+          "$RUNNER_TEMP/measure"
+
       # Ubuntu 24.04 limits unprivileged user namespaces with AppArmor. Pent
       # needs them. Without this step every sandbox test skips, and the job
       # proves nothing.
