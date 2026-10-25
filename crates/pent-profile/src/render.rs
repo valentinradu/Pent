@@ -978,7 +978,10 @@ Network
             &doc,
             &Reasons::from_draft(earlier),
         );
-        assert!(matches!(ProfileDoc::parse(&text), Ok(p) if p == doc), "{text}");
+        assert!(
+            matches!(ProfileDoc::parse(&text), Ok(p) if p == doc),
+            "{text}"
+        );
         assert!(text.contains("# one two [31m\n"), "{text}");
         Ok(())
     }

@@ -132,7 +132,14 @@ pub fn classify(rules: &[GuardRule], path: &Path, access: GuardAccess) -> Option
 /// name: `ssh-keygen -f github_rsa` and a downloaded `work.pem` are private
 /// keys too. The public key has the suffix `.pub`, which the rule excludes.
 const SSH_KEY_PATTERNS: &[&str] = &[
-    "id_", "*_rsa", "*_dsa", "*_ecdsa", "*_ed25519", "*_key", "*.pem", "*.key",
+    "id_",
+    "*_rsa",
+    "*_dsa",
+    "*_ecdsa",
+    "*_ed25519",
+    "*_key",
+    "*.pem",
+    "*.key",
 ];
 
 /// The directories of the Python user site. A `.pth` file and

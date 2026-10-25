@@ -206,12 +206,7 @@ const FORMER_SUFFIXES: &[&str] = &[
 ///
 /// The public suffix list writes such a platform with a wildcard rule
 /// (`*.replit.dev`, `*.azurecontainer.io`, `*.airflow.<region>.on.aws`).
-const NO_WILDCARD_BELOW: &[&str] = &[
-    "amazonaws.com",
-    "on.aws",
-    "azurecontainer.io",
-    "replit.dev",
-];
+const NO_WILDCARD_BELOW: &[&str] = &["amazonaws.com", "on.aws", "azurecontainer.io", "replit.dev"];
 
 /// Return the byte offsets where each suffix of `name` starts: 0, then the
 /// offset after each dot.
@@ -229,9 +224,7 @@ pub fn public_suffix(name: &str) -> &str {
     // The first match is the longest suffix, because the offsets grow.
     suffix_starts(name)
         .filter_map(|start| name.get(start..))
-        .find(|suffix| {
-            MULTI_LABEL_SUFFIXES.contains(suffix) || FORMER_SUFFIXES.contains(suffix)
-        })
+        .find(|suffix| MULTI_LABEL_SUFFIXES.contains(suffix) || FORMER_SUFFIXES.contains(suffix))
         .unwrap_or_else(|| name.rsplit('.').next().unwrap_or(name))
 }
 

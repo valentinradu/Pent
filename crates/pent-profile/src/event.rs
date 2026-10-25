@@ -293,9 +293,7 @@ mod tests {
     #[test]
     fn a_path_that_is_not_utf8_round_trips() -> Result<(), serde_json::Error> {
         use std::os::unix::ffi::OsStringExt as _;
-        let path = PathBuf::from(std::ffi::OsString::from_vec(
-            b"/home/u/\xff\xfe/x".to_vec(),
-        ));
+        let path = PathBuf::from(std::ffi::OsString::from_vec(b"/home/u/\xff\xfe/x".to_vec()));
         let event = WatchEvent::Fs {
             op: FsOp::Read,
             path,

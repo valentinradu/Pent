@@ -7,22 +7,26 @@
 //!
 //! # Example
 //!
-//! ```ignore
-//! use pent_sandbox::{SandboxConfig, SandboxPaths, spawn_sandboxed};
+//! ```no_run
+//! # fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! use pent_sandbox::{build_env, spawn_sandboxed, SandboxConfig, SandboxPaths};
 //!
 //! let paths = SandboxPaths {
-//!     traversal: vec!["/".to_string(), "/Users".to_string()],
+//!     traversal: vec!["/".to_string()],
 //!     read: vec!["/usr/lib".to_string()],
+//!     execute: vec!["/usr/bin".to_string()],
 //!     read_write: vec!["/tmp".to_string()],
 //! };
 //!
-//! let config = SandboxConfig::new(
-//!     "/home/user/project".into(),
-//!     paths,
-//!     "/home/user/project".into(),
-//! ).with_env(build_env(&[]));
+//! let workspace = std::path::PathBuf::from("/home/user/project");
+//! let config = SandboxConfig::new(workspace.clone(), paths, workspace)
+//!     .with_env(build_env(&[]));
 //!
-//! let child = spawn_sandboxed(&config, "my-process", &[])?;
+//! let mut child = spawn_sandboxed(&config, "my-process", &[])?;
+//! let status = child.child.wait()?;
+//! # let _ = status;
+//! # Ok(())
+//! # }
 //! ```
 
 mod config;

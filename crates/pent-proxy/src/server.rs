@@ -427,11 +427,19 @@ impl ProxyServer {
     ///   valid (for example, if it contains characters that are not ASCII).
     ///
     /// # Example
-    /// ```ignore
-    /// let server = ProxyServer::new(ProxyConfig::default())?;
-    /// let handle = server.start().await?;
-    /// // ... later ...
+    /// ```no_run
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// use pent_proxy::{ProxyConfig, ProxyServer};
+    ///
+    /// let config = ProxyConfig {
+    ///     domain_allowlist: vec!["*.github.com".to_string()],
+    ///     ..ProxyConfig::default()
+    /// };
+    /// let handle = ProxyServer::new(config)?.start().await?;
+    /// // ... the sandboxed process uses the proxy ...
     /// handle.shutdown().await?;
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn new(config: ProxyConfig) -> Result<Self> {
         let state = Arc::new(

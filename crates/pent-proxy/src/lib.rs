@@ -33,20 +33,23 @@
 //!
 //! # Usage
 //!
-//! ```ignore
-//! use pent_proxy::{ProxyServer, ProxyConfig};
+//! ```no_run
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! use pent_proxy::{ProxyConfig, ProxyServer};
 //!
 //! let config = ProxyConfig {
-//!     bind_addr: "127.0.0.1:9300".parse()?,
-//!     dns_port: 5353,
 //!     domain_allowlist: vec![
 //!         "api.anthropic.com".to_string(),
 //!         "*.github.com".to_string(),
 //!     ],
+//!     ..ProxyConfig::default()
 //! };
 //!
-//! let server = ProxyServer::new(config)?;
-//! server.run().await?;
+//! let handle = ProxyServer::new(config)?.start().await?;
+//! println!("the proxy listens on {:?}", handle.proxy_addr());
+//! handle.shutdown().await?;
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! # Security Model

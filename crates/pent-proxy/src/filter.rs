@@ -309,11 +309,22 @@ impl DomainFilter {
     /// * `allowlist` - List of allowed domain patterns
     ///
     /// # Example
-    /// ```ignore
+    /// ```
+    /// use pent_proxy::{DomainFilter, DomainMatch};
+    ///
     /// let filter = DomainFilter::new(&[
     ///     "api.anthropic.com".to_string(),
     ///     "*.github.com".to_string(),
     /// ]);
+    /// assert!(matches!(
+    ///     filter.matches("api.anthropic.com"),
+    ///     DomainMatch::Exact(_)
+    /// ));
+    /// assert!(matches!(
+    ///     filter.matches("raw.github.com"),
+    ///     DomainMatch::Wildcard { .. }
+    /// ));
+    /// assert!(matches!(filter.matches("example.com"), DomainMatch::Blocked));
     /// ```
     #[must_use]
     pub fn new(allowlist: &[String]) -> Self {

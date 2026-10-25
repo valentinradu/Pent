@@ -67,9 +67,7 @@ impl Harness {
         let draft = h.state.join("pent/drafts").join(format!("{name}.toml"));
         std::fs::create_dir_all(draft.parent().unwrap())?;
         std::fs::write(&draft, profile_toml)?;
-        let out = h
-            .command(&[PENT, "trust", name, "--yes"])
-            .output()?;
+        let out = h.command(&[PENT, "trust", name, "--yes"]).output()?;
         if !out.status.success() {
             return Err(std::io::Error::other(format!(
                 "pent trust {name} failed: {}",
@@ -421,10 +419,7 @@ fn test_tmp_not_shared_with_host() -> TestResult {
     std::fs::write(&victim, "HOST_TMP_DATA")?;
     let script = h.script(
         "probe.sh",
-        &format!(
-            "cat '{v}'\necho TAMPERED > '{v}'\n",
-            v = victim.display()
-        ),
+        &format!("cat '{v}'\necho TAMPERED > '{v}'\n", v = victim.display()),
     )?;
     let out = h.run(&["sh", script.to_str().unwrap()])?;
     let after = std::fs::read_to_string(&victim).unwrap_or_default();
@@ -545,7 +540,14 @@ fn test_workspace_under_tmp_still_works() -> TestResult {
     let _ = std::fs::remove_dir_all(&ws);
     std::fs::create_dir_all(&ws)?;
     std::fs::write(ws.join("input"), "WORKSPACE_DATA")?;
-    let mut cmd = h.command(&[PENT, "run", "--", "sh", "-c", "cat input; echo OUT > output"]);
+    let mut cmd = h.command(&[
+        PENT,
+        "run",
+        "--",
+        "sh",
+        "-c",
+        "cat input; echo OUT > output",
+    ]);
     cmd.current_dir(&ws);
     let out = cmd.output()?;
     let written = std::fs::read_to_string(ws.join("output")).unwrap_or_default();

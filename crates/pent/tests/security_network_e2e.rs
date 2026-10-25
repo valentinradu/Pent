@@ -185,7 +185,10 @@ except OSError as e:
     );
     let out = run_sandboxed(&xdg, &script)?;
     let text = out_text(&out);
-    assert!(text.contains("BLOCKED"), "the child reached host loopback:\n{text}");
+    assert!(
+        text.contains("BLOCKED"),
+        "the child reached host loopback:\n{text}"
+    );
     assert!(
         rx.recv_timeout(Duration::from_millis(200)).is_err(),
         "the victim accepted a connection from the child"

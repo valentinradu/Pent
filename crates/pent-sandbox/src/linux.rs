@@ -406,9 +406,9 @@ pub fn check_user_namespaces() -> Result<(), SandboxError> {
     if pid == 0 {
         // SAFETY: unshare(2) with integer flags.
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-        let ok = unsafe {
-            libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET | libc::CLONE_NEWPID)
-        } == 0;
+        let ok =
+            unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET | libc::CLONE_NEWPID) }
+                == 0;
         let code = if ok {
             0
         } else {
@@ -796,12 +796,8 @@ static SUPERVISED_PID: AtomicI32 = AtomicI32::new(0);
 /// process group. A process group holds its members across a PID namespace,
 /// so the command gets these signals directly and needs no relay. The other
 /// signals come from `kill`, and pent sends them to the direct child.
-const FORWARDED_SIGNALS: [libc::c_int; 4] = [
-    libc::SIGTERM,
-    libc::SIGHUP,
-    libc::SIGUSR1,
-    libc::SIGUSR2,
-];
+const FORWARDED_SIGNALS: [libc::c_int; 4] =
+    [libc::SIGTERM, libc::SIGHUP, libc::SIGUSR1, libc::SIGUSR2];
 
 /// Pass the signal to the supervised process. Async-signal-safe.
 extern "C" fn forward_signal(sig: libc::c_int) {
@@ -840,7 +836,10 @@ fn install_signal_forwarders() {
 /// parent reads that pipe until every copy of it is closed, and it holds
 /// the spawn until then. Async-signal-safe.
 fn close_inherited_fds(keep: libc::c_int) {
-    let ranges = [(3, keep.saturating_sub(1)), (keep.saturating_add(1), i32::MAX)];
+    let ranges = [
+        (3, keep.saturating_sub(1)),
+        (keep.saturating_add(1), i32::MAX),
+    ];
     let mut ok = true;
     for (first, last) in ranges {
         if first > last {
@@ -2233,7 +2232,8 @@ pub(crate) fn spawn_linux(
     // The private temporary and runtime directories. The child keeps the
     // overlay mount points and the write targets of the guard, because a
     // mount needs a target that exists.
-    let mut keep_private: Vec<PathBuf> = overlay_mounts.iter().map(|m| m.real_dir.clone()).collect();
+    let mut keep_private: Vec<PathBuf> =
+        overlay_mounts.iter().map(|m| m.real_dir.clone()).collect();
     if let Some(plan) = guard {
         keep_private.extend(plan.ro_binds.iter().cloned());
     }
