@@ -1755,6 +1755,29 @@ mod tests {
         );
     }
 
+    /// A normal rule must never give access to a path that the summary
+    /// calls blocked. The review selects a normal rule by default, thus
+    /// such a rule would give the program the credential that the guard
+    /// stopped.
+    #[test]
+    fn a_normal_rule_that_covers_a_blocked_path_goes_away() {
+        let mut events = vec![blocked(
+            Read,
+            "/home/u/.tool/secret.key",
+            "tool",
+            GuardClass::Credential,
+        )];
+        // Four reads in the same directory give a rule on the directory,
+        // and that rule holds the blocked file too.
+        for file in ["a", "b", "c", "d"] {
+            events.push(fs(Read, &format!("/home/u/.tool/{file}"), "tool"));
+        }
+        assert_eq!(
+            run(&events),
+            vec!["blocked Read ~/.tool/secret.key | tool (Credential)"]
+        );
+    }
+
     #[test]
     fn wildcards_need_three_names_and_never_use_a_public_suffix() {
         let events = [
