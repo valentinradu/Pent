@@ -97,11 +97,10 @@ pub(crate) fn summarize_review_and_draft(
         existing: existing.clone(),
     };
     let summary = summarize(events, &ctx);
-    let runs = match origin {
-        DraftSource::WatchRuns(runs) => runs,
-        DraftSource::DeniedReview => 1,
+    let header = WatchHeader {
+        name,
+        source: origin,
     };
-    let header = WatchHeader { name, runs };
 
     // With a terminal, the review shows the items itself, so pent prints only
     // the header first. Without a terminal, pent prints the full summary.

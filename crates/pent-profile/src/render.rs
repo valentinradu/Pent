@@ -34,8 +34,9 @@ pub(crate) const SECTIONS: [Section; 5] = [
 pub struct WatchHeader<'a> {
     /// The profile name.
     pub name: &'a ProfileName,
-    /// The number of watch runs in the summary (more than 1 with `--append`).
-    pub runs: usize,
+    /// Where the events come from. A review of denied accesses has
+    /// [`DraftSource::DeniedReview`].
+    pub source: DraftSource,
 }
 
 /// Return the title of a section.
@@ -166,9 +167,16 @@ pub(crate) fn plural(n: usize, one: &str, many: &str) -> String {
 #[must_use]
 pub fn render_header(summary: &Summary, header: &WatchHeader<'_>) -> String {
     let mut out = String::new();
-    out.push_str(&format!("pent watch: {}", header.name));
-    if header.runs > 1 {
-        out.push_str(&format!(" ({} runs)", format_count(header.runs)));
+    match header.source {
+        DraftSource::WatchRuns(runs) => {
+            out.push_str(&format!("pent watch: {}", header.name));
+            if runs > 1 {
+                out.push_str(&format!(" ({} runs)", format_count(runs)));
+            }
+        }
+        DraftSource::DeniedReview => {
+            out.push_str(&format!("pent trust --review: {}", header.name));
+        }
     }
     out.push('\n');
 
@@ -181,10 +189,16 @@ pub fn render_header(summary: &Summary, header: &WatchHeader<'_>) -> String {
         plural(rules, "rule", "rules")
     };
     out.push_str(&format!(
-        "  {what} from {} by {}.",
-        plural(stats.total_events(), "access", "accesses"),
-        plural(stats.processes.len(), "process", "processes"),
+        "  {what} from {}",
+        plural(stats.total_events(), "access", "accesses")
     ));
+    if !stats.processes.is_empty() {
+        out.push_str(&format!(
+            " by {}",
+            plural(stats.processes.len(), "process", "processes")
+        ));
+    }
+    out.push('.');
     if blocked > 0 {
         out.push_str(&format!(
             " The guard blocked {}.",
@@ -631,7 +645,7 @@ mod tests {
             &summary,
             &WatchHeader {
                 name: &profile,
-                runs: 1,
+                source: DraftSource::WatchRuns(1),
             },
         );
         let expected = "\
@@ -674,12 +688,12 @@ pent watch: claude
             &Summary::default(),
             &WatchHeader {
                 name: &profile,
-                runs: 3,
+                source: DraftSource::WatchRuns(3),
             },
         );
         assert_eq!(
             text,
-            "pent watch: tool (3 runs)\n  No new rules from 0 accesses by 0 processes.\n"
+            "pent watch: tool (3 runs)\n  No new rules from 0 accesses.\n"
         );
         Ok(())
     }
