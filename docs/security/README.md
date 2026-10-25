@@ -7,6 +7,7 @@ result.
 | Report | Area |
 |--------|------|
 | [linux-sandbox.md](linux-sandbox.md) | The Linux filesystem and process sandbox of `pent run` |
+| [containment.md](containment.md) | The private directories, the PID namespace, the `connect(2)` supervisor and the guard |
 | [network.md](network.md) | The proxy, the DNS server and the network namespace |
 | [watch-and-profiles.md](watch-and-profiles.md) | The recorder, the guard, the summary, the review and the profile store |
 | [macos.md](macos.md) | The macOS Seatbelt backend: the first test suite, and the findings that it states |
