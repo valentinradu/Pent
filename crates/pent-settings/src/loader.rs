@@ -127,6 +127,43 @@ mod tests {
         Ok(())
     }
 
+    /// [`ConfigLoader::load`] reads the global config file and resolves the
+    /// relative mount paths against the workspace.
+    ///
+    /// With the seam the body reads:
+    ///
+    /// ```text
+    /// let dirs = PentDirs::from_vars(Some(config_home.into()), None, Some(home));
+    /// fs::write(dirs.global_config(), "[proxy]\ndns_ttl_seconds = 7\n")?;
+    /// let config = ConfigLoader::load(&workspace, dirs.as_ref())?;
+    /// assert_eq!(config.proxy.dns_ttl_seconds, Some(7));
+    /// ```
+    ///
+    /// Today `load` finds the file through `PentDirs::from_env`, which
+    /// reads the environment of the process. A test cannot change the
+    /// environment without a race with the other tests.
+    #[test]
+    #[ignore = "NEEDS SEAM: ConfigLoader::load and ConfigLoader::global_config_path must take \
+                the PentDirs as a parameter, and PentDirs::from_vars must be public, so the \
+                caller (the CLI) does the one call to PentDirs::from_env"]
+    fn test_load_reads_the_global_config_of_the_given_directories() {}
+
+    /// [`ConfigLoader::global_config_path`] names `pent.toml` in the config
+    /// directory of the given directories.
+    ///
+    /// With the seam the body reads:
+    ///
+    /// ```text
+    /// let dirs = PentDirs::from_vars(Some("/c".into()), None, None);
+    /// assert_eq!(ConfigLoader::global_config_path(dirs.as_ref()),
+    ///            Some(PathBuf::from("/c/pent/pent.toml")));
+    /// assert_eq!(ConfigLoader::global_config_path(None), None);
+    /// ```
+    #[test]
+    #[ignore = "NEEDS SEAM: ConfigLoader::global_config_path must take the PentDirs as a \
+                parameter instead of calling PentDirs::from_env"]
+    fn test_global_config_path_names_pent_toml_in_the_config_directory() {}
+
     #[test]
     fn test_global_config_path_ends_with_pent_toml() {
         // global_config_path() may be None in environments without $HOME.
@@ -146,6 +183,42 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("domain_alowlist"), "{msg}");
         assert!(msg.contains("pent.toml"), "{msg}");
+        Ok(())
+    }
+
+    /// An I/O error that is not "not found" and not "permission denied"
+    /// stops the load. A directory in the place of the file gives such an
+    /// error.
+    #[test]
+    fn test_a_config_path_that_is_a_directory_is_an_error() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("pent.toml");
+        fs::create_dir(&path)?;
+        let result = ConfigLoader::load_file(&path);
+        assert!(
+            matches!(result, Err(SettingsError::Io(_))),
+            "a directory must not read as no config: {result:?}"
+        );
+        Ok(())
+    }
+
+    /// A file that the user cannot read counts as no config, so pent runs
+    /// in a restricted environment.
+    #[cfg(unix)]
+    #[test]
+    fn test_a_config_file_that_the_user_cannot_read_gives_no_config() -> TestResult {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("pent.toml");
+        fs::write(&path, "[proxy]\ndns_ttl_seconds = 7\n")?;
+        fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000))?;
+        if fs::read(&path).is_ok() {
+            // The root user reads each file, so the test has no meaning.
+            return Ok(());
+        }
+        let result = ConfigLoader::load_file(&path);
+        assert!(matches!(result, Ok(None)), "{result:?}");
         Ok(())
     }
 

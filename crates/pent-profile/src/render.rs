@@ -1085,8 +1085,7 @@ Network
         Ok(())
     }
 
-    // ========================================================================
-    // The lines that the coverage run found open.
+    // =================================================================    // The lines that the coverage run found open.
     // See docs/testing/fuzzing-and-coverage.md.
     // ========================================================================
 
@@ -1181,6 +1180,160 @@ Network
             reasons.get(&Grant::Domain("a.example".to_string())),
             Some("why")
         );
+    }
+    // ── Warnings ────────────────────────────────────────────────────────────
+
+    /// [`Warnings::is_empty`] is true only when each of the three counts is
+    /// zero.
+    #[test]
+    fn warnings_are_empty_only_when_each_count_is_zero() {
+        assert!(Warnings::default().is_empty());
+        let counts = [
+            Warnings {
+                outside_home: 1,
+                ..Warnings::default()
+            },
+            Warnings {
+                other_repository: 1,
+                ..Warnings::default()
+            },
+            Warnings {
+                refused_unix_sockets: 1,
+                ..Warnings::default()
+            },
+        ];
+        for warnings in counts {
+            assert!(
+                !warnings.is_empty(),
+                "one count that is not zero makes a warning: {warnings:?}"
+            );
+        }
+    }
+
+    /// [`Warnings::lines`] writes one line for each count that is not zero,
+    /// and nothing for a count that is zero.
+    #[test]
+    fn warning_lines_name_only_the_counts_that_are_not_zero() {
+        assert!(Warnings::default().lines().is_empty());
+        let warnings = Warnings {
+            outside_home: 2,
+            other_repository: 1,
+            refused_unix_sockets: 3,
+        };
+        assert_eq!(
+            warnings.lines(),
+            vec![
+                "2 rules read outside the home directory".to_string(),
+                "1 rule reads in another repository".to_string(),
+                "pent refused 3 connections to a Unix socket".to_string(),
+            ]
+        );
+        let one = Warnings {
+            refused_unix_sockets: 1,
+            ..Warnings::default()
+        };
+        assert_eq!(
+            one.lines(),
+            vec!["pent refused 1 connection to a Unix socket".to_string()]
+        );
+    }
+
+    /// The terminal summary shows the block "Not in the rules" also when
+    /// only one of the two lists has a member.
+    #[test]
+    fn the_block_that_is_not_in_the_rules_needs_only_one_list() -> TestResult {
+        let profile = name("tool")?;
+        let header = WatchHeader {
+            name: &profile,
+            source: DraftSource::WatchRuns(1),
+        };
+
+        let mut only_socket = Summary::default();
+        only_socket.stats.unreachable_sockets = vec!["@abstract".to_string()];
+        let text = render_terminal(&only_socket, &header);
+        assert!(text.contains("Not in the rules"), "{text}");
+        assert!(text.contains("@abstract"), "{text}");
+
+        let mut only_host = Summary::default();
+        only_host.stats.ip_hosts = vec!["203.0.113.9:443".to_string()];
+        let text = render_terminal(&only_host, &header);
+        assert!(text.contains("Not in the rules"), "{text}");
+        assert!(text.contains("203.0.113.9:443"), "{text}");
+
+        let text = render_terminal(&Summary::default(), &header);
+        assert!(!text.contains("Not in the rules"), "{text}");
+        Ok(())
+    }
+
+    // ── Reasons ─────────────────────────────────────────────────────────────
+
+    /// The end of a list and the start of a table both end the list, so a
+    /// stray string between two lists gets no reason.
+    #[test]
+    fn a_string_between_two_lists_gets_no_reason() {
+        let text = "\
+[filesystem]
+read = [
+  \"~/a\",  # one
+]
+\"stray.example\",  # two
+
+[network]
+\"other.example\",  # three
+domains = [
+  \"x.example\",  # four
+]
+";
+        let reasons = Reasons::from_draft(text);
+        assert_eq!(
+            reasons.get(&Grant::Fs {
+                access: FsAccess::Read,
+                path: "~/a".to_string(),
+            }),
+            Some("one")
+        );
+        for stray in ["stray.example", "other.example"] {
+            assert_eq!(
+                reasons.get(&Grant::Fs {
+                    access: FsAccess::Read,
+                    path: stray.to_string(),
+                }),
+                None,
+                "the list ended before {stray}"
+            );
+        }
+        assert_eq!(
+            reasons.get(&Grant::Domain("x.example".to_string())),
+            Some("four")
+        );
+    }
+
+    /// [`Reasons::is_empty`] is true only when no rule has a reason.
+    #[test]
+    fn reasons_are_empty_only_without_a_reason() {
+        assert!(Reasons::default().is_empty());
+        assert!(
+            !Reasons::from_summary(&claude_summary()).is_empty(),
+            "the fixture gives a reason to each rule"
+        );
+    }
+
+    /// [`Reasons::merge_missing`] adds the reason of a rule that has none,
+    /// and keeps the reason that the set already holds.
+    #[test]
+    fn merge_missing_keeps_the_reason_that_exists() {
+        let kept = Grant::Domain("a.example".to_string());
+        let added = Grant::Domain("b.example".to_string());
+        let mut reasons = Reasons::from_draft("domains = [\n  \"a.example\",  # first\n]\n");
+        let other = Reasons::from_draft(
+            "domains = [\n  \"a.example\",  # second\n  \"b.example\",  # new\n]\n",
+        );
+        assert_eq!(reasons.get(&kept), Some("first"));
+        assert_eq!(reasons.get(&added), None);
+
+        reasons.merge_missing(other);
+        assert_eq!(reasons.get(&kept), Some("first"), "the old reason stays");
+        assert_eq!(reasons.get(&added), Some("new"), "the new reason comes in");
     }
 }
 

@@ -1334,14 +1334,48 @@ mod tests {
     ///
     /// After this returns, the stream is tunnelled to `dest` and application
     /// data can flow freely in both directions.
+    /// The time that a test waits for data from the proxy.
+    const REPLY_LIMIT: Duration = Duration::from_secs(5);
+
+    /// Read exactly `buf.len()` bytes, with a time limit.
+    ///
+    /// A test that waits for a reply that the proxy does not send must
+    /// fail. Without the limit the whole test binary stops.
+    async fn read_exact_in_time<S: AsyncRead + Unpin>(stream: &mut S, buf: &mut [u8]) {
+        match tokio::time::timeout(REPLY_LIMIT, stream.read_exact(buf)).await {
+            Ok(Ok(n)) => assert_eq!(n, buf.len(), "the proxy sent too few bytes"),
+            Ok(Err(e)) => panic!("the read from the proxy failed: {e}"),
+            Err(_) => panic!("the proxy sent no reply in {REPLY_LIMIT:?}"),
+        }
+    }
+
+    /// Read one block of data, with a time limit. Returns the number of
+    /// bytes; zero is the end of the data.
+    async fn read_in_time<S: AsyncRead + Unpin>(stream: &mut S, buf: &mut [u8]) -> usize {
+        match tokio::time::timeout(REPLY_LIMIT, stream.read(buf)).await {
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => panic!("the read from the proxy failed: {e}"),
+            Err(_) => panic!("the proxy sent nothing in {REPLY_LIMIT:?}"),
+        }
+    }
+
+    /// Read until the end of the data, with a time limit.
+    async fn read_to_end_in_time<S: AsyncRead + Unpin>(stream: &mut S, buf: &mut Vec<u8>) {
+        match tokio::time::timeout(REPLY_LIMIT, stream.read_to_end(buf)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => panic!("the read from the proxy failed: {e}"),
+            Err(_) => panic!("the proxy did not close the connection in {REPLY_LIMIT:?}"),
+        }
+    }
+
     async fn socks5_connect(stream: &mut tokio::net::TcpStream, dest: std::net::SocketAddr) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
 
         // Greeting: SOCKS5, one method, no-auth
         stream.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
 
         let mut resp = [0u8; 2];
-        stream.read_exact(&mut resp).await.unwrap();
+        read_exact_in_time(stream, &mut resp).await;
         assert_eq!(resp, [0x05, 0x00], "Expected NO_AUTH method selected");
 
         // CONNECT request
@@ -1362,7 +1396,7 @@ mod tests {
 
         // Read reply header
         let mut header = [0u8; 4];
-        stream.read_exact(&mut header).await.unwrap();
+        read_exact_in_time(stream, &mut header).await;
         assert_eq!(header[0], 0x05, "Expected SOCKS5 version in reply");
         assert_eq!(header[1], 0x00, "Expected SUCCEEDED reply");
 
@@ -1373,7 +1407,7 @@ mod tests {
             t => panic!("Unexpected ATYP in CONNECT reply: {t}"),
         };
         let mut buf = vec![0u8; remaining];
-        stream.read_exact(&mut buf).await.unwrap();
+        read_exact_in_time(stream, &mut buf).await;
     }
 
     /// Parse a SOCKS5 request from a byte slice.
@@ -1838,7 +1872,9 @@ mod tests {
     // Data Relay Tests
     // ========================================================================
 
-    #[tokio::test]
+    // A relay test needs more than one thread: a mutant that makes `pump`
+    // loop without end must fail the test, not stop the whole test binary.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_relay_bidirectional_data() {
         use crate::{ResolvedAddress, SharedState};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1892,7 +1928,7 @@ mod tests {
         client.write_all(test_data).await.unwrap();
 
         let mut response = [0u8; 64];
-        let n = client.read(&mut response).await.unwrap();
+        let n = read_in_time(&mut client, &mut response).await;
 
         assert_eq!(&response[..n], test_data);
 
@@ -1900,7 +1936,9 @@ mod tests {
         echo_handle.abort();
     }
 
-    #[tokio::test]
+    // A relay test needs more than one thread: a mutant that makes `pump`
+    // loop without end must fail the test, not stop the whole test binary.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_relay_large_data_transfer() {
         use crate::{ResolvedAddress, SharedState};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1954,7 +1992,7 @@ mod tests {
         client.shutdown().await.unwrap();
 
         let mut response = Vec::new();
-        client.read_to_end(&mut response).await.unwrap();
+        read_to_end_in_time(&mut client, &mut response).await;
 
         assert_eq!(response.len(), large_data.len());
 
@@ -1962,7 +2000,9 @@ mod tests {
         server_handle.abort();
     }
 
-    #[tokio::test]
+    // A relay test needs more than one thread: a mutant that makes `pump`
+    // loop without end must fail the test, not stop the whole test binary.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_relay_client_closes_first() {
         use crate::{ResolvedAddress, SharedState};
         use tokio::io::AsyncReadExt;
@@ -2019,10 +2059,11 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    // A relay test needs more than one thread: a mutant that makes `pump`
+    // loop without end must fail the test, not stop the whole test binary.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_relay_destination_closes_first() {
         use crate::{ResolvedAddress, SharedState};
-        use tokio::io::AsyncReadExt;
 
         let Some(listener) = tcp_listener_or_skip("127.0.0.1:0").await else {
             return;
@@ -2064,7 +2105,7 @@ mod tests {
 
         // Relay must propagate destination FIN to client
         let mut buf = [0u8; 1024];
-        let n = client.read(&mut buf).await.unwrap();
+        let n = read_in_time(&mut client, &mut buf).await;
         assert_eq!(n, 0); // EOF
 
         // The task of the destination accepts the connection; a panic in
@@ -2799,7 +2840,9 @@ mod tests {
         drop(feeder.await.unwrap());
     }
 
-    #[tokio::test]
+    // A relay test needs more than one thread: a mutant that makes `pump`
+    // loop without end must fail the test, not stop the whole test binary.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_split_socks5_request_through_proxy() {
         let Some(listener) = tcp_listener_or_skip("127.0.0.1:0").await else {
             return;
@@ -2826,7 +2869,7 @@ mod tests {
         client.set_nodelay(true).unwrap();
         client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
         let mut greeting = [0u8; 2];
-        client.read_exact(&mut greeting).await.unwrap();
+        read_exact_in_time(&mut client, &mut greeting).await;
 
         let mut request = vec![0x05, 0x01, 0x00, 0x01];
         if let IpAddr::V4(ip) = dest.ip() {
@@ -2838,12 +2881,12 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         let mut reply = [0u8; 10];
-        client.read_exact(&mut reply).await.unwrap();
+        read_exact_in_time(&mut client, &mut reply).await;
         assert_eq!(reply[1], socks5::SUCCEEDED);
 
         client.write_all(b"ping").await.unwrap();
         let mut echo = [0u8; 4];
-        client.read_exact(&mut echo).await.unwrap();
+        read_exact_in_time(&mut client, &mut echo).await;
         assert_eq!(&echo, b"ping");
 
         handle.abort();
@@ -3081,7 +3124,9 @@ mod tests {
             .is_err());
     }
 
-    #[tokio::test]
+    // A relay test needs more than one thread: a mutant that makes `pump`
+    // loop without end must fail the test, not stop the whole test binary.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_idle_timeout_resets_on_activity() {
         // The connection lives longer than the idle timeout while data flows,
         // and closes when the data stops.
@@ -3121,7 +3166,7 @@ mod tests {
         for _ in 0..8 {
             client.write_all(b"x").await.unwrap();
             let mut echo = [0u8; 1];
-            client.read_exact(&mut echo).await.unwrap();
+            read_exact_in_time(&mut client, &mut echo).await;
             assert_eq!(&echo, b"x");
             tokio::time::sleep(Duration::from_millis(150)).await;
         }
@@ -3131,6 +3176,27 @@ mod tests {
         let read = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buf)).await;
         assert!(matches!(read, Ok(Ok(0)) | Ok(Err(_))), "{read:?}");
         handle.abort();
+    }
+
+    /// `pump` copies each block of data and stops at the end of the data.
+    /// A read of zero bytes is the end; every other read is data.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_pump_copies_the_data_and_stops_at_the_end() {
+        let (mut source, reader) = tokio::io::duplex(64);
+        let (writer, mut sink) = tokio::io::duplex(64);
+        source.write_all(b"hello").await.unwrap();
+        drop(source); // The end of the data.
+
+        let activity = Activity::new();
+        let pumped = tokio::time::timeout(REPLY_LIMIT, pump(reader, writer, &activity)).await;
+        assert!(
+            matches!(pumped, Ok(Ok(()))),
+            "pump must stop at the end of the data: {pumped:?}"
+        );
+
+        let mut copied = Vec::new();
+        read_to_end_in_time(&mut sink, &mut copied).await;
+        assert_eq!(copied, b"hello", "pump must copy each block");
     }
 
     #[tokio::test]
@@ -3519,6 +3585,84 @@ mod tests {
             )
         );
         assert!(rx.try_recv().is_err(), "exactly one event");
+    }
+
+    /// A name that the policy permits but that does not resolve is not a
+    /// policy decision. The event keeps the outcome `Allowed`, so the
+    /// summary does not show the name as a denial.
+    #[tokio::test]
+    async fn test_a_name_that_does_not_resolve_keeps_the_allowed_outcome() {
+        // RFC 2606 reserves ".invalid". A resolver that answers it anyway
+        // would give the proxy a destination, so the test stops there.
+        const HOST: &str = "pent-no-such-host.invalid";
+        if tokio::net::lookup_host((HOST, 443)).await.is_ok() {
+            crate::test_support::skip("this machine resolves a name under \".invalid\"");
+            return;
+        }
+        let (state, mut rx) = watched_state(&[], ProxyPolicy::Observe);
+        let Some((proxy, _task)) = start_proxy(state, TcpProxyConfig::default()).await else {
+            return;
+        };
+
+        let code = socks5_reply_code(proxy, &socks5_domain_request(HOST, 443)).await;
+        assert_eq!(
+            code,
+            socks5::CONNECTION_NOT_ALLOWED,
+            "the proxy cannot connect, so it reports a failure"
+        );
+        assert_eq!(
+            next_event(&mut rx).await,
+            connect_event(HOST, 443, NetProtocol::Socks5, Outcome::Allowed),
+            "the policy permitted the name, so the outcome is Allowed"
+        );
+    }
+
+    /// The limit of the HTTP CONNECT head is a maximum, not a threshold
+    /// that the head reaches. A head of exactly the limit stays, and one
+    /// byte more gets the 400 reply.
+    #[tokio::test]
+    async fn test_http_connect_rejects_a_head_above_the_limit_only() {
+        let state = Arc::new(crate::SharedState::new(vec![]));
+        let config = TcpProxyConfig {
+            handshake_timeout: Duration::from_millis(300),
+            ..Default::default()
+        };
+        let Some((proxy, _task)) = start_proxy(state, config).await else {
+            return;
+        };
+
+        // A head of exactly the limit is not too long. It has no end, so
+        // the proxy closes the connection at the time limit, with no reply.
+        let mut head = b"CONNECT ".to_vec();
+        head.resize(inspect::MAX_HTTP_HEAD_LEN, b'a');
+        let mut client = TcpStream::connect(proxy).await.unwrap();
+        client.write_all(&head).await.unwrap();
+        let mut answer = Vec::new();
+        let read =
+            tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut answer)).await;
+        assert!(
+            matches!(read, Ok(Ok(0))),
+            "the proxy answered a head of the maximum length: {read:?} {:?}",
+            String::from_utf8_lossy(&answer)
+        );
+
+        // One byte more is too long.
+        let mut longer = head;
+        longer.push(b'b');
+        let mut client = TcpStream::connect(proxy).await.unwrap();
+        client.write_all(&longer).await.unwrap();
+        let mut answer = Vec::new();
+        let read =
+            tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut answer)).await;
+        assert!(
+            read.is_ok(),
+            "the proxy did not answer a head that is too long"
+        );
+        assert!(
+            String::from_utf8_lossy(&answer).starts_with("HTTP/1.1 400 "),
+            "the proxy must answer 400 for a head that is too long: {:?}",
+            String::from_utf8_lossy(&answer)
+        );
     }
 }
 
