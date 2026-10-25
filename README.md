@@ -51,7 +51,7 @@ Pent launches a child process inside a sandbox with two complementary controls.
 
 On macOS, Pent generates a [Sandbox Profile Language (SBPL)](https://reverse.put.as/wp-content/uploads/2011/09/Apple-Sandbox-Guide-v1.0.pdf) policy and launches the child process via `sandbox-exec`.
 
-The profile starts from `(allow default)`. It denies file reads (file content) and file writes, and then allows the configured paths and the workspace. See [Platform limitations](#platform-limitations) for the operations that the profile does not limit.
+The profile starts from `(allow default)`. It denies file reads (file content) and file writes, and then allows the configured paths and the workspace. Every other operation stays allowed, so a program that wants to leave the sandbox can leave it: see [macOS: the profile starts from `(allow default)`](#macos-the-profile-starts-from-allow-default).
 
 macOS has no network namespaces. In proxy mode, the profile denies outbound connections and allows only the proxy port on loopback, the system name resolver socket and the Unix sockets in the writable paths. See [Platform limitations](#platform-limitations) below.
 
@@ -88,9 +88,20 @@ On macOS, the Seatbelt profile enforces proxy mode. The process can connect only
 
 ### macOS: the profile starts from `(allow default)`
 
-The macOS profile is not a deny-by-default sandbox. It limits file content reads, file writes and (in the `blocked` and `localhost` modes) network access. All other operations stay allowed. For example, the process can read file metadata (`stat`) everywhere, look up Mach services, send signals and read sysctl values. The execute paths add allow rules for `process-exec`, but the profile has no global deny for `process-exec`.
+The macOS profile is not a deny-by-default sandbox. It limits file content reads, file writes and (in the `blocked` and `localhost` modes) network access. All other operations stay allowed:
+
+- a Mach service lookup, so the process reaches `launchd` and the services of your applications;
+- `process-exec` without a path rule, so the process runs any program (the execute paths add allow rules, but the profile has no global deny);
+- a metadata read (`stat`) on every path, also outside the profile;
+- a signal to another process of yours, a sysctl read, and the other operation families of SBPL.
+
+**A program can therefore leave the macOS sandbox.** It asks `launchd` to start a program, and that program is a child of `launchd`, not of the sandboxed process, so it runs with no profile at all. On macOS, the filesystem sandbox of Pent stops an accident; it does not stop a program that wants out. Linux has no such hole: the Landlock rules and the namespaces hold for every descendant. The finding is MAC-4 in [docs/security/macos.md](docs/security/macos.md), with the test that states the secure behaviour.
 
 The macOS backend also ignores `[[sandbox.mounts]]`. Use a profile rule (or `--read`, `--write`) to give access to a path on macOS.
+
+### macOS: no test has run on a Mac yet
+
+The macOS backend of Pent compiles for `aarch64-apple-darwin` and has a full test suite, but nobody has run that suite on a Mac. The SBPL forms of the profile and the reader of the unified log come from the Apple documentation and from other profiles, not from a run. [docs/security/macos.md](docs/security/macos.md) names each uncertain point and the test of each claim.
 
 ### Linux: requirements and Unix sockets
 
