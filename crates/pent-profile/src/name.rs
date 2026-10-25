@@ -142,6 +142,36 @@ mod tests {
         assert!("a".repeat(65).parse::<ProfileName>().is_err());
     }
 
+    /// The limit is 64 characters: a name of 64 characters is valid, and a
+    /// name of 65 characters is not.
+    #[test]
+    fn the_length_limit_is_64_characters() {
+        assert!("a".repeat(MAX_LEN).parse::<ProfileName>().is_ok());
+        assert!("a"
+            .repeat(MAX_LEN.saturating_add(1))
+            .parse::<ProfileName>()
+            .is_err());
+    }
+
+    /// `as_str` and `file_name` give the name that the store uses for the
+    /// file of the profile. A wrong value here reads or writes another
+    /// profile.
+    #[test]
+    fn the_name_gives_the_text_and_the_file_name() {
+        let parsed = "claude".parse::<ProfileName>();
+        assert_eq!(parsed.as_ref().map(ProfileName::as_str), Ok("claude"));
+        assert_eq!(
+            parsed.as_ref().map(ProfileName::file_name),
+            Ok("claude.toml".to_string())
+        );
+        let other = "other".parse::<ProfileName>();
+        assert_eq!(other.as_ref().map(ProfileName::as_str), Ok("other"));
+        assert_eq!(
+            other.as_ref().map(ProfileName::file_name),
+            Ok("other.toml".to_string())
+        );
+    }
+
     #[test]
     fn generic_names() {
         assert_eq!(
