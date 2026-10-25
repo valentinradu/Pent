@@ -25,9 +25,11 @@ help:
 	@echo "  make check               fmt-check + clippy + test"
 	@echo ""
 	@echo "E2E:"
-	@echo "  make e2e-macos           Run macOS e2e agent tests"
+	@echo "  make e2e-macos           Run the macOS e2e tests"
 	@echo "  make e2e-linux           Run the Linux e2e tests in Docker"
 	@echo "  make e2e-linux-native    Run the Linux e2e tests on this host"
+	@echo ""
+	@echo "  Each e2e target sets PENT_REQUIRE_ALL_TESTS=1: a skip is a failure."
 	@echo ""
 	@echo "Release:"
 	@echo "  make release-check VERSION=X.Y.Z"
@@ -81,8 +83,11 @@ fmt-check:
 
 check: fmt-check clippy test
 
+# The macOS suites: the Seatbelt sandbox, the network and the parity with
+# Linux. PENT_REQUIRE_ALL_TESTS makes each skip a failure, as in the CI.
 e2e-macos:
-	cargo test --test e2e_macos -- --nocapture
+	PENT_REQUIRE_ALL_TESTS=1 cargo test -p pent --no-fail-fast \
+		--test e2e_macos --test e2e_macos_network --test parity_watch -- --nocapture
 
 # The image runs the e2e, integration and profile tests in parallel (see
 # the CMD of e2e/Dockerfile). Pent needs unshare(2): the default seccomp and
@@ -91,12 +96,12 @@ e2e-macos:
 e2e-linux:
 	docker build --file e2e/Dockerfile --tag "$(DOCKER_IMAGE)" .
 	docker run --rm --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
-		--tmpfs /tmp:exec,mode=1777 "$(DOCKER_IMAGE)"
+		--tmpfs /tmp:exec,mode=1777 --env PENT_REQUIRE_ALL_TESTS=1 "$(DOCKER_IMAGE)"
 
 # The same tests on this host, without Docker.
 e2e-linux-native:
-	cargo test -p pent --no-fail-fast --test e2e_linux --test integration_test \
-		--test profile_test -- --include-ignored
+	PENT_REQUIRE_ALL_TESTS=1 cargo test -p pent --no-fail-fast --test e2e_linux \
+		--test integration_test --test profile_test --test parity_watch -- --nocapture
 
 release-check:
 	@if [[ -z "$${VERSION:-}" ]]; then \
