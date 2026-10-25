@@ -10,11 +10,16 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # A test that skips proves nothing. With this variable, each skip is a
+  # failure, so a job cannot stay green while the sandbox never ran. See
+  # crates/pent/tests/common/e2e.rs.
+  PENT_REQUIRE_ALL_TESTS: 1
 
 jobs:
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -37,15 +42,56 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: Build
-        run: cargo build --workspace
+      # The version of the runner decides which sandbox features work. Print
+      # it, so that a future failure is easy to place.
+      - name: Show the platform (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          uname -a
+          cat /etc/os-release | head -2
+          echo "user.max_user_namespaces=$(sysctl -n user.max_user_namespaces 2>/dev/null || echo unknown)"
 
+      - name: Show the platform (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          sw_vers
+          uname -m
+          echo "developer directory: $(xcode-select --print-path 2>/dev/null || echo none)"
+          pkgutil --pkg-info=com.apple.pkg.CLTools_Executables 2>/dev/null \
+            || echo "the command line tools package is not registered"
+          clang --version | head -1 || true
+          ls -l /usr/bin/sandbox-exec /usr/bin/log /usr/bin/logger || true
+
+      # Ubuntu 24.04 limits unprivileged user namespaces with AppArmor. Pent
+      # needs them. Without this step every sandbox test skips, and the job
+      # proves nothing.
+      - name: Allow unprivileged user namespaces
+        if: runner.os == 'Linux'
+        run: |
+          knob=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          if [ -e "$knob" ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          else
+            echo "this kernel has no apparmor_restrict_unprivileged_userns knob"
+          fi
+
+      - name: Build
+        run: cargo build --workspace --tests
+
+      # The whole workspace, in debug. The macOS suites (e2e_macos,
+      # e2e_macos_network, parity_watch) are part of the workspace, so this
+      # one command runs them too. --nocapture keeps the profile and the log
+      # lines that a failed assertion prints.
       - name: Run tests
-        run: cargo test --workspace
+        run: cargo test --workspace --no-fail-fast -- --nocapture
 
   clippy:
-    name: Clippy
-    runs-on: ubuntu-latest
+    name: Clippy (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
 
@@ -61,7 +107,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ubuntu-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
@@ -81,42 +127,54 @@ jobs:
         run: cargo fmt --all -- --check
 
   test-linux-agents:
-    name: Agent configs (Linux / Docker)
+    name: E2E (Linux / Docker)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+
+      # Ubuntu 24.04 limits unprivileged user namespaces with AppArmor.
+      # Pent needs them, also in the container.
+      - name: Allow unprivileged user namespaces
+        run: |
+          knob=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+          if [ -e "$knob" ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          else
+            echo "this kernel has no apparmor_restrict_unprivileged_userns knob"
+          fi
 
       - name: Build Docker image
         run: docker build --file e2e/Dockerfile --tag pent-test .
 
-      - name: Run agent-config smoke tests
+      # The default command of the image runs the e2e, integration and
+      # profile tests in parallel. Pent needs no privilege; the default
+      # seccomp and AppArmor profiles of Docker block unshare(2). The
+      # overlay upper layers of pent are in /tmp, which must not be on
+      # overlayfs: thus /tmp is a tmpfs.
+      # Run 1: the masks of the container runtime stay. The kernel then
+      # refuses a private /proc, and pent gives up the PID namespace with a
+      # warning. This run proves that pent works in an ordinary container.
+      - name: Run e2e tests (the masks of the runtime stay)
         run: |
           docker run --rm \
-            --privileged \
+            --security-opt seccomp=unconfined \
+            --security-opt apparmor=unconfined \
             --tmpfs /tmp:exec,mode=1777 \
-            pent-test \
-            cargo test --test e2e_linux -- --nocapture --include-ignored
+            --env PENT_REQUIRE_ALL_TESTS=1 \
+            pent-test
 
-  test-macos-agents:
-    name: Agent configs (macOS)
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: macos-cargo-agents-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Build
-        run: cargo build --workspace --release
-
-      - name: Run macOS agent config tests
-        run: cargo test --test e2e_macos -- --nocapture --include-ignored
+      # Run 2: the same image with no mask below /proc. The kernel then
+      # permits a private /proc, so pent keeps the PID namespace and the
+      # containment of LS-3 holds inside a container too. Without this run
+      # the pipeline would only prove that pent gives up gracefully, never
+      # that the protection works where the kernel allows it.
+      - name: Run e2e tests (no mask below /proc)
+        run: |
+          docker run --rm \
+            --security-opt seccomp=unconfined \
+            --security-opt apparmor=unconfined \
+            --security-opt systempaths=unconfined \
+            --tmpfs /tmp:exec,mode=1777 \
+            --env PENT_REQUIRE_ALL_TESTS=1 \
+            pent-test

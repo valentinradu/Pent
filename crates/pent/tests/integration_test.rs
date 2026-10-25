@@ -13,10 +13,14 @@
 //! only on macOS where `sandbox-exec` is available. They are skipped at
 //! runtime on other platforms or when `sandbox-exec` is absent.
 
+mod common;
+
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
 use tempfile::TempDir;
+
+use common::{Xdg, PENT, TEST_PROFILE};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -24,16 +28,19 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 // Infrastructure
 // ============================================================================
 
-/// Path to the compiled `pent` binary, injected by Cargo at compile time.
-const PENT: &str = env!("CARGO_BIN_EXE_pent");
-
 /// Invoke `pent` with the given arguments in `cwd` and return the full Output.
+///
+/// `XDG_CONFIG_HOME` and `XDG_STATE_HOME` point into `cwd/.test-home`, thus
+/// the test does not read or change the real user config.
 #[allow(clippy::panic)] // infrastructure helper: spawn failure is a hard test setup error
 fn run_pent(cwd: &Path, args: &[&str]) -> Output {
+    let home = cwd.join(".test-home");
     Command::new(PENT)
         .args(args)
         .current_dir(cwd)
         .env_remove("PENT_LOG") // keep test output clean
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_STATE_HOME", home.join(".local/state"))
         .output()
         .unwrap_or_else(|e| panic!("Failed to spawn pent binary: {e}"))
 }
@@ -62,21 +69,14 @@ fn expect_failure(out: &Output) {
     );
 }
 
-/// True when we are on macOS and sandbox-exec can actually apply a profile.
-///
-/// Merely checking that the binary exists is insufficient: macOS does not
-/// allow nested Seatbelt sandboxes, so `sandbox_apply` returns EPERM when
-/// `pent` is itself running under `sandbox-exec` (e.g. during development).
-fn sandbox_available() -> bool {
-    if !cfg!(target_os = "macos") || !Path::new("/usr/bin/sandbox-exec").exists() {
-        return false;
-    }
-    Command::new("/usr/bin/sandbox-exec")
-        .args(["-p", "(version 1) (allow default)", "/bin/true"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
+// The guard of each macOS test is `common::e2e::sandbox_ready`. It asks the
+// question that matters: can pent apply a profile on this machine. The
+// earlier guard ran `sandbox-exec -p '(version 1) (allow default)'
+// /bin/true`, which answered a different question and gave the wrong
+// answer: it asked whether `sandbox-exec` can run `/bin/true`. The probe
+// read each failure of that program as "no sandbox", so thirteen tests
+// skipped on a machine that runs the sandbox well. See MAC-7 in
+// `docs/security/macos.md`.
 
 /// Extra --read flags that must be added to give the sandboxed shell
 /// access to system executables (/bin/sh, /bin/cat, /usr/bin/nc, etc.)
@@ -85,6 +85,7 @@ fn sandbox_available() -> bool {
 /// System defaults only include /usr/lib, /usr/share, /etc, /tmp.
 /// /bin, /usr/bin, and /System/Library are NOT included, so we pass
 /// them explicitly in each test that actually runs a command.
+#[cfg(target_os = "macos")]
 fn sys_exec_args() -> Vec<String> {
     vec![
         "--read".into(),
@@ -96,19 +97,26 @@ fn sys_exec_args() -> Vec<String> {
     ]
 }
 
-/// Invoke `pent run --no-config [extra_args] -- [cmd_args]` in `workspace`.
-#[allow(clippy::panic)] // infrastructure helper: spawn failure is a hard test setup error
+/// Invoke `pent run --profile pent-test [extra_args] -- [cmd_args]` in
+/// `workspace`.
+///
+/// The profile is empty and trusted, in temporary XDG directories. `HOME`
+/// stays the real home directory, so that the tests can place files outside
+/// the sandbox defaults.
+#[allow(clippy::panic)] // infrastructure helper: setup failure is a hard test setup error
 fn sandboxed_run(workspace: &Path, extra_args: &[String], cmd_args: &[&str]) -> Output {
-    let mut args: Vec<String> = vec!["run".into(), "--no-config".into()];
+    let xdg = Xdg::new().unwrap_or_else(|e| panic!("cannot make the XDG directories: {e}"));
+    xdg.install_profile(TEST_PROFILE, "")
+        .unwrap_or_else(|e| panic!("cannot install the test profile: {e}"));
+    let mut args: Vec<String> = vec!["run".into(), "--profile".into(), TEST_PROFILE.into()];
     args.extend_from_slice(extra_args);
     args.push("--".into());
     for a in cmd_args {
         args.push((*a).to_string());
     }
-    Command::new(PENT)
+    xdg.apply(&mut Command::new(PENT))
         .args(&args)
         .current_dir(workspace)
-        .env_remove("PENT_LOG")
         .output()
         .unwrap_or_else(|e| panic!("Failed to spawn pent: {e}"))
 }
@@ -118,10 +126,63 @@ fn sandboxed_run(workspace: &Path, extra_args: &[String], cmd_args: &[&str]) -> 
 ///
 /// $HOME is typically /Users/<username> on macOS — not under /tmp, not
 /// under /usr/lib, and not under $TMPDIR (which is /var/folders/…/T/).
-fn home_path(name: &str) -> Option<std::path::PathBuf> {
-    std::env::var("HOME").ok().map(|h| {
-        std::path::PathBuf::from(h).join(format!("pent-integration-{}-{name}", std::process::id()))
-    })
+#[cfg(target_os = "macos")]
+fn home_path(test: &str, name: &str) -> Option<std::path::PathBuf> {
+    match std::env::var("HOME") {
+        Ok(home) => Some(
+            std::path::PathBuf::from(home)
+                .join(format!("pent-integration-{}-{name}", std::process::id())),
+        ),
+        Err(_) => {
+            common::e2e::skip(
+                test,
+                "HOME is not set, so the test has no path outside the sandbox",
+            );
+            None
+        }
+    }
+}
+
+/// Return true when the host reaches `host:port` with `nc`, without pent.
+///
+/// A test of a network denial needs this: a host without the internet
+/// gives the same exit status as a denial of the sandbox.
+#[cfg(target_os = "macos")]
+fn host_can_reach(test: &str, host: &str, port: &str) -> bool {
+    let reached = Command::new("/usr/bin/nc")
+        .args(["-zw2", host, port])
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !reached {
+        common::e2e::skip(
+            test,
+            &format!("nc cannot reach {host}:{port} without pent (no internet, or no nc)"),
+        );
+    }
+    reached
+}
+
+/// Run `nc -zw2 <host> <port>` in a shell under pent and return the text
+/// of stdout.
+///
+/// The shell prints `NC_RC=<status>` after `nc`, so the test can tell a
+/// denial of the connection from a child that never ran.
+#[cfg(target_os = "macos")]
+fn nc_under_pent(workspace: &Path, net_args: &[&str], host: &str, port: &str) -> String {
+    let mut extra = sys_exec_args();
+    for a in net_args {
+        extra.push((*a).to_string());
+    }
+    let script = format!("/usr/bin/nc -zw2 {host} {port} 2>&1; echo NC_RC=$?");
+    let out = sandboxed_run(workspace, &extra, &["/bin/sh", "-c", &script]);
+    // The shell itself always exits 0, thus pent exits 0. A failure here
+    // means that the sandbox did not start, not that nc was denied.
+    let text = expect_success(&out);
+    assert!(
+        text.contains("NC_RC="),
+        "the child did not run nc at all: {text}"
+    );
+    text
 }
 
 // ============================================================================
@@ -129,13 +190,17 @@ fn home_path(name: &str) -> Option<std::path::PathBuf> {
 // ============================================================================
 
 #[test]
-fn test_config_init_creates_project_config() -> TestResult {
+fn test_config_init_creates_global_config() -> TestResult {
     let dir = TempDir::new()?;
     let out = run_pent(dir.path(), &["config", "init"]);
     expect_success(&out);
 
-    let config_path = dir.path().join(".pent").join("pent.toml");
-    assert!(config_path.exists(), ".pent/pent.toml was not created");
+    let config_path = dir.path().join(".test-home/.config/pent/pent.toml");
+    assert!(config_path.exists(), "pent.toml was not created");
+    assert!(
+        !dir.path().join(".pent").exists(),
+        "pent has no project config now"
+    );
     let contents = fs::read_to_string(&config_path)?;
     assert!(
         toml::from_str::<toml::Value>(&contents).is_ok(),
@@ -214,34 +279,6 @@ fn test_config_show_without_config_file_uses_defaults() -> TestResult {
     Ok(())
 }
 
-#[test]
-fn test_config_project_overrides_domain_allowlist() -> TestResult {
-    let dir = TempDir::new()?;
-
-    // Write a project config with a specific domain
-    let dot_pent = dir.path().join(".pent");
-    fs::create_dir_all(&dot_pent)?;
-    fs::write(
-        dot_pent.join("pent.toml"),
-        "[proxy]\ndomain_allowlist = [\"project-domain.example\"]\n",
-    )?;
-
-    let out = run_pent(dir.path(), &["config", "show", "--format", "json"]);
-    let stdout = expect_success(&out);
-    let json: serde_json::Value = serde_json::from_str(&stdout)?;
-
-    let allowlist = json["proxy"]["domain_allowlist"]
-        .as_array()
-        .ok_or("domain_allowlist should be an array")?;
-    assert!(
-        allowlist
-            .iter()
-            .any(|v| v.as_str() == Some("project-domain.example")),
-        "Expected project-domain.example in allowlist, got: {allowlist:?}"
-    );
-    Ok(())
-}
-
 // ============================================================================
 // B. Check command
 // ============================================================================
@@ -264,9 +301,10 @@ fn test_check_reports_platform() -> TestResult {
 // C. Run — filesystem tests (macOS sandbox required)
 // ============================================================================
 
+#[cfg(target_os = "macos")] // the Linux behaviour is in e2e_linux.rs
 #[test]
 fn test_run_reads_file_in_workspace() -> TestResult {
-    if !sandbox_available() {
+    if !common::e2e::sandbox_ready("test_run_reads_file_in_workspace") {
         return Ok(());
     }
 
@@ -282,9 +320,10 @@ fn test_run_reads_file_in_workspace() -> TestResult {
     Ok(())
 }
 
+#[cfg(target_os = "macos")] // the Linux behaviour is in e2e_linux.rs
 #[test]
 fn test_run_writes_file_in_workspace() -> TestResult {
-    if !sandbox_available() {
+    if !common::e2e::sandbox_ready("test_run_writes_file_in_workspace") {
         return Ok(());
     }
 
@@ -305,47 +344,65 @@ fn test_run_writes_file_in_workspace() -> TestResult {
     Ok(())
 }
 
+#[cfg(target_os = "macos")] // the Linux behaviour is in e2e_linux.rs
 #[test]
 fn test_run_cannot_read_file_in_home_dir() -> TestResult {
     // $HOME (/Users/<user>) is NOT in sandbox defaults, so the sandboxed
     // process should not be able to read files placed there.
-    if !sandbox_available() {
+    if !common::e2e::sandbox_ready("test_run_cannot_read_file_in_home_dir") {
         return Ok(());
     }
 
-    let Some(secret_path) = home_path("secret.txt") else {
-        return Ok(()); // no HOME env var, skip
+    let Some(secret_path) = home_path("test_run_cannot_read_file_in_home_dir", "secret.txt") else {
+        return Ok(());
     };
 
-    fs::write(&secret_path, "should-not-be-readable\n")?;
+    const SECRET: &str = "should-not-be-readable";
+    fs::write(&secret_path, format!("{SECRET}\n"))?;
 
     let dir = TempDir::new()?;
-    let out = sandboxed_run(
-        dir.path(),
-        &sys_exec_args(),
-        &[
-            "/bin/cat",
-            secret_path
-                .to_str()
-                .ok_or("secret path is not valid UTF-8")?,
-        ],
+    // The workspace file is the positive control: the same child must read
+    // it in the same run. Without it, a child that never started gives the
+    // same output as a denied read.
+    fs::write(dir.path().join("inside.txt"), "WORKSPACE_CONTENT\n")?;
+    let secret = secret_path
+        .to_str()
+        .ok_or("secret path is not valid UTF-8")?;
+    let script = format!("/bin/cat '{secret}' 2>&1; /bin/cat inside.txt");
+    let out = sandboxed_run(dir.path(), &sys_exec_args(), &["/bin/sh", "-c", &script]);
+    let text = format!(
+        "{}{}",
+        expect_success(&out),
+        String::from_utf8_lossy(&out.stderr)
     );
-    // Sandbox blocks the read → non-zero exit
-    expect_failure(&out);
+
+    assert!(
+        text.contains("WORKSPACE_CONTENT"),
+        "the child did not read the file of the workspace, so this run \
+         proves no denial: {text}"
+    );
+    assert!(
+        !text.contains(SECRET),
+        "the child read the file in the home directory: {text}"
+    );
 
     let _ = fs::remove_file(&secret_path); // cleanup
     Ok(())
 }
 
+#[cfg(target_os = "macos")] // the Linux behaviour is in e2e_linux.rs
 #[test]
 fn test_run_extra_read_gives_access_to_home_dir_file() -> TestResult {
     // Verify that --read <dir> grants read access to that directory from
     // inside the sandbox, even if it would otherwise be inaccessible.
-    if !sandbox_available() {
+    if !common::e2e::sandbox_ready("test_run_extra_read_gives_access_to_home_dir_file") {
         return Ok(());
     }
 
-    let Some(secret_dir) = home_path("extra-read-dir") else {
+    let Some(secret_dir) = home_path(
+        "test_run_extra_read_gives_access_to_home_dir_file",
+        "extra-read-dir",
+    ) else {
         return Ok(());
     };
     fs::create_dir_all(&secret_dir)?;
@@ -399,15 +456,17 @@ fn test_run_extra_read_gives_access_to_home_dir_file() -> TestResult {
     Ok(())
 }
 
+#[cfg(target_os = "macos")] // the Linux behaviour is in e2e_linux.rs
 #[test]
 fn test_run_extra_write_gives_write_access() -> TestResult {
     // --write <dir> should grant write access to a directory that is
     // otherwise inaccessible.
-    if !sandbox_available() {
+    if !common::e2e::sandbox_ready("test_run_extra_write_gives_write_access") {
         return Ok(());
     }
 
-    let Some(write_dir) = home_path("extra-write-dir") else {
+    let Some(write_dir) = home_path("test_run_extra_write_gives_write_access", "extra-write-dir")
+    else {
         return Ok(());
     };
     fs::create_dir_all(&write_dir)?;
@@ -445,68 +504,70 @@ fn test_run_extra_write_gives_write_access() -> TestResult {
 // D. Run — network isolation tests (macOS sandbox required)
 // ============================================================================
 
-/// Run `nc -zw2 <host> <port>` inside the sandbox with the given network args.
-/// Returns the Output of the pent invocation.
-fn nc_test(workspace: &Path, net_args: &[&str]) -> Output {
-    let mut extra = sys_exec_args();
-    for a in net_args {
-        extra.push((*a).to_string());
+/// Assert that pent denies a TCP connection to `host:port`.
+///
+/// The test first proves that the host reaches the address without pent,
+/// then that the same `nc` under pent does not. The shell prints the exit
+/// status of `nc`, so a child that never ran cannot pass.
+#[cfg(target_os = "macos")]
+fn assert_connect_denied(test: &str, net_args: &[&str], host: &str, port: &str) -> TestResult {
+    if !common::e2e::sandbox_ready(test) {
+        return Ok(());
     }
-    // nc -zw2 1.1.1.1 80 — TCP connect to Cloudflare DNS, 2s timeout
-    // Exit 0 if connected, non-zero if blocked/failed
-    sandboxed_run(workspace, &extra, &["/usr/bin/nc", "-zw2", "1.1.1.1", "80"])
+    if !host_can_reach(test, host, port) {
+        return Ok(());
+    }
+    let dir = TempDir::new()?;
+    let text = nc_under_pent(dir.path(), net_args, host, port);
+    assert!(
+        !text.contains("NC_RC=0"),
+        "pent {net_args:?} must deny the connection to {host}:{port}, and \
+         the same connection works without pent: {text}"
+    );
+    Ok(())
 }
 
+#[cfg(target_os = "macos")] // the Linux behaviour is in e2e_linux.rs
 #[test]
 fn test_run_blocked_network_prevents_tcp_connect() -> TestResult {
-    if !sandbox_available() {
-        return Ok(());
-    }
-
-    let dir = TempDir::new()?;
     // --network blocked: SBPL generates (deny network*) → connect() returns EPERM
-    let out = nc_test(dir.path(), &["--network", "blocked"]);
-    expect_failure(&out);
-    Ok(())
+    assert_connect_denied(
+        "test_run_blocked_network_prevents_tcp_connect",
+        &["--network", "blocked"],
+        "1.1.1.1",
+        "80",
+    )
 }
 
+#[cfg(target_os = "macos")] // the Linux behaviour is in e2e_linux.rs
 #[test]
 fn test_run_localhost_network_blocks_external_connect() -> TestResult {
-    if !sandbox_available() {
-        return Ok(());
-    }
-
-    let dir = TempDir::new()?;
     // --network localhost: only loopback allowed; 1.1.1.1 is not localhost
-    let out = nc_test(dir.path(), &["--network", "localhost"]);
-    expect_failure(&out);
-    Ok(())
+    assert_connect_denied(
+        "test_run_localhost_network_blocks_external_connect",
+        &["--network", "localhost"],
+        "1.1.1.1",
+        "80",
+    )
 }
 
+#[cfg(target_os = "macos")] // the Linux behaviour is in e2e_linux.rs
 #[test]
 fn test_run_blocked_network_by_direct_ip() -> TestResult {
-    if !sandbox_available() {
-        return Ok(());
-    }
-
-    // Direct IP (bypasses DNS) under blocked mode. The sandbox network* deny
-    // covers connect() regardless of how the destination was obtained.
-    let dir = TempDir::new()?;
-    let mut extra = sys_exec_args();
-    extra.extend_from_slice(&["--network".into(), "blocked".into()]);
-    // Use 8.8.8.8:53 (Google DNS) — different IP to avoid any local-network edge cases
-    let out = sandboxed_run(
-        dir.path(),
-        &extra,
-        &["/usr/bin/nc", "-zw2", "8.8.8.8", "53"],
-    );
-    expect_failure(&out);
-    Ok(())
+    // A direct IP needs no DNS. The deny of the sandbox covers connect()
+    // for each way to name the destination.
+    assert_connect_denied(
+        "test_run_blocked_network_by_direct_ip",
+        &["--network", "blocked"],
+        "8.8.8.8",
+        "53",
+    )
 }
 
+#[cfg(target_os = "macos")] // the Linux behaviour is in e2e_linux.rs
 #[test]
 fn test_run_localhost_network_allows_loopback() -> TestResult {
-    if !sandbox_available() {
+    if !common::e2e::sandbox_ready("test_run_localhost_network_allows_loopback") {
         return Ok(());
     }
 
@@ -538,9 +599,10 @@ fn test_run_localhost_network_allows_loopback() -> TestResult {
 // E. Run — proxy / --allow flag
 // ============================================================================
 
+#[cfg(target_os = "macos")] // the Linux behaviour is in e2e_linux.rs
 #[test]
 fn test_run_allow_flag_starts_proxy_without_crash() -> TestResult {
-    if !sandbox_available() {
+    if !common::e2e::sandbox_ready("test_run_allow_flag_starts_proxy_without_crash") {
         return Ok(());
     }
 
@@ -559,9 +621,10 @@ fn test_run_allow_flag_starts_proxy_without_crash() -> TestResult {
 // F. Run — environment variable passthrough
 // ============================================================================
 
+#[cfg(target_os = "macos")] // the Linux behaviour is in e2e_linux.rs
 #[test]
 fn test_run_env_flag_passes_named_variable() -> TestResult {
-    if !sandbox_available() {
+    if !common::e2e::sandbox_ready("test_run_env_flag_passes_named_variable") {
         return Ok(());
     }
 
@@ -577,9 +640,10 @@ fn test_run_env_flag_passes_named_variable() -> TestResult {
     Ok(())
 }
 
+#[cfg(target_os = "macos")] // the Linux behaviour is in e2e_linux.rs
 #[test]
 fn test_run_env_explicit_kv_sets_variable() -> TestResult {
-    if !sandbox_available() {
+    if !common::e2e::sandbox_ready("test_run_env_explicit_kv_sets_variable") {
         return Ok(());
     }
 
@@ -600,196 +664,15 @@ fn test_run_env_explicit_kv_sets_variable() -> TestResult {
 }
 
 // ============================================================================
-// G. Run — --no-config flag
-// ============================================================================
-
-#[test]
-fn test_run_no_config_ignores_project_config() -> TestResult {
-    if !sandbox_available() {
-        return Ok(());
-    }
-
-    let dir = TempDir::new()?;
-
-    // Create a project config that requests blocked networking.
-    // With --no-config this should be ignored and defaults apply.
-    let dot_pent = dir.path().join(".pent");
-    fs::create_dir_all(&dot_pent)?;
-    fs::write(
-        dot_pent.join("pent.toml"),
-        "[sandbox.network]\nmode = \"blocked\"\n",
-    )?;
-
-    // sandboxed_run already passes --no-config; echo should succeed even
-    // though the project config requests blocked networking.
-    let out = sandboxed_run(dir.path(), &sys_exec_args(), &["/bin/echo", "no-config"]);
-    let stdout = expect_success(&out);
-    assert!(stdout.contains("no-config"));
-    Ok(())
-}
-
-// ============================================================================
-// H. Run — extra config file via --config flag
-// ============================================================================
-
-// ============================================================================
-// I. Profile add / rm commands
-// ============================================================================
-
-#[test]
-fn test_config_add_creates_config_if_missing() -> TestResult {
-    let dir = TempDir::new()?;
-    let config_path = dir.path().join(".pent").join("pent.toml");
-    assert!(!config_path.exists());
-
-    let out = run_pent(dir.path(), &["config", "add", "@cargo"]);
-    expect_success(&out);
-
-    assert!(config_path.exists(), "config should be created by add");
-    Ok(())
-}
-
-#[test]
-fn test_config_add_writes_domains() -> TestResult {
-    let dir = TempDir::new()?;
-    let out = run_pent(dir.path(), &["config", "add", "@npm"]);
-    expect_success(&out);
-
-    let config_path = dir.path().join(".pent").join("pent.toml");
-    let contents = fs::read_to_string(&config_path)?;
-    assert!(
-        contents.contains("registry.npmjs.org"),
-        "Expected registry.npmjs.org in config after adding @npm: {contents}"
-    );
-    Ok(())
-}
-
-#[test]
-fn test_config_add_npm_also_adds_node() -> TestResult {
-    let dir = TempDir::new()?;
-    let out = run_pent(dir.path(), &["config", "add", "@npm"]);
-    expect_success(&out);
-
-    // @npm depends on @node; @node adds traversal: ~ on all platforms
-    let config_path = dir.path().join(".pent").join("pent.toml");
-    let contents = fs::read_to_string(&config_path)?;
-    assert!(
-        contents.contains("\"~\""),
-        "Expected traversal '~' from @node profile after adding @npm: {contents}"
-    );
-
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("@node"),
-        "Expected '@node' in add stderr: {stderr}"
-    );
-    Ok(())
-}
-
-#[test]
-fn test_config_add_deduplicates() -> TestResult {
-    let dir = TempDir::new()?;
-    expect_success(&run_pent(dir.path(), &["config", "add", "@npm"]));
-    expect_success(&run_pent(dir.path(), &["config", "add", "@npm"]));
-
-    let config_path = dir.path().join(".pent").join("pent.toml");
-    let contents = fs::read_to_string(&config_path)?;
-    let count = contents.matches("registry.npmjs.org").count();
-    assert_eq!(
-        count, 1,
-        "registry.npmjs.org should appear exactly once: {contents}"
-    );
-    Ok(())
-}
-
-#[test]
-fn test_config_rm_removes_domains() -> TestResult {
-    let dir = TempDir::new()?;
-    expect_success(&run_pent(dir.path(), &["config", "add", "@npm"]));
-    expect_success(&run_pent(dir.path(), &["config", "rm", "@npm"]));
-
-    let config_path = dir.path().join(".pent").join("pent.toml");
-    let contents = fs::read_to_string(&config_path)?;
-    assert!(
-        !contents.contains("registry.npmjs.org"),
-        "registry.npmjs.org should be removed after rm @npm: {contents}"
-    );
-    Ok(())
-}
-
-#[test]
-fn test_config_rm_node_blocked_by_gemini() -> TestResult {
-    let dir = TempDir::new()?;
-    expect_success(&run_pent(dir.path(), &["config", "add", "@gemini"]));
-
-    let out = run_pent(dir.path(), &["config", "rm", "@node"]);
-    expect_failure(&out);
-
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("@gemini") || stderr.contains("depends"),
-        "Expected error mentioning @gemini dependency: {stderr}"
-    );
-    Ok(())
-}
-
-#[test]
-fn test_config_rm_gemini_node_together_succeeds() -> TestResult {
-    let dir = TempDir::new()?;
-    expect_success(&run_pent(dir.path(), &["config", "add", "@gemini"]));
-
-    let out = run_pent(dir.path(), &["config", "rm", "@gemini", "@node"]);
-    expect_success(&out);
-
-    let config_path = dir.path().join(".pent").join("pent.toml");
-    let contents = fs::read_to_string(&config_path)?;
-    assert!(
-        !contents.contains("generativelanguage.googleapis.com"),
-        "gemini domains should be removed: {contents}"
-    );
-    Ok(())
-}
-
-#[test]
-fn test_config_add_multiple_profiles() -> TestResult {
-    let dir = TempDir::new()?;
-    let out = run_pent(dir.path(), &["config", "add", "@npm", "@cargo", "@gh"]);
-    expect_success(&out);
-
-    let config_path = dir.path().join(".pent").join("pent.toml");
-    let contents = fs::read_to_string(&config_path)?;
-    assert!(
-        contents.contains("registry.npmjs.org"),
-        "npm domain missing"
-    );
-    assert!(contents.contains("crates.io"), "cargo domain missing");
-    assert!(contents.contains("github.com"), "gh domain missing");
-    Ok(())
-}
-
-#[test]
-fn test_config_add_unknown_profile_fails() -> TestResult {
-    let dir = TempDir::new()?;
-    let out = run_pent(dir.path(), &["config", "add", "@not-a-real-profile"]);
-    expect_failure(&out);
-
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("unknown") || stderr.contains("@not-a-real-profile"),
-        "Expected error about unknown profile: {stderr}"
-    );
-    Ok(())
-}
-
-// ============================================================================
 // J. MCP server accessibility — localhost connectivity in proxy_only mode
 // ============================================================================
 
+#[cfg(target_os = "macos")] // the Linux behaviour is in e2e_linux.rs
 #[test]
 fn test_proxy_mode_allows_localhost_mcp_connection() -> TestResult {
     // MCP servers typically run on localhost (stdio or SSE). Verify that a
     // sandboxed process in proxy_only mode can reach a TCP server on 127.0.0.1.
-    if !sandbox_available() {
+    if !common::e2e::sandbox_ready("test_proxy_mode_allows_localhost_mcp_connection") {
         return Ok(());
     }
 
@@ -828,46 +711,6 @@ fn test_proxy_mode_allows_localhost_mcp_connection() -> TestResult {
     Ok(())
 }
 
-#[test]
-fn test_run_extra_config_merges_domain_allowlist() -> TestResult {
-    // Verify that an additional config file passed via --config is merged into
-    // the effective configuration. We test this at the `config show` level.
-    let dir = TempDir::new()?;
-    let extra_cfg = dir.path().join("extra.toml");
-    fs::write(
-        &extra_cfg,
-        "[proxy]\ndomain_allowlist = [\"extra-domain.example\"]\n",
-    )?;
-
-    // Write a project config with a base domain
-    let dot_pent = dir.path().join(".pent");
-    fs::create_dir_all(&dot_pent)?;
-    fs::write(
-        dot_pent.join("pent.toml"),
-        "[proxy]\ndomain_allowlist = [\"base-domain.example\"]\n",
-    )?;
-
-    // `pent run --config extra.toml --no-config echo` would skip project config
-    // but load the extra one. Instead we test via a `run` that exits immediately.
-    // Simpler: use `config show` (no --config option on config show, so test
-    // via the run command's config loading indirectly).
-    //
-    // For now, just verify the project config is reflected in config show.
-    let out = run_pent(dir.path(), &["config", "show", "--format", "json"]);
-    let stdout = expect_success(&out);
-    let json: serde_json::Value = serde_json::from_str(&stdout)?;
-    let allowlist = json["proxy"]["domain_allowlist"]
-        .as_array()
-        .ok_or("domain_allowlist should be an array")?;
-    assert!(
-        allowlist
-            .iter()
-            .any(|v| v.as_str() == Some("base-domain.example")),
-        "Expected base-domain.example in allowlist, got: {allowlist:?}"
-    );
-    Ok(())
-}
-
 // ============================================================================
 // K. Run — --execute flag
 // ============================================================================
@@ -878,19 +721,36 @@ fn test_execute_flag_allows_binary() -> TestResult {
     // Only runs when Landlock is enforcing; otherwise meaningless.
     // We skip silently if unavailable.
     //
-    // execute_access is now ReadDir | Execute (no ReadFile), so the binary and
-    // its shared libraries must also be listed under --read for execve to succeed.
-    let out = run_pent(
-        std::path::Path::new("/tmp"),
+    // execute_access is ReadDir | Execute (no ReadFile), so the binary must
+    // also be listed under --read for execve to succeed. The test finds
+    // `true` in PATH: some systems (NixOS) do not have /usr/bin/true.
+    let Some(bin) = common::e2e::which("true") else {
+        common::e2e::skip("test_execute_flag_allows_binary", "true is not in PATH");
+        return Ok(());
+    };
+    // Run the path in PATH: on NixOS it is a link to a multi-call binary,
+    // which needs its name. Allow the directory of the link and of the
+    // target.
+    let real = bin.canonicalize()?;
+    let dir = bin.parent().ok_or("the binary has no directory")?;
+    let real_dir = real.parent().ok_or("the binary has no directory")?;
+    let bin = bin.to_str().ok_or("the path is not UTF-8")?;
+    let dir = dir.to_str().ok_or("the path is not UTF-8")?;
+    let real_dir = real_dir.to_str().ok_or("the path is not UTF-8")?;
+    let ws = TempDir::new()?;
+    let out = sandboxed_run(
+        ws.path(),
         &[
-            "run",
-            "--no-config",
             "--network",
             "unrestricted",
             "--execute",
-            "/usr/bin",
+            dir,
             "--read",
-            "/usr/bin",
+            dir,
+            "--execute",
+            real_dir,
+            "--read",
+            real_dir,
             "--read",
             "/usr/lib",
             "--read",
@@ -899,9 +759,9 @@ fn test_execute_flag_allows_binary() -> TestResult {
             "/lib",
             "--read",
             "/lib64",
-            "--",
-            "/usr/bin/true",
-        ],
+        ]
+        .map(String::from),
+        &[bin],
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     // Skip if the sandbox itself cannot be set up (overlay requires privileges).
@@ -910,124 +770,15 @@ fn test_execute_flag_allows_binary() -> TestResult {
             || stderr.contains("overlayfs")
             || stderr.contains("user namespace"))
     {
-        println!("SKIP: overlay sandbox not available: {stderr}");
+        common::e2e::skip(
+            "test_execute_flag_allows_binary",
+            &format!("the overlay sandbox is not available: {stderr}"),
+        );
         return Ok(());
     }
     assert!(
         out.status.success(),
-        "pent --execute /usr/bin --read /usr/bin -- /usr/bin/true should succeed\nstderr: {stderr}",
-    );
-    Ok(())
-}
-
-// ============================================================================
-// N. Profile content verification (all platforms)
-// ============================================================================
-
-#[test]
-fn test_config_add_claude_has_correct_domains_and_paths() -> TestResult {
-    let dir = TempDir::new()?;
-    expect_success(&run_pent(dir.path(), &["config", "add", "@claude"]));
-
-    let contents = fs::read_to_string(dir.path().join(".pent").join("pent.toml"))?;
-    assert!(
-        contents.contains("api.anthropic.com"),
-        "@claude missing api.anthropic.com: {contents}"
-    );
-    assert!(
-        contents.contains("statsig.anthropic.com"),
-        "@claude missing statsig.anthropic.com: {contents}"
-    );
-    assert!(
-        contents.contains("~/.claude\""),
-        "@claude missing ~/.claude path: {contents}"
-    );
-    assert!(
-        contents.contains("~/.local/share/claude"),
-        "@claude missing ~/.local/share/claude: {contents}"
-    );
-    assert!(
-        contents.contains("api.github.com"),
-        "@claude missing api.github.com (marketplace): {contents}"
-    );
-    assert!(
-        contents.contains("raw.githubusercontent.com"),
-        "@claude missing raw.githubusercontent.com (marketplace): {contents}"
-    );
-    Ok(())
-}
-
-#[test]
-#[cfg(target_os = "macos")]
-fn test_config_add_claude_has_macos_app_support_path() -> TestResult {
-    let dir = TempDir::new()?;
-    expect_success(&run_pent(dir.path(), &["config", "add", "@claude"]));
-
-    let contents = fs::read_to_string(dir.path().join(".pent").join("pent.toml"))?;
-    assert!(
-        contents.contains("Application Support/claude"),
-        "@claude missing ~/Library/Application Support/claude on macOS: {contents}"
-    );
-    Ok(())
-}
-
-#[test]
-fn test_config_add_codex_has_correct_domains_and_paths() -> TestResult {
-    let dir = TempDir::new()?;
-    expect_success(&run_pent(dir.path(), &["config", "add", "@codex"]));
-
-    let contents = fs::read_to_string(dir.path().join(".pent").join("pent.toml"))?;
-    assert!(
-        contents.contains("api.openai.com"),
-        "@codex missing api.openai.com: {contents}"
-    );
-    assert!(
-        contents.contains("~/.codex"),
-        "@codex missing ~/.codex path: {contents}"
-    );
-    Ok(())
-}
-
-#[test]
-fn test_config_add_gemini_has_correct_domains_and_paths() -> TestResult {
-    let dir = TempDir::new()?;
-    expect_success(&run_pent(dir.path(), &["config", "add", "@gemini"]));
-
-    let contents = fs::read_to_string(dir.path().join(".pent").join("pent.toml"))?;
-    assert!(
-        contents.contains("generativelanguage.googleapis.com"),
-        "@gemini missing generativelanguage.googleapis.com: {contents}"
-    );
-    assert!(
-        contents.contains("~/.gemini") || contents.contains("gemini-cli"),
-        "@gemini missing data path (~/.gemini or gemini-cli): {contents}"
-    );
-    Ok(())
-}
-
-#[test]
-fn test_config_add_output_shows_file_path() -> TestResult {
-    let dir = TempDir::new()?;
-    let out = run_pent(dir.path(), &["config", "add", "@cargo"]);
-    expect_success(&out);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("pent.toml"),
-        "Expected pent.toml path in add stderr: {stderr}"
-    );
-    Ok(())
-}
-
-#[test]
-fn test_config_rm_output_shows_file_path() -> TestResult {
-    let dir = TempDir::new()?;
-    expect_success(&run_pent(dir.path(), &["config", "add", "@cargo"]));
-    let out = run_pent(dir.path(), &["config", "rm", "@cargo"]);
-    expect_success(&out);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("pent.toml"),
-        "Expected pent.toml path in rm stderr: {stderr}"
+        "pent --execute DIR --read DIR -- {bin} should succeed\nstderr: {stderr}",
     );
     Ok(())
 }
@@ -1045,7 +796,6 @@ fn test_config_rm_output_shows_file_path() -> TestResult {
 #[cfg(target_os = "linux")]
 mod no_hang {
     use super::*;
-    use serial_test::serial;
     use std::io::Read as _;
     use std::process::Stdio;
     use std::time::{Duration, Instant};
@@ -1053,10 +803,10 @@ mod no_hang {
     /// Spawn `pent` with `args` in `dir`; kill it if it has not exited after
     /// `timeout_secs`.  Returns `(finished_before_deadline, stderr_text)`.
     ///
-    /// `home` must be an empty temp dir — it is set as `$HOME` so the real
-    /// `~/.config/pent/pent.toml` global config is invisible to pent.
-    /// `XDG_CONFIG_HOME` and `XDG_DATA_HOME` are also cleared so they cannot
-    /// override the isolated home.
+    /// `home` must be a temp dir from [`profile_home`] — it is set as `$HOME`
+    /// so the real `~/.config/pent` is invisible to pent.
+    /// `XDG_CONFIG_HOME`, `XDG_STATE_HOME` and `XDG_DATA_HOME` are also
+    /// cleared so they cannot override the isolated home.
     /// stdout is discarded (`Stdio::null`) — we only capture stderr for
     /// diagnostics.  stderr is drained in a background thread so the child
     /// can never block on a full pipe.
@@ -1067,6 +817,7 @@ mod no_hang {
             .current_dir(dir)
             .env("HOME", home)
             .env_remove("XDG_CONFIG_HOME")
+            .env_remove("XDG_STATE_HOME")
             .env_remove("XDG_DATA_HOME")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -1101,6 +852,28 @@ mod no_hang {
         (exited, stderr)
     }
 
+    /// Make a temp `$HOME` with the trusted profile `name` (content `toml`).
+    #[allow(clippy::unwrap_used, clippy::panic)] // infrastructure helper: setup failures are hard test setup errors
+    fn profile_home(name: &str, toml: &str) -> TempDir {
+        let home = TempDir::new().unwrap();
+        let drafts = home.path().join(".local/state/pent/drafts");
+        fs::create_dir_all(&drafts).unwrap();
+        fs::write(drafts.join(format!("{name}.toml")), toml).unwrap();
+        let status = Command::new(PENT)
+            .args(["trust", name, "--yes"])
+            .env("HOME", home.path())
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("XDG_STATE_HOME")
+            .env_remove("XDG_DATA_HOME")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap_or_else(|e| panic!("pent trust {name}: {e}"));
+        assert!(status.success(), "pent trust {name} --yes failed");
+        home
+    }
+
     /// Find `name` via `which`; fall back to `~/.local/bin/<name>`.
     fn detect_binary(name: &str) -> Option<std::path::PathBuf> {
         if let Ok(out) = Command::new("which").arg(name).output() {
@@ -1118,21 +891,18 @@ mod no_hang {
 
     // ── baseline: system binaries ─────────────────────────────────────────────
 
-    /// /usr/bin/true: the simplest possible exit.  Should always finish in <2s.
+    /// `true` from PATH: the simplest possible exit.  Should always finish in <2s.
     #[test]
     fn system_true_exits_quickly() -> TestResult {
         let dir = TempDir::new()?;
-        let home = TempDir::new()?;
+        let home = profile_home(TEST_PROFILE, "");
         let (ok, stderr) = pent_timeout(
             dir.path(),
             home.path(),
-            &["run", "--no-config", "--", "/usr/bin/true"],
+            &["run", "--profile", TEST_PROFILE, "--", "true"],
             2,
         );
-        assert!(
-            ok,
-            "pent run -- /usr/bin/true timed out (2s)\nstderr:\n{stderr}"
-        );
+        assert!(ok, "pent run -- true timed out (2s)\nstderr:\n{stderr}");
         Ok(())
     }
 
@@ -1140,40 +910,41 @@ mod no_hang {
     #[test]
     fn system_true_blocked_network_exits_quickly() -> TestResult {
         let dir = TempDir::new()?;
-        let home = TempDir::new()?;
+        let home = profile_home(TEST_PROFILE, "");
         let (ok, stderr) = pent_timeout(
             dir.path(),
             home.path(),
             &[
                 "run",
-                "--no-config",
+                "--profile",
+                TEST_PROFILE,
                 "--network",
                 "blocked",
                 "--",
-                "/usr/bin/true",
+                "true",
             ],
             2,
         );
         assert!(
             ok,
-            "pent run --network blocked -- /usr/bin/true timed out (2s)\nstderr:\n{stderr}"
+            "pent run --network blocked -- true timed out (2s)\nstderr:\n{stderr}"
         );
         Ok(())
     }
 
-    /// /usr/bin/curl --version: a real binary that reads shared libs from /usr/lib.
+    /// `curl --version`: a real binary with shared libraries.
     #[test]
     fn system_curl_version_exits_quickly() -> TestResult {
-        if !std::path::Path::new("/usr/bin/curl").exists() {
-            println!("SKIP: /usr/bin/curl not found");
+        if common::e2e::which("curl").is_none() {
+            crate::common::e2e::skip("system_curl_version_exits_quickly", "curl is not in PATH");
             return Ok(());
         }
         let dir = TempDir::new()?;
-        let home = TempDir::new()?;
+        let home = profile_home(TEST_PROFILE, "");
         let (ok, stderr) = pent_timeout(
             dir.path(),
             home.path(),
-            &["run", "--no-config", "--", "/usr/bin/curl", "--version"],
+            &["run", "--profile", TEST_PROFILE, "--", "curl", "--version"],
             2,
         );
         assert!(
@@ -1187,20 +958,26 @@ mod no_hang {
     //
     // detect_binary uses the REAL $HOME (the test process's env) to locate the
     // binary.  pent itself gets a fresh empty home so it finds no global config.
+    //
+    // Only `claude` has a test here. The tests for `codex` and `gemini` are
+    // gone: no machine that we use installs those two programs, so the six
+    // tests skipped on each machine and proved nothing. A developer with one
+    // of them runs the `claude` tests with the other name by hand. Install a
+    // program in `e2e/Dockerfile` before you add a test for it.
 
     #[allow(clippy::unwrap_used)] // infrastructure helper: to_str() only fails on non-UTF-8 paths
     fn assert_version_exits_quickly(name: &str) {
         let Some(bin) = detect_binary(name) else {
-            println!("SKIP: {name} not found in PATH or ~/.local/bin");
+            crate::common::e2e::skip_optional(name, "not in PATH or ~/.local/bin");
             return;
         };
         let bin_s = bin.to_str().unwrap();
         let dir = TempDir::new().unwrap();
-        let home = TempDir::new().unwrap();
+        let home = profile_home(TEST_PROFILE, "");
         let (ok, stderr) = pent_timeout(
             dir.path(),
             home.path(),
-            &["run", "--no-config", "--", bin_s, "--version"],
+            &["run", "--profile", TEST_PROFILE, "--", bin_s, "--version"],
             5,
         );
         assert!(
@@ -1210,72 +987,45 @@ mod no_hang {
     }
 
     #[test]
-    #[serial(pty)]
     fn claude_version_exits_quickly() {
         assert_version_exits_quickly("claude");
     }
-    #[test]
-    #[serial(pty)]
-    fn codex_version_exits_quickly() {
-        assert_version_exits_quickly("codex");
-    }
-    #[test]
-    #[serial(pty)]
-    fn gemini_version_exits_quickly() {
-        assert_version_exits_quickly("gemini");
-    }
 
-    // ── with-config: project pent.toml sets domain_allowlist → ProxyOnly ─────
+    // ── with a profile: the profile has domains → ProxyOnly ─────────────────
     //
-    // The project config lives only in the temp `dir` (.pent/pent.toml).
-    // The isolated `home` ensures no global config is loaded on top of it.
+    // The profile lives only in the isolated `home`.
 
     #[allow(clippy::unwrap_used)] // infrastructure helper: to_str()/TempDir failures are hard errors
     fn assert_proxy_mode_exits_quickly(name: &str) {
         let Some(bin) = detect_binary(name) else {
-            println!("SKIP: {name} not found in PATH or ~/.local/bin");
+            crate::common::e2e::skip_optional(name, "not in PATH or ~/.local/bin");
             return;
         };
         let bin_s = bin.to_str().unwrap();
 
         let dir = TempDir::new().unwrap();
-        let home = TempDir::new().unwrap();
-        let dot_pent = dir.path().join(".pent");
-        fs::create_dir_all(&dot_pent).unwrap();
-        fs::write(
-            dot_pent.join("pent.toml"),
-            "[proxy]\ndomain_allowlist = [\"api.anthropic.com\"]\n",
-        )
-        .unwrap();
+        let home = profile_home(
+            TEST_PROFILE,
+            "[network]\ndomains = [\"api.anthropic.com\"]\n",
+        );
 
         let (ok, stderr) = pent_timeout(
             dir.path(),
             home.path(),
-            &["run", "--", bin_s, "--version"],
-            5, // proxy + veth setup may take ~1s; allow 5s total
+            &["run", "--profile", TEST_PROFILE, "--", bin_s, "--version"],
+            5, // the proxy setup takes much less than 1s; allow 5s total
         );
         assert!(
             ok,
             "pent run (proxy mode) -- {name} --version timed out (5s)\n\
-             hint: pent may be hanging in veth/nft setup or the child is \
+             hint: pent may be hanging in the proxy setup or the child is \
              not routing through the proxy\nstderr:\n{stderr}",
         );
     }
 
     #[test]
-    #[serial(netns)]
     fn claude_proxy_mode_exits_quickly() {
         assert_proxy_mode_exits_quickly("claude");
-    }
-    #[test]
-    #[serial(netns)]
-    fn codex_proxy_mode_exits_quickly() {
-        assert_proxy_mode_exits_quickly("codex");
-    }
-    #[test]
-    #[serial(netns)]
-    fn gemini_proxy_mode_exits_quickly() {
-        assert_proxy_mode_exits_quickly("gemini");
     }
 
     // ── PTY-simulated interactive sessions ────────────────────────────────────
@@ -1283,11 +1033,12 @@ mod no_hang {
     // Isolation model:
     //   HOME            = real test-process HOME  (so ~/.npm-global, ~/.local/share/claude
     //                     etc. are reachable by the sandboxed binary)
-    //   XDG_CONFIG_HOME = fresh TempDir with @{agent} profile installed
+    //   XDG_CONFIG_HOME = fresh TempDir with the {agent} profile installed
     //   cwd             = fresh empty TempDir
     //
-    // Each test runs `pent config add --global @{agent}` into a temp HOME before
-    // spawning pent, so the agent's paths and network profile are active.
+    // Each test installs and trusts the {agent} profile (common::agent_profile)
+    // in a temp HOME before it spawns pent, so the agent's paths and network
+    // rules are active.
     //
     // Test flow:
     //   1. Wait up to 8s for PTY output that looks like a started TUI:
@@ -1331,9 +1082,10 @@ mod no_hang {
         let child = Command::new(PENT)
             .args(args)
             .current_dir(dir)
-            // Use the agent_home so the @{agent} global config is visible.
+            // Use the agent_home so the {agent} profile is visible.
             .env("HOME", agent_home)
             .env_remove("XDG_CONFIG_HOME")
+            .env_remove("XDG_STATE_HOME")
             .env_remove("XDG_DATA_HOME")
             .env_remove("PENT_LOG")
             .stdin(unsafe { Stdio::from_raw_fd(slave) })
@@ -1345,22 +1097,10 @@ mod no_hang {
         (master, child)
     }
 
-    /// Install the `@{agent}` global profile into a fresh temp HOME.
+    /// Install the trusted `{agent}` profile into a fresh temp HOME.
     /// Returns the TempDir (keep alive) — its path is used as HOME.
-    #[allow(clippy::unwrap_used, clippy::panic)] // infrastructure helper: config setup failures are hard test setup errors
     fn setup_agent_config(agent: &str) -> TempDir {
-        let home = TempDir::new().unwrap();
-        let status = Command::new(PENT)
-            .args(["config", "add", "--global", &format!("@{agent}")])
-            .env("HOME", home.path())
-            .env_remove("XDG_CONFIG_HOME")
-            .env_remove("XDG_DATA_HOME")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .unwrap_or_else(|e| panic!("pent config add @{agent}: {e}"));
-        assert!(status.success(), "pent config add --global @{agent} failed");
-        home
+        profile_home(agent, &common::agent_profile(agent))
     }
 
     /// Poll `master_fd` (non-blocking) for up to `timeout`.  Returns what arrived.
@@ -1467,7 +1207,7 @@ mod no_hang {
         text.lines().filter(|l| !l.trim().is_empty()).count() >= 2
     }
 
-    /// Core PTY TUI-start test: install `@{agent}` profile into a temp HOME,
+    /// Core PTY TUI-start test: install the `{agent}` profile into a temp HOME,
     /// spawn `pent run --network unrestricted -- <binary>` with a PTY, and
     /// confirm the TUI renders (≥ 2 non-empty lines after ANSI strip, no crash
     /// markers).  Then kill pent.  This test is purely about sandbox access —
@@ -1475,7 +1215,7 @@ mod no_hang {
     #[allow(clippy::panic, clippy::unwrap_used)] // infrastructure helper: PTY test failure should panic with a clear message
     fn assert_pty_interactive(agent: &str) {
         let Some(bin) = detect_binary(agent) else {
-            println!("SKIP: {agent} not found");
+            crate::common::e2e::skip_optional(agent, "not in PATH or ~/.local/bin");
             return;
         };
         let bin_s = bin.to_str().unwrap();
@@ -1487,11 +1227,25 @@ mod no_hang {
         let (master, mut child) = spawn_with_pty(
             dir.path(),
             agent_home.path(),
-            &["run", "--network", "unrestricted", "--", bin_s],
+            &[
+                "run",
+                "--profile",
+                agent,
+                "--network",
+                "unrestricted",
+                "--",
+                bin_s,
+            ],
         );
 
-        // Step 1: wait up to 8 s for the TUI to render.
-        let output = drain_pty(master, Duration::from_secs(8));
+        // Step 1: wait for the TUI to render.
+        //
+        // The budget is generous: the test starts a real agent under a real
+        // sandbox, and a loaded machine needs much longer than a quiet one.
+        // A budget that flakes under load tells nothing about pent, and it
+        // trains the reader to ignore a red suite. The test still fails in
+        // a sensible time when the TUI never comes.
+        let output = drain_pty(master, Duration::from_secs(60));
         let printable = String::from_utf8_lossy(&output);
 
         if !looks_like_prompt(&output) {
@@ -1499,7 +1253,7 @@ mod no_hang {
             child.wait().ok();
             unsafe { libc::close(master) };
             panic!(
-                "pent run -- {agent}: PTY output within 8s was empty or contained errors\n\
+                "pent run -- {agent}: the TUI gave no prompt within 60s\n\
                  output: {printable:?}\n\
                  hint: sandbox may be blocking a resource the binary needs"
             );
@@ -1512,18 +1266,7 @@ mod no_hang {
     }
 
     #[test]
-    #[serial(pty)]
     fn pty_claude_interactive_exits_quickly() {
         assert_pty_interactive("claude");
-    }
-    #[test]
-    #[serial(pty)]
-    fn pty_codex_interactive_exits_quickly() {
-        assert_pty_interactive("codex");
-    }
-    #[test]
-    #[serial(pty)]
-    fn pty_gemini_interactive_exits_quickly() {
-        assert_pty_interactive("gemini");
     }
 }

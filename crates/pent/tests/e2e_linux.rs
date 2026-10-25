@@ -1,382 +1,891 @@
-//! End-to-end tests for Linux agents.
+//! End-to-end tests on Linux: the real `pent` binary, the real sandbox.
 //!
-//! Ports `e2e/test-linux-agents.sh` to native Rust so the tests always run
-//! against the freshly-built binary without a separate bash step.
+//! Each test has its own directories below `CARGO_TARGET_TMPDIR` (see
+//! `common::e2e::TestEnv`): its own `HOME`, `XDG_CONFIG_HOME`,
+//! `XDG_STATE_HOME` and workspace. The tests share no state and run in
+//! parallel.
 //!
 //! # Requirements
 //!
-//! Network namespace creation requires root or `CAP_NET_ADMIN`.  Run with:
+//! Landlock (ABI v3 or later) and unprivileged user namespaces. Pent needs
+//! no root and no capability. The tests find `sh`, `curl`, `getent`, `sleep`
+//! and `sudo` in `PATH`. A test skips (it prints `SKIP` and passes) when the
+//! sandbox is not available or a tool is missing. The network tests need
+//! the internet; they skip when `curl https://example.com` fails without
+//! pent.
 //!
-//! ```
-//! sudo -E cargo test --test e2e_linux -- --nocapture
-//! ```
+//! No test has an `#[ignore]` mark: a test that the continuous integration
+//! must run never carries one. Set `PENT_REQUIRE_ALL_TESTS=1` to make each
+//! skip a failure.
 //!
-//! Tests are skipped (not failed) when not running as root.
+//! ```text
+//! cargo test -p pent --test e2e_linux -- --nocapture
+//! ```
+
+mod common;
 
 #[cfg(target_os = "linux")]
 mod linux {
+    use std::collections::BTreeSet;
     use std::fs;
-    use std::path::{Path, PathBuf};
-    use std::process::{Command, ExitStatus, Stdio};
-    use std::sync::{Mutex, OnceLock};
-    use tempfile::TempDir;
+    use std::os::unix::process::ExitStatusExt as _;
+    use std::process::Stdio;
+    use std::time::Duration;
 
-    type TestResult = Result<(), Box<dyn std::error::Error>>;
+    use super::common::agent_profile;
+    use super::common::e2e::{
+        have_tools, internet, sandbox_ready, staging_dirs, stderr, stdout, wait_timeout, BoxError,
+        TestEnv, TestResult,
+    };
 
-    const PENT_BIN: &str = env!("CARGO_BIN_EXE_pent");
+    /// The time limit for one pent command.
+    const TIMEOUT: Duration = Duration::from_secs(60);
 
-    // ── root check ───────────────────────────────────────────────────────────
+    /// The time limit for one answer on the terminal.
+    const PROMPT_TIMEOUT: Duration = Duration::from_secs(30);
 
-    fn is_root() -> bool {
-        Command::new("id")
-            .arg("-u")
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .and_then(|s| s.trim().parse::<u32>().ok())
-            .is_some_and(|uid| uid == 0)
+    /// Return true if the test can run: the sandbox works and the tools are
+    /// in `PATH`.
+    fn ready(test: &str, tools: &[&str]) -> bool {
+        have_tools(test, tools) && sandbox_ready(test)
     }
 
-    // ── routing guard ────────────────────────────────────────────────────────
+    /// The string list `key` in the table `table` of a profile.
+    fn rules(toml_text: &str, table: &str, key: &str) -> Result<BTreeSet<String>, BoxError> {
+        let doc: toml::Value = toml::from_str(toml_text)?;
+        let Some(list) = doc.get(table).and_then(|t| t.get(key)) else {
+            return Ok(BTreeSet::new());
+        };
+        let list = list
+            .as_array()
+            .ok_or_else(|| format!("{table}.{key} is not a list"))?;
+        list.iter()
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| BoxError::from(format!("{table}.{key} has a non-string value")))
+            })
+            .collect()
+    }
 
-    /// RAII guard: adds uid-restricted routing tables at priority 9990 on
-    /// construction, removes them on drop.
-    ///
-    /// On systems with uid-based policy routing (e.g. VPN or tunnel software
-    /// that installs routes only visible to the owning uid) those tables are
-    /// invisible to root.  We temporarily inject
-    /// `from all lookup <table> priority 9990` for each non-system table so
-    /// the pent proxy can reach the name servers.
-    struct RoutingGuard(Vec<u32>);
+    /// A set of strings, for the comparisons.
+    fn set(items: &[&str]) -> BTreeSet<String> {
+        items.iter().map(|s| (*s).to_string()).collect()
+    }
 
-    impl RoutingGuard {
-        #[allow(clippy::expect_used)] // infrastructure: ip rule show must succeed for routing tests
-        fn install() -> Self {
-            let out = Command::new("ip")
-                .args(["rule", "show"])
-                .output()
-                .expect("ip rule show");
-            let stdout = String::from_utf8_lossy(&out.stdout);
+    /// The lines of `pent profile list`, with single spaces.
+    fn profile_list(env: &TestEnv) -> Result<Vec<String>, BoxError> {
+        let out = env.pent_ok(&["profile", "list"])?;
+        Ok(stdout(&out)
+            .lines()
+            .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+            .collect())
+    }
 
-            let mut added = Vec::new();
-            let mut seen = std::collections::HashSet::new();
-            for line in stdout.lines() {
-                // Lines look like: "5270:\tfrom all lookup 52"
-                if let Some(t_str) = line
-                    .split_whitespace()
-                    .skip_while(|&w| w != "lookup")
-                    .nth(1)
-                {
-                    if let Ok(table) = t_str.parse::<u32>() {
-                        // Skip system tables: local=255, main=254, default=253
-                        if table < 253 && seen.insert(table) {
-                            let ok = Command::new("ip")
-                                .args([
-                                    "rule",
-                                    "add",
-                                    "from",
-                                    "all",
-                                    "lookup",
-                                    &table.to_string(),
-                                    "priority",
-                                    "9990",
-                                ])
-                                .stderr(Stdio::null())
-                                .status()
-                                .map(|s| s.success())
-                                .unwrap_or(false);
-                            if ok {
-                                added.push(table);
-                            }
-                        }
-                    }
-                }
-            }
-            Self(added)
+    // ── the agent profiles ───────────────────────────────────────────────────
+
+    /// The profile of an agent keeps the workspace read-write and denies a
+    /// write outside the workspace.
+    fn agent_filesystem(agent: &str) -> TestResult {
+        if !ready(agent, &["sh"]) {
+            return Ok(());
         }
+        let env = TestEnv::new()?;
+        env.install_profile(agent, &agent_profile(agent))?;
+        let run = |script: &str| {
+            env.pent(&[
+                "run",
+                "--profile",
+                agent,
+                "--network",
+                "unrestricted",
+                "--",
+                "sh",
+                "-c",
+                script,
+            ])
+        };
+
+        let out = run("echo ok > sentinel.txt")?;
+        assert!(out.status.success(), "{agent}: {}", stderr(&out));
+        assert_eq!(fs::read_to_string(env.ws.join("sentinel.txt"))?, "ok\n");
+
+        let out = run("cat sentinel.txt")?;
+        assert!(out.status.success(), "{agent}: {}", stderr(&out));
+        assert_eq!(stdout(&out), "ok\n");
+
+        let outside = env.root.join(format!("outside-{agent}"));
+        let out = run(&format!("echo x > '{}'", outside.display()))?;
+        assert!(!out.status.success(), "{agent}: the write must fail");
+        assert!(
+            !outside.exists(),
+            "{agent}: the write outside the workspace was not denied"
+        );
+        Ok(())
     }
 
-    impl Drop for RoutingGuard {
-        fn drop(&mut self) {
-            for &table in &self.0 {
-                let _ = Command::new("ip")
-                    .args([
-                        "rule",
-                        "del",
-                        "from",
-                        "all",
-                        "lookup",
-                        &table.to_string(),
-                        "priority",
-                        "9990",
-                    ])
-                    .stderr(Stdio::null())
-                    .status();
-            }
+    #[test]
+    fn filesystem_claude() -> TestResult {
+        agent_filesystem("claude")
+    }
+
+    #[test]
+    fn filesystem_codex() -> TestResult {
+        agent_filesystem("codex")
+    }
+
+    #[test]
+    fn filesystem_gemini() -> TestResult {
+        agent_filesystem("gemini")
+    }
+
+    /// The profile of an agent allows its API domain and denies other
+    /// domains.
+    fn agent_network(agent: &str, allowed: &str) -> TestResult {
+        if !ready(agent, &["curl"]) || !internet(agent) {
+            return Ok(());
         }
+        let env = TestEnv::new()?;
+        env.install_profile(agent, &agent_profile(agent))?;
+        let curl = |url: &str| {
+            env.pent(&[
+                "run",
+                "--profile",
+                agent,
+                "--",
+                "curl",
+                "-sS",
+                "-o",
+                "/dev/null",
+                "-w",
+                "%{http_code}",
+                "--max-time",
+                "20",
+                url,
+            ])
+        };
+
+        // Any HTTP answer (also 404) proves that the proxy forwarded the
+        // connection.
+        let out = curl(&format!("https://{allowed}"))?;
+        let code = stdout(&out);
+        assert!(
+            code.len() == 3 && code != "000",
+            "{agent}: {allowed} is not reachable (http code {code:?})\nstderr: {}",
+            stderr(&out)
+        );
+
+        let out = curl("https://blocked-domain.invalid")?;
+        assert!(!out.status.success(), "{agent}: the domain was not denied");
+        assert_eq!(stdout(&out), "000", "{agent}: {}", stderr(&out));
+        Ok(())
     }
 
-    // ── sandbox availability probe ───────────────────────────────────────────
-
-    fn landlock_available() -> bool {
-        static CACHE: OnceLock<bool> = OnceLock::new();
-        *CACHE.get_or_init(|| {
-            // Phase 1: kernel supports Landlock? (ABI >= 1 means kernel >= 5.13)
-            let abi: u64 = fs::read_to_string("/proc/sys/kernel/landlock_abi")
-                .unwrap_or_default()
-                .trim()
-                .parse()
-                .unwrap_or(0);
-            if abi == 0 {
-                println!("NOTE: Landlock not supported (kernel too old or not compiled in) — skipping filesystem tests");
-                return false;
-            }
-
-            // Phase 2: pent check reports ready?
-            let api_ok = Command::new(PENT_BIN)
-                .arg("check")
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
-            if !api_ok {
-                println!("NOTE: pent check reports sandbox unavailable — skipping filesystem tests");
-                return false;
-            }
-
-            // Phase 3: actually enforcing? (behavioral probe)
-            let probe = "/etc/pent-landlock-probe";
-            let _ = fs::remove_file(probe);
-            let _ = Command::new(PENT_BIN)
-                .args([
-                    "run", "--no-config",
-                    "--network", "unrestricted",
-                    "--",
-                    "bash", "-c",
-                    "echo probe > /etc/pent-landlock-probe 2>/dev/null; exit 0",
-                ])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-            if Path::new(probe).exists() {
-                let _ = fs::remove_file(probe);
-                println!("NOTE: Landlock API available but not enforcing (kernel limitation) — skipping filesystem tests");
-                false
-            } else {
-                true
-            }
-        })
+    #[test]
+    fn network_claude() -> TestResult {
+        agent_network("claude", "api.anthropic.com")
     }
 
-    // ── config setup ─────────────────────────────────────────────────────────
+    #[test]
+    fn network_codex() -> TestResult {
+        agent_network("codex", "api.openai.com")
+    }
 
-    /// Create a temp $HOME, run `pent config add --global @{agent}`, and return
-    /// the `TempDir` (keep alive) and the resulting config file path.
-    ///
-    /// On Linux `dirs::config_dir()` = `~/.config`, so the config lands at
-    /// `$HOME/.config/pent/pent.toml`.
-    /// Returns `(home_dir, config_path)`.
-    #[allow(clippy::unwrap_used, clippy::panic)] // infrastructure helper: TempDir/spawn failures are test setup failures
-    fn agent_config(agent: &str, configs_root: &Path) -> (PathBuf, PathBuf) {
-        let home = configs_root.join(format!("{agent}_home"));
-        fs::create_dir_all(&home).unwrap();
-        let status = Command::new(PENT_BIN)
-            .args(["config", "add", "--global", &format!("@{agent}")])
-            .env("HOME", &home)
+    #[test]
+    fn network_gemini() -> TestResult {
+        agent_network("gemini", "generativelanguage.googleapis.com")
+    }
+
+    // ── pent run without a trusted profile ───────────────────────────────────
+
+    /// `pent run` does not start the program without a trusted profile. The
+    /// message tells the next step: record, trust, or trust again.
+    #[test]
+    fn run_needs_a_trusted_profile() -> TestResult {
+        if !ready("run_needs_a_trusted_profile", &["sh"]) {
+            return Ok(());
+        }
+        let env = TestEnv::new()?;
+        let marker = env.ws.join("ran");
+        let script = "touch ran";
+        let run = || env.pent(&["run", "--profile", "m", "--", "sh", "-c", script]);
+
+        let out = run()?;
+        assert!(!out.status.success());
+        let err = stderr(&out);
+        assert!(
+            err.contains("✗ no trusted profile for \"m\"\n  record one: pent watch --profile m -- sh -c 'touch ran'"),
+            "{err}"
+        );
+        assert!(!marker.exists(), "the program must not start");
+
+        env.pent_ok(&["watch", "--yes", "--profile", "m", "--", "sh", "-c", "true"])?;
+        let out = run()?;
+        assert!(!out.status.success());
+        let err = stderr(&out);
+        assert!(err.contains("the draft is not trusted"), "{err}");
+        assert!(err.contains("review and trust it: pent trust m"), "{err}");
+        assert!(!marker.exists(), "the program must not start");
+
+        env.pent_ok(&["trust", "m", "--yes"])?;
+        let out = run()?;
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert!(marker.exists());
+        fs::remove_file(&marker)?;
+
+        let profile = env.profile_path("m");
+        let mut text = fs::read_to_string(&profile)?;
+        text.push_str("\n[network]\ndomains = [\"evil.example\"]\n");
+        fs::write(&profile, text)?;
+        let out = run()?;
+        assert!(!out.status.success());
+        let err = stderr(&out);
+        assert!(
+            err.contains("the profile \"m\" changed after you trusted it"),
+            "{err}"
+        );
+        assert!(err.contains("pent trust m"), "{err}");
+        assert!(!marker.exists(), "the program must not start");
+        Ok(())
+    }
+
+    // ── watch → trust → run ──────────────────────────────────────────────────
+
+    /// The watched program reads a file, edits one config file, edits two
+    /// files in one directory and makes files in its cache. The draft has
+    /// one rule for each, and the trusted profile allows exactly these
+    /// accesses: other paths in the home directory stay hidden, and writes
+    /// to them never reach the real home directory.
+    #[test]
+    fn watch_trust_run_gives_exactly_the_recorded_accesses() -> TestResult {
+        if !ready("watch_trust_run", &["sh"]) {
+            return Ok(());
+        }
+        let env = TestEnv::new()?;
+        env.write_home(".foorc", "foo\n")?;
+        env.write_home(".config/app/settings.toml", "a = 1\n")?;
+        env.write_home(".config/app/other.toml", "other\n")?;
+        env.write_home(".local/share/data/x", "x\n")?;
+        env.write_home(".local/share/data/y", "y\n")?;
+        env.write_home(".local/share/other/file", "other\n")?;
+        env.write_home(".secret", "secret\n")?;
+        fs::create_dir_all(env.home_path(".cache"))?;
+
+        let out = env.pent_ok(&[
+            "watch",
+            "--yes",
+            "--profile",
+            "t",
+            "--",
+            "sh",
+            "-c",
+            "cat ~/.foorc; echo 'b = 2' >> ~/.config/app/settings.toml; \
+             echo x2 > ~/.local/share/data/x; echo y2 > ~/.local/share/data/y; \
+             mkdir -p ~/.cache/tool/sub; echo c > ~/.cache/tool/sub/c1",
+        ])?;
+        assert_eq!(stdout(&out), "foo\n");
+        let draft = fs::read_to_string(env.draft_path("t"))?;
+        assert_eq!(
+            rules(&draft, "filesystem", "read_write")?,
+            set(&[
+                "~/.cache/tool",
+                "~/.config/app/settings.toml",
+                "~/.local/share/data"
+            ]),
+            "{draft}"
+        );
+        assert_eq!(
+            rules(&draft, "filesystem", "read")?,
+            set(&["~/.foorc"]),
+            "{draft}"
+        );
+        assert!(draft.contains("# cache"), "{draft}");
+        assert!(draft.contains("# config file"), "{draft}");
+
+        env.pent_ok(&["trust", "t", "--yes"])?;
+        assert!(env.profile_path("t").exists());
+
+        let out = env.pent(&[
+            "run",
+            "--profile",
+            "t",
+            "--",
+            "sh",
+            "-c",
+            "cat ~/.foorc; \
+             echo 'c = 3' >> ~/.config/app/settings.toml && echo SETTINGS_OK; \
+             echo x3 > ~/.local/share/data/x && echo DATA_OK; \
+             echo n > ~/.local/share/data/new && echo DATA_NEW_OK; \
+             echo c2 > ~/.cache/tool/c2 && echo CACHE_OK; \
+             cat ~/.config/app/other.toml 2>/dev/null || echo SIBLING_HIDDEN; \
+             cat ~/.local/share/other/file 2>/dev/null || echo OTHER_DIR_HIDDEN; \
+             cat ~/.secret 2>/dev/null || echo SECRET_DENIED; \
+             echo w 2>/dev/null > ~/.foorc; \
+             echo leak 2>/dev/null > ~/.config/app/leak.toml; \
+             echo leak 2>/dev/null > ~/.leak; \
+             echo leak 2>/dev/null > ~/.local/share/leak; \
+             echo DONE",
+        ])?;
+        let text = stdout(&out);
+        let expected = [
+            "foo",
+            "SETTINGS_OK",
+            "DATA_OK",
+            "DATA_NEW_OK",
+            "CACHE_OK",
+            "SIBLING_HIDDEN",
+            "OTHER_DIR_HIDDEN",
+            "SECRET_DENIED",
+            "DONE",
+        ];
+        assert_eq!(
+            text.lines().collect::<Vec<_>>(),
+            expected,
+            "stderr: {}",
+            stderr(&out)
+        );
+
+        // The allowed writes reach the real home directory.
+        assert_eq!(
+            fs::read_to_string(env.home_path(".config/app/settings.toml"))?,
+            "a = 1\nb = 2\nc = 3\n"
+        );
+        assert_eq!(
+            fs::read_to_string(env.home_path(".local/share/data/x"))?,
+            "x3\n"
+        );
+        assert!(env.home_path(".local/share/data/new").exists());
+        assert!(env.home_path(".cache/tool/c2").exists());
+        // The other paths do not change. A write to them can work in the
+        // overlay of the home directory, but pent discards it.
+        assert_eq!(fs::read_to_string(env.home_path(".foorc"))?, "foo\n");
+        assert_eq!(
+            fs::read_to_string(env.home_path(".config/app/other.toml"))?,
+            "other\n"
+        );
+        for leak in [".config/app/leak.toml", ".leak", ".local/share/leak"] {
+            assert!(
+                !env.home_path(leak).exists(),
+                "~/{leak} reached the real home directory"
+            );
+        }
+        Ok(())
+    }
+
+    // ── the watch guard ──────────────────────────────────────────────────────
+
+    /// The guard of `pent watch` blocks a credential read, writes to the
+    /// shell rc files and to the files of pent, and privilege escalation.
+    /// The summary lists the attempts in the Blocked section, and the draft
+    /// does not have them.
+    #[test]
+    fn watch_guard_blocks_dangerous_accesses() -> TestResult {
+        if !ready("watch_guard", &["sh", "cat", "grep", "touch"]) {
+            return Ok(());
+        }
+        let env = TestEnv::new()?;
+        env.write_home(".ssh/id_x", "SECRET-KEY\n")?;
+        env.write_home(".zshrc", "z\n")?;
+        fs::create_dir_all(env.config_dir().join("pent"))?;
+        let sudo = super::common::e2e::which("sudo").is_some();
+        let sudo_part = if sudo {
+            "sudo -n id -u 2>/dev/null; echo \"sudo=$?\""
+        } else {
+            eprintln!("NOTE watch_guard: sudo is not in PATH; only NO_NEW_PRIVS is checked");
+            "true"
+        };
+        let script = format!(
+            "echo \"ssh=[$(cat ~/.ssh/id_x)]\"; \
+             echo pwn 2>/dev/null >> ~/.bashrc; echo \"bashrc=$?\"; \
+             echo pwn 2>/dev/null >> ~/.zshrc; echo \"zshrc=$?\"; \
+             touch ~/.config/pent/x 2>/dev/null; echo \"pent=$?\"; \
+             grep NoNewPrivs /proc/self/status; {sudo_part}"
+        );
+        let out = env.pent_ok(&[
+            "watch",
+            "--yes",
+            "--profile",
+            "g",
+            "--",
+            "sh",
+            "-c",
+            &script,
+        ])?;
+        let text = stdout(&out);
+        let err = stderr(&out);
+        assert!(text.contains("ssh=[]\n"), "the key was readable: {text}");
+        // Each write fails. The status of a failed redirection depends on
+        // the shell (1 in bash, 2 in dash).
+        for name in ["bashrc", "zshrc", "pent"] {
+            let status = text
+                .lines()
+                .find_map(|l| l.strip_prefix(&format!("{name}=")))
+                .ok_or_else(|| format!("no status for {name}: {text}"))?;
+            assert_ne!(status, "0", "the write to {name} worked: {text}");
+        }
+        assert!(text.contains("NoNewPrivs:\t1\n"), "{text}");
+        if sudo {
+            assert!(!text.lines().any(|l| l == "0"), "sudo became root: {text}");
+            assert!(!text.contains("sudo=0"), "{text}");
+        }
+        assert!(!env.home_path(".bashrc").exists(), "~/.bashrc was made");
+        assert_eq!(fs::read_to_string(env.home_path(".zshrc"))?, "z\n");
+        assert!(!env.config_dir().join("pent/x").exists());
+
+        let blocked = err
+            .split("Blocked by the guard")
+            .nth(1)
+            .ok_or_else(|| format!("no Blocked section:\n{err}"))?;
+        for item in [
+            "read ~/.ssh/id_x",
+            "write ~/.bashrc",
+            "write ~/.zshrc",
+            "write ~/.config/pent/x",
+        ] {
+            assert!(blocked.contains(item), "{item} is not blocked:\n{err}");
+        }
+        if sudo {
+            assert!(blocked.contains("runs sudo"), "{err}");
+        }
+        let draft = fs::read_to_string(env.draft_path("g"))?;
+        for path in ["id_x", "bashrc", "zshrc", "pent/x"] {
+            assert!(!draft.contains(path), "the draft has {path}:\n{draft}");
+        }
+        // The draft does not let the program run sudo. (sudo can read its
+        // libraries before it fails, thus the draft can have read rules for
+        // them.)
+        assert_eq!(rules(&draft, "filesystem", "execute")?, set(&[]), "{draft}");
+        Ok(())
+    }
+
+    // ── the interactive review ───────────────────────────────────────────────
+
+    /// Prepare the files of the review tests and return the watched script.
+    /// The summary has two read-write rules, two read rules and two blocked
+    /// items.
+    fn review_setup(env: &TestEnv) -> Result<&'static str, BoxError> {
+        env.write_home(".foorc", "foo\n")?;
+        env.write_home(".barrc", "bar\n")?;
+        env.write_home(".config/app/settings.toml", "a = 1\n")?;
+        env.write_home(".ssh/id_x", "KEY\n")?;
+        fs::create_dir_all(env.home_path(".cache"))?;
+        Ok("cat ~/.foorc ~/.barrc >/dev/null; \
+            echo 'b = 2' >> ~/.config/app/settings.toml; \
+            mkdir -p ~/.cache/tool; echo c > ~/.cache/tool/c; \
+            cat ~/.ssh/id_x; echo x 2>/dev/null >> ~/.bashrc; true")
+    }
+
+    /// The number of the item that has `needle`, in the section that starts
+    /// at `title` in `text`.
+    fn item_number(text: &str, title: &str, needle: &str) -> Result<String, BoxError> {
+        let section = text
+            .rsplit(title)
+            .next()
+            .ok_or_else(|| format!("no section {title:?}:\n{text}"))?;
+        section
+            .lines()
+            .find(|l| l.contains(needle))
+            .and_then(|l| l.split_whitespace().next())
+            .map(str::to_string)
+            .ok_or_else(|| format!("no item {needle:?} in {title:?}:\n{text}").into())
+    }
+
+    /// The review on a terminal: Enter accepts a section, `n` rejects one,
+    /// an invalid answer asks again, a number picks one blocked item, and
+    /// `y` trusts the profile.
+    #[test]
+    fn review_on_a_terminal_follows_the_answers() -> TestResult {
+        if !ready("review_on_a_terminal", &["sh", "cat", "mkdir"]) {
+            return Ok(());
+        }
+        let env = TestEnv::new()?;
+        let script = review_setup(&env)?;
+        let mut pty = env.spawn_pty(&["watch", "--profile", "r", "--", "sh", "-c", script])?;
+        pty.expect("Continue? [y/N]", PROMPT_TIMEOUT)?;
+        pty.send_line("y")?;
+
+        pty.expect("Read-write (2)", PROMPT_TIMEOUT)?;
+        pty.expect("[a] ", PROMPT_TIMEOUT)?;
+        pty.send_line("")?;
+
+        pty.expect("Read (2)", PROMPT_TIMEOUT)?;
+        pty.expect("[a] ", PROMPT_TIMEOUT)?;
+        pty.send_line("7")?;
+        pty.expect("Enter a, n, or numbers from 1 to 2", PROMPT_TIMEOUT)?;
+        pty.expect("[a] ", PROMPT_TIMEOUT)?;
+        pty.send_line("n")?;
+
+        pty.expect("Blocked by the guard (2)", PROMPT_TIMEOUT)?;
+        pty.expect("[n] ", PROMPT_TIMEOUT)?;
+        let key = item_number(&pty.text(), "Blocked by the guard (2)", "~/.ssh/id_x")?;
+        pty.send_line(&key)?;
+
+        pty.expect("3 of 6 rules selected", PROMPT_TIMEOUT)?;
+        pty.expect("Trust this profile now? [y/N]", PROMPT_TIMEOUT)?;
+        pty.send_line("y")?;
+        let (status, text) = pty.wait(TIMEOUT)?;
+        assert!(status.success(), "{text}");
+        assert!(text.contains("trusted \"r\""), "{text}");
+
+        let profile = fs::read_to_string(env.profile_path("r"))?;
+        assert_eq!(
+            rules(&profile, "filesystem", "read_write")?,
+            set(&["~/.cache/tool", "~/.config/app/settings.toml"]),
+            "{profile}"
+        );
+        assert_eq!(
+            rules(&profile, "filesystem", "read")?,
+            set(&["~/.ssh/id_x"]),
+            "{profile}"
+        );
+        assert!(!profile.contains("bashrc"), "{profile}");
+
+        // The trusted profile works at once.
+        let out = env.pent(&["run", "--profile", "r", "--", "cat", "/dev/null"])?;
+        assert!(out.status.success(), "{}", stderr(&out));
+        Ok(())
+    }
+
+    /// The review on a terminal with `a` and `n` and without the trust: the
+    /// draft has the choice, and `pent trust` asks on the terminal.
+    #[test]
+    fn review_on_a_terminal_without_trust() -> TestResult {
+        if !ready("review_without_trust", &["sh", "cat", "mkdir"]) {
+            return Ok(());
+        }
+        let env = TestEnv::new()?;
+        let script = review_setup(&env)?;
+        let mut pty = env.spawn_pty(&["watch", "--profile", "r", "--", "sh", "-c", script])?;
+        pty.expect("Continue? [y/N]", PROMPT_TIMEOUT)?;
+        pty.send_line("y")?;
+        pty.expect("Read-write (2)", PROMPT_TIMEOUT)?;
+        pty.expect("[a] ", PROMPT_TIMEOUT)?;
+        pty.send_line("n")?;
+        pty.expect("Read (2)", PROMPT_TIMEOUT)?;
+        pty.expect("[a] ", PROMPT_TIMEOUT)?;
+        pty.send_line("a")?;
+        // Enter keeps the default of the blocked section: none.
+        pty.expect("Blocked by the guard (2)", PROMPT_TIMEOUT)?;
+        pty.expect("[n] ", PROMPT_TIMEOUT)?;
+        pty.send_line("")?;
+        pty.expect("Trust this profile now? [y/N]", PROMPT_TIMEOUT)?;
+        pty.send_line("")?;
+        let (status, text) = pty.wait(TIMEOUT)?;
+        assert!(status.success(), "{text}");
+        assert!(text.contains("review and trust it: pent trust r"), "{text}");
+        assert!(!env.profile_path("r").exists(), "the profile is trusted");
+
+        let draft = fs::read_to_string(env.draft_path("r"))?;
+        assert_eq!(rules(&draft, "filesystem", "read_write")?, set(&[]));
+        assert_eq!(
+            rules(&draft, "filesystem", "read")?,
+            set(&["~/.barrc", "~/.foorc"]),
+            "{draft}"
+        );
+
+        // `pent trust` shows the draft and asks. "n" keeps it a draft.
+        let mut pty = env.spawn_pty(&["trust", "r"])?;
+        pty.expect("Trust this profile? [y/N]", PROMPT_TIMEOUT)?;
+        pty.send_line("n")?;
+        let (_, text) = pty.wait(TIMEOUT)?;
+        assert!(!env.profile_path("r").exists(), "{text}");
+
+        let mut pty = env.spawn_pty(&["trust", "r"])?;
+        pty.expect("~/.foorc", PROMPT_TIMEOUT)?;
+        pty.expect("Trust this profile? [y/N]", PROMPT_TIMEOUT)?;
+        pty.send_line("y")?;
+        let (status, text) = pty.wait(TIMEOUT)?;
+        assert!(status.success(), "{text}");
+        assert!(env.profile_path("r").exists(), "{text}");
+        Ok(())
+    }
+
+    // ── network ──────────────────────────────────────────────────────────────
+
+    /// Watch records the domain. The trusted profile allows it and denies
+    /// other domains, also at the DNS level. A direct connection past the
+    /// proxy fails. `pent trust --review` adds a denied domain.
+    #[test]
+    fn network_watch_trust_run_review() -> TestResult {
+        if !ready("network_flow", &["curl", "sh"]) || !internet("network_flow") {
+            return Ok(());
+        }
+        let env = TestEnv::new()?;
+        let curl = ["curl", "-sS", "-o", "/dev/null", "--max-time", "20"];
+        let with = |extra: &[&str]| -> Vec<String> {
+            curl.iter().chain(extra).map(|s| (*s).to_string()).collect()
+        };
+        let run = |args: &[String]| {
+            let mut all = vec!["run", "--profile", "net", "--"];
+            all.extend(args.iter().map(String::as_str));
+            env.pent(&all)
+        };
+
+        let mut watch = vec!["watch", "--yes", "--profile", "net", "--"];
+        let args = with(&["https://example.com"]);
+        watch.extend(args.iter().map(String::as_str));
+        env.pent_ok(&watch)?;
+        let draft = fs::read_to_string(env.draft_path("net"))?;
+        assert_eq!(
+            rules(&draft, "network", "domains")?,
+            set(&["example.com"]),
+            "{draft}"
+        );
+        env.pent_ok(&["trust", "net", "--yes"])?;
+
+        let out = run(&with(&["https://example.com"]))?;
+        assert!(out.status.success(), "allowed: {}", stderr(&out));
+
+        let out = run(&with(&["https://example.org"]))?;
+        assert!(!out.status.success(), "example.org must be denied");
+        assert!(
+            stderr(&out).contains("1 access denied; review it: pent trust net --review"),
+            "{}",
+            stderr(&out)
+        );
+
+        let out = run(&with(&["--noproxy", "*", "https://example.com"]))?;
+        assert!(
+            !out.status.success(),
+            "a direct connection must fail: {}",
+            stderr(&out)
+        );
+
+        if have_tools("network_flow (getent)", &["getent"]) {
+            let out = run(&[
+                "sh".to_string(),
+                "-c".to_string(),
+                "getent hosts example.com >/dev/null && echo ALLOWED_RESOLVES; \
+                 getent hosts example.org >/dev/null || echo DENIED_FAILS"
+                    .to_string(),
+            ])?;
+            assert_eq!(
+                stdout(&out),
+                "ALLOWED_RESOLVES\nDENIED_FAILS\n",
+                "{}",
+                stderr(&out)
+            );
+        }
+
+        let denied = fs::read_to_string(env.denied_log("net"))?;
+        assert!(denied.contains("\"example.org\""), "{denied}");
+
+        let out = env.pent_ok(&["trust", "net", "--review", "--yes"])?;
+        assert!(stderr(&out).contains("example.org"), "{}", stderr(&out));
+        let profile = fs::read_to_string(env.profile_path("net"))?;
+        assert_eq!(
+            rules(&profile, "network", "domains")?,
+            set(&["example.com", "example.org"]),
+            "{profile}"
+        );
+        assert!(
+            !env.denied_log("net").exists(),
+            "the review must consume the denied log"
+        );
+
+        let out = run(&with(&["https://example.org"]))?;
+        assert!(out.status.success(), "after review: {}", stderr(&out));
+        Ok(())
+    }
+
+    // ── --trace ──────────────────────────────────────────────────────────────
+
+    /// `--trace` writes a denied filesystem access and a denied domain to
+    /// `$XDG_STATE_HOME/pent/trace/<profile>.log`, each with a fix hint. The proxy denies the domain
+    /// before any connection, so this test needs no internet.
+    #[test]
+    fn trace_logs_filesystem_and_network_denials() -> TestResult {
+        if !ready("trace", &["sh", "cat", "curl"]) {
+            return Ok(());
+        }
+        let env = TestEnv::new()?;
+        env.install_profile("tr", "[network]\ndomains = [\"allowed.example\"]\n")?;
+        let outside = env.root.join("outside.txt");
+        fs::write(&outside, "secret\n")?;
+        let script = format!(
+            "cat '{}'; curl -sS -o /dev/null --max-time 10 https://denied.example; true",
+            outside.display()
+        );
+        let out = env.pent(&[
+            "run",
+            "--profile",
+            "tr",
+            "--trace",
+            "--",
+            "sh",
+            "-c",
+            &script,
+        ])?;
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert!(!stdout(&out).contains("secret"), "the read was not denied");
+
+        let log = fs::read_to_string(env.trace_log("tr"))?;
+        assert!(
+            !env.ws.join(".pent/trace.log").exists(),
+            "the trace log must not be in the workspace"
+        );
+        assert!(
+            log.contains("pent: [denied] filesystem: \"cat\" (pid "),
+            "{log}"
+        );
+        assert!(
+            log.contains(&format!("was denied read on \"{}\"", outside.display())),
+            "{log}"
+        );
+        assert!(
+            log.contains(&format!("--read \"{}\"", outside.display())),
+            "{log}"
+        );
+        assert!(
+            log.contains("pent: [denied] network:") && log.contains("\"denied.example\""),
+            "{log}"
+        );
+        assert!(log.contains("--allow denied.example"), "{log}");
+
+        // The denials are in the list for `pent trust --review` too.
+        let denied = fs::read_to_string(env.denied_log("tr"))?;
+        assert!(denied.contains("outside.txt"), "{denied}");
+        assert!(denied.contains("denied.example"), "{denied}");
+        Ok(())
+    }
+
+    // ── signals ──────────────────────────────────────────────────────────────
+
+    /// SIGTERM to pent ends the child. Pent removes its overlay staging
+    /// directories and exits like the child: killed by SIGTERM (status 143
+    /// in a shell).
+    #[test]
+    fn sigterm_ends_the_child_and_cleans_up() -> TestResult {
+        if !ready("sigterm", &["sh", "sleep"]) {
+            return Ok(());
+        }
+        let env = TestEnv::new()?;
+        env.write_home(".config/app/settings.toml", "a = 1\n")?;
+        env.install_profile(
+            "sig",
+            "[filesystem]\nread_write = [\"~/.config/app/settings.toml\"]\n",
+        )?;
+        // A unique argument: the test finds the sleep process by it.
+        let nap = format!("300.{}", std::process::id());
+        let script = format!("touch started; exec sleep {nap}");
+        let mut child = env
+            .command(&["run", "--profile", "sig", "--", "sh", "-c", &script])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status()
-            .unwrap_or_else(|e| panic!("pent config add @{agent}: {e}"));
-        assert!(status.success(), "pent config add --global @{agent} failed");
-        let config = home.join(".config").join("pent").join("pent.toml");
-        (home, config)
-    }
-
-    // ── run_pent helper ──────────────────────────────────────────────────────
-
-    #[allow(clippy::panic)] // infrastructure helper: spawn failure is a hard test setup error
-    fn run_pent(home: &Path, config: &Path, extra: &[&str], cmd: &[&str]) -> (ExitStatus, String) {
-        let out = Command::new(PENT_BIN)
-            .env("HOME", home)
-            .arg("run")
-            .arg("--no-config")
-            .arg("--config")
-            .arg(config)
-            .args(extra)
-            .arg("--")
-            .args(cmd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .output()
-            .unwrap_or_else(|e| panic!("pent spawn: {e}"));
-        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-        (out.status, stderr)
-    }
-
-    // ── filesystem tests ─────────────────────────────────────────────────────
-
-    fn test_filesystem(agent: &str) -> TestResult {
-        if !landlock_available() {
-            println!("\nSKIP {agent}: sandbox not enforcing");
-            return Ok(());
+            .spawn()?;
+        let pid = child.id();
+        let started = env.ws.join("started");
+        let deadline = std::time::Instant::now() + TIMEOUT;
+        while !started.exists() {
+            if let Some(status) = child.try_wait()? {
+                return Err(format!("pent exited before the child started: {status:?}").into());
+            }
+            if std::time::Instant::now() >= deadline {
+                // The kill can fail when pent exits now; the wait reaps it.
+                let _ = child.kill();
+                child.wait()?;
+                return Err("the child did not start".into());
+            }
+            std::thread::sleep(Duration::from_millis(20));
         }
-
-        let configs = TempDir::new()?;
-        let ws = TempDir::new()?;
-        let (home, config) = agent_config(agent, configs.path());
-        let sentinel = ws.path().join(format!("sentinel-{agent}.txt"));
-        let sentinel_s = sentinel
-            .to_str()
-            .ok_or("sentinel path is not valid UTF-8")?;
-
-        // 1. Workspace write must succeed.
-        let (status, stderr) = run_pent(
-            &home,
-            &config,
-            &["--network", "unrestricted"],
-            &["bash", "-c", &format!("echo ok > '{sentinel_s}'")],
-        );
         assert!(
-            status.success() && sentinel.exists(),
-            "{agent}: workspace write failed (exit {:?})\nstderr: {stderr}",
-            status.code()
+            !staging_dirs(pid).is_empty(),
+            "the run has no overlay staging directory"
         );
+        let sleepers = || sleep_processes(&nap);
+        let deadline = std::time::Instant::now() + TIMEOUT;
+        while sleepers().is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!sleepers().is_empty(), "the child does not run");
 
-        // 2. Workspace read must succeed.
-        let (status, stderr) = run_pent(
-            &home,
-            &config,
-            &["--network", "unrestricted"],
-            &["bash", "-c", &format!("cat '{sentinel_s}'")],
-        );
+        let pid_i32 = i32::try_from(pid)?;
+        // SAFETY: kill() has no memory-safety preconditions. The pid is the
+        // pent process of this test, and the test did not reap it yet.
+        let rc = unsafe { libc::kill(pid_i32, libc::SIGTERM) };
+        assert_eq!(rc, 0, "kill: {}", std::io::Error::last_os_error());
+        let status = wait_timeout(&mut child, TIMEOUT)?;
         assert!(
-            status.success(),
-            "{agent}: workspace read failed\nstderr: {stderr}"
+            status.code() == Some(143) || status.signal() == Some(libc::SIGTERM),
+            "pent must exit like the child (SIGTERM): {status:?}"
         );
-
-        // 3. Write outside workspace must be blocked.
-        let blocked = format!("/etc/pent-test-{agent}");
-        let _ = fs::remove_file(&blocked);
-        let _ = run_pent(
-            &home,
-            &config,
-            &["--network", "unrestricted"],
-            &[
-                "bash",
-                "-c",
-                &format!("echo x > '{blocked}' 2>/dev/null; exit 0"),
-            ],
-        );
-        assert!(
-            !Path::new(&blocked).exists(),
-            "{agent}: write to /etc was NOT blocked by sandbox"
-        );
-        let _ = fs::remove_file(&blocked);
-
+        assert!(sleepers().is_empty(), "the child still runs");
+        assert_eq!(staging_dirs(pid), Vec::<std::path::PathBuf>::new());
         Ok(())
     }
 
-    #[test]
-    #[ignore = "requires agent binary and CAP_NET_ADMIN"]
-    fn filesystem_claude() -> TestResult {
-        test_filesystem("claude")
-    }
-    #[test]
-    #[ignore = "requires agent binary and CAP_NET_ADMIN"]
-    fn filesystem_codex() -> TestResult {
-        test_filesystem("codex")
-    }
-    #[test]
-    #[ignore = "requires agent binary and CAP_NET_ADMIN"]
-    fn filesystem_gemini() -> TestResult {
-        test_filesystem("gemini")
+    /// The process IDs of the `sleep` processes with the argument `arg`.
+    fn sleep_processes(arg: &str) -> Vec<u32> {
+        let Ok(entries) = fs::read_dir("/proc") else {
+            return Vec::new();
+        };
+        entries
+            .filter_map(Result::ok)
+            .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+            .filter(|pid| {
+                fs::read(format!("/proc/{pid}/cmdline"))
+                    .is_ok_and(|c| c.split(|b| *b == 0).any(|part| part == arg.as_bytes()))
+            })
+            .collect()
     }
 
-    // ── network tests ────────────────────────────────────────────────────────
+    // ── profile management ───────────────────────────────────────────────────
 
-    // Serialize network tests so RoutingGuard add/del doesn't race across threads.
-    static NETWORK_MUTEX: Mutex<()> = Mutex::new(());
-
-    fn test_network(agent: &str, allowed_domain: &str) -> TestResult {
-        if !is_root() {
-            println!(
-                "\nSKIP {agent} network: requires root (`sudo -E cargo test --test e2e_linux`)"
-            );
+    /// `pent profile list/show/rm` and `pent untrust` through the full
+    /// flow.
+    #[test]
+    fn profile_list_show_untrust_rm() -> TestResult {
+        if !ready("profile_management", &["sh", "cat"]) {
             return Ok(());
         }
+        let env = TestEnv::new()?;
+        env.write_home(".foorc", "foo\n")?;
+        let out = env.pent_ok(&["profile", "list"])?;
+        assert!(stdout(&out).is_empty(), "{}", stdout(&out));
 
-        let _lock = NETWORK_MUTEX
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _routing = RoutingGuard::install();
+        env.pent_ok(&[
+            "watch",
+            "--yes",
+            "--profile",
+            "pm",
+            "--",
+            "sh",
+            "-c",
+            "cat ~/.foorc",
+        ])?;
+        assert_eq!(profile_list(&env)?, vec!["pm draft only"]);
 
-        let configs = TempDir::new()?;
-        let (home, config) = agent_config(agent, configs.path());
+        env.pent_ok(&["trust", "pm", "--yes"])?;
+        assert_eq!(profile_list(&env)?, vec!["pm trusted"]);
+        let out = env.pent_ok(&["profile", "show", "pm"])?;
+        assert!(stdout(&out).contains("\"~/.foorc\""), "{}", stdout(&out));
+        assert!(stderr(&out).contains("(trusted)"), "{}", stderr(&out));
+        let foorc = env.home_path(".foorc");
+        let foorc = foorc.to_str().ok_or("the path is not UTF-8")?;
+        let out = env.pent_ok(&["run", "--profile", "pm", "--", "cat", foorc])?;
+        assert_eq!(stdout(&out), "foo\n");
 
-        // 4. Allowed domain reachable through proxy.
-        //    curl exit 0=success  7=connect refused (DNS worked)  22=HTTP error (tunnel worked)
-        //    curl exit 6=DNS fail  28=timeout — both are failures
-        // stdout is already null via run_pent — no -o /dev/null needed (would
-        // trigger curl exit 23 because the sandbox may block opening /dev/null for write).
-        let (status, stderr) = run_pent(
-            &home,
-            &config,
-            &[],
-            &[
-                "curl",
-                "-sS",
-                "--max-time",
-                "15",
-                &format!("https://{allowed_domain}"),
-            ],
-        );
-        let code = status.code().unwrap_or(-1);
+        env.pent_ok(&["untrust", "pm"])?;
+        assert_eq!(profile_list(&env)?, vec!["pm not trusted"]);
+        let out = env.pent(&["run", "--profile", "pm", "--", "cat", foorc])?;
+        assert!(!out.status.success());
         assert!(
-            matches!(code, 0 | 7 | 22),
-            "{agent}: allowed domain '{allowed_domain}' NOT reachable \
-             (curl exit {code}, expected 0/7/22)\nstderr: {stderr}"
+            stderr(&out).contains("the profile \"pm\" is not trusted"),
+            "{}",
+            stderr(&out)
         );
 
-        // 5. Blocked domain must be denied.
-        //    curl exit 6=NXDOMAIN  56=proxy rejected CONNECT
-        let (status, stderr) = run_pent(
-            &home,
-            &config,
-            &[],
-            &[
-                "curl",
-                "-sS",
-                "--max-time",
-                "5",
-                "https://blocked-domain.invalid",
-            ],
-        );
-        let code = status.code().unwrap_or(-1);
+        env.pent_ok(&["profile", "rm", "pm"])?;
+        assert_eq!(profile_list(&env)?, Vec::<String>::new());
+        assert!(!env.profile_path("pm").exists());
+        assert!(!env.draft_path("pm").exists());
+        assert!(!env.state_dir().join("pent/watch/pm").exists());
+        let out = env.pent(&["run", "--profile", "pm", "--", "cat", foorc])?;
         assert!(
-            matches!(code, 6 | 56),
-            "{agent}: blocked domain NOT denied \
-             (curl exit {code}, expected 6 or 56)\nstderr: {stderr}"
+            stderr(&out).contains("no trusted profile for \"pm\""),
+            "{}",
+            stderr(&out)
         );
-
         Ok(())
-    }
-
-    #[test]
-    #[ignore = "requires agent binary and CAP_NET_ADMIN"]
-    fn network_claude() -> TestResult {
-        test_network("claude", "api.anthropic.com")
-    }
-    #[test]
-    #[ignore = "requires agent binary and CAP_NET_ADMIN"]
-    fn network_codex() -> TestResult {
-        test_network("codex", "api.openai.com")
-    }
-    #[test]
-    #[ignore = "requires agent binary and CAP_NET_ADMIN"]
-    fn network_gemini() -> TestResult {
-        test_network("gemini", "generativelanguage.googleapis.com")
     }
 }

@@ -9,7 +9,7 @@ REMOTE ?= origin
 BRANCH ?= main
 
 .PHONY: help build build-release install test clippy fmt fmt-check check \
-	e2e-macos e2e-linux release-check release-tag release-publish-all
+	e2e-macos e2e-linux e2e-linux-native release-check release-tag release-publish-all
 
 help:
 	@echo "Pent developer tasks"
@@ -25,8 +25,11 @@ help:
 	@echo "  make check               fmt-check + clippy + test"
 	@echo ""
 	@echo "E2E:"
-	@echo "  make e2e-macos           Run macOS e2e agent tests"
-	@echo "  make e2e-linux           Run Linux e2e agent tests in Docker"
+	@echo "  make e2e-macos           Run the macOS e2e tests"
+	@echo "  make e2e-linux           Run the Linux e2e tests in Docker"
+	@echo "  make e2e-linux-native    Run the Linux e2e tests on this host"
+	@echo ""
+	@echo "  Each e2e target sets PENT_REQUIRE_ALL_TESTS=1: a skip is a failure."
 	@echo ""
 	@echo "Release:"
 	@echo "  make release-check VERSION=X.Y.Z"
@@ -65,20 +68,6 @@ install:
 		done; \
 		echo "Man pages installed to $$MAN_DIR"; \
 	fi
-	@PENT_BIN=$$(which pent); \
-	echo ""; \
-	echo "pent uses veth pairs for network proxying, which requires CAP_NET_ADMIN."; \
-	echo "This capability must be set once on the pent binary."; \
-	echo "Your password will be used to run setcap on $$PENT_BIN."; \
-	echo "Skip this if you only need filesystem sandboxing (proxy mode won't work)."; \
-	read -r -p "Enable network proxying? [Y/n] " REPLY; \
-	case "$$REPLY" in \
-		[nN]*) \
-			echo "Skipped. To enable later: sudo setcap cap_net_admin=eip $$PENT_BIN" ;; \
-		*) \
-			sudo setcap cap_net_admin=eip "$$PENT_BIN" && \
-			echo "Successfully set CAP_NET_ADMIN on $$PENT_BIN" ;; \
-	esac
 
 test:
 	cargo test --workspace
@@ -94,12 +83,25 @@ fmt-check:
 
 check: fmt-check clippy test
 
+# The macOS suites: the Seatbelt sandbox, the network and the parity with
+# Linux. PENT_REQUIRE_ALL_TESTS makes each skip a failure, as in the CI.
 e2e-macos:
-	cargo test --test e2e_macos -- --nocapture
+	PENT_REQUIRE_ALL_TESTS=1 cargo test -p pent --no-fail-fast \
+		--test e2e_macos --test e2e_macos_network --test parity_watch -- --nocapture
 
+# The image runs the e2e, integration and profile tests in parallel (see
+# the CMD of e2e/Dockerfile). Pent needs unshare(2): the default seccomp and
+# AppArmor profiles of Docker block it. The overlay upper layers of pent are
+# in /tmp, which must not be on overlayfs: thus /tmp is a tmpfs.
 e2e-linux:
 	docker build --file e2e/Dockerfile --tag "$(DOCKER_IMAGE)" .
-	docker run --rm --cap-add NET_ADMIN "$(DOCKER_IMAGE)"
+	docker run --rm --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
+		--tmpfs /tmp:exec,mode=1777 --env PENT_REQUIRE_ALL_TESTS=1 "$(DOCKER_IMAGE)"
+
+# The same tests on this host, without Docker.
+e2e-linux-native:
+	PENT_REQUIRE_ALL_TESTS=1 cargo test -p pent --no-fail-fast --test e2e_linux \
+		--test integration_test --test profile_test --test parity_watch -- --nocapture
 
 release-check:
 	@if [[ -z "$${VERSION:-}" ]]; then \

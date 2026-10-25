@@ -1,193 +1,114 @@
-use std::path::{Path, PathBuf};
-use std::str::FromStr;
+//! `pent config init|show|edit`: the global settings (`pent.toml`).
+//!
+//! The global settings have only the proxy tunables and the mounts. The paths
+//! and the domains are in the profiles.
 
-use pent_settings::{
-    build_profiles_config, is_profile_likely_active, profile_deps_transitive, profile_requires,
-    ConfigLoader, PentConfig, Profile,
-};
+use std::path::{Path, PathBuf};
+
+use pent_settings::{ConfigLoader, PentConfig};
 
 use crate::cli::{ConfigSubcommand, OutputFormat};
 use crate::error::CliError;
 use crate::ui;
 
-/// Resolve the config file path for `--global` or project-local operations.
-fn resolve_config_path(global: bool, cwd: &Path) -> Result<PathBuf, CliError> {
-    if global {
-        ConfigLoader::global_config_path().ok_or_else(|| {
+/// The starter text of `pent config init`.
+const STARTER: &str = "\
+# The global settings of pent.
+# The paths and the domains are in the profiles: record one with `pent watch`.
+
+[proxy]
+# upstream_dns = [\"1.1.1.1:53\"]
+# dns_ttl_seconds = 300
+# tcp_connect_timeout_secs = 30
+# tcp_idle_timeout_secs = 300
+# private_destinations = \"deny\"
+
+# Linux only: more mount points in the sandbox.
+# [[sandbox.mounts]]
+# path = \"/opt/tools\"
+# readonly = true
+";
+
+/// The path of the global settings file.
+fn global_path() -> Result<PathBuf, CliError> {
+    ConfigLoader::global_config_path(pent_settings::PentDirs::from_env().as_ref()).ok_or_else(
+        || {
             CliError::Other(
-                "Cannot determine global config path: home directory not available".to_string(),
+                "Cannot determine the global config path: the home directory is not available"
+                    .to_string(),
             )
-        })
-    } else {
-        Ok(ConfigLoader::project_config_path(cwd))
-    }
+        },
+    )
 }
 
-#[allow(clippy::needless_pass_by_value)] // PathBuf taken for ergonomics
-pub(crate) fn config(args: crate::cli::ConfigArgs, cwd: PathBuf) -> Result<(), CliError> {
+pub(crate) fn config(args: crate::cli::ConfigArgs, cwd: &Path) -> Result<(), CliError> {
     match args.subcommand {
-        ConfigSubcommand::Init { global } => init(global, &cwd),
-        ConfigSubcommand::Show { format } => show(format, &cwd),
-        ConfigSubcommand::Edit { global } => edit(global, &cwd),
-        ConfigSubcommand::Add { profiles, global } => add_profile(global, &profiles, &cwd),
-        ConfigSubcommand::Remove { profiles, global } => rm_profile(global, &profiles, &cwd),
+        ConfigSubcommand::Init => init(),
+        ConfigSubcommand::Show { format } => show(format, cwd),
+        ConfigSubcommand::Edit => edit(),
     }
 }
 
-fn init(global: bool, cwd: &Path) -> Result<(), CliError> {
-    let path = resolve_config_path(global, cwd)?;
-
+fn init() -> Result<(), CliError> {
+    let path = global_path()?;
     if path.exists() {
         return Err(CliError::Other(format!(
             "Config file already exists: {}",
             path.display()
         )));
     }
-
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-
-    PentConfig::default().save(&path)?;
+    std::fs::write(&path, STARTER)?;
     ui::ok(format!("created {}", path.display()));
     Ok(())
 }
 
 fn show(format: OutputFormat, cwd: &Path) -> Result<(), CliError> {
-    let config = ConfigLoader::load(cwd)?;
+    let config = ConfigLoader::load(cwd, pent_settings::PentDirs::from_env().as_ref())?;
     match format {
-        OutputFormat::Toml => {
-            let toml = config.to_toml()?;
-            print!("{toml}");
-        }
+        OutputFormat::Toml => print!("{}", config.to_toml()?),
         OutputFormat::Json => {
             let json = serde_json::to_string_pretty(&config)
                 .map_err(|e| CliError::Other(format!("JSON serialization failed: {e}")))?;
             println!("{json}");
         }
     }
+    // The status line goes to stderr, thus stdout stays valid TOML or JSON.
+    let path = global_path()?;
+    let found = if path.exists() { "found" } else { "not found" };
+    ui::status("global", format!("{} ({found})", path.display()));
     Ok(())
 }
 
-fn edit(global: bool, cwd: &Path) -> Result<(), CliError> {
-    let path = resolve_config_path(global, cwd)?;
-
+fn edit() -> Result<(), CliError> {
+    let path = global_path()?;
     // Try $VISUAL, then $EDITOR, then fall back to vi.
     let editor = std::env::var("VISUAL")
         .or_else(|_| std::env::var("EDITOR"))
         .unwrap_or_else(|_| "vi".to_string());
-
-    std::process::Command::new(&editor).arg(&path).status()?;
-
+    let status = std::process::Command::new(&editor).arg(&path).status()?;
+    if !status.success() {
+        return Err(CliError::Other(format!(
+            "The editor {editor} failed ({status})"
+        )));
+    }
+    if path.exists() {
+        // Check the result now, so that the next `pent run` does not fail.
+        PentConfig::load(&path)?;
+        ui::ok(format!("{} is valid", path.display()));
+    }
     Ok(())
 }
 
-fn add_profile(global: bool, profiles: &[String], cwd: &Path) -> Result<(), CliError> {
-    let parsed: Vec<Profile> = profiles
-        .iter()
-        .map(|s| Profile::from_str(s).map_err(CliError::Other))
-        .collect::<Result<_, _>>()?;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    let expanded = profile_deps_transitive(&parsed);
-
-    let path = resolve_config_path(global, cwd)?;
-
-    let existing = if path.exists() {
-        PentConfig::load(&path)?
-    } else {
-        PentConfig::default()
-    };
-
-    let fragment = build_profiles_config(&expanded);
-    let merged = existing.merge(fragment);
-    merged.save(&path)?;
-
-    let names: Vec<String> = expanded.iter().map(ToString::to_string).collect();
-    ui::ok(format!("added {} → {}", names.join(" "), path.display()));
-    Ok(())
-}
-
-fn rm_profile(global: bool, profiles: &[String], cwd: &Path) -> Result<(), CliError> {
-    let parsed: Vec<Profile> = profiles
-        .iter()
-        .map(|s| Profile::from_str(s).map_err(CliError::Other))
-        .collect::<Result<_, _>>()?;
-
-    let removing_set: std::collections::HashSet<String> =
-        parsed.iter().map(ToString::to_string).collect();
-
-    let path = resolve_config_path(global, cwd)?;
-
-    if !path.exists() {
-        return Err(CliError::Other("No config file found".to_string()));
+    #[test]
+    fn starter_is_a_valid_config() {
+        let parsed = PentConfig::parse(STARTER);
+        assert!(parsed.is_ok(), "{parsed:?}");
     }
-    let mut config = PentConfig::load(&path)?;
-
-    // Check for active dependents not included in this removal
-    for p in &parsed {
-        let mut blocking: Vec<String> = Vec::new();
-        for dependent in Profile::all() {
-            if profile_requires(dependent).contains(p)
-                && !removing_set.contains(&dependent.to_string())
-                && is_profile_likely_active(&config, dependent)
-            {
-                blocking.push(dependent.to_string());
-            }
-        }
-        if !blocking.is_empty() {
-            let blocker = &blocking[0];
-            let mut hint: Vec<String> = blocking.clone();
-            hint.extend(parsed.iter().map(ToString::to_string));
-            return Err(CliError::Other(format!(
-                "cannot remove '{}': profile '{}' appears active and depends on it.\nRun: pent config rm {}",
-                p,
-                blocker,
-                hint.join(" ")
-            )));
-        }
-    }
-
-    // Build removal fragment and remove matching values
-    let removal = build_profiles_config(&parsed);
-    let rm_domains: std::collections::HashSet<String> =
-        removal.proxy.domain_allowlist.into_iter().collect();
-    let rm_traversal: std::collections::HashSet<String> =
-        removal.sandbox.paths.traversal.into_iter().collect();
-    let rm_read: std::collections::HashSet<String> =
-        removal.sandbox.paths.read.into_iter().collect();
-    let rm_execute: std::collections::HashSet<String> =
-        removal.sandbox.paths.execute.into_iter().collect();
-    let rm_read_write: std::collections::HashSet<String> =
-        removal.sandbox.paths.read_write.into_iter().collect();
-
-    config
-        .proxy
-        .domain_allowlist
-        .retain(|d| !rm_domains.contains(d));
-    config
-        .sandbox
-        .paths
-        .traversal
-        .retain(|p| !rm_traversal.contains(p));
-    config.sandbox.paths.read.retain(|p| !rm_read.contains(p));
-    config
-        .sandbox
-        .paths
-        .execute
-        .retain(|p| !rm_execute.contains(p));
-    config
-        .sandbox
-        .paths
-        .read_write
-        .retain(|p| !rm_read_write.contains(p));
-
-    config.save(&path)?;
-
-    let names: Vec<String> = parsed.iter().map(ToString::to_string).collect();
-    ui::ok(format!(
-        "removed {} from {}",
-        names.join(" "),
-        path.display()
-    ));
-    Ok(())
 }

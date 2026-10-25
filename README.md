@@ -6,16 +6,16 @@
 Wrap any process in a lightweight containment layer that restricts filesystem and network access using native OS mechanisms. No containers, no VMs.
 
 ```bash
-# Setup: run once to write ~/.config/pent/pent.toml.
-# @claude, @npm, @gh, etc. are profiles: named sets of domains and filesystem paths.
-pent config add --global @claude @gh @npm @cargo @pip @gem @go @git
+# 1. Record: run the program one time without the sandbox. Pent records each
+#    file and each domain that it uses, groups them into rules, and asks you.
+pent watch -- claude
 
-# Run: every invocation. Pent enforces the config:
-# only listed domains resolve, only listed paths are accessible.
+# 2. Trust: read the draft profile, then trust it.
+pent trust claude
+
+# 3. Run: every time. Pent finds the "claude" profile from the command name.
+#    Only the domains and paths of the profile are accessible.
 pent run -- claude
-
-# Inspect what's allowed
-pent config show
 ```
 
 ## Why Pent?
@@ -28,7 +28,7 @@ Pent is for developers who need to run powerful but untrusted processes without 
 | **Platforms** | macOS & Linux | All (via VM) | Linux only | Linux only |
 | **Network control** | Domain allowlist | IP/port rules | IP/firewall | None |
 | **Filesystem control** | Path allowlist + overlayfs | Volume mounts | Path rules | Bind mounts |
-| **Setup** | Zero-config profiles | Dockerfile | Per-app profiles | Manual flags |
+| **Setup** | Recorded profiles | Dockerfile | Per-app profiles | Manual flags |
 | **Overhead** | Native (no VM) | High | Low | Low |
 
 ## What Pent does
@@ -43,29 +43,117 @@ Pent launches a child process inside a sandbox with two complementary controls.
 
 **Pent is not a security tool.** It is designed to catch accidental misbehaviour, not to stop a determined adversary. Use Pent to add a reasonable guard-rail around untrusted processes operating on your workstation, not as a substitute for proper network segmentation.
 
+[docs/security](docs/security/) holds the audit: the attacks that we tried, the defenses that hold, the findings that are open, and a test for each one.
+
 ## How it works
 
 ### macOS: Seatbelt (sandbox-exec + SBPL)
 
 On macOS, Pent generates a [Sandbox Profile Language (SBPL)](https://reverse.put.as/wp-content/uploads/2011/09/Apple-Sandbox-Guide-v1.0.pdf) policy and launches the child process via `sandbox-exec`.
 
-Network containment is not yet available on macOS. macOS does not expose network namespaces or a programmable packet filter API accessible without root, so the veth+proxy approach used on Linux has no direct equivalent. See [Platform limitations](#platform-limitations) below.
+The profile starts from `(allow default)`. It denies file reads (file content), file writes, program execution, a launchd job and a Mach service lookup, and then allows the configured paths, the workspace, the system program directories and the Mach services that an ordinary program needs. The other operation families stay allowed: see [macOS: the profile starts from `(allow default)`](#macos-the-profile-starts-from-allow-default).
 
-### Linux: Landlock + overlayfs + network namespaces
+macOS has no network namespaces. In proxy mode, the profile denies outbound connections and allows only the proxy port on loopback, the system name resolver socket and the Unix sockets in the writable paths. See [Platform limitations](#platform-limitations) below.
 
-On Linux, Pent combines three kernel mechanisms. **Landlock LSM** restricts filesystem access at the kernel level. **Overlayfs shadowing** protects parent directories by mounting a temporary layer in a private namespace; writes to non-allowlisted paths disappear when the process exits. **Network namespaces** (`unshare(CLONE_NEWNET)`) isolate the network stack, with traffic bridged to Pent's proxy via a `veth` pair.
+### Linux: Landlock + overlayfs + namespaces
+
+On Linux, Pent combines four kernel mechanisms. **Landlock LSM** restricts filesystem access at the kernel level. **Overlayfs shadowing** protects parent directories by mounting a temporary layer in a private namespace; writes to non-allowlisted paths disappear when the process exits. **Mount namespaces** give the child its own empty `/tmp`, `/var/tmp` and `/run`, so the temporary files and the control sockets of the host stay out of reach. **Network namespaces** (`unshare(CLONE_NEWNET)`) isolate the network stack. In proxy mode, the child can reach only its own loopback. Pent's proxy listens there on sockets that the child makes and gives to Pent. A **PID namespace** with its own `proc` hides the processes of the host and ends the background processes of the sandbox; inside a container the kernel refuses this one mount, and Pent then says so (see [Processes](#processes)). Pent needs no root and no capability.
 
 ### Built-in proxy
 
-Pent includes a DNS and TCP proxy. The DNS side returns `NXDOMAIN` for disallowed domains. The TCP side only forwards connections when the destination IP resolves to an allowed domain.
+Pent includes a DNS and TCP proxy. The DNS side returns `NXDOMAIN` for disallowed domains. The TCP side only forwards connections when the destination IP resolves to an allowed domain. On ports 443 and 80, the proxy also checks the TLS server name or the HTTP `Host` header against the allowlist.
+
+The proxy rejects destinations that are not public (loopback, private, CGNAT, link-local and unique local addresses), also for an allowed domain. If an allowed domain resolves to an internal address that you trust, set `private_destinations = "allow"` in the `[proxy]` section.
+
+### Network mode
+
+Pent uses the same rule on all platforms to select the network mode. The first item that applies sets the mode:
+
+1. An explicit `--network` flag.
+2. One or more `--allow` flags. These select proxy mode.
+3. Domains in the profile. These select proxy mode.
+4. The default: `blocked`.
+
+`--trace` does not change the network mode.
+
+### Signals
+
+Pent sends SIGTERM, SIGHUP, SIGUSR1 and SIGUSR2 to the child. Pent ignores SIGINT and SIGQUIT while the child runs: the terminal sends these signals to the child directly. After the child exits, Pent removes its temporary resources and exits with the status of the child. If a signal stopped the child, Pent stops itself with the same signal.
 
 ## Platform limitations
 
-### macOS: network containment not yet available
+### macOS: proxy mode with Seatbelt
 
-`--allow` and `--network proxy` are accepted on macOS but do not yet enforce network policy. Pent runs with unrestricted network access until a macOS-compatible isolation mechanism is implemented. On Linux, network policy is enforced at the kernel level via network namespaces.
+On macOS, the Seatbelt profile enforces proxy mode. The process can connect only to the proxy port on loopback. Pent sets `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY`, so a proxy-aware program sends its traffic through the proxy. A program that ignores these variables cannot connect to a remote host. There are two differences from Linux. DNS queries go to the system resolver, not to the Pent DNS server, so the process can resolve names that the allowlist does not have (it cannot connect to them). The process also cannot connect to the other loopback ports of the host.
+
+### macOS: the profile starts from `(allow default)`
+
+The macOS profile is not a deny-by-default sandbox. It limits file content reads, file writes, program execution, a launchd job, a Mach service lookup and (in the `blocked` and `localhost` modes) network access. These operation families stay allowed:
+
+- a metadata read (`stat`) on every path, also outside the profile;
+- a signal to another process of yours, a sysctl read, an IOKit open, and the other operation families of SBPL.
+
+**The three ways to run a program are closed.** Pent denies `process-exec`, and it allows it again for the `execute` paths, for the executable files of the read paths and for the system program directories. The workspace is in none of these, so a program in the workspace runs only with `--execute`, as on Linux. Pent also denies `job-creation`, so the process cannot ask `launchd` for a job, and `mach-lookup`, so it cannot ask a service of another program to act for it. The allowlist of the Mach services holds the ones that an ordinary program needs; a run on a Mac named each one. See MAC-4 in [docs/security/macos.md](docs/security/macos.md).
+
+None of the operation families that stay allowed runs a program outside the sandbox. A deny-by-default profile is still the stronger form, and it needs a run on a Mac for each family that an ordinary program uses.
+
+The macOS backend also ignores `[[sandbox.mounts]]`. Use a profile rule (or `--read`, `--write`) to give access to a path on macOS.
+
+### macOS: watch mode records the root process, not every forked child
+
+The macOS test suite ran on a Mac for the first time on 2026-10-25. The profile forms and the reader of the unified log hold, with these results.
+
+Watch mode reads the Seatbelt reports of the kernel from the unified log. To tell a real report from a line that the watched program writes itself, Pent checks the name of each report against the program that the process runs, and it reads the process tree from `ps`. A child process that lives less than one poll of `ps` (about 100 ms) never reaches that tree, so Pent loses its accesses. The root process of the run has no such gap, and a program that the root runs **in place** has none either: it keeps the process ID of the root, and Pent learns its name from the exec report of the kernel. A shell that runs one command (`sh -c 'cat FILE'`) works this way. A shell that runs two forks for the first one, and that child is the gap.
+
+A run on a Mac measured the recommended fix and it does not work: `kqueue` with `EVFILT_PROC` and `NOTE_TRACK` answers `ENOTSUP`, so the kernel of macOS never names the child of a fork. The next step needs the `EndpointSecurity` framework, which needs an Apple entitlement that a tool you build yourself cannot have.
+
+The first watch run of a machine also records nothing, because the first `log stream` delivers no report: run `pent watch` a second time if the summary says "No new rules from 0 accesses" (MAC-12).
+
+Watch mode on macOS is therefore a lower bound: the draft can miss an access of a forked short-lived child, and `pent watch --append` merges more runs. Linux has no such gap, because the Linux recorder reads each access from the kernel through seccomp. The finding is MAC-10 in [docs/security/macos.md](docs/security/macos.md), with the test that states the secure behaviour.
+
+### Linux: requirements and Unix sockets
+
+Pent requires Landlock ABI v3 or later (Linux 6.2), and Landlock must be enabled at boot. Pent uses the highest ABI up to v6. On ABI v6, the sandboxed process cannot connect to abstract Unix sockets outside the sandbox and cannot send signals to processes outside the sandbox.
+
+#### Private `/tmp`, `/var/tmp` and `/run`
+
+The sandboxed process gets its own empty `/tmp`, `/var/tmp` and `/run` in its mount namespace. It does not see the temporary files of your other programs, and it does not see the control sockets that the daemons of the host keep under `/run`. Pent binds back only what the session needs: the workspace, the data directory, the working directory, every path that your profile names, every directory of `PATH`, and the system paths (on NixOS `/run/current-system`, `/run/wrappers/bin` and the graphics drivers). A workspace under `/tmp` keeps working. `XDG_RUNTIME_DIR` and a `TMPDIR` under these directories become an empty directory; a `TMPDIR` outside them stays as it is.
+
+Each private directory is a tmpfs with `nosuid` and `nodev`, and with no size limit, so it takes the kernel default of half of the memory. A build writes large temporary files, and a smaller limit breaks it. There is no setting to share `/tmp` or `/run` with the host.
+
+#### Unix sockets
+
+Landlock does not control `connect(2)` on Unix sockets that have a path. The kernel also needs no file right to walk through a directory. A sandboxed process can connect to any socket file that it can find, even when the file is outside the profile. The private directories above remove the main targets: every socket under `/tmp`, `/var/tmp` and `/run` is gone, among them the socket of a terminal multiplexer (which would run a command for the process outside the sandbox), the system D-Bus socket, the `tailscaled` LocalAPI socket (which opens a TCP stream to any host, past the proxy), the Docker and Podman sockets, and the sockets of the host resolvers.
+
+A fixed list of sockets can never be complete, so Pent hides a directory, not a name. For the sockets that no private directory covers, Pent keeps a list and covers each one with `/dev/null`: the system D-Bus socket, the agent sockets of your home directory (`~/.gnupg/S.gpg-agent*`, `~/.gnupg/S.dirmngr*`, `~/.ssh/agent.*`), the container sockets, and, when the network is not `unrestricted`, the sockets of the host resolvers and of `tailscaled`. If your configuration names one of these paths, Pent does not hide it. A name in `unix_sockets` and the flag `--unix-socket` count too, so a program that reads the kind of the file before it connects finds a socket.
+
+A socket in another directory is still **visible**, but it is not **reachable**: a supervisor in pent controls each call that carries an address (`connect(2)`, `sendto(2)`, `sendmsg(2)` and `sendmmsg(2)`) and refuses each path that your configuration does not name. See [`docs/security/linux-sandbox.md`](docs/security/linux-sandbox.md).
+
+A profile names the sockets that the program needs in `filesystem.unix_sockets`, and `pent run --unix-socket PATH` adds one for a single run. Pent makes each permitted connection and each permitted message itself, and gives the connected socket to the program. The program keeps the Unix family for its own use: `socketpair(2)` and its own abstract names work, and a `sendmmsg(2)` to a named path is the one form that pent does not perform.
+
+#### Processes
+
+The sandboxed process runs in a new PID namespace with its own `proc` mount. It sees only the processes of the sandbox, so it cannot read the command line of your other programs (a command line often holds a token). When the command exits, the kernel ends every other process of the sandbox, so no background process outlives `pent run`. The exit code and the signal of the command reach you unchanged. Watch mode takes a PID namespace too, and its PID 1 waits for the processes that stay, so that the recorder keeps their accesses.
+
+**Inside a container Pent gives no PID namespace.** The runtime hides a part of `/proc` with its own mounts, for example on `/proc/acpi` and on `/proc/kcore`. The kernel then refuses a new `proc` mount to a process that has no privilege on the host, at any target. Pent probes this one time at the start of the run. Where the answer is no, Pent runs the command without the PID namespace and prints a warning that names what the command can see: the processes of the container, and `/proc/<pid>/cmdline` of each neighbour. `pent check` reports the same answer. The file rules, the network rules and the other mounts hold there. To get the protection, run Pent on a host, or start the container without the masks of `/proc` (for Docker: `--security-opt systempaths=unconfined`).
+
+The sandboxed process keeps the controlling terminal, because interactive tools need it. A seccomp filter blocks `ioctl(TIOCSTI)` and `ioctl(TIOCLINUX)`, so the process cannot push keystrokes into your shell. Pent makes `<workspace>/.pent` read-only inside the sandbox.
+
+### Linux: proxy mode without privileges
+
+Pent needs no root and no capability on Linux. It needs unprivileged user namespaces (and the PID and network namespaces inside them). `pent check` tells you if they are available. Some distributions turn them off (the sysctl `user.max_user_namespaces`, or `kernel.apparmor_restrict_unprivileged_userns` on Ubuntu 24.04 and later).
+
+In proxy mode, the child gets a new network namespace with only the loopback interface. Before the program starts, the child makes three sockets in this namespace: the proxy port `127.0.0.1:3128` (SOCKS5 and HTTP CONNECT) and the DNS port `127.0.0.1:53` (UDP and TCP). It gives them to Pent. Pent serves the proxy on these sockets and connects to the allowed hosts from the host network. The child has no route out of its namespace, so it cannot reach a host past the proxy. When IPv6 is available in the namespace, the proxy port also listens on `[::1]:3128`. The DNS port is IPv4 only.
+
+Inside the sandbox, `/etc/resolv.conf` contains `nameserver 127.0.0.1` and nothing else. Pent writes this file itself and binds it read-only into the sandbox, so the child reaches only the Pent resolver. A program that uses a fixed resolver (for example `8.8.8.8`) cannot resolve names: the query fails, and the sandbox stays closed.
+
+On a host with `systemd-resolved` (Ubuntu, Fedora and most other distributions), `/etc/resolv.conf` is a symbolic link into `/run`, for example to `/run/systemd/resolve/stub-resolv.conf`. The sandbox replaces `/run` with an empty directory, so the target of the link is not there. Pent reads the link before the sandbox starts, makes the directories of the target inside the private `/run`, and puts its own file at that path. The child follows the link and reads the Pent resolver. Pent follows a chain of up to eight links.
+
+Two cases give the child no resolver at all. The first: a link inside `/run` or `/tmp` that points out of these directories, or a chain of more than eight links. The second: a host with no `/etc/resolv.conf` at all. Pent does not write in `/etc` of your host, so it leaves the path absent. In both cases every name lookup of the child fails, and Pent writes a warning. The sandbox stays closed, and a program that needs a name reports an error.
 
 ## Installation
+
+Pent needs no root and no capability. The packages do not run `setcap`.
 
 ### Homebrew (macOS / Linux)
 ```bash
@@ -91,49 +179,258 @@ sudo apt install pent
 
 ## Quick start
 
-### One-off runs
+### Record a profile
+
+Pent applies a profile to each program. A profile is a short list of the paths and the domains that the program needs. You do not write it by hand: `pent watch` records it.
+
 ```bash
-# Restricted network (domain allowlist)
-pent run --allow example.com -- curl https://example.com
-
-# No network access
-pent run --network blocked -- curl https://example.com
-
-# Read-only access to specific paths
-pent run --read /etc/ssl/certs -- my-app
+pent watch -- claude
 ```
 
-### Persistent configuration
-```bash
-# Add profiles for common tools
-pent config add --global @claude @gh @npm
+Watch mode does not sandbox the program. Pent shows a banner and asks before the start:
 
-# Run the tool (config is applied automatically)
+```
+pent watch: claude
+  Watch mode does not sandbox the program. It records what the program does.
+  The program can read and change your files and use the network.
+  The network is open in this run. Use --allow DOMAIN or --network blocked to close it.
+  Pent blocks only the most dangerous accesses (credentials, persistence).
+  If you do not trust this binary, run it in a VM or a container.
+Continue? [y/N]
+```
+
+Use the program as usual, then exit it. Pent groups the recorded accesses into rules and shows them one section at a time. For each section, accept all items, no items, or some items by number:
+
+```
+Read-write (3)
+  1  ~/.claude              creates and edits files (37 new)
+  2  ~/.claude.json         config file
+  3  ~/.cache/claude        cache
+Accept: [a]ll, [n]one, or the numbers (1,3-5)? [a]
+```
+
+Two sections have the default `[n]`, because their rules are strong: `Blocked by the guard` and `Unix sockets`. Pent selects an item of these sections only when you ask for it.
+
+Pent writes the selected rules to a draft and asks `Trust this profile now? [y/N]`.
+
+Under the header, pent shows one warning line for each fact that needs your attention:
+
+```
+pent watch: claude
+  14 rules from 1,835 accesses by 4 processes. The guard blocked 2 accesses.
+▲ 2 rules read outside the home directory
+▲ pent refused 1 connection to a Unix socket
+```
+
+The same facts are comments in the first lines of the draft.
+
+### The network of a watch run
+
+A watch run must learn which domains the program needs, so the network is open by default: the proxy observes each request and allows each domain. A hostile program can then send out everything that it reads.
+
+To close the network, use the same two flags as in `pent run`. The proxy then enforces the allowlist, and each refused request becomes an item of the summary:
+
+```bash
+# Allow one domain. The proxy refuses each other domain
+pent watch --allow api.anthropic.com -- claude
+
+# No network at all
+pent watch --network blocked -- claude
+```
+
+`--network` has precedence over `--allow`, as in `pent run`.
+
+### Trust and run
+
+```bash
+# Show the draft, ask, then trust it
+pent trust claude
+
+# Run with the trusted profile
 pent run -- claude
 ```
 
+Without a trusted profile, `pent run` does not start the program:
+
+```
+✗ no trusted profile for "claude"
+  record one: pent watch -- claude
+```
+
+### Flags for one run
+
+The flags add to the profile for one run. They never replace it.
+
+```bash
+# One more domain (this also selects proxy mode)
+pent run --allow example.com -- claude
+
+# One more read-only path, read-write path or executable path
+pent run --read /etc/ssl/certs --write ./out --execute ~/tools/bin -- claude
+
+# One more Unix socket
+pent run --unix-socket ~/.gnupg/S.gpg-agent -- claude
+
+# No network access
+pent run --network blocked -- claude
+```
+
+## Configuration
+
+### Files
+
+Pent uses the XDG directories on all platforms. When `$XDG_CONFIG_HOME` or `$XDG_STATE_HOME` is set, pent uses it.
+
+| Path | Content |
+|---|---|
+| `~/.config/pent/pent.toml` | The global settings (see below). |
+| `~/.config/pent/profiles/<name>.toml` | A trusted profile. |
+| `~/.config/pent/trusted.toml` | The trust store: the path and the SHA-256 hash of each trusted profile. |
+| `~/.local/state/pent/drafts/<name>.toml` | The draft that `pent watch` writes. |
+| `~/.local/state/pent/watch/<name>/<run>.jsonl` | The raw events of one watch run. |
+| `~/.local/state/pent/denied/<name>.jsonl` | The accesses that `pent run` denied. |
+
+Pent has no project or local settings file. A file in a repository cannot change the sandbox.
+
+### Global settings
+
+The global settings have only the proxy tunables and the mounts. They have no paths and no domains: these are in the profiles.
+
+```toml
+[proxy]
+upstream_dns = ["1.1.1.1:53"]       # default: the resolvers in /etc/resolv.conf
+dns_ttl_seconds = 300
+tcp_connect_timeout_secs = 30
+tcp_idle_timeout_secs = 300
+private_destinations = "deny"       # "allow" for an internal registry on 10.x
+
+# Linux only. A mount is read-only unless you set readonly = false.
+[[sandbox.mounts]]
+path = "/opt/tools"
+```
+
+```bash
+pent config init     # write a starter file
+pent config show     # print the settings (--format json for JSON)
+pent config edit     # open the file in $EDITOR
+```
+
+Pent rejects an unknown key, thus a typo causes an error that names the key. A key of an older pent version causes an error that tells where the setting went, for example:
+
+```
+✗ ~/.config/pent/pent.toml: `domain_allowlist` moved to profiles; record one with `pent watch`
+```
+
+## Profiles
+
+### The profile name
+
+The profile name is the file name of the command as you type it:
+
+| Command | Profile |
+|---|---|
+| `pent run -- claude` | `claude` |
+| `pent run -- ~/.local/bin/claude --resume` | `claude` |
+| `pent run -- python3 train.py` | `python3`, with a warning. Use `--profile train`. |
+| `pent run -- bash -c "npm test"` | `bash`, with a warning. Use `--profile npm-test`. |
+
+Use the same `--profile NAME` for `pent watch` and for `pent run`. A profile covers the full process tree: when `claude` starts `git`, `git` gets the rules of the `claude` profile.
+
+### The draft
+
+The draft has one comment for each rule. The comment tells why the rule exists. Remove a line to remove the rule.
+
+```toml
+# Profile for "claude". Pent made it from 3 watch runs.
+# Each comment tells why the rule exists. Remove a line to remove the rule.
+# pent refused 1 connection to a Unix socket.
+
+[filesystem]
+read_write = [
+  "~/.claude",          # creates and edits files (37 new)
+  "~/.claude.json",     # config file
+]
+read = [
+  "~/.gitconfig",       # read by git
+]
+execute = [
+  "~/.local/share/claude",
+]
+unix_sockets = [
+  "~/.gnupg/S.gpg-agent",  # gpg-agent
+]
+
+[network]
+domains = [
+  "api.anthropic.com",
+  "*.npmjs.org",        # registry, www, cdn
+]
+```
+
+Pent expands a leading `~` to your home directory. A relative path resolves against the workspace. The workspace (the current directory) is always read-write, and the system paths (`/usr`, `/etc`, `/tmp`, ...) are always available.
+
+`unix_sockets` names the Unix sockets that the program can connect to. Pent makes each permitted connection itself, so a socket that the list does not name is not reachable, also when a path rule gives access to its directory. This rule is strong: a program that reaches the socket of an agent can use the key of that agent. Thus the review never selects such an item for you. The reason names the agent when pent knows the socket (`ssh-agent`, `gpg-agent`, `D-Bus`, `Docker`), else it names the process that connected.
+
+A program can also connect to an abstract address (`@name`). A rule cannot name an abstract address, so the summary lists it under "Not in the rules".
+
+To record more accesses into the same draft, run `pent watch --append -- claude`. Each run adds to the draft.
+
+### Trust
+
+Pent applies a profile only after you trust its exact content, as `direnv allow` does. Pent keeps the SHA-256 hash of each trusted profile. When the file changes, `pent run` stops and tells you to trust it again.
+
+| Command | Description |
+|---|---|
+| `pent trust NAME` | Show the draft (or the changed profile), ask, then trust it. `--yes` skips the question. |
+| `pent trust NAME --review` | Review the accesses that `pent run` denied, and add the selected rules. |
+| `pent untrust NAME` | Remove the trust. `pent run` then does not apply the profile. |
+| `pent profile list` | List the profiles, their trust status and the drafts. |
+| `pent profile show NAME` | Print the profile (or the draft). |
+| `pent profile rm NAME` | Remove the profile, its draft, its trust and its logs. |
+
 ## Debugging
 
-### `--trace`: log policy violations at runtime
+### The program needs a Unix socket
 
-Use `--trace` to log every denial without killing the process. Pent will emit a fix hint for each violation so you can copy-paste the missing paths and domains into your config.
+A program that cannot reach its agent fails with "Permission denied" on the socket, or it asks for a passphrase that the agent holds. Record the run with `pent watch`: the connection becomes an item in the `Unix sockets` section, with the name of the agent. Accept the item, or add the path with `--unix-socket PATH` for one run.
+
+An abstract address (`@name`) has no path, so no rule can allow it. The summary lists it under "Not in the rules".
+
+### Denied accesses and `pent trust --review`
+
+`pent run` records each access that the sandbox denies. At exit, pent tells you:
+
+```
+▲ 3 accesses denied; review them: pent trust claude --review
+```
+
+`pent trust claude --review` groups the denied accesses into rules, with the same review as `pent watch`. Pent adds the selected rules to a new draft, asks you to trust it, and then deletes the list of denied accesses.
+
+Pent always records the domains that the proxy denies. Pent records the filesystem denials only with `--trace`.
+
+### `--trace`: write the denials to a log
+
+Use `--trace` to write the sandbox and proxy events to `~/.local/state/pent/trace/<profile>.log` (`$XDG_STATE_HOME` when it is set), and to record the filesystem denials. The process continues after a denial. `--trace` does not change the network mode.
 
 ```bash
 pent run --trace -- claude
-cat .pent/trace.log
+cat ~/.local/state/pent/trace/claude.log
 ```
 
-Example output:
+Each denial has a fix hint:
+
 ```
-pent: [denied] filesystem: "claude" was denied "read" access to "/Users/alice/.ssh/id_rsa"
-pent: fix: add "/Users/alice/.ssh/id_rsa" to [sandbox.paths.read] in your pent config
+pent: [denied] network: DNS query for "evil.example" (A) blocked: the domain is not in the allowlist
+pent: fix: allow it for one run with --allow evil.example, or add it to the profile: pent trust claude --review
+
+pent: [allowed] network: connection to "example.com" allowed
 ```
 
-`--trace` only records accesses that Pent's sandbox actually intercepts and denies. It cannot tell you everything a binary will try to open before you run it. For a complete picture, use `strace`.
+The proxy events are in the log only in proxy mode (domains in the profile, `--allow`, or `--network proxy`). In other modes, pent shows a note. On macOS, pent also reads the Seatbelt denials of the process tree from the unified log (`log stream`).
 
-### `strace`: discover all filesystem access upfront
+### `strace`: see all filesystem accesses
 
-`strace` intercepts every system call the process makes, including all file opens. This lets you build a complete allowlist before running under Pent.
+`pent watch` is the usual way to find the paths that a program needs. To see every system call, use `strace` without pent:
 
 ```bash
 strace -e trace=openat,open,stat,statx,access,faccessat \
@@ -141,16 +438,7 @@ strace -e trace=openat,open,stat,statx,access,faccessat \
        your-command
 ```
 
-To extract the paths it tried to open, run `grep -oP '"\K[^"]+(?=", O_)' strace.log | sort -u` for successful opens and `grep 'EACCES\|ENOENT' strace.log | grep -oP '"\K[^"]+(?=")' | sort -u` for denials. Then add the relevant entries to your Pent config:
-```toml
-[sandbox.paths]
-read  = ["/path/to/thing"]
-write = ["/path/to/writable"]
-```
-
-## Contributing profiles
-
-Profiles are the heart of Pent's zero-config experience. If you use a tool that isn't covered, please contribute a profile by opening `crates/pent-settings/src/profiles.rs`, adding your tool to the `Profile` enum and `PROFILES` table, defining its domains and paths in `profile_config`, and submitting a PR.
+To get the paths that the program opened, run `grep -oP '"\K[^"]+(?=", O_)' strace.log | sort -u`. Give a path for one run with `--read` or `--write`, or record it with `pent watch --append`.
 
 ## License
 

@@ -138,9 +138,12 @@ mod tests {
     #[test]
     #[serial]
     fn test_build_env_includes_safe_vars() {
-        // Set a known safe var
+        // Set a known safe var. Restore it after, because other tests in this
+        // process read PATH to find binaries.
+        let original = std::env::var("PATH").unwrap_or_default();
         std::env::set_var("PATH", "/usr/bin");
         let env = build_env(&[]);
+        std::env::set_var("PATH", original);
         assert!(env.contains_key("PATH"));
     }
 

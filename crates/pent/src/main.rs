@@ -10,12 +10,9 @@ use error::CliError;
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
-    let run_mode = matches!(cli.command, Command::Run(_));
+    // The child owns the terminal in `run` and `watch`.
+    let run_mode = matches!(cli.command, Command::Run(_) | Command::Watch(_));
     setup_tracing(cli.verbose, run_mode);
-
-    // Note: CAP_NET_ADMIN should be set on the pent binary via:
-    //   sudo setcap cap_net_admin=eip $(which pent)
-    // This allows pent to create veth pairs for network proxying without sudo.
 
     #[cfg(target_os = "linux")]
     pent_sandbox::cleanup_stale_overlays();
@@ -31,8 +28,12 @@ async fn dispatch(cli: Cli) -> Result<(), CliError> {
     let cwd = std::env::current_dir()?;
     match cli.command {
         Command::Run(args) => commands::run::run(args, cwd).await,
+        Command::Watch(args) => commands::watch::watch(args, cwd).await,
+        Command::Trust(args) => commands::trust::trust(&args, cwd),
+        Command::Untrust(args) => commands::trust::untrust(&args),
+        Command::Profile(args) => commands::trust::profile(&args),
         Command::Check => commands::check::check(cwd).await,
-        Command::Config(args) => commands::config::config(args, cwd),
+        Command::Config(args) => commands::config::config(args, &cwd),
     }
 }
 

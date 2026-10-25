@@ -32,14 +32,31 @@ pub fn system_default_paths() -> SandboxPaths {
             // Homebrew: ARM Macs → /opt/homebrew, Intel → /usr/local (covered by /usr/*)
             "/opt/homebrew".to_string(),
         ],
-        read_write: vec![
-            "/tmp".to_string(),
-            // Device files — processes need /dev/null, /dev/urandom, etc.
-            "/dev".to_string(),
-            // macOS per-user volatile cache dirs (Keychain/MDS/Security framework)
-            "/private/var/folders".to_string(),
-        ],
+        read_write: default_read_write_paths(),
     }
+}
+
+/// Default read-write paths.
+///
+/// On Linux, the Landlock backend always grants the minimal device set
+/// (`/dev/null`, `/dev/zero`, `/dev/tty`, `/dev/pts`, ... read-write and
+/// `/dev/urandom`, ... read-only). Thus `/dev` is not in this list: a
+/// read-write grant on all of `/dev` includes `/dev/shm` and `/dev/mqueue`.
+#[cfg(target_os = "linux")]
+fn default_read_write_paths() -> Vec<String> {
+    vec!["/tmp".to_string()]
+}
+
+/// Default read-write paths.
+#[cfg(not(target_os = "linux"))]
+fn default_read_write_paths() -> Vec<String> {
+    vec![
+        "/tmp".to_string(),
+        // Device files — processes need /dev/null, /dev/urandom, etc.
+        "/dev".to_string(),
+        // macOS per-user volatile cache dirs (Keychain/MDS/Security framework)
+        "/private/var/folders".to_string(),
+    ]
 }
 
 /// Configuration for sandboxed process execution.
@@ -74,6 +91,19 @@ pub struct SandboxConfig {
     /// When true, skip filesystem enforcement (no Landlock, no overlayfs).
     /// Network isolation is unaffected.  Used by `--no-sandbox`.
     pub no_enforcement: bool,
+
+    /// When true, record the accesses of the process tree next to the
+    /// enforcement, and return them in [`crate::SandboxChild::events`].
+    /// Used by `pent run --trace`.
+    pub record_events: bool,
+
+    /// The Unix socket paths that the child can connect to.
+    ///
+    /// Landlock does not control `connect(2)` on a Unix socket that has a
+    /// path, so the supervisor makes each connection itself and gives the
+    /// connected socket to the child. A path that is not in this list gets
+    /// `EACCES`. An empty list permits no connection to a Unix socket.
+    pub unix_sockets: Vec<PathBuf>,
 }
 
 impl SandboxConfig {
@@ -94,6 +124,8 @@ impl SandboxConfig {
             network: NetworkMode::default(),
             cwd,
             no_enforcement: false,
+            record_events: false,
+            unix_sockets: Vec::new(),
         }
     }
 
@@ -132,18 +164,17 @@ impl SandboxConfig {
         self
     }
 
-    /// Build a `SandboxConfig` from a `SandboxSettings` fragment, merging
-    /// the settings' paths on top of [`system_default_paths()`].
-    ///
-    /// This is the canonical way to construct a `SandboxConfig` from loaded
-    /// config files; it avoids the manual path-extension boilerplate in callers.
+    /// Build a `SandboxConfig` from the global `SandboxSettings` (the
+    /// mounts) and the paths of a profile. The profile paths merge on top of
+    /// [`system_default_paths()`].
     #[must_use]
     pub fn from_sandbox_settings(
         settings: SandboxSettings,
+        profile_paths: SandboxPaths,
         workspace: PathBuf,
         cwd: PathBuf,
     ) -> Self {
-        let paths = system_default_paths().merge(settings.paths);
+        let paths = system_default_paths().merge(profile_paths);
         let mut cfg = Self::new(workspace, paths, cwd);
         for mount in settings.mounts {
             cfg.mounts.push(mount);

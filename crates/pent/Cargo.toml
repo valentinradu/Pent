@@ -14,9 +14,11 @@ path = "src/main.rs"
 pent-settings = { path = "../pent-settings" }
 pent-sandbox  = { path = "../pent-sandbox" }
 pent-proxy    = { path = "../pent-proxy" }
+pent-profile  = { path = "../pent-profile" }
+dirs          = "5"
 clap          = { workspace = true }
 console       = "0.15"
-tokio         = { workspace = true }
+tokio         = { workspace = true, features = ["signal"] }
 tracing       = { workspace = true }
 tracing-subscriber = { workspace = true }
 thiserror     = { workspace = true }
@@ -32,7 +34,6 @@ clap        = { workspace = true, features = ["string"] }
 [dev-dependencies]
 tempfile    = { workspace = true }
 toml        = "0.8"
-serial_test = "3"
 
 [package.metadata.deb]
 name = "pent"
@@ -51,11 +52,16 @@ assets = [
     ["../../man/pent.1",            "usr/share/man/man1/", "644"],
     ["../../man/pent-run.1",        "usr/share/man/man1/", "644"],
     ["../../man/pent-check.1",      "usr/share/man/man1/", "644"],
+    ["../../man/pent-watch.1",      "usr/share/man/man1/", "644"],
+    ["../../man/pent-trust.1",      "usr/share/man/man1/", "644"],
+    ["../../man/pent-untrust.1",    "usr/share/man/man1/", "644"],
+    ["../../man/pent-profile.1",    "usr/share/man/man1/", "644"],
+    ["../../man/pent-profile-list.1","usr/share/man/man1/", "644"],
+    ["../../man/pent-profile-show.1","usr/share/man/man1/", "644"],
+    ["../../man/pent-profile-rm.1", "usr/share/man/man1/", "644"],
     ["../../man/pent-config.1",     "usr/share/man/man1/", "644"],
-    ["../../man/pent-config-add.1", "usr/share/man/man1/", "644"],
     ["../../man/pent-config-edit.1","usr/share/man/man1/", "644"],
     ["../../man/pent-config-init.1","usr/share/man/man1/", "644"],
-    ["../../man/pent-config-rm.1",  "usr/share/man/man1/", "644"],
     ["../../man/pent-config-show.1","usr/share/man/man1/", "644"],
 ]
 

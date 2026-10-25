@@ -6,9 +6,7 @@ pkgdesc="Wrap any process in a filesystem and network sandbox"
 arch=('x86_64' 'aarch64')
 url="https://github.com/valentinradu/Pent"
 license=('MIT')
-depends=('libcap')
 makedepends=('cargo')
-install="pent.install"
 source=("$pkgname-$pkgver.tar.gz::https://github.com/valentinradu/Pent/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('PLACEHOLDER_SOURCE_SHA256')
 

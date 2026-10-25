@@ -2,53 +2,197 @@
 //!
 //! Provides filesystem and network containment using native OS mechanisms:
 //! - macOS: sandbox-exec with SBPL profiles
-//! - Linux: Landlock LSM for filesystem, network namespaces for network
+//! - Linux: Landlock LSM for filesystem, network namespaces for network.
+//!   No privileges are necessary: pent uses unprivileged user namespaces.
 //!
 //! # Example
 //!
-//! ```ignore
-//! use pent_sandbox::{SandboxConfig, SandboxPaths, spawn_sandboxed};
+//! ```no_run
+//! # fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! use pent_sandbox::{build_env, spawn_sandboxed, SandboxConfig, SandboxPaths};
 //!
 //! let paths = SandboxPaths {
-//!     traversal: vec!["/".to_string(), "/Users".to_string()],
+//!     traversal: vec!["/".to_string()],
 //!     read: vec!["/usr/lib".to_string()],
+//!     execute: vec!["/usr/bin".to_string()],
 //!     read_write: vec!["/tmp".to_string()],
 //! };
 //!
-//! let config = SandboxConfig::new(
-//!     "/home/user/project".into(),
-//!     paths,
-//!     "/home/user/project".into(),
-//! ).with_env(build_env(&[]));
+//! let workspace = std::path::PathBuf::from("/home/user/project");
+//! let config = SandboxConfig::new(workspace.clone(), paths, workspace)
+//!     .with_env(build_env(&[]));
 //!
-//! let child = spawn_sandboxed(&config, "my-process", &[])?;
+//! let mut child = spawn_sandboxed(&config, "my-process", &[])?;
+//! let status = child.child.wait()?;
+//! # let _ = status;
+//! # Ok(())
+//! # }
 //! ```
 
 mod config;
 mod env;
 
-#[cfg(target_os = "macos")]
+// The SBPL generator is pure Rust, so its unit tests also run on Linux.
+// On Linux, only the tests use the module; the allow stops dead-code
+// warnings for the macOS spawn functions.
+#[cfg(any(target_os = "macos", test))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod macos;
+
+// The parse and filter functions of the macOS log reader are pure Rust, so
+// their unit tests also run on Linux.
+#[cfg(any(target_os = "macos", test))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod macos_log;
+
+// The measurement of `kqueue` for MAC-10. The module holds no production
+// code: `kqueue` gives no fact that the poll of the process table does not
+// already give (see the comment of the module). The test holds the answer
+// of the kernel, so a later macOS that follows a `fork` is visible.
+#[cfg(all(target_os = "macos", test))]
+mod macos_kqueue;
 
 #[cfg(target_os = "linux")]
 mod linux;
 
 #[cfg(target_os = "linux")]
-mod linux_netns;
+mod linux_landlock;
+
+#[cfg(target_os = "linux")]
+mod linux_fdpass;
+
+#[cfg(target_os = "linux")]
+mod linux_proxynet;
 
 #[cfg(target_os = "linux")]
 mod linux_overlayfs;
 
+#[cfg(target_os = "linux")]
+mod linux_watch;
+
+#[cfg(target_os = "linux")]
+mod linux_unixconn;
+
 pub use config::{system_default_paths, SandboxConfig};
 pub use env::{build_env, resolve_path_directories, resolve_path_dirs_from};
 #[cfg(target_os = "linux")]
+pub use linux::check_user_namespaces;
+#[cfg(target_os = "linux")]
 pub use linux::compute_accessible_set;
 #[cfg(target_os = "linux")]
-pub use linux_overlayfs::{cleanup_stale_overlays, OverlayHandle};
+pub use linux::{proc_isolation, ProcDenial, ProcIsolation};
+#[cfg(target_os = "linux")]
+pub use linux_overlayfs::{
+    cleanup_stale_overlays, DiscardKind, DiscardedWrite, FlushError, FlushFailure, OverlayHandle,
+    OverlayTeardownReport,
+};
+#[cfg(target_os = "linux")]
+pub use linux_proxynet::{child_proxy_addr, ProxyListeners, CHILD_DNS_PORT, CHILD_PROXY_PORT};
 pub use pent_settings::{Mount, NetworkMode, SandboxPaths, SandboxSettings};
 
 use std::process::Child;
 use thiserror::Error;
+
+/// Return the paths that the sandbox allows without a profile rule.
+///
+/// The list has the default paths of [`system_default_paths`], the paths that
+/// the platform backend always allows (on Linux: `/nix/store`, `/proc`, the
+/// device nodes, ...), the directories in `path_env` (a `PATH` value) and
+/// their canonical targets. The summary of watch mode omits accesses below
+/// these paths, because a profile does not need a rule for them.
+#[must_use]
+pub fn implicit_allowed_paths(path_env: &str) -> Vec<std::path::PathBuf> {
+    let (_traversal, read, execute, read_write) = system_default_paths().expand_paths();
+    let mut paths: Vec<std::path::PathBuf> = read
+        .into_iter()
+        .chain(execute)
+        .chain(read_write)
+        .map(|(path, _glob)| path)
+        .collect();
+    #[cfg(target_os = "linux")]
+    paths.extend(linux::implicit_paths());
+    for dir in resolve_path_dirs_from(path_env) {
+        if let Ok(real) = std::fs::canonicalize(&dir) {
+            paths.push(real);
+        }
+        paths.push(dir);
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// The options of watch mode.
+///
+/// Watch mode does not apply the sandbox policy. It records each access of
+/// the process tree and blocks only the accesses that `guard` names. The
+/// kernel enforces the guard (mount masks on Linux, Seatbelt deny rules on
+/// macOS).
+#[derive(Debug, Clone)]
+pub struct WatchOptions {
+    /// The dangerous accesses to block (see [`pent_profile::guard_rules`]).
+    pub guard: Vec<pent_profile::GuardRule>,
+    /// The Unix socket paths that the child can connect to. See
+    /// [`SandboxConfig::unix_sockets`]. Watch mode records each connection
+    /// that it refuses, so the review can propose the path.
+    pub unix_sockets: Vec<std::path::PathBuf>,
+}
+
+/// A process that runs in watch mode.
+pub struct WatchedChild {
+    /// The child and the platform resources (the overlay and the proxy
+    /// listeners on Linux).
+    pub child: SandboxChild,
+    /// The recorded events. The channel closes when the last process of the
+    /// tree exits and the recorder has sent all events.
+    pub events: std::sync::mpsc::Receiver<pent_profile::WatchEvent>,
+}
+
+/// Spawn `cmd` in watch mode.
+///
+/// `config.network` selects the network path as for [`spawn_sandboxed`].
+/// Watch mode uses [`NetworkMode::ProxyOnly`] with the proxy in observe mode,
+/// so that network events have domain names.
+///
+/// On macOS, the child runs under a Seatbelt profile that allows each
+/// operation with `(with report)` and denies the guard accesses. A reader of
+/// `log stream` (started before the spawn) turns the reports of the process
+/// tree into events. macOS limits the rate of the reports, so the events are
+/// a lower bound.
+///
+/// On Linux, a seccomp filter with user notification reports the path
+/// syscalls of the process tree to a supervisor thread, and masks in the
+/// private mount namespace of the child enforce the guard.
+///
+/// The event channel closes only after the caller reaps the last process of
+/// the tree, because a zombie still holds the seccomp filter. Call `wait()`
+/// on the child (and `teardown_overlay` when pent is a child subreaper)
+/// before you wait for the channel to close.
+///
+/// # Errors
+/// Returns [`SandboxError::UnsupportedPlatform`] on a platform without a
+/// recorder, [`SandboxError::SandboxUnavailable`] on macOS if
+/// `log stream` cannot start, or a spawn error.
+pub fn spawn_watched(
+    config: &SandboxConfig,
+    options: &WatchOptions,
+    cmd: &str,
+    args: &[String],
+) -> Result<WatchedChild, SandboxError> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::spawn_watched(config, options, cmd, args)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux_watch::spawn_watched(config, options, cmd, args)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (config, options, cmd, args);
+        Err(SandboxError::UnsupportedPlatform)
+    }
+}
 
 /// A sandboxed child process, optionally with an overlayfs handle.
 pub struct SandboxChild {
@@ -58,10 +202,23 @@ pub struct SandboxChild {
     /// Pass this to [`teardown_overlay`] after `child.wait()` returns.
     #[cfg(target_os = "linux")]
     pub overlay: Option<linux_overlayfs::OverlayHandle>,
-    /// Anonymous network namespace handle for `ProxyOnly` mode on Linux.
-    /// Dropping this cleans up firewall/routing rules added during setup.
+    /// The proxy listeners for `ProxyOnly` mode on Linux. The child made
+    /// them in its network namespace before `exec`. Give them to the proxy;
+    /// the child can reach nothing else.
     #[cfg(target_os = "linux")]
-    pub netns: Option<linux_netns::NetnsHandle>,
+    pub proxy_listeners: Option<ProxyListeners>,
+    /// The recorded events when [`SandboxConfig::record_events`] is set
+    /// (`pent run --trace`). The recorder observes next to the enforcement.
+    /// Events that the policy denies have [`pent_profile::Outcome::Denied`].
+    ///
+    /// On macOS, the channel has the Seatbelt denials of the process tree.
+    /// It is `None` if `log stream` cannot start.
+    ///
+    /// On Linux, the seccomp recorder reports each access, and the outcome is
+    /// `Denied` when the Landlock policy does not allow the access. The
+    /// channel closes only after the caller reaps the last process of the
+    /// tree.
+    pub events: Option<std::sync::mpsc::Receiver<pent_profile::WatchEvent>>,
 }
 
 /// Errors that can occur during sandbox operations.
@@ -83,13 +240,9 @@ pub enum SandboxError {
     #[error("Failed to spawn process: {0}")]
     SpawnFailed(#[from] std::io::Error),
 
-    /// Network namespace setup failed.
+    /// The setup of the sandbox network failed.
     #[error("Network setup failed: {0}")]
     NetworkSetupFailed(String),
-
-    /// Operation requires elevated privileges.
-    #[error("Privilege required: {0}")]
-    PrivilegeRequired(String),
 }
 
 /// Spawn a command in a sandbox, returning a [`SandboxChild`] handle.
@@ -97,6 +250,12 @@ pub enum SandboxError {
 /// On Linux, the returned [`SandboxChild::overlay`] may contain an
 /// [`OverlayHandle`] for write-listed file paths. Pass it to [`teardown_overlay`]
 /// after `child.wait()` returns to flush writes and clean up.
+///
+/// On Linux, the child gets `PR_SET_PDEATHSIG(SIGKILL)`: it dies when pent
+/// dies. The kernel sends this signal when the *thread* that called `fork`
+/// exits. Thus call this function on a thread that lives as long as the
+/// child (for example the main thread), not on a short-lived worker thread.
+/// File descriptors from 3 up do not pass to the child.
 ///
 /// # Errors
 /// Returns a [`SandboxError`] if the sandbox cannot be set up or the process cannot be spawned.
@@ -106,82 +265,33 @@ pub fn spawn_sandboxed(
     args: &[String],
 ) -> Result<SandboxChild, SandboxError> {
     // ── Auto-grant access to the binary's location ───────────────────────────
-    // Rule: the binary's resolved directory (and the package root when it lives
-    // in a `bin/` subdirectory) is always readable and executable.  This lets
-    // runtimes like Node.js find sibling dirs (lib/node_modules/, etc.).
-    //
-    // Two-step resolution:
-    // 1. Locate the binary in PATH without canonicalising — the symlink path
-    //    preserves the `bin/` structure we need for the package-root heuristic.
-    //    (e.g. ~/.npm-global/bin/gemini → ../lib/…/index.js: the symlink parent
-    //    IS `bin/`, but the canonicalized parent is `dist/`.)
-    // 2. Canonicalize separately and add the real parent as well, so the
-    //    Landlock execute rule covers the actual inode the kernel will check.
+    // The binary's directories receive read + execute access (see
+    // `binary_grant_dirs` for the rules). This lets runtimes like Node.js read
+    // the files of their own package.
     //
     // Must happen before any platform-specific call:
     // - Linux: overlayfs accessible set is built from config at mount time.
     // - macOS: SBPL profile is generated from config before spawn.
     let mut effective_config = config.clone();
-    // Canonical binary parent directories that need ReadFile for execve to work.
-    // These are collected separately from execute_paths so they can receive
-    // syslib_access (ReadFile | ReadDir | Execute) rather than execute_access
-    // (ReadDir | Execute only). On Linux, the kernel requires ReadFile on the
-    // binary's directory for execve to succeed under Landlock, even though
-    // Execute alone should theoretically be sufficient.
+    // Directories that need ReadFile for execve to work. On Linux these get
+    // read + execute access (ReadFile | ReadDir | Execute), not the
+    // execute-only access of configured execute paths.
     let mut binary_real_parents: Vec<std::path::PathBuf> = Vec::new();
     {
         let path_env = config.env.get("PATH").map_or("", String::as_str);
-
-        // Step 1: find the binary as it appears in PATH (symlink not resolved).
-        let found: Option<std::path::PathBuf> = if std::path::Path::new(cmd).is_absolute() {
-            Some(std::path::PathBuf::from(cmd))
-        } else {
-            path_env
-                .split(':')
-                .map(|dir| std::path::Path::new(dir).join(cmd))
-                .find(|p| p.is_file())
-        };
-
-        let mut add = |s: String| {
-            if !effective_config.paths.execute.contains(&s) {
-                effective_config.paths.execute.push(s);
-            }
-        };
-
-        if let Some(ref fp) = found {
-            if let Some(parent) = fp.parent() {
-                // Symlink-path parent → always add (covers bin/ dirs).
-                add(parent.to_string_lossy().into_owned());
-                // The symlink parent also needs syslib_access so that any
-                // binaries symlinked from it can be read and executed.
-                binary_real_parents.push(parent.to_path_buf());
-                // Package-root heuristic: `bin/` sibling dirs (lib/, etc.).
-                // The package root receives syslib_access so that Node.js
-                // runtimes can read .js files and spawn nested binaries from
-                // anywhere in the package tree.
-                // Only apply for user-space package roots (e.g. ~/.npm-global),
-                // NOT for system directories like / (pkg_root of /bin/true is /).
-                // Adding / to accessible/path_dirs would make every path appear
-                // to be "in an accessible subtree", breaking overlay stub logic.
-                if parent.file_name().is_some_and(|n| n == "bin") {
-                    if let Some(pkg_root) = parent.parent() {
-                        // Skip filesystem root and other degenerate cases.
-                        if pkg_root.parent().is_some() {
-                            add(pkg_root.to_string_lossy().into_owned());
-                            binary_real_parents.push(pkg_root.to_path_buf());
-                        }
-                    }
+        if let Some(found) = find_in_path(cmd, path_env) {
+            let canonical = std::fs::canonicalize(&found).unwrap_or_else(|_| found.clone());
+            let home = config
+                .env
+                .get("HOME")
+                .map(std::path::PathBuf::from)
+                .or_else(dirs::home_dir);
+            for dir in binary_grant_dirs(&found, &canonical, home.as_deref()) {
+                let s = dir.to_string_lossy().into_owned();
+                if !effective_config.paths.execute.contains(&s) {
+                    effective_config.paths.execute.push(s);
                 }
-            }
-            // Step 2: canonical parent for Landlock execute on the real inode.
-            // Added to binary_real_parents so it receives syslib_access (with
-            // ReadFile) — required for execve to succeed under Landlock on Linux.
-            if let Ok(real) = std::fs::canonicalize(fp) {
-                if let Some(real_parent) = real.parent() {
-                    binary_real_parents.push(real_parent.to_path_buf());
-                    // Also add as execute path for the accessible set computation.
-                    add(real_parent.to_string_lossy().into_owned());
-                }
+                binary_real_parents.push(dir);
             }
         }
     }
@@ -189,41 +299,22 @@ pub fn spawn_sandboxed(
 
     #[cfg(target_os = "macos")]
     {
-        let profile = macos::generate_sbpl_profile(config)?;
-        let env_with_proxy;
-        let env = if let NetworkMode::ProxyOnly { proxy_addr, .. } = &config.network {
-            let port = proxy_addr.port();
-            let http_url = format!("http://127.0.0.1:{port}");
-            let socks_url = format!("socks5h://127.0.0.1:{port}");
-            let no_proxy = "localhost,127.0.0.1,::1";
-            let mut e = config.env.clone();
-            e.insert("HTTP_PROXY".to_string(), http_url.clone());
-            e.insert("HTTPS_PROXY".to_string(), http_url.clone());
-            e.insert("http_proxy".to_string(), http_url.clone());
-            e.insert("https_proxy".to_string(), http_url.clone());
-            e.insert("ALL_PROXY".to_string(), socks_url.clone());
-            e.insert("all_proxy".to_string(), socks_url.clone());
-            e.insert("GRPC_PROXY".to_string(), socks_url.clone());
-            e.insert("grpc_proxy".to_string(), socks_url);
-            e.insert("NO_PROXY".to_string(), no_proxy.to_string());
-            e.insert("no_proxy".to_string(), no_proxy.to_string());
-            e.insert(
-                "GIT_SSH_COMMAND".to_string(),
-                format!("ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:{port} %h %p'"),
-            );
-            e.insert("SANDBOX_RUNTIME".to_string(), "1".to_string());
-            env_with_proxy = e;
-            &env_with_proxy
-        } else {
-            &config.env
-        };
-        let child = macos::spawn_with_sandbox(&profile, cmd, args, env, &config.cwd)?;
-        Ok(SandboxChild { child })
+        macos::spawn_run(config, cmd, args)
     }
     #[cfg(target_os = "linux")]
     {
         let child_path = config.env.get("PATH").map_or("", |s| s.as_str());
         let mut path_dirs = resolve_path_dirs_from(child_path);
+        // Landlock checks the inode that a symbolic link resolves to. Add the
+        // canonical target of each PATH directory too (for example
+        // /run/current-system/sw/bin -> /nix/store/...-system-path/bin).
+        for dir in path_dirs.clone() {
+            if let Ok(real) = std::fs::canonicalize(&dir) {
+                if !path_dirs.contains(&real) {
+                    path_dirs.push(real);
+                }
+            }
+        }
         // Add canonical binary parent dirs to path_dirs so they receive
         // syslib_access (ReadFile | ReadDir | Execute) — execve requires ReadFile.
         for p in binary_real_parents {
@@ -231,12 +322,19 @@ pub fn spawn_sandboxed(
                 path_dirs.push(p);
             }
         }
-        let (child, overlay, netns) =
-            linux::spawn_with_landlock(config, cmd, args, &config.env, &path_dirs)?;
+        let spawned = linux::spawn_linux(
+            config,
+            cmd,
+            args,
+            &config.env,
+            &path_dirs,
+            linux::SpawnMode::Sandbox,
+        )?;
         Ok(SandboxChild {
-            child,
-            overlay,
-            netns,
+            child: spawned.child,
+            overlay: spawned.overlay,
+            proxy_listeners: spawned.proxy_listeners,
+            events: spawned.events,
         })
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -245,41 +343,136 @@ pub fn spawn_sandboxed(
     }
 }
 
-/// Clean up Linux sandbox resources created by `spawn_sandboxed`.
-///
-/// Called after `child.wait()` to remove the named network namespace
-/// (created for `ProxyOnly` mode): `pent-{pid}`.
-///
-/// Keyed by the *parent* process ID (`std::process::id()`).
-///
-/// # Errors
-/// Returns `NetworkSetupFailed` if the network namespace cannot be deleted.
-/// Non-Linux platforms always return `Ok(())`.
-#[cfg(target_os = "linux")]
-pub const fn delete_sandbox_netns(_pid: u32) -> Result<(), SandboxError> {
-    Ok(())
+/// Find `cmd` the way `execvp` does: a path with a slash is used as is; a
+/// bare name is searched in `path_env`. The result is not canonical, so the
+/// caller sees the symbolic link in PATH.
+fn find_in_path(cmd: &str, path_env: &str) -> Option<std::path::PathBuf> {
+    if cmd.contains('/') {
+        return Some(std::path::PathBuf::from(cmd));
+    }
+    path_env
+        .split(':')
+        .filter(|dir| !dir.is_empty())
+        .map(|dir| std::path::Path::new(dir).join(cmd))
+        .find(|p| p.is_file())
 }
 
-/// No-op on non-Linux platforms.
-#[cfg(not(target_os = "linux"))]
-pub const fn delete_sandbox_netns(_pid: u32) -> Result<(), SandboxError> {
-    Ok(())
+/// Paths in `$HOME` that must never receive an automatic grant. Their
+/// ancestors must not receive one either.
+const SENSITIVE_HOME_PATHS: &[&str] = &[
+    ".ssh",
+    ".gnupg",
+    ".aws",
+    ".config",
+    ".local",
+    ".netrc",
+    ".kube",
+    ".docker",
+    ".password-store",
+    ".cargo/credentials.toml",
+    ".npmrc",
+];
+
+/// Return true if an automatic grant on `dir` is too broad.
+///
+/// A grant is too broad if `dir` is `/`, `$HOME`, an ancestor of `$HOME`, a
+/// direct child of `$HOME` (for example `~/.cargo` or `~/.bun`, which can
+/// hold credentials), or an ancestor of a sensitive path in `$HOME`.
+fn is_too_broad(dir: &std::path::Path, home: Option<&std::path::Path>) -> bool {
+    if dir.parent().is_none() {
+        return true;
+    }
+    let Some(home) = home else {
+        return false;
+    };
+    home.starts_with(dir)
+        || dir.parent() == Some(home)
+        || SENSITIVE_HOME_PATHS
+            .iter()
+            .any(|s| home.join(s).starts_with(dir))
+}
+
+/// Return the nearest Node.js package directory that contains `file`.
+///
+/// A package directory is `.../node_modules/<name>` or
+/// `.../node_modules/@scope/<name>`, with a `package.json` file.
+fn node_package_dir(file: &std::path::Path) -> Option<std::path::PathBuf> {
+    let is_node_modules = |p: &std::path::Path| p.file_name().is_some_and(|n| n == "node_modules");
+    file.ancestors().skip(1).find_map(|dir| {
+        let parent = dir.parent()?;
+        let scoped = parent
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with('@'))
+            && parent.parent().is_some_and(is_node_modules);
+        ((is_node_modules(parent) || scoped) && dir.join("package.json").is_file())
+            .then(|| dir.to_path_buf())
+    })
+}
+
+/// Compute the directories that receive automatic read + execute access for
+/// the binary `found` (as found in PATH) with the canonical path `canonical`.
+///
+/// The heuristic:
+/// 1. The directory of `found` (usually a PATH directory such as `bin/`).
+/// 2. The directory of `canonical` (the real file that `execve` opens).
+/// 3. If `canonical` is inside a Node.js package
+///    (`.../node_modules/<pkg>/...`), that package directory, so that the
+///    runtime can read the other files of the package.
+/// 4. Otherwise, if the directory of `canonical` is a `bin/` directory, its
+///    parent (the package root, for example `/opt/tool/bin` → `/opt/tool`).
+///
+/// A directory that [`is_too_broad`] rejects (`/`, `$HOME`, `~/.local`, a
+/// direct child of `$HOME`, an ancestor of `~/.ssh`, ...) never receives a
+/// grant.
+#[must_use]
+pub(crate) fn binary_grant_dirs(
+    found: &std::path::Path,
+    canonical: &std::path::Path,
+    home: Option<&std::path::Path>,
+) -> Vec<std::path::PathBuf> {
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    let mut push = |d: &std::path::Path| {
+        if !is_too_broad(d, home) && !dirs.iter().any(|x| x == d) {
+            dirs.push(d.to_path_buf());
+        }
+    };
+    if let Some(p) = found.parent() {
+        push(p);
+    }
+    if let Some(real_parent) = canonical.parent() {
+        push(real_parent);
+        if let Some(pkg) = node_package_dir(canonical) {
+            push(&pkg);
+        } else if real_parent.file_name().is_some_and(|n| n == "bin") {
+            if let Some(root) = real_parent.parent() {
+                push(root);
+            }
+        }
+    }
+    dirs
 }
 
 /// Flush write-listed files from the overlay upper layer back to the real
 /// filesystem inodes and clean up staging directories.
 ///
-/// Call this **after** `child.wait()` returns. The child's mount namespace
-/// (and all overlayfs mounts) are already destroyed at this point.
+/// Call this **after** `child.wait()` returns.
 ///
 /// # Linux
 ///
-/// Signals the inotify watcher thread to stop, joins it, performs a final
-/// flush of any writes not already caught by inotify, then removes the staging
-/// directories under `/tmp/pent-ovl-<pid>-N/`.
+/// First waits until no background process of the session is alive. Pent
+/// is a child subreaper (the spawn sets this), so the kernel gives orphaned
+/// session processes to pent. Processes that do not exit in a grace time get
+/// `SIGKILL`. Then the function stops the inotify watcher thread, does a
+/// final flush of any writes not already caught by inotify, and removes the
+/// staging directories.
+///
+/// The returned report lists the paths that pent could not flush and the
+/// writes that the overlay discards. When a flush fails, the function keeps
+/// the staging directory, so the data stays recoverable. Show the report to
+/// the user.
 #[cfg(target_os = "linux")]
-pub fn teardown_overlay(handle: OverlayHandle) {
-    linux_overlayfs::teardown(handle);
+pub fn teardown_overlay(handle: OverlayHandle) -> OverlayTeardownReport {
+    linux_overlayfs::teardown(handle)
 }
 
 /// Check if sandboxing is available on this system.
@@ -320,13 +513,6 @@ mod tests {
     }
 
     #[test]
-    fn test_sandbox_error_privilege() {
-        let err =
-            SandboxError::PrivilegeRequired("Network namespace requires CAP_NET_ADMIN".to_string());
-        assert!(err.to_string().contains("CAP_NET_ADMIN"));
-    }
-
-    #[test]
     fn test_sandbox_error_unsupported_platform() {
         let err = SandboxError::UnsupportedPlatform;
         assert!(err.to_string().contains("not supported"));
@@ -340,9 +526,28 @@ mod tests {
 
     #[test]
     fn test_check_availability() {
-        // On macOS and Linux this should succeed; on other platforms it errors.
-        let _result = check_availability();
-        // We don't assert success/failure since it depends on kernel version.
+        // The result depends on the kernel, so the test asserts the two
+        // things that do not: the function answers for the platform that
+        // pent supports, and a refusal names the reason.
+        let result = check_availability();
+        if cfg!(not(any(target_os = "linux", target_os = "macos"))) {
+            assert!(
+                matches!(result, Err(SandboxError::UnsupportedPlatform)),
+                "an unsupported platform must say so: {result:?}"
+            );
+            return;
+        }
+        if let Err(e) = result {
+            let message = e.to_string();
+            assert!(
+                !message.is_empty(),
+                "a refusal must tell the user what is missing"
+            );
+            assert!(
+                !matches!(e, SandboxError::UnsupportedPlatform),
+                "Linux and macOS are supported platforms: {message}"
+            );
+        }
     }
 
     struct TestDirs {
@@ -399,8 +604,11 @@ mod tests {
     #[serial]
     #[cfg(target_os = "linux")]
     fn test_spawn_sandboxed_native_linux() -> TestResult {
+        let Some(true_bin) = which("true") else {
+            return Ok(()); // skip: no `true` in PATH
+        };
         let dirs = make_test_config();
-        let result = spawn_sandboxed(&dirs.config, "/bin/true", &[]);
+        let result = spawn_sandboxed(&dirs.config, &true_bin.to_string_lossy(), &[]);
 
         if check_availability().is_ok() {
             match result {
@@ -468,8 +676,15 @@ mod tests {
         let test_file = workspace.join("hello.txt");
         std::fs::write(&test_file, "hello landlock").map_err(|e| format!("write: {e}"))?;
 
+        let Some(cat) = which("cat") else {
+            return Ok(()); // skip: no `cat` in PATH
+        };
         let config = linux_test_config(workspace, NetworkMode::LocalhostOnly);
-        let code = match sandboxed_exit(&config, "/bin/cat", &[test_file.to_str().unwrap_or("")]) {
+        let code = match sandboxed_exit(
+            &config,
+            &cat.to_string_lossy(),
+            &[test_file.to_str().unwrap_or("")],
+        ) {
             Ok(code) => code,
             Err(SandboxError::SpawnFailed(err))
                 if err.kind() == std::io::ErrorKind::PermissionDenied =>
@@ -503,8 +718,11 @@ mod tests {
         let temp = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
         let workspace = temp.path().to_path_buf();
 
+        let Some(cat) = which("cat") else {
+            return Ok(()); // skip: no `cat` in PATH
+        };
         let config = linux_test_config(workspace, NetworkMode::LocalhostOnly);
-        let code = match sandboxed_exit(&config, "/bin/cat", &["/sys/kernel/version"]) {
+        let code = match sandboxed_exit(&config, &cat.to_string_lossy(), &["/sys/kernel/version"]) {
             Ok(code) => code,
             Err(SandboxError::SpawnFailed(err))
                 if err.kind() == std::io::ErrorKind::PermissionDenied =>
@@ -531,9 +749,9 @@ mod tests {
             return Ok(());
         }
         // Skip if bash is not available (needed for /dev/tcp redirection).
-        if !std::path::Path::new("/bin/bash").exists() {
+        let Some(bash) = which("bash") else {
             return Ok(());
-        }
+        };
         let temp = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
         let workspace = temp.path().to_path_buf();
 
@@ -543,7 +761,7 @@ mod tests {
         // has no routes — a reliable signal that the namespace is isolated.
         let code = match sandboxed_exit(
             &config,
-            "/bin/bash",
+            &bash.to_string_lossy(),
             &["-c", "exec 3<>/dev/tcp/1.1.1.1/80 2>/dev/null"],
         ) {
             Ok(code) => code,
@@ -572,9 +790,9 @@ mod tests {
         if check_availability().is_err() {
             return Ok(());
         }
-        if !std::path::Path::new("/bin/bash").exists() {
+        let Some(bash) = which("bash") else {
             return Ok(());
-        }
+        };
         let temp = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
         let workspace = temp.path().to_path_buf();
 
@@ -584,7 +802,7 @@ mod tests {
         // the loopback interface exists and routes work.
         let code = match sandboxed_exit(
             &config,
-            "/bin/bash",
+            &bash.to_string_lossy(),
             &["-c", "exec 3<>/dev/tcp/127.0.0.1/1 2>/dev/null; echo $?"],
         ) {
             Ok(code) => code,
@@ -601,6 +819,97 @@ mod tests {
             code.is_some(),
             "Child should exit (even with an error) when loopback is available"
         );
+        Ok(())
+    }
+
+    // =========================================================================
+    // Binary grants and PATH resolution
+    // =========================================================================
+
+    /// Find `name` in PATH (like `which`). Returns `None` if it is absent.
+    ///
+    /// Only the Linux tests use this helper.
+    #[cfg(target_os = "linux")]
+    fn which(name: &str) -> Option<std::path::PathBuf> {
+        std::env::var_os("PATH").and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|d| d.join(name))
+                .find(|p| p.is_file())
+        })
+    }
+
+    #[test]
+    fn test_find_in_path() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let a = temp.path().join("a");
+        let b = temp.path().join("b");
+        std::fs::create_dir_all(&a)?;
+        std::fs::create_dir_all(&b)?;
+        std::fs::write(b.join("tool"), "")?;
+        let path_env = format!("{}::{}", a.display(), b.display());
+        assert_eq!(find_in_path("tool", &path_env), Some(b.join("tool")));
+        assert_eq!(find_in_path("missing", &path_env), None);
+        assert_eq!(
+            find_in_path("./rel/tool", &path_env),
+            Some(std::path::PathBuf::from("./rel/tool"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_binary_grant_dirs_never_home_or_local() {
+        use std::path::Path;
+        let home = Path::new("/home/u");
+        // ~/.local/bin/tool -> ~/.local/share/tool/bin/tool
+        let dirs = binary_grant_dirs(
+            Path::new("/home/u/.local/bin/tool"),
+            Path::new("/home/u/.local/share/tool/bin/tool"),
+            Some(home),
+        );
+        for d in &dirs {
+            assert_ne!(d, Path::new("/home/u"));
+            assert_ne!(d, Path::new("/home/u/.local"));
+            assert!(!Path::new("/home/u/.ssh").starts_with(d));
+        }
+        assert!(dirs.contains(&std::path::PathBuf::from("/home/u/.local/bin")));
+        assert!(dirs.contains(&std::path::PathBuf::from("/home/u/.local/share/tool/bin")));
+        assert!(dirs.contains(&std::path::PathBuf::from("/home/u/.local/share/tool")));
+
+        // A binary directly in $HOME/bin: $HOME is never granted.
+        let dirs = binary_grant_dirs(
+            Path::new("/home/u/bin/x"),
+            Path::new("/home/u/bin/x"),
+            Some(home),
+        );
+        assert!(!dirs.iter().any(|d| d == Path::new("/home/u")));
+
+        // ~/.cargo/bin/x: ~/.cargo (direct child of $HOME) is not granted.
+        let dirs = binary_grant_dirs(
+            Path::new("/home/u/.cargo/bin/x"),
+            Path::new("/home/u/.cargo/bin/x"),
+            Some(home),
+        );
+        assert!(!dirs.iter().any(|d| d == Path::new("/home/u/.cargo")));
+
+        // /bin/true: `/` is never granted.
+        let dirs = binary_grant_dirs(Path::new("/bin/true"), Path::new("/bin/true"), None);
+        assert!(!dirs.iter().any(|d| d == Path::new("/")));
+    }
+
+    #[test]
+    fn test_binary_grant_dirs_node_package() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path().join("home");
+        let pkg = home.join(".npm-global/lib/node_modules/@scope/tool");
+        std::fs::create_dir_all(pkg.join("dist"))?;
+        std::fs::write(pkg.join("package.json"), "{}")?;
+        std::fs::write(pkg.join("dist/cli.js"), "")?;
+        let bin = home.join(".npm-global/bin");
+        let dirs = binary_grant_dirs(&bin.join("tool"), &pkg.join("dist/cli.js"), Some(&home));
+        assert!(dirs.contains(&pkg), "package dir must be granted: {dirs:?}");
+        assert!(dirs.contains(&bin));
+        assert!(!dirs.contains(&home.join(".npm-global")));
+        assert!(!dirs.iter().any(|d| d.ends_with("node_modules")));
         Ok(())
     }
 }

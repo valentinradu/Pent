@@ -13,25 +13,46 @@ child process can access.
 pent/
 ├── Cargo.toml                    # Workspace root
 ├── AGENTS.md                     # This file
+├── docs/design/watch.md          # Design of watch mode and recorded profiles
 └── crates/
-    ├── pent-settings/            # Layered TOML config + shared types
+    ├── pent/                     # The CLI (run, watch, trust, profile, config, check)
+    ├── pent-profile/             # Watch events, profile files, guard, summary, review
     │   └── src/
-    │       ├── lib.rs            # PentConfig, SandboxMode, NetworkMode, …
-    │       └── loader.rs         # ConfigLoader (global + project merge)
-    ├── pent-sandbox/             # OS-level process sandboxing
+    │       ├── event.rs          # WatchEvent (the output of every recorder)
+    │       ├── doc.rs            # ProfileDoc (the profile file)
+    │       ├── name.rs           # ProfileName
+    │       ├── guard.rs          # guard_rules (dangerous accesses in watch mode)
+    │       ├── summary.rs        # summarize: group events into rules
+    │       ├── render.rs         # terminal summary, draft, profile text
+    │       ├── review.rs         # interactive review
+    │       └── psl.rs            # public suffix subset (wildcard rules)
+    ├── pent-settings/            # Global settings + profile store
     │   └── src/
-    │       ├── lib.rs            # spawn_sandboxed, SandboxError
+    │       ├── lib.rs            # PentConfig, NetworkMode, SandboxPaths, …
+    │       ├── loader.rs         # ConfigLoader (~/.config/pent/pent.toml)
+    │       ├── store.rs          # ProfileStore (profiles, drafts, watch logs)
+    │       └── trust.rs          # TrustStore (hash of each trusted profile)
+    ├── pent-sandbox/             # OS-level process sandboxing and recording
+    │   └── src/
+    │       ├── lib.rs            # spawn_sandboxed, spawn_watched, SandboxError
     │       ├── config.rs         # SandboxConfig builder
     │       ├── env.rs            # build_env, resolve_path_directories
     │       ├── macos.rs          # macOS Seatbelt (SBPL) backend
+    │       ├── macos_log.rs      # macOS Seatbelt report reader (log stream)
+    │       ├── macos_kqueue.rs   # the measurement of kqueue for MAC-10 (tests only)
     │       ├── linux.rs          # Linux Landlock backend
-    │       └── linux_netns.rs    # Linux network-namespace helpers
+    │       ├── linux_landlock.rs # Landlock syscalls
+    │       ├── linux_overlayfs.rs# overlayfs shadow and flush
+    │       ├── linux_watch.rs    # seccomp-notify recorder and watch guard
+    │       ├── linux_unixconn.rs # the control of each call to a Unix socket
+    │       ├── linux_proxynet.rs # Linux proxy network (listeners made in the child)
+    │       └── linux_fdpass.rs   # SCM_RIGHTS descriptor passing
     └── pent-proxy/               # DNS + TCP proxy with allowlist enforcement
         └── src/
             ├── lib.rs            # Public API surface
             ├── server.rs         # ProxyServer, ProxyHandle, ProxyConfig
-            ├── dns.rs            # DnsServer (UDP, recursive resolution)
-            ├── proxy.rs          # TcpProxy (SOCKS5)
+            ├── dns.rs            # DnsServer (UDP and TCP, recursive resolution)
+            ├── proxy.rs          # TcpProxy (SOCKS5 and HTTP CONNECT)
             └── …
 ```
 
@@ -39,15 +60,18 @@ pent/
 
 | Crate | Description |
 |-------|-------------|
-| `pent-settings` | Owns `SandboxMode`, `NetworkMode`, `SandboxPaths`, `Mount`. Provides `PentConfig` (serializable TOML config) and `ConfigLoader` (global `~/.config/pent/pent.toml` + project `.pent/pent.toml` merge). |
+| `pent-profile` | The platform-independent part of watch mode: the event type, the profile file, the guard list, the summary, the renderers and the interactive review. |
+| `pent-settings` | Owns `NetworkMode`, `SandboxPaths`, `Mount`. Provides `PentConfig` (the global settings in `~/.config/pent/pent.toml`; there are no local settings), `ProfileStore` and `TrustStore`. |
 | `pent-sandbox` | Spawns or execs a process under OS-native sandbox constraints. Re-exports the shared types from `pent-settings`. |
-| `pent-proxy` | DNS server + SOCKS5 TCP proxy. Only forwards traffic to domains on the allowlist; everything else is rejected at the DNS layer. |
+| `pent-proxy` | DNS server + SOCKS5 and HTTP CONNECT proxy. In enforce mode it forwards only traffic to domains on the allowlist. In observe mode (watch) it allows each domain and records it. |
 
 ### Dependency graph
 
 ```
-pent-sandbox  →  pent-settings
-pent-proxy    (standalone, no dependency on the other crates)
+pent          →  pent-sandbox, pent-proxy, pent-settings, pent-profile
+pent-sandbox  →  pent-settings, pent-profile
+pent-proxy    →  pent-settings, pent-profile
+pent-settings →  pent-profile
 ```
 
 ---
@@ -127,12 +151,39 @@ These rules are non-negotiable. All code must comply before being committed.
 
 ## Platform notes
 
-### macOS — network containment not enforced
+### Linux — network containment without privileges
 
-Proxy-based network enforcement (`--allow`, `--network proxy`) is accepted by the CLI but has **no effect on macOS**. The reasons:
+Pent needs no root and no capability on Linux. It needs unprivileged user namespaces; `pent check` reports them. Do not add a step that needs `CAP_NET_ADMIN` or `setcap`.
 
-- macOS has no per-process network namespaces. On Linux, `unshare(CLONE_NEWNET)` isolates the child's network stack entirely; all traffic is forced through the proxy via a veth pair regardless of what the process does. No equivalent exists on macOS for unprivileged processes.
-- `DYLD_INSERT_LIBRARIES` interposition (the proxychains approach) only hooks libc's `connect()`. Go binaries make raw syscalls and bypass it entirely. Binaries built with hardened runtime (`com.apple.security.cs.disable-library-validation` absent) strip `DYLD_INSERT_LIBRARIES` before loading.
-- `pf` packet-filter redirection requires root and is system-wide — it cannot be scoped to a single process without also injecting a source-address bind, which circles back to the DYLD limitation.
+In `ProxyOnly` mode, the child unshares a user namespace and a network namespace and brings up `lo`. In the `pre_exec` hook, it still has all capabilities in its user namespace. It makes the proxy listeners in its network namespace: TCP `127.0.0.1:3128` (SOCKS5 and HTTP CONNECT on one port), and `127.0.0.1:53` for DNS (UDP and TCP). `[::1]:3128` is added when IPv6 works. The child sends the listeners to the parent with `SCM_RIGHTS` (`linux_fdpass.rs`), closes its copies and continues to `exec`. A socket keeps the network namespace of its creation, so the parent serves the proxy on them (`ProxyHandle::attach_listeners`) and connects upstream from the host network.
 
-On macOS, pent provides **filesystem isolation only** (via Seatbelt/SBPL). Network access is unrestricted. For network containment use the Linux e2e environment (`make e2e-linux`) or run pent on a Linux host.
+The child can reach only its own loopback. `/etc/resolv.conf` is a read-only bind mount of a file with `nameserver 127.0.0.1` and nothing else. DNS works only through `127.0.0.1:53`: a program with a fixed resolver (for example `8.8.8.8`) cannot resolve names, and the sandbox stays closed.
+
+On a host with `systemd-resolved` (Ubuntu, Fedora), `/etc/resolv.conf` is a symbolic link into `/run`, and the tmpfs of the child hides the target. The parent reads the link chain (`resolv_link_target`, up to eight links), the child makes the directory chain and the mount point inside the tmpfs (`resolv_bind`, mode `0755` for a directory and `0644` for the file), and `add_ruleset_rules` adds a Landlock read rule for that path: the child adds its rules after the mounts, so the rule binds to the inode of the file of pent. A link that leaves the private directories, a chain that is too long and a host with no `/etc/resolv.conf` each leave the child without a resolver, with a warning. See NET-5 in `docs/security/network.md`.
+
+### Linux — private `/tmp`, `/var/tmp`, `/run` and `/proc`
+
+With enforcement, the child gets an empty tmpfs over `/tmp`, `/var/tmp` and `/run` (see `PRIVATE_DIRS` in `linux.rs`), and pent binds back only what the session needs: the workspace, the data directory, the working directory, each configured path and mount, each directory of `PATH`, the system paths of `SYSTEM_PATHS` and `PRIVATE_KEEP`, the overlay mount points and the write targets of the watch guard. Pent binds the path that the configuration names itself, not a parent of it (`bind_back_paths`): the traversal list holds each parent of a rule, and a bind of such a parent brings the whole subtree of the host back. The directories above a bind come from `mount_point_parents` and stay inside the tmpfs. The child opens an `O_PATH` descriptor of each source before the tmpfs hides it, and binds from `/proc/self/fd/<n>`. This removes the temporary files of the host and every control socket under `/run` (the system message bus, `tailscaled`, the resolvers, Docker and Podman) in one rule, because a fixed list of sockets can never be complete. `ESCAPE_SOCKETS`, `RESOLVER_SOCKETS` and `HOME_AGENT_SOCKETS` are the second layer, for the sockets that no private directory covers. Keep these lists as data in one place: a user setting can extend them later.
+
+The child also gets a new PID namespace with a private `proc` mount, so it sees only the processes of the sandbox, **where the kernel gives the mount**. In a container the runtime hides a part of `/proc` (for example `/proc/acpi`), and the kernel then refuses a new `proc` mount at any target (`mount_too_revealing`). `proc_isolation` in `linux.rs` probes this one time before the first `unshare`, because a child cannot leave a PID namespace. Where the answer is `ProcIsolation::Shared`, pent runs the command without the namespace and without the mount, and `pent run`, `pent watch` and `pent check` name what the command can see. Never fail a run for this, and never lose the protection in silence. A new `proc` mount needs a new PID namespace. `unshare(CLONE_NEWPID)` does not move the caller, so the `pre_exec` hook forks twice: a stub in the old namespace, PID 1 of the new namespace, and the command as PID 2 (see `fork_pid_namespace`). The command must not be PID 1: the kernel drops each signal that has the default action for the init of a namespace. Watch mode takes the same three namespaces. Only the end differs (`Orphans`): in run mode PID 1 exits with the command and the kernel ends the rest of the namespace, and in watch mode PID 1 first waits up to five seconds for the orphans, so that the recorder gets their events.
+
+Landlock up to ABI v6 does not control `connect(2)` on a path Unix socket, so the supervisor controls each call itself (`linux_unixconn.rs`): `connect(2)`, `sendto(2)` with an address, `sendmsg(2)` and `sendmmsg(2)`. It takes the family from the socket (`pidfd_getfd(2)` and `SO_DOMAIN`), never from the `sockaddr`, which another thread can change. A socket of another family keeps `CONTINUE`. On an `AF_UNIX` socket the supervisor never answers `CONTINUE`: it reads the address one time, compares the canonical path with `SandboxConfig::unix_sockets`, and performs the call (a connection with its own socket, which it gives to the child with `SECCOMP_IOCTL_NOTIF_ADDFD`; a send with the payload of the child). Every other path gets `EACCES`, and `sendmmsg(2)` with a path too. An abstract name follows the network namespace: the supervisor makes the call on the socket of the child when the child has its own namespace, and refuses it with `--network unrestricted`. The filter permits `socket(AF_UNIX, ...)`, so a program keeps its own sockets. The control needs the supervisor, so `pent run` starts the recorder also without `--trace`; it then traps only these calls. The child hands the seccomp listener over with a pidfd of itself and `pidfd_getfd(2)`, not with `SCM_RIGHTS`: the filter traps `sendmsg(2)`. See `docs/security/linux-sandbox.md` and `docs/security/network.md`.
+
+### macOS — network containment with Seatbelt
+
+macOS has no per-process network namespace. Pent cannot isolate the network of the child, as Linux does with a network namespace. Instead, the Seatbelt profile of proxy mode denies each outbound connection except these:
+
+- TCP to the proxy port on loopback: `(allow network-outbound (remote ip "localhost:<port>"))`.
+- The `mDNSResponder` socket (`/private/var/run/mDNSResponder`), for name resolution.
+- The Unix sockets in the writable paths (workspace, `TMPDIR`, `read_write` paths).
+
+Pent sets `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and `NO_PROXY` as on Linux. A program that ignores these variables cannot connect to a remote host.
+
+The differences from Linux:
+
+- DNS does not go through the pent DNS server. The system resolver answers each query, so the child can resolve names that the allowlist does not have. It cannot connect to them. The proxy resolves the names for proxy-aware clients.
+- The child cannot connect to the other loopback ports of the host.
+
+Watch mode uses a Seatbelt profile that allows each operation with `(with report)` and denies the guard accesses. `macos_log.rs` reads the reports from `log stream`. The suite ran on a Mac on 2026-10-25, and each SBPL form of `macos.rs` holds. The reader builds the process tree from a poll of `ps`, so it loses the accesses of a child process that forks and exits inside one poll (MAC-10 in `docs/security/macos.md`). `kqueue` cannot close that gap: macOS answers `ENOTSUP` for `NOTE_TRACK`, so the kernel never names the child of a fork. A program that the root runs in place keeps the PID of the root and has no gap.
+
+The run profile denies the three ways to run a program that no profile holds: `process-exec` (it allows the `execute` paths and `SYSTEM_EXEC_PATHS` again), `job-creation` (a launchd job) and `mach-lookup` (a service of another program; it allows `SYSTEM_MACH_SERVICES` again). The other operation families of SBPL stay allowed, so the profile is still not deny-by-default. See MAC-4.

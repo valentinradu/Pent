@@ -1,24 +1,37 @@
-#[cfg(unix)]
-extern crate libc;
+//! `pent run`: run a command in the sandbox with its trusted profile.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-use pent_proxy::TraceEvent;
-#[cfg(not(target_os = "macos"))]
-use pent_proxy::{ProxyConfig, ProxyHandle, ProxyServer};
-#[cfg(target_os = "linux")]
-use pent_sandbox::teardown_overlay;
+use pent_profile::{Outcome, ProfileName, WatchEvent};
+use pent_proxy::{ProxyPolicy, TraceEvent};
 use pent_sandbox::{build_env, check_availability, spawn_sandboxed, NetworkMode, SandboxConfig};
-use pent_settings::{ConfigLoader, PentConfig};
+use pent_settings::{ConfigLoader, EventLog, ProfileStore};
 
-#[cfg(target_os = "macos")]
-use crate::cli::NetworkModeArg;
-use crate::cli::RunArgs;
+use crate::cli::{NetworkModeArg, RunArgs};
+use crate::commands::select::{generic_warning, load_trusted, profile_paths, select_profile};
+use crate::commands::session::{
+    drain, exit_like_child, forward_std, forward_tokio, is_broad_workspace, start_proxy,
+    wait_child, ForwardStop, ProxyChannels, SessionCleanup, SignalRelay,
+};
 use crate::error::CliError;
 use crate::ui;
 
+/// The longest time to wait for the last events after the child exits and
+/// the forwarders stop.
+const FINAL_DRAIN: Duration = Duration::from_secs(2);
+
+/// One event of the run: a line for the trace log, or a structured access
+/// event for the log of denied accesses.
+enum RunEvent {
+    Trace(TraceLine),
+    Access(WatchEvent),
+}
+
+// The function is long because it lists the steps of one run in order, with
+// platform-specific steps under `cfg`. To split it would hide this order.
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
     #[cfg(target_os = "macos")]
@@ -28,29 +41,87 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
         ));
     }
 
-    let mut config = load_config(&args, &cwd)?;
-    apply_cli_overrides(&mut config, &args)?;
+    // ── Profile ──────────────────────────────────────────────────────────────
+    let selected = select_profile(args.profile.as_deref(), &args.command)?;
+    if let Some(warning) = generic_warning(&selected) {
+        ui::warn(warning);
+    }
+    let store = ProfileStore::open_default()?;
+    let profile = load_trusted(&store, &selected, &args.command)?;
+    let name = selected.name;
+    let settings = ConfigLoader::load(&cwd, pent_settings::PentDirs::from_env().as_ref())?;
+
+    let mut paths = profile_paths(&profile);
+    add_cli_paths(&mut paths, &args);
+    paths.resolve_relative(&cwd);
+    // On Linux, read_write paths must be exact filenames — glob ('*') patterns
+    // are not supported because overlayfs requires specific paths to mount over.
+    #[cfg(target_os = "linux")]
+    paths.validate_no_rw_globs()?;
+
+    // Decide the network mode before `--allow` merges into the profile
+    // domains, so that the two sources stay separate.
+    let decision = resolve_network(args.network, &args.allow, &profile.network.domains);
+    let domains = merge_domains(&profile.network.domains, &args.allow);
     let env_map = build_run_env(&args.env);
-    let trace_log_path = open_trace_log(args.trace, &cwd);
+    let trace_log_path = open_trace_log(args.trace, &store, &name);
 
-    // ── macOS path ────────────────────────────────────────────────────────────
-    #[cfg(target_os = "macos")]
-    let resolved_network: NetworkMode = resolve_macos_network(&args, &config);
+    for warning in network_warnings(decision, &args.allow, args.trace) {
+        ui::warn(warning);
+    }
 
-    // ── non-macOS path ────────────────────────────────────────────────────────
-    #[cfg(not(target_os = "macos"))]
-    let ProxySetup {
-        network: resolved_network,
-        handle: proxy_handle,
-        event_rx: violation_rx,
-    } = setup_proxy(&config, args.network, args.trace).await?;
+    // ── Events ───────────────────────────────────────────────────────────────
+    // All event sources send into one channel: the proxy (trace lines and
+    // structured events), the recorder of the sandbox (`--trace`), and on
+    // macOS the Seatbelt log.
+    let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<RunEvent>();
+    let stop = ForwardStop::default();
 
-    // Build SandboxConfig.
-    // from_sandbox_settings merges user paths on top of system defaults and
-    // handles mounts, replacing the previous manual path-extension loop.
-    let mut sandbox_cfg = SandboxConfig::from_sandbox_settings(config.sandbox, cwd.clone(), cwd)
-        .with_network(resolved_network)
-        .with_env(env_map);
+    // ── Proxy ────────────────────────────────────────────────────────────────
+    let proxy = if decision.choice == NetworkChoice::Proxy {
+        let (access_tx, access_rx) = tokio::sync::mpsc::unbounded_channel::<WatchEvent>();
+        forward_tokio(access_rx, event_tx.clone(), RunEvent::Access, &stop);
+        let trace_tx = if args.trace {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<TraceEvent>();
+            let profile_name = name.clone();
+            forward_tokio(
+                rx,
+                event_tx.clone(),
+                move |e| RunEvent::Trace(proxy_trace_line(e, &profile_name)),
+                &stop,
+            );
+            Some(tx)
+        } else {
+            None
+        };
+        let channels = ProxyChannels {
+            trace: trace_tx,
+            events: Some(access_tx),
+        };
+        Some(start_proxy(&settings.proxy, domains, ProxyPolicy::Enforce, channels).await?)
+    } else {
+        None
+    };
+    let resolved_network = proxy
+        .as_ref()
+        .map_or_else(|| base_network_mode(decision.choice), |p| p.network.clone());
+
+    // The workspace is always read-write. If it is `/` or the home directory,
+    // the sandbox gives write access to almost all user files.
+    if !args.no_sandbox && is_broad_workspace(&cwd) {
+        ui::warn(format!(
+            "the workspace is {}; the sandboxed process can change all files below it",
+            cwd.display()
+        ));
+    }
+
+    let mut sandbox_cfg =
+        SandboxConfig::from_sandbox_settings(settings.sandbox, paths, cwd.clone(), cwd.clone())
+            .with_network(resolved_network)
+            .with_env(env_map);
+    sandbox_cfg.record_events = args.trace;
+    sandbox_cfg.unix_sockets =
+        unix_socket_paths(&profile.filesystem.unix_sockets, &args.unix_socket, &cwd);
 
     if let Some(data_dir) = args.data_dir {
         sandbox_cfg = sandbox_cfg.with_data_dir(data_dir);
@@ -65,133 +136,148 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
         check_availability()?;
     }
 
-    let cmd_parts = &args.command;
-    let cmd = cmd_parts
-        .first()
-        .ok_or_else(|| CliError::Other("command list is empty".to_string()))?;
-    let cmd_args: Vec<String> = cmd_parts[1..].to_vec();
-
-    // Print network mode hint BEFORE spawn so the user sees it even if spawn
-    // takes time (ProxyOnly veth setup) or stalls during namespace init.
-    #[cfg(not(target_os = "macos"))]
-    match &sandbox_cfg.network {
-        NetworkMode::ProxyOnly { .. } => {} // proxy message already shown by setup_proxy
-        NetworkMode::Blocked => ui::status(
-            "network",
-            "blocked — add domains to [proxy] domain_allowlist in pent.toml to enable",
-        ),
-        NetworkMode::LocalhostOnly => ui::status("network", "localhost only"),
-        NetworkMode::Unrestricted => ui::status("network", "unrestricted"),
-    }
-
-    let mut sandbox_child = spawn_sandboxed(&sandbox_cfg, cmd, &cmd_args)?;
-
-    // `mut` is required on macOS for child.wait(); on Linux the value is moved.
-    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
-    let mut child = sandbox_child.child;
+    // The command gets a private `/proc` only where the kernel gives one. A
+    // container runtime hides a part of `/proc`, and the kernel then refuses
+    // the mount. Pent goes on, and the user learns what the command can
+    // see. See `ProcIsolation` in pent-sandbox.
     #[cfg(target_os = "linux")]
-    let overlay_handle = sandbox_child.overlay;
-
-    // macOS: in trace mode, stream sandboxd denials live so the user can see
-    // every blocked path in one run. Without --trace just wait for the child.
-    #[cfg(target_os = "macos")]
-    let child_pid = child.id();
-    #[cfg(target_os = "macos")]
-    let exit_status = if args.trace {
-        macos_trace_wait(child, child_pid, trace_log_path).await
-    } else {
-        child.wait()?
-    };
-
-    // non-macOS: in trace mode, stream proxy events (violations and granted
-    // access) to the log while the child runs to completion.
-    #[cfg(not(target_os = "macos"))]
-    let exit_status = wait_child_with_events(child, violation_rx, trace_log_path).await;
-
-    // Flush overlayfs write-listed files back to real inodes and clean up
-    // staging directories. Must happen after child.wait() so the child's mount
-    // namespace is already destroyed and no writes are in flight.
-    #[cfg(target_os = "linux")]
-    if let Some(handle) = overlay_handle {
-        teardown_overlay(handle);
-    }
-
-    // Drop the netns handle — removes firewall/routing rules added during setup.
-    #[cfg(target_os = "linux")]
-    drop(sandbox_child.netns.take());
-
-    #[cfg(not(target_os = "macos"))]
-    if let Some(handle) = proxy_handle {
-        handle.shutdown().await?;
-    }
-
-    // On Unix, if the sandboxed process was killed by a signal, re-raise that
-    // signal so the parent shell / CI system sees the correct termination reason.
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        if let Some(signal) = exit_status.signal() {
-            // SAFETY: raise() sends the signal to the calling process.
-            // We are on the main thread, past all cleanup, about to exit.
-            unsafe { libc::raise(signal) };
+    if !args.no_sandbox {
+        for line in pent_sandbox::proc_isolation().warning_lines() {
+            ui::warn(line);
         }
     }
 
-    std::process::exit(exit_status.code().unwrap_or(1));
-}
+    let (cmd, cmd_args) = args
+        .command
+        .split_first()
+        .ok_or_else(|| CliError::Other("command list is empty".to_string()))?;
 
-/// Load and merge config.
-/// `--no-config` skips global/project config files but `--config <extra>` still applies.
-fn load_config(args: &RunArgs, cwd: &Path) -> Result<PentConfig, CliError> {
-    let mut config = if args.no_config {
-        PentConfig::default()
-    } else {
-        ConfigLoader::load(cwd)?
-    };
-    if let Some(ref extra) = args.extra_config {
-        let extra_cfg = PentConfig::load(extra)?;
-        config = config.merge(extra_cfg);
+    // Print network mode hint BEFORE spawn so the user sees it even if spawn
+    // takes time or stalls during namespace init.
+    if let Some(line) = network_status(&sandbox_cfg.network, decision.source) {
+        ui::status("network", line);
     }
-    Ok(config)
+
+    let mut signals = SignalRelay::install()?;
+
+    let sandbox_child = spawn_sandboxed(&sandbox_cfg, cmd, cmd_args)?;
+
+    #[cfg(target_os = "linux")]
+    let cleanup = SessionCleanup::new(
+        sandbox_child.child.id(),
+        crate::commands::session::LinuxResources {
+            overlay: sandbox_child.overlay,
+            trace: args.trace,
+        },
+    );
+    // The child made the proxy listeners in its network namespace. If the
+    // proxy cannot use them, the error drops `cleanup`, which stops the
+    // child.
+    #[cfg(target_os = "linux")]
+    if let Some(proxy) = &proxy {
+        proxy.attach(sandbox_child.proxy_listeners)?;
+    }
+    #[cfg(not(target_os = "linux"))]
+    let cleanup = SessionCleanup::new(sandbox_child.child.id(), ());
+    let child = sandbox_child.child;
+    if let Some(rx) = sandbox_child.events {
+        forward_std(rx, event_tx.clone(), RunEvent::Access);
+    }
+
+    // Both platforms get the denials through `SandboxChild::events`. On
+    // macOS the reader of the unified log holds the channel open for a
+    // moment after the child exits, and `FINAL_DRAIN` covers that.
+    let drain_grace = Duration::ZERO;
+    // Only the forwarders keep senders. When they stop, the channel closes.
+    drop(event_tx);
+
+    let mut denied = DeniedRecorder::new(&store, &name);
+    let mut sink = |event: RunEvent| match event {
+        RunEvent::Trace(line) => write_trace_line(trace_log_path.as_deref(), &line),
+        RunEvent::Access(event) => {
+            // The recorder sends the filesystem denials only with --trace.
+            // Write them to the trace log too.
+            if let Some(line) = fs_trace_line(&event, &name) {
+                write_trace_line(trace_log_path.as_deref(), &line);
+            }
+            denied.record(&event);
+        }
+    };
+    let (exit_status, rest) = wait_child(child, &mut signals, Some(event_rx), &mut sink).await;
+
+    // Flush overlayfs write-listed files back to real inodes and clean up
+    // staging directories. This must happen after the wait, so the child's
+    // mount namespace is already destroyed and no writes are in flight.
+    cleanup.finish();
+
+    // Read the late events, then stop the forwarders and read the rest.
+    let rest = drain(rest, drain_grace, &mut sink).await;
+    stop.stop();
+    if let Some(proxy) = proxy {
+        proxy.shutdown().await;
+    }
+    drain(rest, FINAL_DRAIN, &mut sink).await;
+
+    if let Some(message) = denied.summary() {
+        ui::warn(message);
+    }
+
+    exit_like_child(exit_status)
 }
 
-/// Merge CLI flag overrides into the loaded config.
-fn apply_cli_overrides(config: &mut PentConfig, args: &RunArgs) -> Result<(), CliError> {
-    config.sandbox.paths.traversal.extend(
-        args.traverse
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned()),
-    );
-    config
-        .sandbox
-        .paths
-        .read
-        .extend(args.read.iter().map(|p| p.to_string_lossy().into_owned()));
-    config
-        .sandbox
-        .paths
-        .read_write
-        .extend(args.write.iter().map(|p| p.to_string_lossy().into_owned()));
-    config.sandbox.paths.execute.extend(
-        args.execute
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned()),
-    );
-    config
-        .proxy
-        .domain_allowlist
-        .extend(args.allow.iter().cloned());
+/// Add the paths of the CLI flags to the profile paths.
+fn add_cli_paths(paths: &mut pent_settings::SandboxPaths, args: &RunArgs) {
+    let strings = |list: &[PathBuf]| -> Vec<String> {
+        list.iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect()
+    };
+    paths.traversal.extend(strings(&args.traverse));
+    paths.read.extend(strings(&args.read));
+    paths.read_write.extend(strings(&args.write));
+    paths.execute.extend(strings(&args.execute));
+}
 
-    // On Linux, read_write paths must be exact filenames — glob ('*') patterns
-    // are not supported because overlayfs requires specific paths to mount over.
-    #[cfg(target_os = "linux")]
-    config
-        .sandbox
-        .paths
-        .validate_no_rw_globs()
-        .map_err(CliError::Other)?;
+/// The Unix sockets of the profile and of `--unix-socket`, without
+/// duplicates.
+///
+/// A leading `~` expands to the home directory, as it does for the other
+/// path lists. A relative path resolves against the workspace.
+pub(crate) fn unix_socket_paths(
+    profile: &[String],
+    flags: &[PathBuf],
+    workspace: &Path,
+) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut add = |entry: &Path| {
+        let path = pent_settings::expand_home(entry);
+        let path = if path.is_absolute() {
+            path
+        } else {
+            workspace.join(path)
+        };
+        if !out.contains(&path) {
+            out.push(path);
+        }
+    };
+    for entry in profile {
+        add(Path::new(entry));
+    }
+    for entry in flags {
+        add(entry);
+    }
+    out
+}
 
-    Ok(())
+/// The profile domains and the `--allow` domains, without duplicates.
+fn merge_domains(profile: &[String], allow: &[String]) -> Vec<String> {
+    let mut domains = profile.to_vec();
+    for d in allow {
+        if !domains.contains(d) {
+            domains.push(d.clone());
+        }
+    }
+    domains
 }
 
 /// Parse `KEY=VALUE` and bare `KEY` env entries; return a merged env map.
@@ -199,11 +285,9 @@ fn build_run_env(args_env: &[String]) -> HashMap<String, String> {
     let mut allowlist_keys: Vec<String> = Vec::new();
     let mut explicit_env: Vec<(String, String)> = Vec::new();
     for entry in args_env {
-        if let Some(eq) = entry.find('=') {
-            let key = entry[..eq].to_string();
-            let value = entry[eq + 1..].to_string();
-            allowlist_keys.push(key.clone());
-            explicit_env.push((key, value));
+        if let Some((key, value)) = entry.split_once('=') {
+            allowlist_keys.push(key.to_string());
+            explicit_env.push((key.to_string(), value.to_string()));
         } else {
             allowlist_keys.push(entry.clone());
         }
@@ -215,401 +299,571 @@ fn build_run_env(args_env: &[String]) -> HashMap<String, String> {
     env_map
 }
 
-/// Create `.pent/trace.log` when `trace` is true; emit warnings on failure.
-fn open_trace_log(trace: bool, cwd: &Path) -> Option<PathBuf> {
+/// Create the trace log of `name` when `trace` is true; emit a warning on
+/// failure.
+///
+/// The log is in the state directory of pent, not in the workspace: the
+/// sandboxed process can write the workspace, so it could put a symbolic link
+/// there and make pent write to another file.
+fn open_trace_log(trace: bool, store: &ProfileStore, name: &ProfileName) -> Option<PathBuf> {
     if !trace {
         return None;
     }
-    let pent_dir = cwd.join(".pent");
-    match std::fs::create_dir_all(&pent_dir) {
-        Ok(()) => {
-            let log_path = pent_dir.join("trace.log");
-            match std::fs::File::create(&log_path) {
-                Ok(_) => {
-                    ui::status("tracing", log_path.display());
-                    Some(log_path)
-                }
-                Err(e) => {
-                    ui::warn(format!("could not create trace log: {e}"));
-                    None
-                }
-            }
+    match store.create_trace_log(name) {
+        Ok(path) => {
+            ui::status("tracing", path.display());
+            Some(path)
         }
         Err(e) => {
-            ui::warn(format!("could not create .pent directory: {e}"));
+            ui::warn(format!("could not create the trace log: {e}"));
             None
         }
     }
 }
 
-/// macOS proxy-degradation logic.
+// ── Denied accesses ──────────────────────────────────────────────────────────
+
+/// Writes the denied accesses of this run to the denied log of the profile.
 ///
-/// Proxy-based network enforcement is not available on macOS (no per-process
-/// network namespaces; `DYLD_INSERT_LIBRARIES` is unreliable across Go binaries
-/// and hardened-runtime binaries). Any flag or config that would normally start
-/// the proxy (`--allow`, `--network proxy`, `domain_allowlist`) silently
-/// degrades to `Unrestricted` so the process is not blocked. Only explicit
-/// `--network localhost/blocked/unrestricted` take effect.
-#[cfg(target_os = "macos")]
-fn resolve_macos_network(args: &RunArgs, config: &PentConfig) -> NetworkMode {
-    let proxy_requested = args.network == Some(NetworkModeArg::Proxy)
-        || !config.proxy.domain_allowlist.is_empty()
-        || matches!(config.sandbox.network, Some(NetworkMode::ProxyOnly { .. }));
-    if proxy_requested {
-        // Proxy enforcement is unavailable; degrade silently so the process
-        // is not blocked from making external connections.
-        NetworkMode::Unrestricted
-    } else {
-        match args.network {
-            // Proxy already handled above via proxy_requested.
-            Some(NetworkModeArg::Unrestricted | NetworkModeArg::Proxy) => NetworkMode::Unrestricted,
-            Some(NetworkModeArg::Localhost) => NetworkMode::LocalhostOnly,
-            Some(NetworkModeArg::Blocked) => NetworkMode::Blocked,
-            None => match config
-                .sandbox
-                .network
-                .clone()
-                .unwrap_or(NetworkMode::Blocked)
-            {
-                NetworkMode::ProxyOnly { .. } => NetworkMode::Unrestricted,
-                other => other,
-            },
+/// The recorder writes each distinct event one time, and opens the log only
+/// at the first denial.
+struct DeniedRecorder<'a> {
+    store: &'a ProfileStore,
+    name: &'a ProfileName,
+    log: Option<EventLog>,
+    seen: HashSet<String>,
+    /// True after the first write error; pent then shows no more warnings.
+    failed: bool,
+}
+
+impl<'a> DeniedRecorder<'a> {
+    fn new(store: &'a ProfileStore, name: &'a ProfileName) -> Self {
+        Self {
+            store,
+            name,
+            log: None,
+            seen: HashSet::new(),
+            failed: false,
+        }
+    }
+
+    /// Record `event` if the policy denied it.
+    fn record(&mut self, event: &WatchEvent) {
+        if event.outcome() != Outcome::Denied {
+            return;
+        }
+        let Ok(key) = event.to_json_line() else {
+            return;
+        };
+        if !self.seen.insert(key) {
+            return;
+        }
+        if self.failed {
+            return;
+        }
+        let result = match &mut self.log {
+            Some(log) => log.append(event),
+            None => self.store.denied_log(self.name).and_then(|mut log| {
+                let result = log.append(event);
+                self.log = Some(log);
+                result
+            }),
+        };
+        if let Err(e) = result {
+            self.failed = true;
+            ui::warn(format!("cannot record a denied access: {e}"));
+        }
+    }
+
+    /// The message for the end of the run, if the run had denied accesses.
+    fn summary(&self) -> Option<String> {
+        denied_message(self.seen.len(), self.name)
+    }
+}
+
+/// The message for `count` denied accesses of the profile `name`.
+fn denied_message(count: usize, name: &ProfileName) -> Option<String> {
+    match count {
+        0 => None,
+        1 => Some(format!(
+            "1 access denied; review it: pent trust {name} --review"
+        )),
+        n => Some(format!(
+            "{n} accesses denied; review them: pent trust {name} --review"
+        )),
+    }
+}
+
+// ── Network mode resolution ──────────────────────────────────────────────────
+
+/// The network mode that the user asks for, before pent starts a proxy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NetworkChoice {
+    Unrestricted,
+    Localhost,
+    Proxy,
+    Blocked,
+}
+
+impl NetworkChoice {
+    /// The value of `--network` that selects this mode.
+    const fn flag_value(self) -> &'static str {
+        match self {
+            Self::Unrestricted => "unrestricted",
+            Self::Localhost => "localhost",
+            Self::Proxy => "proxy",
+            Self::Blocked => "blocked",
         }
     }
 }
 
-/// Wait for `child` to exit, streaming proxy trace events to the log in parallel.
+/// The input that decided the network mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NetworkSource {
+    /// An explicit `--network` flag.
+    NetworkFlag,
+    /// One or more `--allow` flags.
+    AllowFlag,
+    /// The profile has domains.
+    ProfileDomains,
+    /// No input; pent uses the default.
+    Default,
+}
+
+/// The resolved network mode and the input that decided it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NetworkDecision {
+    /// The mode.
+    pub choice: NetworkChoice,
+    /// The input that decided the mode.
+    pub source: NetworkSource,
+}
+
+/// Resolve the network mode. This rule is the same on all platforms.
 ///
-/// When `violation_rx` is `Some`, events are drained from the channel while the
-/// child runs; when `None` the child is awaited directly.
-#[cfg(not(target_os = "macos"))]
-async fn wait_child_with_events(
-    mut child: std::process::Child,
-    violation_rx: Option<tokio::sync::mpsc::UnboundedReceiver<TraceEvent>>,
-    trace_log_path: Option<PathBuf>,
-) -> std::process::ExitStatus {
-    if let Some(mut event_rx) = violation_rx {
-        let (done_tx, mut done_rx) = tokio::sync::oneshot::channel::<std::process::ExitStatus>();
-        std::thread::spawn(move || {
-            let status = child.wait().unwrap_or_else(|_| {
-                // wait() can only fail if the child was already waited on.
-                // Synthesize exit-code-1 without spawning a subprocess.
-                std::os::unix::process::ExitStatusExt::from_raw(1 << 8)
-            });
-            let _ = done_tx.send(status);
-        });
-
-        loop {
-            tokio::select! {
-                biased;
-                Some(event) = event_rx.recv() => {
-                    if let Some(ref p) = trace_log_path {
-                        log_trace_event(p, event);
-                    }
-                }
-                Ok(status) = &mut done_rx => {
-                    // Drain any in-flight events before returning.
-                    while let Ok(ev) = event_rx.try_recv() {
-                        if let Some(ref p) = trace_log_path {
-                            log_trace_event(p, ev);
-                        }
-                    }
-                    break status;
-                }
-            }
-        }
-    } else {
-        child.wait().unwrap_or_else(|_| {
-            // wait() can only fail if the child was already waited on.
-            std::os::unix::process::ExitStatusExt::from_raw(1 << 8)
-        })
-    }
-}
-
-/// Runs the child to completion, streaming every sandboxd event for the child
-/// to the trace log in real time.
+/// The precedence, from high to low:
+/// 1. An explicit `--network` flag.
+/// 2. `--allow` (this implies proxy mode).
+/// 3. Domains in the profile (this implies proxy mode).
+/// 4. The default: blocked.
 ///
-/// Used by `--trace` mode. The SBPL profile does NOT use `(with send-signal
-/// SIGKILL)`, so the child receives EPERM on each denied access and keeps
-/// running.  Every denial that sandboxd logs is written to `log_path`
-/// immediately so the user can see the full access pattern in a single run.
-#[cfg(target_os = "macos")]
-async fn macos_trace_wait(
-    mut child: std::process::Child,
-    _child_pid: u32,
-    log_path: Option<PathBuf>,
-) -> std::process::ExitStatus {
-    use std::io::BufRead;
-
-    // Start `log stream` to capture file/network denials in real time.
-    // We filter by operation type rather than PID because the child process may
-    // spawn sub-processes (e.g. Node.js workers) with different PIDs that also
-    // hit the sandbox; all of them run under our SBPL profile.
-    // mach-lookup and syscall-mach noise from unrelated system processes is
-    // excluded by the predicate.
-    let mut log_proc = std::process::Command::new("/usr/bin/log")
-        .args([
-            "stream",
-            "--predicate",
-            r#"eventMessage CONTAINS "deny" AND (eventMessage CONTAINS "file-read" OR eventMessage CONTAINS "file-write" OR eventMessage CONTAINS "network-outbound")"#,
-            "--style",
-            // syslog avoids the column-width truncation of "compact" style,
-            // which cuts off long paths like deep Application Support paths.
-            "syslog",
-        ])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok();
-
-    let (violation_tx, mut violation_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-
-    if let Some(ref mut lp) = log_proc {
-        if let Some(stdout) = lp.stdout.take() {
-            let reader = std::io::BufReader::new(stdout);
-            let tx = violation_tx;
-            std::thread::spawn(move || {
-                for line in reader.lines() {
-                    let Ok(line) = line else { break };
-                    // "deny(" matches actual denial records ("deny(1)")
-                    // without matching the predicate description header line.
-                    if line.contains("deny(") {
-                        let _ = tx.send(parse_sandboxd_line(&line));
-                    }
-                }
-            });
-        }
+/// `--trace` is not an input: tracing never changes the network mode.
+/// `profile_domains` must not contain the `--allow` values.
+pub(crate) fn resolve_network(
+    network_flag: Option<NetworkModeArg>,
+    allow_flags: &[String],
+    profile_domains: &[String],
+) -> NetworkDecision {
+    let decide = |choice, source| NetworkDecision { choice, source };
+    if let Some(flag) = network_flag {
+        let choice = match flag {
+            NetworkModeArg::Unrestricted => NetworkChoice::Unrestricted,
+            NetworkModeArg::Localhost => NetworkChoice::Localhost,
+            NetworkModeArg::Proxy => NetworkChoice::Proxy,
+            NetworkModeArg::Blocked => NetworkChoice::Blocked,
+        };
+        return decide(choice, NetworkSource::NetworkFlag);
     }
-
-    // Wait for the child in a background thread so tokio can drive the
-    // violation channel concurrently.
-    let (done_tx, mut done_rx) = tokio::sync::oneshot::channel::<std::process::ExitStatus>();
-    std::thread::spawn(move || {
-        let status = child.wait().unwrap_or_else(|_| {
-            // wait() can only fail if the child was already waited on.
-            std::os::unix::process::ExitStatusExt::from_raw(1 << 8)
-        });
-        let _ = done_tx.send(status);
-    });
-
-    let exit_status = loop {
-        tokio::select! {
-            biased;
-            Some(violation) = violation_rx.recv() => {
-                if let Some(ref p) = log_path {
-                    log_trace_event(p, TraceEvent::Violation(violation));
-                }
-            }
-            Ok(status) = &mut done_rx => {
-                // Drain any violations that arrived before or just after exit.
-                while let Ok(v) = violation_rx.try_recv() {
-                    if let Some(ref p) = log_path {
-                        log_trace_event(p, TraceEvent::Violation(v));
-                    }
-                }
-                break status;
-            }
-        }
-    };
-
-    if let Some(mut lp) = log_proc {
-        let _ = lp.kill();
+    if !allow_flags.is_empty() {
+        return decide(NetworkChoice::Proxy, NetworkSource::AllowFlag);
     }
-
-    exit_status
+    if !profile_domains.is_empty() {
+        return decide(NetworkChoice::Proxy, NetworkSource::ProfileDomains);
+    }
+    decide(NetworkChoice::Blocked, NetworkSource::Default)
 }
 
-/// Convert a raw `sandboxd` log line into the `"filesystem: ..."` format that
-/// `print_violation` already knows how to format into a user-friendly hint.
-///
-/// sandboxd compact log lines look roughly like:
-/// ```text
-/// 2024-01-01 12:00:00.000 Zzz  sandboxd[123:456]  deny(1) file-read-data /Users/x/.claude
-/// ```
-#[cfg(target_os = "macos")]
-fn parse_sandboxd_line(log_line: &str) -> String {
-    let tokens: Vec<&str> = log_line.split_whitespace().collect();
-    // Find the operation token (starts with "file-" or "network-") and join
-    // all remaining tokens as the path to handle paths with spaces
-    // (e.g. "/Users/x/Library/Application Support/...").
-    for (i, tok) in tokens.iter().enumerate() {
-        if tok.starts_with("file-") || tok.starts_with("network-") {
-            let path = tokens[i + 1..].join(" ");
-            let op = if tok.contains("write") {
-                "write"
-            } else {
-                "read"
-            };
-            if !path.is_empty() {
-                return format!("filesystem: \"process\" was denied \"{op}\" access to \"{path}\"");
-            }
-            return format!("filesystem: sandbox denied \"{tok}\"");
-        }
-    }
-    format!("filesystem: sandbox denied: {}", log_line.trim())
-}
-
-/// Compute a human-readable fix hint for a violation message.
-fn violation_fix(violation: &str) -> String {
-    if violation.starts_with("network: DNS query for") {
-        // Extract domain from: network: DNS query for "domain" blocked ...
-        if let Some(start) = violation.find('"') {
-            if let Some(end) = violation[start + 1..].find('"') {
-                let domain = &violation[start + 1..start + 1 + end];
-                return format!("add \"{domain}\" to [proxy.domain_allowlist] in your pent config");
-            }
-        }
-        "add the domain to [proxy.domain_allowlist] in your pent config".to_string()
-    } else if violation.starts_with("network:") {
-        "verify the process uses DNS resolution and the target domain is in [proxy.domain_allowlist]".to_string()
-    } else if violation.starts_with("filesystem:") {
-        // Format: filesystem: "proc" was denied "operation" access to "path"
-        // Extract operation (second quoted token) and path (last quoted token).
-        let mut quotes = violation.match_indices('"').map(|(i, _)| i);
-        let op = quotes.next().and_then(|_| {
-            let o = quotes.next()?;
-            let c = quotes.next()?;
-            Some(&violation[o + 1..c])
-        });
-        // Path is the last quoted substring.
-        let path = violation.rfind('"').and_then(|end| {
-            let before = &violation[..end];
-            before.rfind('"').map(|start| &violation[start + 1..end])
-        });
-
-        match path {
-            Some(p) if !p.is_empty() => {
-                let is_dir = std::path::Path::new(p).is_dir();
-                let is_write = op.is_some_and(|o| o.contains("write"));
-                if is_write {
-                    format!("add \"{p}\" to [sandbox.paths.read_write] in your pent config")
-                } else if is_dir {
-                    format!(
-                        "add \"{p}\" to [sandbox.paths.traversal] (directory listing) \
-                         or [sandbox.paths.read] (file reads inside) in your pent config"
-                    )
-                } else {
-                    format!(
-                        "add \"{p}\" to [sandbox.paths.read] or [sandbox.paths.read_write] in your pent config"
-                    )
-                }
-            }
-            _ => "add the path to [sandbox.paths.traversal], [sandbox.paths.read], or [sandbox.paths.read_write] in your pent config".to_string(),
-        }
-    } else {
-        "review your pent config".to_string()
+/// The network mode for a choice without a proxy.
+pub(crate) const fn base_network_mode(choice: NetworkChoice) -> NetworkMode {
+    match choice {
+        NetworkChoice::Unrestricted => NetworkMode::Unrestricted,
+        NetworkChoice::Localhost => NetworkMode::LocalhostOnly,
+        NetworkChoice::Blocked => NetworkMode::Blocked,
+        // Pent starts the proxy for this choice; the proxy gives the mode.
+        // Without a proxy, nothing may go out.
+        NetworkChoice::Proxy => NetworkMode::Blocked,
     }
 }
 
-/// Write a single trace event to the log file.
-///
-/// Opens the log in append mode so entries accumulate across the run without
-/// races between successive writes.
-fn log_trace_event(log_path: &std::path::Path, event: TraceEvent) {
-    if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(log_path) {
-        match event {
-            TraceEvent::Access(msg) => {
-                let _ = writeln!(f, "pent: [allowed] {msg}");
-            }
-            TraceEvent::Violation(msg) => {
-                let fix = violation_fix(&msg);
-                let _ = writeln!(f, "pent: [denied] {msg}");
-                let _ = writeln!(f, "pent: fix: {fix}");
-            }
-        }
-        let _ = writeln!(f);
-    }
-}
-
-/// Non-macOS: start the proxy (if needed) and return the resolved network mode,
-/// optional proxy handle, and optional event receiver for trace mode.
-#[cfg(not(target_os = "macos"))]
-struct ProxySetup {
-    network: NetworkMode,
-    handle: Option<ProxyHandle>,
-    event_rx: Option<tokio::sync::mpsc::UnboundedReceiver<TraceEvent>>,
-}
-
-#[cfg(not(target_os = "macos"))]
-async fn setup_proxy(
-    config: &PentConfig,
-    network_arg: Option<crate::cli::NetworkModeArg>,
+/// Return the warnings to show for a network decision.
+pub(crate) fn network_warnings(
+    decision: NetworkDecision,
+    allow_flags: &[String],
     trace: bool,
-) -> Result<ProxySetup, CliError> {
-    use crate::cli::NetworkModeArg;
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if decision.source == NetworkSource::NetworkFlag
+        && decision.choice != NetworkChoice::Proxy
+        && !allow_flags.is_empty()
+    {
+        warnings.push(format!(
+            "--allow has no effect: --network {} has precedence",
+            decision.choice.flag_value()
+        ));
+    }
+    if trace && decision.choice != NetworkChoice::Proxy {
+        warnings.push(format!(
+            "--trace records network events only in proxy mode; the network mode is {}, \
+             so this run records no network events",
+            decision.choice.flag_value()
+        ));
+    }
+    warnings
+}
 
-    let (violation_tx, event_rx) = if trace {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<TraceEvent>();
-        (Some(tx), Some(rx))
-    } else {
-        (None, None)
-    };
-
-    let wants_proxy = match network_arg {
-        Some(NetworkModeArg::Proxy) => true,
-        None if trace => true,
-        None if !config.proxy.domain_allowlist.is_empty() => true,
-        _ => matches!(config.sandbox.network, Some(NetworkMode::ProxyOnly { .. })),
-    };
-
-    let base_network: NetworkMode = match network_arg {
-        Some(NetworkModeArg::Unrestricted) => NetworkMode::Unrestricted,
-        // Proxy arm is overridden below when the proxy actually starts.
-        Some(NetworkModeArg::Localhost | NetworkModeArg::Proxy) => NetworkMode::LocalhostOnly,
-        Some(NetworkModeArg::Blocked) => NetworkMode::Blocked,
-        None => config
-            .sandbox
-            .network
-            .clone()
-            .unwrap_or(NetworkMode::Blocked),
-    };
-
-    if wants_proxy {
-        let mut proxy_config = ProxyConfig::try_from(&config.proxy).map_err(CliError::Other)?;
-        proxy_config.violation_tx = violation_tx;
-        // On Linux, ProxyOnly routes child traffic from a separate network
-        // namespace through a veth pair. Both the TCP proxy and DNS server must
-        // listen on all interfaces (0.0.0.0) because:
-        //   1. The child's loopback is isolated from the parent's loopback.
-        //   2. The veth outer interface (10.200.x.1) is created inside
-        //      spawn_sandboxed *after* the proxy binds.
-        //   3. A socket bound to 0.0.0.0 accepts connections on interfaces
-        //      added after bind, so veth traffic arrives correctly.
-        //   4. The DNS server must also be reachable from the veth so that
-        //      DNS queries from the child namespace (redirected from port 53
-        //      via a PREROUTING rule) reach the proxy's resolver.
-        #[cfg(target_os = "linux")]
-        {
-            // Both the TCP proxy and DNS server must listen on all interfaces
-            // (0.0.0.0) so they are reachable from the veth outer IP (10.200.x.1).
-            // The child's loopback is isolated; only the veth reaches the host.
-            const BIND_ALL_ANY: std::net::SocketAddr =
-                std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
-            proxy_config.proxy_bind_addr = BIND_ALL_ANY;
-            proxy_config.dns_bind_addr = BIND_ALL_ANY;
+/// Return the status line for the network mode, if there is one.
+pub(crate) fn network_status(mode: &NetworkMode, source: NetworkSource) -> Option<&'static str> {
+    match mode {
+        // The proxy is the expected mode.
+        NetworkMode::ProxyOnly { .. } => None,
+        NetworkMode::Blocked if source == NetworkSource::Default => {
+            Some("blocked (the profile has no domains)")
         }
-        let handle = ProxyServer::new(proxy_config)?.start().await?;
-        let proxy_addr = handle.proxy_addr();
-        let dns_port = handle.dns_addr().port();
-        tracing::debug!(
-            http_proxy = %format!("http://127.0.0.1:{}", proxy_addr.port()),
-            socks5_proxy = %format!("socks5h://127.0.0.1:{}", proxy_addr.port()),
-            dns = %handle.dns_addr(),
-            "proxy started (HTTP CONNECT + SOCKS5h on same port); DNS resolved server-side"
+        NetworkMode::Blocked => Some("blocked"),
+        NetworkMode::LocalhostOnly => Some("localhost only"),
+        NetworkMode::Unrestricted => Some("unrestricted"),
+    }
+}
+
+// ── Trace log ────────────────────────────────────────────────────────────────
+
+/// One entry in the trace log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TraceLine {
+    /// The proxy allowed an access.
+    Allowed(String),
+    /// The sandbox or the proxy denied an access, with an optional fix hint.
+    Denied {
+        message: String,
+        fix: Option<String>,
+    },
+}
+
+/// Format a trace line as the text for the log file.
+fn format_trace_line(line: &TraceLine) -> String {
+    match line {
+        TraceLine::Allowed(msg) => format!("pent: [allowed] {msg}\n\n"),
+        TraceLine::Denied { message, fix } => match fix {
+            Some(fix) => format!("pent: [denied] {message}\npent: fix: {fix}\n\n"),
+            None => format!("pent: [denied] {message}\n\n"),
+        },
+    }
+}
+
+/// Append a trace line to the log file, if there is a log file.
+///
+/// Opens the log in append mode and writes each entry with one call, so
+/// entries do not mix.
+fn write_trace_line(log_path: Option<&Path>, line: &TraceLine) {
+    let Some(log_path) = log_path else { return };
+    let result = pent_settings::open_log_nofollow(log_path, pent_settings::LogOpen::Append)
+        .and_then(|mut f| f.write_all(format_trace_line(line).as_bytes()));
+    if let Err(e) = result {
+        tracing::warn!(path = %log_path.display(), error = %e, "could not write to the trace log");
+    }
+}
+
+/// Convert one proxy event into a trace line with a fix hint.
+fn proxy_trace_line(event: TraceEvent, profile: &ProfileName) -> TraceLine {
+    match event {
+        TraceEvent::Access(msg) => TraceLine::Allowed(msg),
+        TraceEvent::Violation(msg) => TraceLine::Denied {
+            fix: Some(proxy_violation_fix(&msg, profile)),
+            message: msg,
+        },
+    }
+}
+
+/// Convert a denied filesystem access into a trace line with a fix hint.
+///
+/// Returns `None` for other events and for accesses that the sandbox did not
+/// deny.
+fn fs_trace_line(event: &WatchEvent, profile: &ProfileName) -> Option<TraceLine> {
+    let WatchEvent::Fs {
+        op,
+        path,
+        process,
+        outcome: Outcome::Denied,
+    } = event
+    else {
+        return None;
+    };
+    let (verb, flag) = match op {
+        pent_profile::FsOp::Read => ("read", "--read"),
+        pent_profile::FsOp::Write => ("write", "--write"),
+        pent_profile::FsOp::Create => ("create", "--write"),
+        pent_profile::FsOp::Delete => ("delete", "--write"),
+        pent_profile::FsOp::Exec => ("exec", "--execute"),
+    };
+    let path = path.display();
+    Some(TraceLine::Denied {
+        message: format!(
+            "filesystem: \"{}\" (pid {}) was denied {verb} on \"{path}\"",
+            process.name, process.pid
+        ),
+        fix: Some(format!(
+            "allow it for one run with {flag} \"{path}\", or add it to the profile: \
+             pent trust {profile} --review"
+        )),
+    })
+}
+
+/// Compute a fix hint for a proxy violation message.
+fn proxy_violation_fix(violation: &str, profile: &ProfileName) -> String {
+    let review = format!("pent trust {profile} --review");
+    let Some(rest) = violation.strip_prefix("network: ") else {
+        return format!("review the denied accesses: {review}");
+    };
+    // The message names the domain in quotes, for example:
+    //   DNS query for "x.com" (A) blocked: the domain is not in the allowlist
+    //   SOCKS5 connection to "x.com" port 443 blocked: the domain is not in ...
+    let quoted_domain = rest
+        .split_once('"')
+        .and_then(|(_, tail)| tail.split_once('"'))
+        .map(|(domain, _)| domain);
+    if rest.contains("the domain is not in the allowlist") {
+        if let Some(domain) = quoted_domain {
+            return format!(
+                "allow it for one run with --allow {domain}, or add it to the profile: {review}"
+            );
+        }
+    }
+    if rest.contains("the domain resolves to the") || rest.contains("blocked: the address is") {
+        return "the destination address is not public; if you trust it, set \
+                private_destinations = \"allow\" in the [proxy] section of pent.toml"
+            .to_string();
+    }
+    format!(
+        "make sure that the process uses DNS names, and add the domain to the profile: {review}"
+    )
+}
+
+// ── macOS trace ──────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    // ── resolve_network ──────────────────────────────────────────────────────
+
+    fn domains() -> Vec<String> {
+        vec!["example.com".to_string()]
+    }
+
+    fn profile_name() -> ProfileName {
+        "claude".parse().unwrap()
+    }
+
+    #[test]
+    fn network_flag_wins_over_everything() {
+        let flags = [
+            (NetworkModeArg::Unrestricted, NetworkChoice::Unrestricted),
+            (NetworkModeArg::Localhost, NetworkChoice::Localhost),
+            (NetworkModeArg::Proxy, NetworkChoice::Proxy),
+            (NetworkModeArg::Blocked, NetworkChoice::Blocked),
+        ];
+        for (flag, expected) in flags {
+            for allow in [vec![], domains()] {
+                for profile in [vec![], domains()] {
+                    let d = resolve_network(Some(flag), &allow, &profile);
+                    assert_eq!(
+                        d,
+                        NetworkDecision {
+                            choice: expected,
+                            source: NetworkSource::NetworkFlag
+                        },
+                        "flag {expected:?}, allow {allow:?}, profile {profile:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn allow_flag_wins_over_profile() {
+        for profile in [vec![], domains()] {
+            let d = resolve_network(None, &domains(), &profile);
+            assert_eq!(d.choice, NetworkChoice::Proxy);
+            assert_eq!(d.source, NetworkSource::AllowFlag);
+        }
+    }
+
+    #[test]
+    fn profile_domains_imply_proxy() {
+        let d = resolve_network(None, &[], &domains());
+        assert_eq!(d.choice, NetworkChoice::Proxy);
+        assert_eq!(d.source, NetworkSource::ProfileDomains);
+    }
+
+    #[test]
+    fn default_is_blocked() {
+        let d = resolve_network(None, &[], &[]);
+        assert_eq!(d.choice, NetworkChoice::Blocked);
+        assert_eq!(d.source, NetworkSource::Default);
+        assert_eq!(
+            base_network_mode(NetworkChoice::Proxy),
+            NetworkMode::Blocked
         );
-        Ok(ProxySetup {
-            network: NetworkMode::ProxyOnly {
-                proxy_addr,
-                dns_port,
+    }
+
+    #[test]
+    fn merge_domains_keeps_order_without_duplicates() {
+        let merged = merge_domains(
+            &["a.com".to_string(), "b.com".to_string()],
+            &["b.com".to_string(), "c.com".to_string()],
+        );
+        assert_eq!(merged, vec!["a.com", "b.com", "c.com"]);
+    }
+
+    // ── network_warnings ─────────────────────────────────────────────────────
+
+    fn decision(choice: NetworkChoice, source: NetworkSource) -> NetworkDecision {
+        NetworkDecision { choice, source }
+    }
+
+    #[test]
+    fn warns_when_allow_is_ignored() {
+        let d = decision(NetworkChoice::Blocked, NetworkSource::NetworkFlag);
+        let w = network_warnings(d, &domains(), false);
+        assert_eq!(w.len(), 1);
+        assert!(w.iter().any(|m| m.contains("--allow has no effect")));
+    }
+
+    #[test]
+    fn no_warning_for_proxy_mode() {
+        let d = decision(NetworkChoice::Proxy, NetworkSource::ProfileDomains);
+        assert!(network_warnings(d, &[], false).is_empty());
+        assert!(network_warnings(d, &[], true).is_empty());
+    }
+
+    #[test]
+    fn trace_note_without_proxy() {
+        let d = decision(NetworkChoice::Blocked, NetworkSource::Default);
+        let w = network_warnings(d, &[], true);
+        assert!(w.iter().any(|m| m.contains("only in proxy mode")), "{w:?}");
+    }
+
+    #[test]
+    fn blocked_hint_only_for_default() {
+        let hint = network_status(&NetworkMode::Blocked, NetworkSource::Default);
+        assert!(hint.is_some_and(|h| h.contains("no domains")));
+        let explicit = network_status(&NetworkMode::Blocked, NetworkSource::NetworkFlag);
+        assert_eq!(explicit, Some("blocked"));
+    }
+
+    // ── denied accesses ──────────────────────────────────────────────────────
+
+    #[test]
+    fn denied_message_names_the_review_command() {
+        let n = profile_name();
+        assert_eq!(denied_message(0, &n), None);
+        assert_eq!(
+            denied_message(3, &n).as_deref(),
+            Some("3 accesses denied; review them: pent trust claude --review")
+        );
+        assert_eq!(
+            denied_message(1, &n).as_deref(),
+            Some("1 access denied; review it: pent trust claude --review")
+        );
+    }
+
+    #[test]
+    fn denied_recorder_writes_distinct_denials_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProfileStore::new(pent_settings::PentDirs {
+            config: dir.path().join("c"),
+            state: dir.path().join("s"),
+        });
+        let n = profile_name();
+        let connect = |host: &str, outcome| WatchEvent::Connect {
+            host: host.to_string(),
+            port: 443,
+            protocol: pent_profile::NetProtocol::HttpConnect,
+            outcome,
+        };
+        {
+            let mut rec = DeniedRecorder::new(&store, &n);
+            rec.record(&connect("ok.com", Outcome::Allowed));
+            assert!(rec.summary().is_none());
+            assert!(!store.denied_path(&n).exists(), "no log without a denial");
+            rec.record(&connect("evil.com", Outcome::Denied));
+            rec.record(&connect("evil.com", Outcome::Denied));
+            rec.record(&connect("bad.com", Outcome::Denied));
+            assert!(rec
+                .summary()
+                .is_some_and(|m| m.starts_with("2 accesses denied")));
+        }
+        assert_eq!(store.read_denied(&n).unwrap().len(), 2);
+    }
+
+    // ── trace log ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn proxy_fix_names_the_domain_for_connect() {
+        let fix = proxy_violation_fix(
+            "network: SOCKS5 connection to \"evil.example\" port 443 blocked: \
+             the domain is not in the allowlist",
+            &profile_name(),
+        );
+        assert_eq!(
+            fix,
+            "allow it for one run with --allow evil.example, or add it to the profile: \
+             pent trust claude --review"
+        );
+    }
+
+    #[test]
+    fn proxy_fix_names_private_destinations() {
+        let fix = proxy_violation_fix(
+            "network: CONNECT connection to \"intra.example\" port 443 blocked: \
+             the domain resolves to the private address 10.0.0.5",
+            &profile_name(),
+        );
+        assert!(fix.contains("private_destinations"), "{fix}");
+    }
+
+    #[test]
+    fn trace_line_without_fix_has_no_fix_line() {
+        let line = TraceLine::Denied {
+            message: "network: x".to_string(),
+            fix: None,
+        };
+        assert_eq!(format_trace_line(&line), "pent: [denied] network: x\n\n");
+        let line = TraceLine::Denied {
+            message: "m".to_string(),
+            fix: Some("f".to_string()),
+        };
+        assert_eq!(
+            format_trace_line(&line),
+            "pent: [denied] m\npent: fix: f\n\n"
+        );
+    }
+
+    #[test]
+    fn fs_denial_gives_a_trace_line() {
+        let event = |outcome| WatchEvent::Fs {
+            op: pent_profile::FsOp::Create,
+            path: PathBuf::from("/srv/out.txt"),
+            process: pent_profile::ProcessInfo {
+                pid: 7,
+                name: "sh".to_string(),
             },
-            handle: Some(handle),
-            event_rx,
-        })
-    } else {
-        Ok(ProxySetup {
-            network: base_network,
-            handle: None,
-            event_rx,
-        })
+            outcome,
+        };
+        let line = fs_trace_line(&event(Outcome::Denied), &profile_name());
+        assert_eq!(
+            line.map(|l| format_trace_line(&l)),
+            Some(format!(
+                "pent: [denied] filesystem: \"sh\" (pid 7) was denied create on \"/srv/out.txt\"\n\
+                 pent: fix: allow it for one run with --write \"/srv/out.txt\", or add it to the \
+                 profile: pent trust {} --review\n\n",
+                profile_name()
+            ))
+        );
+        assert_eq!(
+            fs_trace_line(&event(Outcome::Allowed), &profile_name()),
+            None
+        );
     }
 }
