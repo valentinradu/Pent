@@ -646,23 +646,36 @@ fn test_execute_flag_allows_binary() -> TestResult {
     // Only runs when Landlock is enforcing; otherwise meaningless.
     // We skip silently if unavailable.
     //
-    // execute_access is now ReadDir | Execute (no ReadFile), so the binary and
-    // its shared libraries must also be listed under --read for execve to succeed.
-    //
-    // The test uses the FHS layout. Some systems (NixOS) do not have it.
-    if !std::path::Path::new("/usr/bin/true").exists() {
-        println!("SKIP: /usr/bin/true does not exist on this system");
+    // execute_access is ReadDir | Execute (no ReadFile), so the binary must
+    // also be listed under --read for execve to succeed. The test finds
+    // `true` in PATH: some systems (NixOS) do not have /usr/bin/true.
+    let Some(bin) = common::e2e::which("true") else {
+        println!("SKIP: true is not in PATH");
         return Ok(());
-    }
+    };
+    // Run the path in PATH: on NixOS it is a link to a multi-call binary,
+    // which needs its name. Allow the directory of the link and of the
+    // target.
+    let real = bin.canonicalize()?;
+    let dir = bin.parent().ok_or("the binary has no directory")?;
+    let real_dir = real.parent().ok_or("the binary has no directory")?;
+    let bin = bin.to_str().ok_or("the path is not UTF-8")?;
+    let dir = dir.to_str().ok_or("the path is not UTF-8")?;
+    let real_dir = real_dir.to_str().ok_or("the path is not UTF-8")?;
+    let ws = TempDir::new()?;
     let out = sandboxed_run(
-        std::path::Path::new("/tmp"),
+        ws.path(),
         &[
             "--network",
             "unrestricted",
             "--execute",
-            "/usr/bin",
+            dir,
             "--read",
-            "/usr/bin",
+            dir,
+            "--execute",
+            real_dir,
+            "--read",
+            real_dir,
             "--read",
             "/usr/lib",
             "--read",
@@ -673,7 +686,7 @@ fn test_execute_flag_allows_binary() -> TestResult {
             "/lib64",
         ]
         .map(String::from),
-        &["/usr/bin/true"],
+        &[bin],
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     // Skip if the sandbox itself cannot be set up (overlay requires privileges).
@@ -687,7 +700,7 @@ fn test_execute_flag_allows_binary() -> TestResult {
     }
     assert!(
         out.status.success(),
-        "pent --execute /usr/bin --read /usr/bin -- /usr/bin/true should succeed\nstderr: {stderr}",
+        "pent --execute DIR --read DIR -- {bin} should succeed\nstderr: {stderr}",
     );
     Ok(())
 }
@@ -705,7 +718,6 @@ fn test_execute_flag_allows_binary() -> TestResult {
 #[cfg(target_os = "linux")]
 mod no_hang {
     use super::*;
-    use serial_test::serial;
     use std::io::Read as _;
     use std::process::Stdio;
     use std::time::{Duration, Instant};
@@ -801,7 +813,7 @@ mod no_hang {
 
     // ── baseline: system binaries ─────────────────────────────────────────────
 
-    /// /usr/bin/true: the simplest possible exit.  Should always finish in <2s.
+    /// `true` from PATH: the simplest possible exit.  Should always finish in <2s.
     #[test]
     fn system_true_exits_quickly() -> TestResult {
         let dir = TempDir::new()?;
@@ -809,13 +821,10 @@ mod no_hang {
         let (ok, stderr) = pent_timeout(
             dir.path(),
             home.path(),
-            &["run", "--profile", TEST_PROFILE, "--", "/usr/bin/true"],
+            &["run", "--profile", TEST_PROFILE, "--", "true"],
             2,
         );
-        assert!(
-            ok,
-            "pent run -- /usr/bin/true timed out (2s)\nstderr:\n{stderr}"
-        );
+        assert!(ok, "pent run -- true timed out (2s)\nstderr:\n{stderr}");
         Ok(())
     }
 
@@ -834,22 +843,22 @@ mod no_hang {
                 "--network",
                 "blocked",
                 "--",
-                "/usr/bin/true",
+                "true",
             ],
             2,
         );
         assert!(
             ok,
-            "pent run --network blocked -- /usr/bin/true timed out (2s)\nstderr:\n{stderr}"
+            "pent run --network blocked -- true timed out (2s)\nstderr:\n{stderr}"
         );
         Ok(())
     }
 
-    /// /usr/bin/curl --version: a real binary that reads shared libs from /usr/lib.
+    /// `curl --version`: a real binary with shared libraries.
     #[test]
     fn system_curl_version_exits_quickly() -> TestResult {
-        if !std::path::Path::new("/usr/bin/curl").exists() {
-            println!("SKIP: /usr/bin/curl not found");
+        if common::e2e::which("curl").is_none() {
+            println!("SKIP: curl is not in PATH");
             return Ok(());
         }
         let dir = TempDir::new()?;
@@ -857,14 +866,7 @@ mod no_hang {
         let (ok, stderr) = pent_timeout(
             dir.path(),
             home.path(),
-            &[
-                "run",
-                "--profile",
-                TEST_PROFILE,
-                "--",
-                "/usr/bin/curl",
-                "--version",
-            ],
+            &["run", "--profile", TEST_PROFILE, "--", "curl", "--version"],
             2,
         );
         assert!(
@@ -901,17 +903,14 @@ mod no_hang {
     }
 
     #[test]
-    #[serial(pty)]
     fn claude_version_exits_quickly() {
         assert_version_exits_quickly("claude");
     }
     #[test]
-    #[serial(pty)]
     fn codex_version_exits_quickly() {
         assert_version_exits_quickly("codex");
     }
     #[test]
-    #[serial(pty)]
     fn gemini_version_exits_quickly() {
         assert_version_exits_quickly("gemini");
     }
@@ -949,17 +948,14 @@ mod no_hang {
     }
 
     #[test]
-    #[serial(netns)]
     fn claude_proxy_mode_exits_quickly() {
         assert_proxy_mode_exits_quickly("claude");
     }
     #[test]
-    #[serial(netns)]
     fn codex_proxy_mode_exits_quickly() {
         assert_proxy_mode_exits_quickly("codex");
     }
     #[test]
-    #[serial(netns)]
     fn gemini_proxy_mode_exits_quickly() {
         assert_proxy_mode_exits_quickly("gemini");
     }
@@ -1196,17 +1192,14 @@ mod no_hang {
     }
 
     #[test]
-    #[serial(pty)]
     fn pty_claude_interactive_exits_quickly() {
         assert_pty_interactive("claude");
     }
     #[test]
-    #[serial(pty)]
     fn pty_codex_interactive_exits_quickly() {
         assert_pty_interactive("codex");
     }
     #[test]
-    #[serial(pty)]
     fn pty_gemini_interactive_exits_quickly() {
         assert_pty_interactive("gemini");
     }
