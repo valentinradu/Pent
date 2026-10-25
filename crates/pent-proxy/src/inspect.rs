@@ -275,6 +275,14 @@ pub(crate) mod tests {
     /// `host`, and with other extensions before and after it, as real
     /// clients send.
     pub(crate) fn client_hello(host: Option<&str>) -> Vec<u8> {
+        client_hello_padded(host, 0)
+    }
+
+    /// The same ClientHello, with a padding extension of `pad` bytes after
+    /// the `server_name` extension. With enough padding the handshake is
+    /// longer than 255 bytes, so its 24-bit length needs more than the low
+    /// byte.
+    fn client_hello_padded(host: Option<&str>, pad: usize) -> Vec<u8> {
         fn push_u16(v: &mut Vec<u8>, n: usize) {
             v.extend_from_slice(&u16::try_from(n).unwrap().to_be_bytes());
         }
@@ -293,6 +301,12 @@ pub(crate) mod tests {
             extensions.extend_from_slice(&[0x00, 0x00]);
             push_u16(&mut extensions, list.len());
             extensions.extend_from_slice(&list);
+        }
+        if pad > 0 {
+            // padding (0x0015)
+            extensions.extend_from_slice(&[0x00, 0x15]);
+            push_u16(&mut extensions, pad);
+            extensions.extend(std::iter::repeat_n(0x00, pad));
         }
         // supported_versions (0x002b): TLS 1.3
         extensions.extend_from_slice(&[0x00, 0x2b, 0x00, 0x03, 0x02, 0x03, 0x04]);
@@ -406,6 +420,79 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(buf, record);
         drop(writer.await.unwrap());
+    }
+
+    /// The proxy inspects the host name on port 443 and on port 80. If this
+    /// selection gives `None`, the proxy relays without any check of the SNI
+    /// or of the `Host` header, and domain fronting works.
+    #[test]
+    fn inspection_runs_on_port_443_and_on_port_80() {
+        assert_eq!(Inspect::for_port(443), Some(Inspect::Tls));
+        assert_eq!(Inspect::for_port(80), Some(Inspect::Http));
+        assert_eq!(Inspect::for_port(8443), None);
+        assert_eq!(Inspect::for_port(22), None);
+    }
+
+    /// A real ClientHello is longer than 255 bytes, so the 24-bit length of
+    /// the handshake needs its high bytes. The parser must still find the
+    /// SNI.
+    #[test]
+    fn sni_is_found_in_a_client_hello_longer_than_255_bytes() {
+        let record = client_hello_padded(Some("api.github.com"), 400);
+        assert!(
+            record.len() > 400,
+            "the record must be long: {}",
+            record.len()
+        );
+        assert_eq!(extract_sni(&record), Some("api.github.com".to_string()));
+    }
+
+    /// `is_complete` says when the proxy has enough data. A wrong answer
+    /// makes the proxy wait for data that never comes, or inspect a head
+    /// that is not complete.
+    #[test]
+    fn tls_inspection_waits_only_for_a_handshake_record() {
+        // Not a handshake record: there is nothing to wait for.
+        assert!(Inspect::Tls.is_complete(&[0x17, 0x03, 0x03, 0x00, 0x10]));
+        // A handshake record header with no body: wait.
+        assert!(!Inspect::Tls.is_complete(&[0x16, 0x03, 0x01, 0x00, 0x10]));
+    }
+
+    /// A record header can declare a body that is longer than a TLS record
+    /// can be. The proxy waits for at most the maximum record length, so a
+    /// client cannot hold the connection with a false length.
+    #[test]
+    fn tls_inspection_waits_at_most_one_maximum_record() {
+        let header = |body: usize| {
+            let mut v = vec![TLS_HANDSHAKE, 0x03, 0x01];
+            v.extend_from_slice(&u16::try_from(body).unwrap_or(0).to_be_bytes());
+            v
+        };
+        // The record declares 17,000 bytes, which is below the maximum. The
+        // proxy waits for all of them.
+        let mut short = header(17_000);
+        short.extend(std::iter::repeat_n(0x00, 14_500));
+        assert!(!Inspect::Tls.is_complete(&short));
+        // The record declares 60,000 bytes, which is above the maximum
+        // (16,384 plus the permitted expansion of 2,048). The proxy stops at
+        // the maximum.
+        let mut long = header(60_000);
+        long.extend(std::iter::repeat_n(0x00, 18_432));
+        assert!(Inspect::Tls.is_complete(&long));
+    }
+
+    /// The HTTP head is complete at the empty line, at the maximum length,
+    /// or as soon as the first byte cannot start a method.
+    #[test]
+    fn http_inspection_stops_at_the_end_of_the_head() {
+        assert!(Inspect::Http.is_complete(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n"));
+        assert!(!Inspect::Http.is_complete(b"GET / HTTP/1.1\r\nHost: a\r\n"));
+        // The first byte is not an uppercase letter, thus this is not an
+        // HTTP request and the proxy does not wait.
+        assert!(Inspect::Http.is_complete(b"\x00\x01\x02\x03"));
+        // A head that reaches the maximum length is complete.
+        assert!(Inspect::Http.is_complete(&vec![b'G'; MAX_HTTP_HEAD_LEN]));
+        assert!(!Inspect::Http.is_complete(&vec![b'G'; MAX_HTTP_HEAD_LEN - 1]));
     }
 
     #[tokio::test]

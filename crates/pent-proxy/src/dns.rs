@@ -54,6 +54,43 @@ const MAX_WIRE_NAME_LEN: usize = 255;
 /// The maximum number of compression pointers that a name can follow.
 const MAX_POINTER_HOPS: usize = 32;
 
+/// The file that holds the resolvers of the host.
+const RESOLV_CONF: &str = "/etc/resolv.conf";
+
+/// Read the resolvers from the text of a `resolv.conf` file.
+///
+/// Each `nameserver` line gives one address on port 53. The function skips
+/// a line with no address and an address that it cannot parse, and it
+/// returns `None` when the text has no usable address.
+fn parse_resolv_conf(content: &str) -> Option<Vec<SocketAddr>> {
+    let resolvers: Vec<SocketAddr> = content
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            if parts.next() != Some("nameserver") {
+                return None;
+            }
+            let entry = parts.next()?;
+            // Remove a zone index such as "fe80::1%eth0": the parser does
+            // not accept it.
+            let ip_text = entry.split('%').next().unwrap_or(entry);
+            match ip_text.parse::<IpAddr>() {
+                Ok(ip) => Some(SocketAddr::new(ip, 53)),
+                Err(_) => {
+                    warn!(nameserver = %entry, "skip the nameserver entry that is not an IP address");
+                    None
+                }
+            }
+        })
+        .collect();
+
+    if resolvers.is_empty() {
+        None
+    } else {
+        Some(resolvers)
+    }
+}
+
 /// Header flag: the message is a response.
 const FLAG_QR: u8 = 0x80;
 /// Header flag: the response is truncated.
@@ -182,33 +219,7 @@ impl DnsServerConfig {
 
     /// Read system DNS resolvers from /etc/resolv.conf.
     fn read_system_resolvers() -> Option<Vec<SocketAddr>> {
-        let content = std::fs::read_to_string("/etc/resolv.conf").ok()?;
-        let resolvers: Vec<SocketAddr> = content
-            .lines()
-            .filter_map(|line| {
-                let mut parts = line.split_whitespace();
-                if parts.next() != Some("nameserver") {
-                    return None;
-                }
-                let entry = parts.next()?;
-                // Remove a zone index such as "fe80::1%eth0": the parser
-                // does not accept it.
-                let ip_text = entry.split('%').next().unwrap_or(entry);
-                match ip_text.parse::<IpAddr>() {
-                    Ok(ip) => Some(SocketAddr::new(ip, 53)),
-                    Err(_) => {
-                        warn!(nameserver = %entry, "skip the nameserver entry that is not an IP address");
-                        None
-                    }
-                }
-            })
-            .collect();
-
-        if resolvers.is_empty() {
-            None
-        } else {
-            Some(resolvers)
-        }
+        parse_resolv_conf(&std::fs::read_to_string(RESOLV_CONF).ok()?)
     }
 
     /// The TTL bounds in seconds: `(min, max)`.
@@ -2037,6 +2048,280 @@ mod tests {
             read_name(&msg, 12, Pointers::Allowed, LabelBytes::Any),
             Err(WireError::BadPointer)
         );
+    }
+
+    /// A compression pointer must point backwards. A pointer that points
+    /// forward lets a message send the parser ahead in the message.
+    #[test]
+    fn read_name_rejects_a_pointer_that_points_forward() {
+        let mut msg = vec![0x01, b'a', 0x00]; // offset 0: the name "a"
+        msg.extend_from_slice(&[0xC0, 0x08]); // offset 3: a pointer to 8
+        msg.extend_from_slice(&[0x00, 0x00, 0x00]); // offsets 5, 6, 7
+        msg.extend_from_slice(&[0x01, b'b', 0x00]); // offset 8: the name "b"
+        assert_eq!(
+            read_name(&msg, 3, Pointers::Allowed, LabelBytes::Any),
+            Err(WireError::BadPointer)
+        );
+        // The same name, read without the pointer, is valid. Thus the
+        // rejection comes from the direction of the pointer.
+        assert_eq!(
+            read_name(&msg, 8, Pointers::Allowed, LabelBytes::Any),
+            Ok(("b".to_string(), 11))
+        );
+    }
+
+    /// The parser follows at most `MAX_POINTER_HOPS` pointers. The limit
+    /// stops a chain that is long but has no loop.
+    #[test]
+    fn read_name_follows_at_most_the_permitted_number_of_pointers() {
+        // The name "a" at offset 0, then a chain of backward pointers: the
+        // pointer at offset p points to p - 2, and the first one points to 0.
+        let mut msg = vec![0x01, b'a', 0x00];
+        for i in 0..=MAX_POINTER_HOPS {
+            let target = if i == 0 { 0 } else { 1 + 2 * i };
+            msg.push(0xC0);
+            msg.push(u8::try_from(target).unwrap());
+        }
+        let last = 3 + 2 * MAX_POINTER_HOPS;
+        // From the second-last pointer the chain has exactly
+        // `MAX_POINTER_HOPS` pointers, which is permitted.
+        assert_eq!(
+            read_name(&msg, last - 2, Pointers::Allowed, LabelBytes::Any),
+            Ok(("a".to_string(), last))
+        );
+        // One pointer more is not permitted.
+        assert_eq!(
+            read_name(&msg, last, Pointers::Allowed, LabelBytes::Any),
+            Err(WireError::BadPointer)
+        );
+    }
+
+    /// A pointer can name an offset above 255, so the parser must use the
+    /// low six bits of the first byte as the high bits of the offset.
+    #[test]
+    fn read_name_follows_a_pointer_above_offset_255() {
+        let mut msg = vec![0u8; 300];
+        msg.extend_from_slice(&[0x04, b'd', b'e', b'e', b'p', 0x00]); // offset 300
+        msg.extend_from_slice(&[0xC1, 0x2C]); // offset 306: a pointer to 0x012C
+        assert_eq!(
+            read_name(&msg, 306, Pointers::Allowed, LabelBytes::Any),
+            Ok(("deep".to_string(), 308))
+        );
+    }
+
+    /// The resolvers of the host come from the `nameserver` lines of
+    /// `resolv.conf`. A wrong answer here sends each query of the sandbox
+    /// to the wrong server, or to no server.
+    #[test]
+    fn resolv_conf_gives_each_nameserver_on_port_53() {
+        let text = "# a comment\n\
+                    domain example.com\n\
+                    search example.com lan\n\
+                    nameserver 192.0.2.1\n\
+                    nameserver 2001:db8::1\n\
+                    nameserver fe80::1%eth0\n\
+                    nameserver not-an-address\n\
+                    nameserver\n\
+                    options edns0\n";
+        assert_eq!(
+            parse_resolv_conf(text),
+            Some(vec![
+                "192.0.2.1:53".parse().unwrap(),
+                "[2001:db8::1]:53".parse().unwrap(),
+                "[fe80::1]:53".parse().unwrap(),
+            ])
+        );
+        // A file with no usable address gives nothing, so the caller takes
+        // the fallback resolvers.
+        assert_eq!(parse_resolv_conf(""), None);
+        assert_eq!(parse_resolv_conf("search example.com\n"), None);
+        assert_eq!(parse_resolv_conf("nameserver not-an-address\n"), None);
+        // A line that only starts with "nameserver" is not a nameserver
+        // line.
+        assert_eq!(parse_resolv_conf("nameservers 192.0.2.1\n"), None);
+    }
+
+    /// The transaction ID of an upstream query must not be the same each
+    /// time. A fixed ID lets a remote host answer before the real server.
+    #[test]
+    fn the_upstream_transaction_id_changes() {
+        let seen: std::collections::HashSet<u16> = (0..1000).map(|_| random_id()).collect();
+        assert!(
+            seen.len() > 1,
+            "the transaction ID is always the same: {seen:?}"
+        );
+    }
+
+    /// An error response is a server answer: it repeats the ID, it sets QR
+    /// and RA, it keeps the opcode and the RD bit of the query, and it
+    /// carries the response code.
+    #[test]
+    fn an_error_response_has_the_flags_of_a_server_answer() {
+        let query = build_test_dns_query("example.com", rtype::A); // RD = 1
+        let r = build_error_response(&query, None, rcode::NXDOMAIN);
+        assert_eq!(&r[..2], &[0xAB, 0xCD], "the ID of the query");
+        assert_eq!(r[2] & 0x80, 0x80, "QR is set");
+        assert_eq!(r[2] & 0x78, 0x00, "the opcode stays 0");
+        assert_eq!(r[2] & 0x01, 0x01, "RD comes from the query");
+        assert_eq!(r[2] & 0x02, 0x00, "TC is not set");
+        assert_eq!(r[3] & 0x80, 0x80, "RA is set");
+        assert_eq!(rcode_of(&r), rcode::NXDOMAIN);
+
+        let mut no_rd = query.clone();
+        no_rd[2] = 0x00;
+        let r = build_error_response(&no_rd, None, rcode::NXDOMAIN);
+        assert_eq!(
+            r[2] & 0x01,
+            0x00,
+            "a query without RD gives a response without RD"
+        );
+        assert_eq!(r[2] & 0x80, 0x80, "QR is set");
+    }
+
+    /// A SERVFAIL response is a real response: the ID of the query, the QR
+    /// bit, the code and the question.
+    #[test]
+    fn a_servfail_response_answers_the_query() {
+        let query = build_test_dns_query("example.com", rtype::A);
+        let r = DnsServer::build_servfail_response(&query);
+        assert_eq!(&r[..2], &[0xAB, 0xCD], "the ID of the query");
+        assert_eq!(r[2] & 0x80, 0x80, "QR is set");
+        assert_eq!(rcode_of(&r), rcode::SERVFAIL);
+        assert_eq!(
+            u16::from_be_bytes([r[4], r[5]]),
+            1,
+            "the response repeats the question"
+        );
+    }
+
+    /// A query with a header and no question is a malformed query, not an
+    /// internal error. A query shorter than the header is an error.
+    #[test]
+    fn a_header_without_a_question_gets_formerr() {
+        let dead: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let (server, _state, _rx) = server_with_upstream(dead, &["example.com"]);
+        let header_only = vec![0xAB, 0xCD, 0x01, 0x00, 0, 0, 0, 0, 0, 0, 0, 0];
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let r = runtime
+            .block_on(server.handle_query(&header_only))
+            .expect("a malformed query gets a response");
+        assert_eq!(rcode_of(&r), rcode::FORMERR);
+        assert!(
+            runtime
+                .block_on(server.handle_query(&header_only[..11]))
+                .is_err(),
+            "a query shorter than the header is an error"
+        );
+    }
+
+    /// A zone transfer, and a class other than IN, get NOTIMP. The proxy
+    /// does not forward them.
+    #[tokio::test]
+    async fn zone_transfers_and_other_classes_get_notimp() {
+        let dead: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let (server, _state, _rx) = server_with_upstream(dead, &["example.com"]);
+        for qtype in [rtype::AXFR, rtype::IXFR] {
+            let query = build_test_dns_query("example.com", qtype);
+            let r = server.handle_query(&query).await.unwrap();
+            assert_eq!(rcode_of(&r), rcode::NOTIMP, "the query type {qtype}");
+        }
+        // The class CH (3) instead of IN.
+        let mut query = build_test_dns_query("example.com", rtype::A);
+        let last = query.len() - 1;
+        query[last] = 0x03;
+        let r = server.handle_query(&query).await.unwrap();
+        assert_eq!(rcode_of(&r), rcode::NOTIMP, "the class is not IN");
+    }
+
+    /// The response that the client gets is a server answer: QR and RA are
+    /// set, TC is not, the opcode stays 0, and RD comes from the query.
+    #[tokio::test]
+    async fn the_forwarded_response_has_the_flags_of_a_server_answer() {
+        let Some((upstream, _task)) = fake_upstream("127.0.0.1:0").await else {
+            return;
+        };
+        let (server, _state, _rx) =
+            server_with_upstream(upstream, &["example.com", "two.example.com"]);
+        let query = build_test_dns_query("example.com", rtype::A);
+        let r = server.handle_query(&query).await.unwrap();
+        assert_eq!(r[2] & 0x80, 0x80, "QR is set");
+        assert_eq!(r[2] & 0x78, 0x00, "the opcode stays 0");
+        assert_eq!(r[2] & 0x01, 0x01, "RD comes from the query");
+        assert_eq!(r[2] & 0x02, 0x00, "TC is not set");
+        assert_eq!(r[3] & 0x80, 0x80, "RA is set");
+        assert_eq!(rcode_of(&r), rcode::NOERROR);
+
+        let mut no_rd = build_test_dns_query("two.example.com", rtype::A);
+        no_rd[2] = 0x00;
+        let r = server.handle_query(&no_rd).await.unwrap();
+        assert_eq!(
+            r[2] & 0x01,
+            0x00,
+            "a query without RD gives a response without RD"
+        );
+        assert_eq!(r[2] & 0x80, 0x80, "QR is set");
+    }
+
+    /// An upstream server that answers SERVFAIL gives no answer: the
+    /// server asks the next upstream.
+    #[tokio::test]
+    async fn an_upstream_that_fails_is_not_the_answer() {
+        let Some((bad, _t1)) = servfail_upstream().await else {
+            return;
+        };
+        let Some((good, _t2)) = fake_upstream("127.0.0.1:0").await else {
+            return;
+        };
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let state = Arc::new(SharedState::with_violation_tx(
+            vec!["example.com".to_string()],
+            Some(tx),
+        ));
+        let config = DnsServerConfig {
+            upstream: Some(vec![bad, good]),
+            resolve_timeout: Duration::from_secs(3),
+            ..Default::default()
+        };
+        let server = DnsServer::new(config, state).unwrap();
+        let query = build_test_dns_query("example.com", rtype::A);
+        let r = server.handle_query(&query).await.unwrap();
+        assert_eq!(
+            rcode_of(&r),
+            rcode::NOERROR,
+            "the server must ask the next upstream after SERVFAIL"
+        );
+        assert_eq!(
+            u16::from_be_bytes([r[6], r[7]]),
+            1,
+            "the answer comes from the upstream that works"
+        );
+    }
+
+    /// A fake upstream that answers SERVFAIL to each query.
+    async fn servfail_upstream() -> Option<(SocketAddr, tokio::task::JoinHandle<()>)> {
+        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.ok()?);
+        let addr = socket.local_addr().ok()?;
+        let handle = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            loop {
+                let Ok((len, src)) = socket.recv_from(&mut buf).await else {
+                    return;
+                };
+                let query = &buf[..len];
+                let Ok(question) = read_question(query, Pointers::Forbidden) else {
+                    continue;
+                };
+                let mut reply = query[..2].to_vec();
+                reply.extend_from_slice(&[0x81, 0x80 | rcode::SERVFAIL]);
+                reply.extend_from_slice(&[0, 1, 0, 0, 0, 0, 0, 0]);
+                reply.extend_from_slice(&query[HEADER_LEN..question.end]);
+                let _ = socket.send_to(&reply, src).await;
+            }
+        });
+        Some((addr, handle))
     }
 
     #[test]
