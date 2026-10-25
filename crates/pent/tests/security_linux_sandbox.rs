@@ -408,18 +408,179 @@ fn test_tiocsti_blocked() -> TestResult {
     Ok(())
 }
 
+/// LS-2: the child must not read or change a file under `/tmp` that a host
+/// program owns and that is not in its workspace. An empty tmpfs covers
+/// `/tmp` in the mount namespace of the child, so the victim file is not
+/// there.
+#[test]
+fn test_tmp_not_shared_with_host() -> TestResult {
+    let h = Harness::new("sh", EMPTY_PROFILE)?;
+    // A host file under /tmp, outside the workspace, owned by this test.
+    let victim = std::env::temp_dir().join(format!("pent-victim-{}", std::process::id()));
+    std::fs::write(&victim, "HOST_TMP_DATA")?;
+    let script = h.script(
+        "probe.sh",
+        &format!(
+            "cat '{v}'\necho TAMPERED > '{v}'\n",
+            v = victim.display()
+        ),
+    )?;
+    let out = h.run(&["sh", script.to_str().unwrap()])?;
+    let after = std::fs::read_to_string(&victim).unwrap_or_default();
+    let _ = std::fs::remove_file(&victim);
+    if sandbox_unavailable(&out) {
+        eprintln!("skip: sandbox not available on this host");
+        return Ok(());
+    }
+    let text = combined(&out);
+    assert!(
+        !text.contains("HOST_TMP_DATA"),
+        "LS-2: the child read a host file under /tmp:\n{text}"
+    );
+    assert_eq!(
+        after, "HOST_TMP_DATA",
+        "LS-2: the child overwrote a host file under /tmp"
+    );
+    Ok(())
+}
+
+/// LS-2: the child must not reach a Unix socket that a host program keeps in
+/// `/tmp`. This is the escape of a terminal multiplexer: the host server
+/// runs a command for any program that reaches its socket, and that command
+/// runs outside the sandbox.
+#[test]
+fn test_tmp_unix_socket_unreachable() -> TestResult {
+    let Some(py) = python3() else {
+        eprintln!("skip: no python3");
+        return Ok(());
+    };
+    let h = Harness::new("python3", EMPTY_PROFILE)?;
+    let sock = std::env::temp_dir().join(format!("pent-victim-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&sock);
+    let listener = UnixListener::bind(&sock)?;
+    let handle = std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let _ = stream.write_all(b"TMUX_SECRET");
+        }
+    });
+    let probe = h.script(
+        "c.py",
+        &format!(
+            "import socket\n\
+             s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.settimeout(2)\n\
+             try:\n    s.connect('{}'); print('CONNECTED', s.recv(32))\n\
+             except Exception as e:\n    print('BLOCKED', e)\n",
+            sock.display()
+        ),
+    )?;
+    let out = h.run(&[py.to_str().unwrap(), "-I", probe.to_str().unwrap()])?;
+    // Unblock the listener thread if the child never connected.
+    if let Ok(s) = std::os::unix::net::UnixStream::connect(&sock) {
+        drop(s);
+    }
+    handle.join().ok();
+    let _ = std::fs::remove_file(&sock);
+    if sandbox_unavailable(&out) {
+        eprintln!("skip: sandbox not available on this host");
+        return Ok(());
+    }
+    let text = combined(&out);
+    assert!(
+        !text.contains("TMUX_SECRET"),
+        "LS-2: the child reached a host socket in /tmp:\n{text}"
+    );
+    Ok(())
+}
+
+/// The child must not see the control sockets of the host daemons under
+/// `/run`. An empty tmpfs covers `/run`, and pent binds back only the system
+/// paths that a program needs.
+#[test]
+fn test_run_not_shared_with_host() -> TestResult {
+    let Some(py) = python3() else {
+        eprintln!("skip: no python3");
+        return Ok(());
+    };
+    let h = Harness::new("python3", EMPTY_PROFILE)?;
+    // The entries of /run that pent binds back. Everything else of the host
+    // must be absent.
+    let kept = [
+        "current-system",
+        "booted-system",
+        "wrappers",
+        "opengl-driver",
+        "opengl-driver-32",
+        "user",
+    ];
+    let probe = h.script(
+        "c.py",
+        "import os\nprint('RUN', ' '.join(sorted(os.listdir('/run'))))\n",
+    )?;
+    let out = h.run(&[py.to_str().unwrap(), "-I", probe.to_str().unwrap()])?;
+    if sandbox_unavailable(&out) {
+        eprintln!("skip: sandbox not available on this host");
+        return Ok(());
+    }
+    let text = combined(&out);
+    let line = text
+        .lines()
+        .find(|l| l.starts_with("RUN "))
+        .ok_or("the child could not list /run")?;
+    for entry in line.trim_start_matches("RUN ").split_whitespace() {
+        assert!(
+            kept.contains(&entry),
+            "the child saw the host entry /run/{entry}:\n{text}"
+        );
+    }
+    Ok(())
+}
+
+/// A workspace under `/tmp` still works: pent binds it back into the private
+/// tmpfs. A user can keep a scratch workspace there.
+#[test]
+fn test_workspace_under_tmp_still_works() -> TestResult {
+    let h = Harness::new("sh", EMPTY_PROFILE)?;
+    let ws = std::env::temp_dir().join(format!("pent-ws-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&ws);
+    std::fs::create_dir_all(&ws)?;
+    std::fs::write(ws.join("input"), "WORKSPACE_DATA")?;
+    let mut cmd = h.command(&[PENT, "run", "--", "sh", "-c", "cat input; echo OUT > output"]);
+    cmd.current_dir(&ws);
+    let out = cmd.output()?;
+    let written = std::fs::read_to_string(ws.join("output")).unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&ws);
+    if sandbox_unavailable(&out) {
+        eprintln!("skip: sandbox not available on this host");
+        return Ok(());
+    }
+    let text = combined(&out);
+    assert!(
+        text.contains("WORKSPACE_DATA"),
+        "the child could not read its workspace under /tmp:\n{text}"
+    );
+    assert_eq!(
+        written, "OUT\n",
+        "the write of the child did not reach the workspace under /tmp"
+    );
+    Ok(())
+}
+
 // ============================================================================
 // Open findings — these tests assert the secure behaviour and currently fail.
 // Each is `#[ignore]` with its finding ID so the suite stays green.
 // ============================================================================
 
 /// LS-1: the child must not connect to a path-based Unix socket outside its
-/// profile. Landlock does not control `connect(2)` on a path socket, and only
-/// a fixed denylist of sockets is masked, so the child reaches any other
-/// socket whose path it can resolve (an SSH agent in `/tmp`, the system
-/// D-Bus socket, any socket under a traversable directory).
+/// profile. Landlock does not control `connect(2)` on a path socket, and the
+/// kernel needs no file right to walk through a directory. A private tmpfs
+/// now hides every socket under `/tmp`, `/var/tmp` and `/run`, and a mask
+/// hides the agent sockets of the home directory. A socket in any other
+/// directory stays reachable, and this test proves it.
 #[test]
-#[ignore = "OPEN VULN LS-1: path Unix socket connect bypasses the filesystem allowlist"]
+#[ignore = "OPEN VULN LS-1 (partial): /tmp, /var/tmp, /run and the home agent \
+            sockets are hidden; a path socket in another directory is still \
+            reachable, because Landlock does not control connect(2). The full \
+            fix is a connect(2) filter in the supervisor"]
 fn test_unix_socket_connect_outside_profile() -> TestResult {
     let Some(py) = python3() else {
         eprintln!("skip: no python3");
@@ -459,43 +620,6 @@ fn test_unix_socket_connect_outside_profile() -> TestResult {
     assert!(
         !text.contains("VICTIM_SECRET"),
         "LS-1: the child connected to a Unix socket outside its profile:\n{text}"
-    );
-    Ok(())
-}
-
-/// LS-2: the child must not read or change a file under `/tmp` that a host
-/// program owns and that is not in its workspace. The sandbox always grants
-/// `/tmp` read-write and shares it with the host, so the child reads and
-/// overwrites the victim file.
-#[test]
-#[ignore = "OPEN VULN LS-2: /tmp is always read-write and shared with the host"]
-fn test_tmp_not_shared_with_host() -> TestResult {
-    let h = Harness::new("sh", EMPTY_PROFILE)?;
-    // A host file under /tmp, outside the workspace, owned by this test.
-    let victim = std::env::temp_dir().join(format!("pent-victim-{}", std::process::id()));
-    std::fs::write(&victim, "HOST_TMP_DATA")?;
-    let script = h.script(
-        "probe.sh",
-        &format!(
-            "cat '{v}'\necho TAMPERED > '{v}'\n",
-            v = victim.display()
-        ),
-    )?;
-    let out = h.run(&["sh", script.to_str().unwrap()])?;
-    let after = std::fs::read_to_string(&victim).unwrap_or_default();
-    let _ = std::fs::remove_file(&victim);
-    if sandbox_unavailable(&out) {
-        eprintln!("skip: sandbox not available on this host");
-        return Ok(());
-    }
-    let text = combined(&out);
-    assert!(
-        !text.contains("HOST_TMP_DATA"),
-        "LS-2: the child read a host file under /tmp:\n{text}"
-    );
-    assert_eq!(
-        after, "HOST_TMP_DATA",
-        "LS-2: the child overwrote a host file under /tmp"
     );
     Ok(())
 }
