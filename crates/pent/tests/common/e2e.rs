@@ -118,6 +118,33 @@ pub fn skip_optional(test: &str, reason: &str) -> bool {
     false
 }
 
+/// Return true when pent can give the command its own PID namespace with
+/// its own `/proc`. Else print the skip reason for `test` and return false.
+///
+/// A container runtime hides a part of `/proc` with its own mounts, and the
+/// kernel then refuses a new `proc` mount (finding LS-3 in
+/// `docs/security/linux-sandbox.md`). Pent runs the command there without
+/// the PID namespace, and it says so. The protection is thus genuinely
+/// absent in a container, and a test of it cannot hold.
+///
+/// `PENT_REQUIRE_ALL_TESTS` does not make this skip a failure: the
+/// continuous integration runs the same tests in a container and outside
+/// one, and the test must prove the protection outside one. Use this
+/// function only for a test of the PID namespace or of the private `/proc`.
+#[cfg(target_os = "linux")]
+pub fn private_proc_ready(test: &str) -> bool {
+    let isolation = pent_sandbox::proc_isolation();
+    if isolation.is_private() {
+        return true;
+    }
+    eprintln!(
+        "SKIP (container) {test}: this host gives the command no private /proc, \
+         so the protection is absent here: {}",
+        isolation.warning_lines().join("; ")
+    );
+    false
+}
+
 /// The directories of one test.
 pub struct TestEnv {
     _dir: TempDir,

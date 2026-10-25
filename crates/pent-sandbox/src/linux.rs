@@ -28,6 +28,12 @@
 //! outlives the command. `unshare(CLONE_NEWPID)` does not move the caller,
 //! so the `pre_exec` hook forks twice; see [`fork_pid_namespace`].
 //!
+//! The two go together, and not every host gives them. In a container the
+//! kernel refuses a new `proc` mount, because the runtime hides a part of
+//! `/proc`. [`proc_isolation`] probes this one time before the first
+//! `unshare`. Where the answer is [`ProcIsolation::Shared`], pent runs the
+//! command without the PID namespace and names what the command can see.
+//!
 //! Watch mode (`SpawnMode::Watch`) creates the same three namespaces. It
 //! applies no Landlock, no overlay and no masks. The mount namespace holds
 //! the private directories and the mounts of the watch guard (see
@@ -498,6 +504,414 @@ pub fn check_user_namespaces() -> Result<(), SandboxError> {
                       profile for pent"
             .to_string(),
     })
+}
+
+// ── The private `/proc` of the child (finding LS-3) ────────────────────────
+
+/// The error number that the kernel gives when it refuses a new `proc`
+/// mount.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcDenial(i32);
+
+impl ProcDenial {
+    /// The error of the mount that the kernel refused.
+    #[must_use]
+    pub fn error(self) -> std::io::Error {
+        std::io::Error::from_raw_os_error(self.0)
+    }
+
+    /// The name of the error number.
+    #[must_use]
+    fn name(self) -> Option<&'static str> {
+        match self.0 {
+            libc::EPERM => Some("EPERM"),
+            libc::EACCES => Some("EACCES"),
+            libc::EINVAL => Some("EINVAL"),
+            libc::ENOSYS => Some("ENOSYS"),
+            libc::ENOMEM => Some("ENOMEM"),
+            libc::EBUSY => Some("EBUSY"),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for ProcDenial {
+    /// Write the name of the error number, for example `EPERM`.
+    ///
+    /// The name, and not the message of the C library: a warning of pent
+    /// must not hold the words that the sandbox prints for a denied
+    /// access ("Operation not permitted"). A reader of the output, and a
+    /// test, looks for those words.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.name() {
+            Some(name) => write!(f, "{name}"),
+            None => write!(f, "error number {}", self.0),
+        }
+    }
+}
+
+/// The kind of `/proc` that the child can get on this host.
+///
+/// The child needs a new PID namespace **and** a new `proc` mount to see
+/// only the processes of the sandbox (finding LS-3 in
+/// `docs/security/linux-sandbox.md`). The kernel gives a new `proc` mount to
+/// a process that has no privilege on the host only when the mount namespace
+/// already holds a `proc` mount that hides nothing. The rule is
+/// `mount_too_revealing` in `fs/namespace.c`, and it looks at the mounts of
+/// the namespace, not at the target of the new mount.
+///
+/// A container runtime hides a part of `/proc` with its own mounts, for
+/// example on `/proc/acpi` and on `/proc/kcore`. Each inherited mount of a
+/// child user namespace is locked, so pent can neither remove such a mount
+/// nor move it away. The kernel then refuses a new `proc` mount with
+/// `EPERM`, at any target: a mount on a fresh empty directory and a move of
+/// it with `MS_MOVE` give the same error. Thus pent runs the command
+/// without the PID namespace there, and it names what the command can see
+/// (see [`ProcIsolation::warning_lines`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcIsolation {
+    /// The child gets its own PID namespace and its own `proc` mount.
+    Private,
+    /// The kernel refuses a new `proc` mount. The child keeps the PID
+    /// namespace and the `/proc` of this host.
+    Shared(ProcDenial),
+}
+
+impl ProcIsolation {
+    /// True when the child gets its own PID namespace and its own `/proc`.
+    #[must_use]
+    pub fn is_private(self) -> bool {
+        matches!(self, Self::Private)
+    }
+
+    /// The lines that name what the command can see when the protection is
+    /// absent. The list is empty when the child gets its own `/proc`.
+    ///
+    /// The caller prints one warning for each line.
+    #[must_use]
+    pub fn warning_lines(self) -> Vec<String> {
+        let Self::Shared(denial) = self else {
+            return Vec::new();
+        };
+        let mut lines = vec![format!(
+            "pent cannot give the command a private /proc: the kernel refuses the mount \
+             with {denial}"
+        )];
+        let hidden = hidden_proc_paths_here();
+        if hidden.is_empty() {
+            lines.push("the kernel of this host refuses a new proc mount".to_string());
+        } else {
+            lines.push(format!(
+                "a mount hides a part of /proc ({}), as a container runtime does",
+                short_list(&hidden)
+            ));
+        }
+        lines.push(
+            "thus the command keeps the PID namespace of this host and sees each process of it"
+                .to_string(),
+        );
+        lines.push(
+            "the command reads /proc/<pid>/cmdline of a neighbour, and a command line can hold \
+             a token"
+                .to_string(),
+        );
+        lines
+    }
+}
+
+/// Whether the mode of the spawn asks for a new PID namespace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PidNamespace {
+    /// The sandbox and watch mode ask for one.
+    Wanted,
+    /// A run without enforcement and without watch asks for none.
+    NotWanted,
+}
+
+/// The `unshare` flag for the PID namespace of the child.
+///
+/// The PID namespace and the private `proc` mount go together: a child in a
+/// new PID namespace that keeps the `/proc` of the host reads the PIDs of
+/// another namespace there, and that confuses each tool. Thus a host that
+/// gives no private `proc` mount gets no PID namespace either. See
+/// [`ProcIsolation`].
+fn pid_namespace_flag(wants: PidNamespace, isolation: ProcIsolation) -> libc::c_int {
+    if wants == PidNamespace::Wanted && isolation.is_private() {
+        libc::CLONE_NEWPID
+    } else {
+        0
+    }
+}
+
+/// Join up to three paths for a message.
+fn short_list(paths: &[String]) -> String {
+    const SHOWN: usize = 3;
+    let head = paths
+        .iter()
+        .take(SHOWN)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if paths.len() > SHOWN {
+        format!("{head} and more")
+    } else {
+        head
+    }
+}
+
+/// One line of `/proc/self/mountinfo`.
+struct MountLine<'a> {
+    /// The identifier of the mount.
+    id: &'a str,
+    /// The identifier of the parent mount.
+    parent: &'a str,
+    /// The mount point.
+    mount_point: &'a str,
+    /// The type of the filesystem.
+    fs_type: &'a str,
+}
+
+/// Read the fields of one line of `/proc/self/mountinfo`.
+///
+/// The line holds the identifier of the mount, the identifier of the parent
+/// mount, the device, the root, the mount point and the mount options. Then
+/// come optional fields, a `-`, the type of the filesystem and the source.
+fn parse_mount_line(line: &str) -> Option<MountLine<'_>> {
+    let (head, tail) = line.split_once(" - ")?;
+    let mut fields = head.split(' ');
+    let id = fields.next()?;
+    let parent = fields.next()?;
+    let _device = fields.next()?;
+    let _root = fields.next()?;
+    let mount_point = fields.next()?;
+    let fs_type = tail.split(' ').next()?;
+    Some(MountLine {
+        id,
+        parent,
+        mount_point,
+        fs_type,
+    })
+}
+
+/// The paths that another mount hides inside a `proc` mount.
+///
+/// `mountinfo` is the content of `/proc/self/mountinfo`. A mount whose
+/// parent is a `proc` mount hides the part of `/proc` at its mount point.
+/// This is the layout that makes the kernel refuse a new `proc` mount; see
+/// [`ProcIsolation`].
+///
+/// The kernel makes one exception that this function does not make: a mount
+/// on a directory that is permanently empty hides nothing. Thus the list can
+/// name one path more than the kernel counts. The list is a message for the
+/// user, and [`proc_isolation`] gives the answer.
+fn hidden_proc_paths(mountinfo: &str) -> Vec<String> {
+    let lines: Vec<MountLine<'_>> = mountinfo.lines().filter_map(parse_mount_line).collect();
+    let proc_ids: Vec<&str> = lines
+        .iter()
+        .filter(|m| m.fs_type == "proc")
+        .map(|m| m.id)
+        .collect();
+    let mut out: Vec<String> = lines
+        .iter()
+        .filter(|m| proc_ids.contains(&m.parent))
+        .map(|m| m.mount_point.to_string())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The paths that another mount hides inside the `/proc` of this host.
+fn hidden_proc_paths_here() -> Vec<String> {
+    std::fs::read_to_string("/proc/self/mountinfo")
+        .map(|text| hidden_proc_paths(&text))
+        .unwrap_or_default()
+}
+
+/// How many times [`probe_proc_isolation`] forked. The cache must make it
+/// run one time for the life of the process.
+#[cfg(test)]
+static PROBE_RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Ask whether the kernel gives the child its own PID namespace and its own
+/// `/proc` on this host.
+///
+/// The answer comes from one probe, and the probe runs one time for the life
+/// of the process.
+///
+/// The question must have an answer **before** the real child unshares. A
+/// process cannot leave a PID namespace, and the `/proc` that it inherits
+/// then names the processes of another namespace, which confuses each tool
+/// that reads it.
+#[must_use]
+pub fn proc_isolation() -> ProcIsolation {
+    static ANSWER: std::sync::OnceLock<ProcIsolation> = std::sync::OnceLock::new();
+    *ANSWER.get_or_init(probe_proc_isolation)
+}
+
+/// Probe whether a new `proc` mount works on this host.
+///
+/// The probe forks a short-lived child, as [`check_user_namespaces`] does.
+/// The child unshares a user namespace, a mount namespace and a PID
+/// namespace, writes the identity maps, and forks again: only a child of
+/// the process that unshares is in the new PID namespace. The grandchild
+/// makes its mount tree private and mounts a new `proc` over `/proc`. The
+/// exit status carries the answer: 0 for a mount that works, else the error
+/// number of the step that failed.
+///
+/// Each mount of the probe lives in the mount namespace of the grandchild,
+/// which the kernel removes with it. The probe changes nothing on the host.
+fn probe_proc_isolation() -> ProcIsolation {
+    #[cfg(test)]
+    PROBE_RUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    // SAFETY: getuid/getgid have no preconditions.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+    // The maps come from the parent: after `fork` the child may only call
+    // async-signal-safe functions.
+    let uid_map = format!("{uid} {uid} 1\n").into_bytes();
+    let gid_map = format!("{gid} {gid} 1\n").into_bytes();
+
+    // SAFETY: the child of the fork calls only async-signal-safe system
+    // calls (see `probe_child`), so the fork is safe in a multithreaded
+    // process.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return ProcIsolation::Shared(ProcDenial(errno_now()));
+    }
+    if pid == 0 {
+        let code = probe_child(&uid_map, &gid_map);
+        // SAFETY: _exit(2) ends the child without the atexit handlers of
+        // the parent.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe { libc::_exit(code) };
+    }
+    match wait_for_code(pid) {
+        Ok(0) => ProcIsolation::Private,
+        Ok(code) => ProcIsolation::Shared(ProcDenial(code)),
+        Err(errno) => ProcIsolation::Shared(ProcDenial(errno)),
+    }
+}
+
+/// The error number of the last system call, or `EPERM` when the error
+/// carries none.
+fn errno_now() -> i32 {
+    std::io::Error::last_os_error()
+        .raw_os_error()
+        .unwrap_or(libc::EPERM)
+}
+
+/// An error number that fits in an exit code.
+fn exit_code_of_errno() -> libc::c_int {
+    errno_now() & 0xff
+}
+
+/// Wait for `pid` and return its exit code.
+///
+/// # Errors
+/// Returns the error number of the `waitpid` that failed, or `EPERM` when a
+/// signal ended the child.
+fn wait_for_code(pid: libc::pid_t) -> Result<libc::c_int, i32> {
+    let mut status: libc::c_int = 0;
+    loop {
+        // SAFETY: waitpid(2) on our own child with a valid status pointer.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let ret = unsafe { libc::waitpid(pid, &raw mut status, 0) };
+        if ret == pid {
+            break;
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::Interrupted {
+            return Err(err.raw_os_error().unwrap_or(libc::EPERM));
+        }
+    }
+    if libc::WIFEXITED(status) {
+        Ok(libc::WEXITSTATUS(status))
+    } else {
+        Err(libc::EPERM)
+    }
+}
+
+/// The steps of the probe in the short-lived child. Returns the exit code:
+/// 0 for a private `/proc`, else an error number.
+///
+/// Async-signal-safe. The function writes no message: the caller reports the
+/// answer one time, with [`ProcIsolation::warning_lines`].
+fn probe_child(uid_map: &[u8], gid_map: &[u8]) -> libc::c_int {
+    if prepare_caps_for_userns().is_err() {
+        return exit_code_of_errno();
+    }
+    // SAFETY: unshare(2) with integer flags.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let unshared =
+        unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS | libc::CLONE_NEWPID) == 0 };
+    if !unshared {
+        return exit_code_of_errno();
+    }
+    // The same three writes as `setup_userns_mappings`, without its
+    // messages.
+    if write_proc_file(c"/proc/self/setgroups", b"deny").is_err()
+        || write_proc_file(c"/proc/self/gid_map", gid_map).is_err()
+        || write_proc_file(c"/proc/self/uid_map", uid_map).is_err()
+    {
+        return exit_code_of_errno();
+    }
+    // SAFETY: the child of this fork calls only async-signal-safe system
+    // calls (see `probe_proc_mount`).
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return exit_code_of_errno();
+    }
+    if pid == 0 {
+        let code = probe_proc_mount();
+        // SAFETY: _exit(2) ends the grandchild at once.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe { libc::_exit(code) };
+    }
+    match wait_for_code(pid) {
+        Ok(code) => code,
+        Err(errno) => errno & 0xff,
+    }
+}
+
+/// Mount a new `proc` over `/proc`, as [`MountPlan::apply`] does. Returns 0
+/// or the error number. Async-signal-safe.
+fn probe_proc_mount() -> libc::c_int {
+    // Make the tree private, as the real child does. The result does not
+    // change the answer: after `unshare(CLONE_NEWUSER | CLONE_NEWNS)` each
+    // inherited mount is a slave already, so no mount of the probe reaches
+    // the host.
+    // SAFETY: mount(2) with static NUL-terminated strings.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let _ignored = unsafe {
+        libc::mount(
+            c"none".as_ptr(),
+            c"/".as_ptr(),
+            std::ptr::null(),
+            libc::MS_REC | libc::MS_PRIVATE,
+            std::ptr::null(),
+        )
+    };
+    // SAFETY: mount(2) with static NUL-terminated strings. The flags are
+    // the flags of the real mount, because the kernel compares them with
+    // the flags of the `proc` mount that the namespace already holds.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let ret = unsafe {
+        libc::mount(
+            c"proc".as_ptr(),
+            c"/proc".as_ptr(),
+            c"proc".as_ptr(),
+            libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+            std::ptr::null(),
+        )
+    };
+    if ret == 0 {
+        0
+    } else {
+        exit_code_of_errno()
+    }
 }
 
 /// Add all filesystem rules for `config` to `ruleset`.
@@ -2602,11 +3016,22 @@ pub(crate) fn spawn_linux(
     // and `SECCOMP_IOCTL_NOTIF_RECV` names the task in the namespace of
     // the reader, so an orphan that PID 1 of the sandbox adopts keeps its
     // events. Only the end differs; see `Orphans`.
-    let pid_flag = if enforce || watch {
-        libc::CLONE_NEWPID
-    } else {
-        0
-    };
+    //
+    // The namespace needs the private `proc` mount: a child in a new PID
+    // namespace with the `/proc` of the host sees the PIDs of another
+    // namespace, which confuses each tool that reads it. Thus the two go
+    // together, and the probe answers before the `unshare`. In a container
+    // the kernel refuses the mount, and pent then runs the command without
+    // the protection and names what the command can see; see
+    // [`ProcIsolation`].
+    let pid_flag = pid_namespace_flag(
+        if enforce || watch {
+            PidNamespace::Wanted
+        } else {
+            PidNamespace::NotWanted
+        },
+        proc_isolation(),
+    );
     let orphans = if watch { Orphans::Wait } else { Orphans::End };
     let unshare_flags = if enforce || watch {
         libc::CLONE_NEWUSER | libc::CLONE_NEWNS | net_flag | pid_flag
@@ -2883,6 +3308,197 @@ mod tests {
     #[test]
     fn test_min_landlock_abi() {
         assert_eq!(MIN_LANDLOCK_ABI, 3);
+    }
+
+    // ========================================================================
+    // The private `/proc` of the child (finding LS-3)
+    // ========================================================================
+
+    /// The mount table of a plain host: one `proc` mount and nothing in it.
+    const HOST_MOUNTINFO: &str = "\
+23 28 0:22 / /proc rw,nosuid,nodev,noexec,relatime shared:12 - proc proc rw
+24 28 0:23 / /sys rw,nosuid,nodev,noexec,relatime shared:7 - sysfs sysfs rw
+25 28 0:5 / /dev rw,nosuid shared:2 - devtmpfs devtmpfs rw,size=1622056k
+28 1 0:21 / / rw,relatime shared:1 - tmpfs none rw
+";
+
+    /// The mount table inside a container. The runtime hides `/proc/acpi`
+    /// with a tmpfs and `/proc/kcore` with a bind mount of `/dev/null`.
+    /// This layout makes the kernel refuse a new `proc` mount.
+    const CONTAINER_MOUNTINFO: &str = "\
+875 307 0:35 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw
+888 875 0:107 / /proc/acpi rw,relatime - tmpfs tmpfs rw,size=16k
+889 875 0:7 /null /proc/kcore rw,nosuid - devtmpfs devtmpfs rw,size=1622056k
+890 875 0:7 /null /proc/keys rw,nosuid - devtmpfs devtmpfs rw,size=1622056k
+307 1 0:36 / / rw,relatime - overlay overlay rw
+";
+
+    #[test]
+    fn a_plain_host_hides_no_part_of_proc() {
+        assert!(hidden_proc_paths(HOST_MOUNTINFO).is_empty());
+    }
+
+    #[test]
+    fn a_container_hides_the_masked_paths_of_proc() {
+        assert_eq!(
+            hidden_proc_paths(CONTAINER_MOUNTINFO),
+            vec![
+                "/proc/acpi".to_string(),
+                "/proc/kcore".to_string(),
+                "/proc/keys".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_mount_below_another_filesystem_is_not_a_hidden_part_of_proc() {
+        // The parent of the tmpfs is the root mount, not the `proc` mount,
+        // so the path is not inside `/proc`.
+        let layout = "\
+23 28 0:22 / /proc rw,relatime - proc proc rw
+30 28 0:40 / /var/tmp rw,relatime - tmpfs tmpfs rw
+28 1 0:21 / / rw,relatime - tmpfs none rw
+";
+        assert!(hidden_proc_paths(layout).is_empty());
+    }
+
+    #[test]
+    fn a_line_without_the_separator_does_not_stop_the_reader() {
+        let layout = format!("this line has no separator\n{CONTAINER_MOUNTINFO}");
+        assert_eq!(hidden_proc_paths(&layout).len(), 3);
+    }
+
+    #[test]
+    fn the_mount_step_follows_the_answer_of_the_probe() {
+        let shared = ProcIsolation::Shared(ProcDenial(libc::EPERM));
+        // The sandbox and watch mode ask for the namespace. They get it
+        // only where the kernel gives the private `proc` mount with it.
+        assert_eq!(
+            pid_namespace_flag(PidNamespace::Wanted, ProcIsolation::Private),
+            libc::CLONE_NEWPID
+        );
+        assert_eq!(pid_namespace_flag(PidNamespace::Wanted, shared), 0);
+        // A run without enforcement never gets the namespace.
+        assert_eq!(
+            pid_namespace_flag(PidNamespace::NotWanted, ProcIsolation::Private),
+            0
+        );
+        assert_eq!(pid_namespace_flag(PidNamespace::NotWanted, shared), 0);
+    }
+
+    #[test]
+    fn a_private_proc_makes_no_warning() {
+        assert!(ProcIsolation::Private.warning_lines().is_empty());
+    }
+
+    #[test]
+    fn a_shared_proc_names_what_the_command_can_see() {
+        let lines = ProcIsolation::Shared(ProcDenial(libc::EPERM)).warning_lines();
+        let text = lines.join("\n");
+        assert!(
+            text.contains("private /proc"),
+            "the warning must name the protection:\n{text}"
+        );
+        assert!(
+            text.contains("EPERM"),
+            "the warning must name the error of the kernel:\n{text}"
+        );
+        // The words of a denied access must not appear: a reader of the
+        // output, and a test, looks for them.
+        assert!(
+            !text.contains("Operation not permitted"),
+            "the warning must not read like a denied access:\n{text}"
+        );
+        assert!(
+            text.contains("PID namespace of this host"),
+            "the warning must say which processes the command sees:\n{text}"
+        );
+        assert!(
+            text.contains("/proc/<pid>/cmdline"),
+            "the warning must name the file that leaks:\n{text}"
+        );
+        // Each line is short enough for one warning of the terminal.
+        for line in &lines {
+            assert!(line.len() <= 100, "the line is too long: {line}");
+        }
+    }
+
+    #[test]
+    fn the_short_list_names_three_paths_and_counts_the_rest() {
+        let four = vec![
+            "/proc/a".to_string(),
+            "/proc/b".to_string(),
+            "/proc/c".to_string(),
+            "/proc/d".to_string(),
+        ];
+        assert_eq!(short_list(&four), "/proc/a, /proc/b, /proc/c and more");
+        assert_eq!(short_list(&four[..2]), "/proc/a, /proc/b");
+        assert_eq!(short_list(&[]), "");
+    }
+
+    /// The children of the thread that runs this test.
+    ///
+    /// `/proc/self/task/<tid>/children` names only the children of one
+    /// thread, so another test that spawns a process does not appear here.
+    fn children_of_this_thread() -> Option<String> {
+        // SAFETY: gettid(2) has no preconditions.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let tid = unsafe { libc::gettid() };
+        std::fs::read_to_string(format!("/proc/self/task/{tid}/children")).ok()
+    }
+
+    #[test]
+    #[serial]
+    fn the_probe_answers_and_leaves_no_process_behind() {
+        let Some(before) = children_of_this_thread() else {
+            eprintln!(
+                "SKIP the_probe_answers_and_leaves_no_process_behind: \
+                 this kernel has no /proc/<pid>/task/<tid>/children"
+            );
+            return;
+        };
+        assert!(
+            before.trim().is_empty(),
+            "the test starts with a child of its own thread: {before}"
+        );
+        let answer = probe_proc_isolation();
+        // The host of this test either gives the private `proc` mount or
+        // names the reason. Both answers are correct; the probe must not
+        // hang and must not leave a process.
+        match answer {
+            ProcIsolation::Private => {}
+            ProcIsolation::Shared(denial) => {
+                assert_ne!(
+                    denial.error().raw_os_error(),
+                    Some(0),
+                    "a refusal must carry an error number"
+                );
+            }
+        }
+        let after = children_of_this_thread().unwrap_or_default();
+        assert!(
+            after.trim().is_empty(),
+            "the probe left a process behind: {after}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn the_probe_costs_one_fork_for_the_life_of_the_process() {
+        use std::sync::atomic::Ordering;
+        // The answer comes from the cache after the first call, whichever
+        // test asked first.
+        let first = proc_isolation();
+        let runs = PROBE_RUNS.load(Ordering::SeqCst);
+        assert!(runs >= 1, "the first call must run the probe");
+        for _ in 0..5 {
+            assert_eq!(proc_isolation(), first, "the answer must not change");
+        }
+        assert_eq!(
+            PROBE_RUNS.load(Ordering::SeqCst),
+            runs,
+            "a later call must not fork again"
+        );
     }
 
     // ========================================================================

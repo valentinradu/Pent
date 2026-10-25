@@ -169,6 +169,27 @@ fn skip_without_sandbox() -> bool {
     true
 }
 
+/// Return true and print the reason when this host gives the command no
+/// private `/proc`.
+///
+/// A container runtime hides a part of `/proc`, and the kernel then refuses
+/// a new `proc` mount. Pent runs the command there without the PID
+/// namespace and says so, thus the protection of LS-3 is genuinely absent
+/// and a test of it cannot hold. `PENT_REQUIRE_ALL_TESTS` does not make
+/// this skip a failure: the same test must run and pass outside a
+/// container.
+fn skip_without_private_proc() -> bool {
+    let isolation = pent_sandbox::proc_isolation();
+    if isolation.is_private() {
+        return false;
+    }
+    eprintln!(
+        "SKIP (container): this host gives the command no private /proc: {}",
+        isolation.warning_lines().join("; ")
+    );
+    true
+}
+
 /// The path of `python3`, or `None` when it is not in `PATH`.
 fn python3() -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
@@ -622,7 +643,7 @@ fn test_workspace_under_tmp_still_works() -> TestResult {
 /// the sandbox.
 #[test]
 fn test_proc_cmdline_of_host_process_denied() -> TestResult {
-    if skip_without_sandbox() {
+    if skip_without_sandbox() || skip_without_private_proc() {
         return Ok(());
     }
     let Some(py) = python3() else {

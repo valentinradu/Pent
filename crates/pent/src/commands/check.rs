@@ -36,6 +36,22 @@ pub(crate) async fn check(cwd: PathBuf) -> Result<(), CliError> {
         }
     }
 
+    // The PID namespace and the private `/proc` go together, and a container
+    // does not give them. Their absence is not a failure of the check: the
+    // file rules and the network rules hold without them.
+    #[cfg(target_os = "linux")]
+    match pent_sandbox::proc_isolation() {
+        pent_sandbox::ProcIsolation::Private => {
+            ui::ok("pid namespace and private /proc");
+            ui::status("processes", "the command sees only its own processes");
+        }
+        isolation @ pent_sandbox::ProcIsolation::Shared(_) => {
+            for line in isolation.warning_lines() {
+                ui::warn(line);
+            }
+        }
+    }
+
     // 3. Proxy smoke-test
     let proxy_config = ProxyConfig::default();
     match ProxyServer::new(proxy_config) {

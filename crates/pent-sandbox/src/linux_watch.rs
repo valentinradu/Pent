@@ -3415,12 +3415,24 @@ mod tests {
 
     /// Watch mode gets the PID namespace and a private `proc`, so the
     /// program sees only the processes of the sandbox.
+    ///
+    /// A container gives neither: the runtime hides a part of `/proc`, and
+    /// the kernel then refuses a new `proc` mount. The test then skips,
+    /// because the protection is genuinely absent there. See
+    /// `linux::ProcIsolation`.
     #[test]
     #[serial]
     fn watch_proc_shows_only_the_sandbox() -> TestResult {
         let Some(s) = setup()? else {
             return Ok(());
         };
+        if !crate::linux::proc_isolation().is_private() {
+            eprintln!(
+                "skip (container): this host gives the program no private /proc, \
+                 so watch mode cannot hide the processes of the host"
+            );
+            return Ok(());
+        }
         let out = s.dir.join("procs");
         let script = format!("ls /proc > {}", out.display());
         let watched = crate::spawn_watched(
