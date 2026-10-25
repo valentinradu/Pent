@@ -764,13 +764,13 @@ const WATCH_REPORTED_OPERATIONS: &[&str] = &[
 /// (deny process-exec (regex "/sudo$"))
 /// ```
 ///
-/// Uncertain points (from memory; nobody tested them on a Mac yet):
+/// The run of 2026-10-25 on a Mac confirmed each of these points:
 ///
-/// - `(with report)` is a valid modifier on an `allow` rule. The author is
-///   not sure that `(allow default (with report))` is valid, so the profile
-///   keeps a plain `(allow default)` and adds one reported `allow` rule for
-///   each operation of interest. This also keeps the volume of reports
-///   small.
+/// - `(with report)` is a valid modifier on an `allow` rule, and the
+///   kernel writes one line of the unified log for each operation that
+///   such a rule allows. The profile keeps a plain `(allow default)` and
+///   adds one reported `allow` rule for each operation of interest, which
+///   keeps the volume of reports small.
 /// - The modifier comes after the filter. Apple profiles put `(with ...)`
 ///   before or after the filters.
 /// - When more than one rule matches an operation, the last rule wins. The

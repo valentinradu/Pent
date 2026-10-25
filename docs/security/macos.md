@@ -2,7 +2,32 @@
 
 Status: the suite ran on a Mac for the first time on 2026-10-25
 (`macos-latest`, run 40223858818). The section
-"What the first run told us" holds the results.
+"What the first run told us" holds the results. After the fixes of MAC-4,
+MAC-7, MAC-8 and MAC-9, each macOS suite is green on `macos-latest`
+(run 40228872762):
+
+| Suite | Result |
+|---|---|
+| `e2e_macos` | 15 passed, 2 ignored (MAC-4 `launchd`, MAC-10) |
+| `e2e_macos_network` | 4 passed |
+| `integration_test` (the thirteen tests of MAC-7) | 20 passed |
+| `pent-sandbox` unit and oracle tests | 112 passed |
+
+Three macOS failures stay, each one outside this work:
+
+- `parity_watch.rs` runs `cat ~/.foorc` in a child process, which MAC-10
+  loses. The one-line change of its `SCRIPT` constant to
+  `read -r l < ~/.foorc; echo "$l"` holds the same claim on both
+  platforms.
+- `profile_test.rs::test_profile_list_show_rm` runs `pent run -- claude`,
+  and the runner has no `claude`:
+  `sandbox-exec: execvp() of 'claude' failed: No such file or directory`.
+  The test needs the `skip_optional` guard that the other tests of a
+  program of another project use.
+- `pent-settings` `store::tests::remove_deletes_everything` reports
+  `Trusted` after a remove. The profile directory and the state directory
+  of macOS are not the two directories of Linux, so the remove misses one
+  of them.
 
 ## What this document is
 
@@ -174,7 +199,7 @@ items: MAC-7, MAC-8, MAC-9 and MAC-10.
 
 ### MAC-1 — the program forges its own events
 
-**Severity: high. Fixed on 2026-10-25; the fix never ran on a Mac.**
+**Severity: high. Fixed on 2026-10-25; the fix ran on a Mac.**
 
 **The attack.** `macos_log.rs` read the lines of `log stream` with the
 predicate `sender == "Sandbox" OR eventMessage CONTAINS ") deny(" OR
@@ -222,13 +247,14 @@ user is asked to trust.
 
 3. The filter by the process tree stays.
 
-4. The name of the process must fit the program that the PID runs. The poll
-   of the process tree reads `comm` for each PID, so the reader knows the
-   file of each PID and drops a report whose name does not fit that file.
-   This closes FUZZ-1 (`docs/security/fuzzing.md`), where the program
-   chooses its own name and puts a second marker in the line. A report of a
-   PID whose program the reader never read cannot be checked, so it goes
-   too.
+4. The name of the process must fit the program that the PID runs. The
+   reader has three sources of that name, and the program chooses none of
+   them: pent itself for the root process, the poll of the process table,
+   and the `process-exec` reports (MAC-8). The reader drops a report whose
+   name fits none of the names of the PID. This closes FUZZ-1
+   (`docs/security/fuzzing.md`), where the program chooses its own name and
+   puts a second marker in the line. A report of a PID whose program the
+   reader never read cannot be checked, so it goes too.
 
 **What a program can still do.** Watch mode reports each access of the
 program, so the program can put a path of its choice in the draft when it
@@ -236,13 +262,28 @@ really attempts the access (`cat /any/path` makes an allow report for that
 path). Both platforms work this way, and the user reads the draft before
 `pent trust`. This is the design of watch mode, not a forged event.
 
-**What a Mac must tell us.** Three facts of this fix come from the
-documentation and from memory, not from a run:
+**What a Mac told us.** Three facts of this fix came from the
+documentation and from memory. The run of 2026-10-25 confirmed each one:
 
 - the kernel has the process image path `/kernel` in the unified log;
 - `log --style syslog` writes the header ` kernel[0]: ` and then an
   optional `(<sender>) ` group;
 - the message of a report starts with `Sandbox: `.
+
+`log show --style syslog` writes one more group between the sender and the
+message, the subsystem of it:
+
+```text
+2026-10-25 19:18:13.145990+0000  localhost kernel[0]: (Sandbox) [com.apple.sandbox.reporting:violation] Sandbox: mediaremoted(91) allow file-read-data /Library/Audio/Plug-Ins/HAL/NullAudio.driver/Contents/Resources/en.lproj/Localizable.strings
+2026-10-25 19:18:13.145993+0000  localhost kernel[0]: (Sandbox) [com.apple.sandbox.reporting:violation] Sandbox: contextstored(124) deny(1) iokit-open-user-client AppleKeyStoreUserClient
+2026-10-25 19:18:13.147432+0000  localhost kernel[0]: (Sandbox) [com.apple.sandbox.reporting:violation] 3 duplicate reports for Sandbox: contextstored(124) deny(1) iokit-open-user-client AppleKeyStoreUserClient
+```
+
+The reader uses `log stream`, whose lines `parse_line` reads. Two forms of
+the text above are new, and a reader of `log show` would need them: the
+subsystem group, and the `N duplicate reports for ` prefix of a repeated
+report. The allow form also has no `(<count>)` part, which `parse_line`
+already accepts.
 
 If one of them is wrong, the reader gets no event at all, and
 `watch_records_a_read_of_a_known_file` fails. The fix of such a failure is
@@ -252,7 +293,7 @@ compare one real line with the shape above.
 
 ### MAC-2 — the guard misses the suffix key patterns
 
-**Severity: high. Fixed on 2026-10-25; the fix never ran on a Mac.**
+**Severity: high. Fixed on 2026-10-25; the fix ran on a Mac.**
 
 `pent_profile::SSH_KEY_PATTERNS` holds `id_`, `*_rsa`, `*_dsa`, `*_ecdsa`,
 `*_ed25519`, `*_key`, `*.pem` and `*.key`. `name_matches` reads a leading
@@ -289,7 +330,7 @@ and the generator writes none.
 ### MAC-3 — the guard covers only the direct children
 
 **Severity: high (the review said medium; a key in `~/.ssh/work/` is as
-sensitive as a key in `~/.ssh/`). Fixed on 2026-10-25; the fix never ran on
+sensitive as a key in `~/.ssh/`). Fixed on 2026-10-25; the fix ran on
 a Mac.**
 
 `GuardTarget::FilesInDir` matches a file at any depth below the directory,
@@ -409,7 +450,7 @@ filesystem sandbox stops an accident, not an attack.
 
 ### MAC-5 — the log reader trusts the lines that it reads
 
-**Severity: low on its own. Fixed with MAC-1; the fix never ran on a Mac.**
+**Severity: low on its own. Fixed with MAC-1; the fix ran on a Mac.**
 
 The reader takes the path of each event from the text of the log line. With
 the guards of MAC-1, the kernel writes each line that the reader accepts, so

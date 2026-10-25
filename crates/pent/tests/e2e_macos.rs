@@ -8,11 +8,12 @@
 //!
 //! # What these tests prove
 //!
-//! The macOS backend of pent never ran before this suite. Each test holds
-//! one claim that the README or `docs/design/watch.md` makes about macOS.
-//! A test that passes keeps the claim honest. A test that fails tells us
-//! that the claim is wrong. `docs/security/macos.md` lists the claims and
-//! the test of each one.
+//! The macOS backend of pent never ran before this suite. It ran on a Mac
+//! for the first time on 2026-10-25. Each test holds one claim that the
+//! README or `docs/design/watch.md` makes about macOS. A test that passes
+//! keeps the claim honest. A test that fails tells us that the claim is
+//! wrong. `docs/security/macos.md` lists the claims, the test of each one,
+//! and the results of the first run.
 //!
 //! # Requirements
 //!
@@ -396,11 +397,13 @@ mod macos {
 
     /// A watch run produces events at all.
     ///
-    /// This is the single most important unknown of the macOS backend. The
-    /// watch profile allows each operation with `(with report)` and the
-    /// reader takes the reports from `log stream`. Nobody saw an allow
-    /// report on a Mac. If the reports do not arrive, this test fails and
-    /// every other watch test on macOS fails with it.
+    /// This was the single most important unknown of the macOS backend.
+    /// The watch profile allows each operation with `(with report)` and
+    /// the reader takes the reports from `log stream`. The first run on a
+    /// Mac proved that the reports do arrive and that `parse_line` reads
+    /// them; the reader dropped them because it knew no name for the
+    /// process (MAC-8). If this test fails, every other watch test on
+    /// macOS fails with it.
     #[test]
     fn watch_records_a_read_of_a_known_file() -> TestResult {
         if !ready("watch_records_a_read", &["/bin/cat"]) {
