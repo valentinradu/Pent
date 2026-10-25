@@ -43,11 +43,15 @@
 //! cannot tell this line from a real report of a path that holds the text
 //! of a marker.
 //!
-//! Guard 4 uses three sources that the program does not choose:
+//! Guard 4 uses four sources that the program does not choose:
 //!
 //! - Pent itself. It starts the root process, so it knows the two names of
 //!   that process: `sandbox-exec` and the command
 //!   ([`ProcessTree::with_names`]).
+//! - The `kqueue` watcher. The kernel reports each `fork` of the tree at
+//!   the time of the `fork`, and `fork(2)` copies the name of the program,
+//!   so a new child starts with the names of its parent
+//!   ([`ProcessTree::learn_fork`] and `crate::macos_kqueue`).
 //! - The process table. The poll of the tree reads `comm` for each PID, so
 //!   the reader knows the file that each PID runs.
 //! - The exec reports. The kernel writes the path of the program in each
@@ -69,11 +73,11 @@
 //!
 //! What the check does not hold:
 //!
-//! - A descendant that exits and that its parent reaps between two polls
-//!   never reaches the process table, and pent knows no name of it, so its
-//!   reports go. The root process is safe, because pent knows its names.
-//!   macOS watch mode is a lower bound for this reason; `--append` merges
-//!   more runs. See MAC-8 in `docs/security/macos.md`.
+//! - A descendant whose parent is not a member of the tree. The watcher
+//!   follows the tree from pent itself, so each member has a parent in it;
+//!   a process that `launchd` starts for the child does not. Such a
+//!   process is outside the sandbox, and the profile of `pent run` denies
+//!   the two routes to it (MAC-4).
 //! - A file name whose first 16 bytes are the whole name of the record and
 //!   whose rest holds a marker is refused, also when it is honest. Such a
 //!   name is a forgery or a name that nobody needs.
@@ -448,6 +452,32 @@ impl ProcessTree {
         }
     }
 
+    /// Record that `parent` forked `pid`.
+    ///
+    /// The source is the `kqueue` watcher
+    /// (`crate::macos_kqueue::ProcWatcher`), which the kernel feeds at the
+    /// time of the `fork`. A child that lives less than one poll interval
+    /// thus reaches the tree too (MAC-10 in `docs/security/macos.md`).
+    ///
+    /// `fork(2)` copies `p_comm`, so the child runs the program of its
+    /// parent until it runs a new file. The names of the parent are
+    /// therefore the names of the child, and
+    /// [`ProcessTree::learn_exec`] adds the name of the new file after an
+    /// exec. Both sources come from the kernel, so FUZZ-1 stays closed.
+    ///
+    /// A `fork` of a process that is not a member of the tree adds
+    /// nothing: pent follows its own process, so it also sees the forks
+    /// of `ps` and of `log stream`.
+    pub(crate) fn learn_fork(&mut self, pid: u32, parent: u32) {
+        if !self.known.contains(&parent) {
+            return;
+        }
+        self.known.insert(pid);
+        if let Some(names) = self.names.get(&parent).cloned() {
+            self.names.entry(pid).or_default().extend(names);
+        }
+    }
+
     /// Record that `pid` runs the program `name` from now on.
     ///
     /// The source is an accepted `process-exec` report: the kernel writes
@@ -556,6 +586,7 @@ mod runtime {
     use pent_profile::WatchEvent;
 
     use super::{file_name_of, parse_line, parse_ps_output, to_event, ProcessTree, RecordMode};
+    use crate::macos_kqueue::{ProcEvent, ProcWatcher};
     use crate::SandboxError;
 
     /// The time to wait for `log stream` to print its header.
@@ -586,19 +617,52 @@ mod runtime {
     /// `log stream --predicate 'processImagePath == "/kernel"' --style syslog`.
     const PREDICATE: &str = r#"processImagePath == "/kernel" AND (sender == "Sandbox" OR eventMessage BEGINSWITH "Sandbox: ")"#;
 
-    /// The process tree and the time of its last refresh.
+    /// The process tree, the watcher of the kernel and the time of the
+    /// last refresh.
     struct Tree {
         tree: ProcessTree,
+        /// The `kqueue` watcher, which reports each `fork` of the tree at
+        /// the time of the `fork`. `None` when the kernel refused the
+        /// filter; the poll of the process table is then the only source,
+        /// and it misses a short-lived process (MAC-10).
+        watcher: Option<ProcWatcher>,
         last_refresh: Option<Instant>,
     }
 
     impl Tree {
+        /// Apply each event that the watcher has ready.
+        ///
+        /// The call never waits, and the kernel keeps an event until a
+        /// read, so a drain after the process is gone still holds its
+        /// `fork`.
+        fn drain_forks(&mut self) {
+            let Some(events) = self.watcher.as_ref().map(ProcWatcher::drain) else {
+                return;
+            };
+            for event in events {
+                match event {
+                    ProcEvent::Fork { pid, parent } => self.tree.learn_fork(pid, parent),
+                    // The exec has no path, so the name comes from the
+                    // `process-exec` report of the log. The exit does not
+                    // change the tree: the poll owns the liveness, and it
+                    // waits for the drain time of the log.
+                    ProcEvent::Exec { .. } | ProcEvent::Exit { .. } => {}
+                    ProcEvent::TrackError { pid } => tracing::debug!(
+                        pid,
+                        "the kernel could not follow a child; the record can \
+                         miss its accesses"
+                    ),
+                }
+            }
+        }
+
         /// Read the process table and update the tree. Return true if a
         /// member is still live.
         ///
         /// If `ps` fails, keep the tree and return true: the poll tries
         /// again, and the drain does not start too early.
         fn refresh(&mut self) -> bool {
+            self.drain_forks();
             self.last_refresh = Some(Instant::now());
             match Command::new("/bin/ps")
                 .args(["-A", "-o", "pid=,ppid=,stat=,comm="])
@@ -621,6 +685,9 @@ mod runtime {
         /// process can be new, or it can have run a new file after the
         /// last poll.
         fn accepts(&mut self, pid: u32, name: &str) -> bool {
+            // The forks first: they cost one system call and they give
+            // each new process, also one that no poll ever saw.
+            self.drain_forks();
             if self.tree.contains(pid) && self.tree.name_fits(pid, name) {
                 return true;
             }
@@ -647,14 +714,25 @@ mod runtime {
     pub(crate) struct LogReader {
         log_proc: Option<Child>,
         lines: Option<Receiver<String>>,
+        /// The watcher of the process tree. [`LogReader::start`] makes it
+        /// before the spawn of the child, so that no `fork` of the run
+        /// happens before the kernel has the filter (MAC-10).
+        watcher: Option<ProcWatcher>,
     }
 
     impl LogReader {
-        /// Start `log stream` and wait until it prints its header.
+        /// Start `log stream`, wait until it prints its header, and follow
+        /// the process tree of pent with `kqueue`.
         ///
         /// Start the reader before the child, so that the log does not miss
         /// the first reports. A small race stays: `log stream` prints its
         /// header just before it connects to the log.
+        ///
+        /// The watcher follows pent itself, so the spawn of the child is
+        /// already a `fork` that the kernel reports. The caller must thus
+        /// call this function before it spawns the child. A kernel that
+        /// refuses the filter leaves the poll of the process table as the
+        /// only source of the tree, with a warning.
         ///
         /// # Errors
         /// Returns `SandboxUnavailable` if `log stream` cannot start or stops
@@ -664,6 +742,19 @@ mod runtime {
                 reason,
                 remediation: "Make sure that /usr/bin/log works (run `log stream` in a terminal)"
                     .to_string(),
+            };
+            // The filter must be in place before the first `fork` of the
+            // run, which is the spawn of the child below.
+            let watcher = match ProcWatcher::new(std::process::id()) {
+                Ok(watcher) => Some(watcher),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "the record can miss the accesses of a process that \
+                         lives less than 100 ms"
+                    );
+                    None
+                }
             };
             let mut log_proc = Command::new("/usr/bin/log")
                 .args([
@@ -708,6 +799,7 @@ mod runtime {
             Ok(Self {
                 log_proc: Some(log_proc),
                 lines: Some(rx),
+                watcher,
             })
         }
 
@@ -736,6 +828,7 @@ mod runtime {
             };
             let tree = Arc::new(Mutex::new(Tree {
                 tree: ProcessTree::with_names(root_pid, root_names),
+                watcher: self.watcher.take(),
                 last_refresh: None,
             }));
 
@@ -1194,6 +1287,31 @@ mod tests {
         let _live = tree.update(&parse_ps_output("10 1 S /bin/zsh\n"));
         assert!(tree.name_fits(10, "zsh"));
         assert!(tree.name_fits(10, "bash"));
+    }
+
+    /// MAC-10. The `kqueue` watcher reports a `fork` at the time of the
+    /// `fork`, so a child that no poll of `ps` ever sees is a member of
+    /// the tree, with the names of its parent.
+    #[test]
+    fn a_fork_gives_the_child_the_names_of_the_parent() {
+        let names = ["sandbox-exec".to_string(), "sh".to_string()];
+        let mut tree = ProcessTree::with_names(10, &names);
+        tree.learn_fork(11, 10);
+        assert!(tree.contains(11), "the child must be a member of the tree");
+        assert!(tree.name_fits(11, "sh"), "fork(2) copies the name");
+        assert!(tree.name_fits(11, "sandbox-exec"));
+        // The exec report of the child then adds the new name.
+        tree.learn_exec(11, "cat");
+        assert!(tree.name_fits(11, "cat"));
+        // A grandchild of the child follows the same way.
+        tree.learn_fork(12, 11);
+        assert!(tree.name_fits(12, "cat"));
+        // A fork of a process outside the tree adds nothing. Pent follows
+        // its own process, so it also sees the forks of `ps`.
+        tree.learn_fork(21, 20);
+        assert!(!tree.contains(21));
+        // A name that the program chose for its own file does not fit.
+        assert!(!tree.name_fits(11, "evil"));
     }
 
     #[test]

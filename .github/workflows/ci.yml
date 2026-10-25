@@ -78,74 +78,24 @@ jobs:
       - name: Build
         run: cargo build --workspace --tests
 
-      # TEMPORARY (step 0 of the work on MAC-4 and MAC-10). The step
-      # measures three things that only a Mac can answer:
-      #
-      # 1. Does `launchctl submit` run a job on this runner at all? The
-      #    test of MAC-4 proves nothing without that control.
-      # 2. Which Mach services does an ordinary program look up? The
-      #    answer is the allowlist of `(deny mach-lookup)`.
-      # 3. Does `(deny job-creation)` compile, and does it stop the job?
-      #
-      # The step never fails, so the job stays green and the log holds the
-      # answers. Remove this step when the findings have a verdict.
+      # TEMPORARY. The step runs the three tests of MAC-4, MAC-10 and
+      # DIFF-9 alone and prints the result of each one. The step never
+      # fails, so the log holds the answer also when the suite is red.
+      # Remove this step when the three findings have a verdict.
       - name: Probe the open macOS findings
         if: runner.os == 'macOS'
         run: |
           set +e
-          out=$(mktemp -d)
-          echo "=== P1 launchctl submit outside the sandbox ==="
-          l1="pent-probe-out-$$"
-          /bin/launchctl submit -l "$l1" -- /bin/sh -c "touch '$out/p1'"
-          echo "submit exit=$?"
-          sleep 3
-          /bin/launchctl remove "$l1"; echo "remove exit=$?"
-          if [ -e "$out/p1" ]; then echo "P1: launchd RAN the job"; else echo "P1: launchd ran NO job"; fi
-
-          echo "=== P2 launchctl submit under (allow default) ==="
-          l2="pent-probe-allow-$$"
-          /usr/bin/sandbox-exec -p '(version 1)(allow default)' /bin/sh -c \
-            "/bin/launchctl submit -l $l2 -- /bin/sh -c \"touch '$out/p2'\""
-          echo "exit=$?"
-          sleep 3
-          /bin/launchctl remove "$l2" 2>/dev/null
-          if [ -e "$out/p2" ]; then echo "P2: launchd RAN the job"; else echo "P2: launchd ran NO job"; fi
-
-          echo "=== P3 does (deny job-creation) compile ==="
-          /usr/bin/sandbox-exec -p '(version 1)(allow default)(deny job-creation)' /usr/bin/true
-          echo "P3 exit=$?"
-
-          echo "=== P4 launchctl submit under (deny job-creation) ==="
-          l4="pent-probe-job-$$"
-          /usr/bin/sandbox-exec -p '(version 1)(allow default)(deny job-creation)' /bin/sh -c \
-            "/bin/launchctl submit -l $l4 -- /bin/sh -c \"touch '$out/p4'\""
-          echo "exit=$?"
-          sleep 3
-          /bin/launchctl remove "$l4" 2>/dev/null
-          if [ -e "$out/p4" ]; then echo "P4: launchd RAN the job"; else echo "P4: launchd ran NO job"; fi
-
-          echo "=== P5 does (deny mach-lookup) compile, and does a shell run ==="
-          /usr/bin/sandbox-exec -p '(version 1)(allow default)(deny mach-lookup)' /bin/sh -c 'echo P5_SHELL_RAN'
-          echo "P5 exit=$?"
-
-          echo "=== P6 an ordinary program under (deny mach-lookup) ==="
-          start=$(date -u +%Y-%m-%d\ %H:%M:%S)
-          /usr/bin/sandbox-exec -p '(version 1)(allow default)(deny mach-lookup)' /bin/sh -c \
-            'echo P6_RAN; /usr/bin/id; /bin/ls / >/dev/null; echo P6_LS=$?; /usr/bin/curl -s -o /dev/null -m 20 https://example.com; echo P6_CURL=$?; /usr/bin/python3 -c "import socket;print(socket.gethostbyname(\"example.com\"))"; echo P6_DNS=$?'
-          echo "P6 exit=$?"
-          sleep 2
-
-          echo "=== P7 the mach-lookup denials of P5 and P6 ==="
-          /usr/bin/log show --style syslog --start "$start" \
-            --predicate 'processImagePath == "/kernel"' 2>/dev/null \
-            | grep -o 'deny(1) mach-lookup .*' | sort | uniq -c | sort -rn
-          echo "=== P7 end ==="
-
-          echo "=== P8 every denial of P5 and P6, by operation ==="
-          /usr/bin/log show --style syslog --start "$start" \
-            --predicate 'processImagePath == "/kernel"' 2>/dev/null \
-            | grep -o ') deny(1) [a-z0-9-]*' | sort | uniq -c | sort -rn
-          echo "=== P8 end ==="
+          probe() {
+            echo "=== PROBE $2 ==="
+            cargo test -p pent --test "$1" -- --include-ignored --exact "$2" --nocapture
+            echo "=== PROBE RESULT $2: exit=$? ==="
+          }
+          probe e2e_macos macos::watch_records_a_read_of_a_short_lived_child
+          probe e2e_macos macos::the_child_cannot_start_a_program_through_launchd
+          probe e2e_macos macos::watch_records_a_read_of_a_known_file
+          probe e2e_macos macos::execute_flag_lets_the_child_run_a_tool
+          probe differential_guard guard_table::diff_9_a_suffix_pattern_on_macos
           exit 0
 
       # The whole workspace, in debug. The macOS suites (e2e_macos,
