@@ -380,12 +380,8 @@ fn test_watch_without_yes_needs_a_terminal() -> TestResult {
     Ok(())
 }
 
-/// `pent watch --yes` shows the banner. On Linux it needs no privilege: it
-/// records the run and writes a draft. Where pent has no recorder, it fails
-/// with a clear message and writes no draft.
-#[test]
-fn test_watch_yes_records_a_draft() -> TestResult {
-    let xdg = Xdg::new()?;
+/// Run `pent watch --yes -- true` in the XDG directories of `xdg`.
+fn watch_true(xdg: &Xdg) -> std::io::Result<(Output, tempfile::TempDir)> {
     let ws = tempfile::TempDir::new()?;
     let mut cmd = Command::new(PENT);
     let out = xdg
@@ -394,24 +390,57 @@ fn test_watch_yes_records_a_draft() -> TestResult {
         .current_dir(ws.path())
         .stdin(Stdio::null())
         .output()?;
+    Ok((out, ws))
+}
+
+/// `pent watch --yes` shows the banner. The banner comes before the
+/// recorder, thus this test needs no recorder and it runs on each machine.
+#[test]
+fn test_watch_yes_shows_the_banner() -> TestResult {
+    let xdg = Xdg::new()?;
+    let (out, _ws) = watch_true(&xdg)?;
     let err = stderr(&out);
     assert!(
         err.starts_with("pent watch: true\n  Watch mode does not sandbox"),
         "{err}"
     );
     assert!(!err.contains("panicked"), "{err}");
-    if out.status.success() {
-        assert!(xdg.draft_path("true").exists(), "{err}");
-    } else {
-        // A host without user namespaces cannot run the recorder.
-        assert!(
-            err.contains("✗ pent watch is not available on this platform yet")
-                || err.contains("user namespace")
-                || err.contains("unshare"),
-            "{err}"
-        );
-        assert!(!xdg.draft_path("true").exists());
+    Ok(())
+}
+
+/// `pent watch --yes` records the run and writes a draft.
+///
+/// The guard probes the host with `pent check` and one sandboxed run (see
+/// `common::e2e::sandbox_ready`). When the probe works, the recorder must
+/// work too: a failure of the recorder is a defect, not a skip.
+#[test]
+fn test_watch_yes_records_a_draft() -> TestResult {
+    let test = "test_watch_yes_records_a_draft";
+    if !common::e2e::sandbox_ready(test) {
+        return Ok(());
     }
+    let xdg = Xdg::new()?;
+    let (out, _ws) = watch_true(&xdg)?;
+    let err = stderr(&out);
+    expect_success(&out);
+    let path = xdg.draft_path("true");
+    assert!(
+        path.exists(),
+        "pent watch wrote no draft at {path:?}: {err}"
+    );
+    let draft = fs::read_to_string(&path)?;
+    // `true` touches nothing, so the draft has no rule. It must still name
+    // the program and the run, and it must parse. The rules of a recorded
+    // run are in tests/parity_watch.rs.
+    assert!(
+        draft.contains("# Profile for \"true\"."),
+        "the draft does not name the program:\n{draft}"
+    );
+    assert!(
+        draft.contains("1 watch run"),
+        "the draft does not count the run:\n{draft}"
+    );
+    toml::from_str::<toml::Value>(&draft)?;
     Ok(())
 }
 

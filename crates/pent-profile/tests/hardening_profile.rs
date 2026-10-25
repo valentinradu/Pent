@@ -18,10 +18,10 @@ use std::time::{Duration, Instant};
 
 use pent_profile::psl;
 use pent_profile::{
-    classify, guard_rules, render_draft, render_draft_with, render_header, render_profile,
-    render_terminal, review, summarize, DraftSource, FsAccess, FsOp, Grant, GuardAccess,
-    GuardClass, NetProtocol, Outcome, ProcessInfo, ProfileDoc, ProfileName, Reasons, Summary,
-    SummaryContext, Warnings, WatchEvent, WatchHeader,
+    classify, guard_rules, guard_rules_with, render_draft, render_draft_with, render_header,
+    render_profile, render_terminal, review, summarize, DraftSource, FsAccess, FsOp, Grant,
+    GuardAccess, GuardClass, NetProtocol, Outcome, ProcessInfo, ProfileDoc, ProfileName, Reasons,
+    Summary, SummaryContext, Warnings, WatchEvent, WatchHeader,
 };
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -1130,6 +1130,51 @@ fn p4_gap_tool_configs_that_run_code() {
         (".config/git/hooks/pre-commit", W, Some(Pers)),
         (".config/direnv/direnvrc", W, Some(Pers)),
     ]);
+}
+
+/// H-14. `$XDG_CONFIG_HOME` moves the whole configuration directory of the
+/// user, not only the files of pent. A rule that names `~/.config/fish` or
+/// `~/.config/autostart` must then protect the real directory, else the
+/// watched program writes a start file that the next login runs.
+///
+/// `guard_rules_with` moves only the `PentFiles` rules. This test states
+/// the behaviour that the guard must have. See the open items of
+/// `docs/security/watch-and-profiles.md`.
+#[test]
+#[ignore = "OPEN H-14: guard_rules_with moves only the PentFiles rules; the \
+            other rules below ~/.config keep the default location"]
+fn p4_persistence_rules_follow_the_xdg_config_directory() {
+    let home = Path::new(HOME);
+    let xdg_config = home.join("dotfiles/config");
+    let xdg_state = home.join("dotfiles/state");
+    let rules = guard_rules_with(home, &[xdg_config.join("pent"), xdg_state.join("pent")]);
+    // The files of pent move. This part holds today (H-11).
+    assert_eq!(
+        classify(
+            &rules,
+            &xdg_config.join("pent/trusted.toml"),
+            GuardAccess::Write
+        ),
+        Some(GuardClass::PentFiles)
+    );
+    // Each other rule below ~/.config must move with it.
+    let bad: Vec<String> = [
+        "fish/config.fish",
+        "nushell/config.nu",
+        "autostart/x.desktop",
+        "systemd/user/x.service",
+        "environment.d/x.conf",
+        "direnv/direnvrc",
+        "nvim/init.lua",
+        "cron/x",
+    ]
+    .iter()
+    .filter(|rel| {
+        classify(&rules, &xdg_config.join(rel), GuardAccess::Write) != Some(GuardClass::Persistence)
+    })
+    .map(|rel| format!("{} is not protected", xdg_config.join(rel).display()))
+    .collect();
+    assert!(bad.is_empty(), "{bad:#?}");
 }
 
 #[test]
