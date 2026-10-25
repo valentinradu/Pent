@@ -78,6 +78,25 @@ jobs:
       - name: Build
         run: cargo build --workspace --tests
 
+      # TEMPORARY (step 0 of the work on MAC-4, MAC-10 and DIFF-9). The
+      # three ignored macOS tests are old predictions that never ran on a
+      # Mac. This step runs each one and prints the result. The step never
+      # fails, so the job stays green and the log holds the answer. Remove
+      # this step when the three findings have a verdict.
+      - name: Probe the ignored macOS findings
+        if: runner.os == 'macOS'
+        run: |
+          set +e
+          probe() {
+            echo "=== PROBE $1 $2 ==="
+            cargo test -p pent --test "$1" -- --include-ignored --exact "$2" --nocapture
+            echo "=== PROBE RESULT $2: exit=$? ==="
+          }
+          probe e2e_macos macos::watch_records_a_read_of_a_short_lived_child
+          probe e2e_macos macos::the_child_cannot_start_a_program_through_launchd
+          probe differential_guard guard_table::diff_9_a_suffix_pattern_on_macos
+          exit 0
+
       # The whole workspace, in debug. The macOS suites (e2e_macos,
       # e2e_macos_network, parity_watch) are part of the workspace, so this
       # one command runs them too. --nocapture keeps the profile and the log
