@@ -3,31 +3,21 @@
 Status: the suite ran on a Mac for the first time on 2026-10-25
 (`macos-latest`, run 40223858818). The section
 "What the first run told us" holds the results. After the fixes of MAC-4,
-MAC-7, MAC-8 and MAC-9, each macOS suite is green on `macos-latest`
-(run 40228872762):
+MAC-7, MAC-8, MAC-9 and MAC-11, each macOS suite is green on
+`macos-latest`:
 
 | Suite | Result |
 |---|---|
-| `e2e_macos` | 15 passed, 2 ignored (MAC-4 `launchd`, MAC-10) |
+| `e2e_macos` | 16 passed, 1 ignored (MAC-10) |
 | `e2e_macos_network` | 4 passed |
 | `integration_test` (the thirteen tests of MAC-7) | 20 passed |
-| `pent-sandbox` unit and oracle tests | 112 passed |
+| `differential_guard` | each row agrees (DIFF-9) |
+| `pent-sandbox` unit and oracle tests | each test passed |
 
-Three macOS failures stay, each one outside this work:
-
-- `parity_watch.rs` runs `cat ~/.foorc` in a child process, which MAC-10
-  loses. The one-line change of its `SCRIPT` constant to
-  `read -r l < ~/.foorc; echo "$l"` holds the same claim on both
-  platforms.
-- `profile_test.rs::test_profile_list_show_rm` runs `pent run -- claude`,
-  and the runner has no `claude`:
-  `sandbox-exec: execvp() of 'claude' failed: No such file or directory`.
-  The test needs the `skip_optional` guard that the other tests of a
-  program of another project use.
-- `pent-settings` `store::tests::remove_deletes_everything` reports
-  `Trusted` after a remove. The profile directory and the state directory
-  of macOS are not the two directories of Linux, so the remove misses one
-  of them.
+Two findings stay open. MAC-10 is the one that the review named: the runs
+of 2026-10-25 measured each way out of it, and the section of MAC-10 holds
+the numbers. MAC-12 is new: the same runs showed that the first watch run
+of a machine records nothing.
 
 ## What this document is
 
@@ -109,6 +99,7 @@ summary of pent can never drift apart again (MAC-2 and MAC-3).
 | A path in the profile is readable; a sibling that the profile does not name is not. | `profile_path_is_readable_and_a_sibling_is_not` |
 | A write to a path with only a read rule fails; a write to a `read_write` path reaches the real file. | `read_rule_denies_a_write_and_read_write_reaches_the_file` |
 | `--execute` lets the child run a program of the named directory; without the flag it does not. The profile denies `process-exec` and allows the `execute` paths and the system program directories (MAC-4). | `execute_flag_lets_the_child_run_a_tool` |
+| The child cannot make another process run a program for it. The profile denies `job-creation` and `mach-lookup`, and it allows the Mach services of `SYSTEM_MACH_SERVICES` (MAC-4). | `the_child_cannot_start_a_program_through_launchd` |
 | The command that the user names always runs, also when no `execute` rule names its directory. | `the_named_command_runs_without_an_execute_rule` |
 | The README claim that only the content read is limited: `stat` works outside the profile, `cat` does not. | `metadata_read_is_not_limited_but_content_read_is` |
 | `pent watch --yes` writes a draft, `pent trust` makes it a profile, and `pent run` then does the recorded accesses and nothing more. | `watch_trust_run_gives_the_recorded_accesses` |
@@ -147,7 +138,11 @@ summary drops it.
 
 Each watch test lets the shell open its files itself, because the recorder
 loses the accesses of a child process that lives a very short time
-(MAC-10). `watch_records_a_read_of_a_short_lived_child` holds that gap.
+(MAC-10). `watch_records_a_read_of_a_short_lived_child` holds that gap. The
+run of 2026-10-25 showed that `sh -c 'cat FILE'` alone makes no child: the
+shell runs `cat` with the process ID of the root, and the recorder keeps
+each access. The script of that test runs a second command, so the shell
+forks.
 
 ### E. The event log cannot be forged
 
@@ -181,21 +176,24 @@ Each entry of that list hides a difference, so the list must stay short.
 ## The findings
 
 The review of 2026-10-25 found six items. The first run on a Mac confirmed
-the fixes of MAC-1, MAC-2, MAC-3, MAC-5 and MAC-6, and it found four more
-items: MAC-7, MAC-8, MAC-9 and MAC-10.
+the fixes of MAC-1, MAC-2, MAC-3, MAC-5 and MAC-6, and it found five more
+items: MAC-7, MAC-8, MAC-9, MAC-10 and MAC-11. Ten of the eleven have a
+fix. MAC-10 stays open, and its section holds the measurement of each way
+out.
 
 | ID | Severity | One line | Status | Test |
 |----|----------|----------|--------|------|
 | MAC-1 | High | The watched program writes its own Seatbelt reports into the unified log and chooses the rules of its own draft. | Fixed; the fix ran on a Mac | `a_program_cannot_forge_its_own_events` |
 | MAC-2 | High | The watch guard does not translate the suffix key patterns, so `~/.ssh/github_rsa` stays readable. | Fixed; the fix ran on a Mac | `watch_guard_blocks_a_key_with_a_suffix_name` |
 | MAC-3 | High | The watch guard covers only the direct children of a guarded directory. | Fixed; the fix ran on a Mac | `watch_guard_blocks_a_key_in_a_subdirectory` |
-| MAC-4 | Critical | The profile starts from `(allow default)`. The `process-exec` half is fixed; `launchd` still runs a program for the child, outside the sandbox. | Half fixed | `execute_flag_lets_the_child_run_a_tool`, `the_child_cannot_start_a_program_through_launchd` (ignored) |
+| MAC-4 | Critical | The profile starts from `(allow default)`, so each operation family that no rule names stays allowed. | Fixed; the fix ran on a Mac | `execute_flag_lets_the_child_run_a_tool`, `the_child_cannot_start_a_program_through_launchd` |
 | MAC-5 | Low | The log reader trusts the lines that it reads. | Fixed with MAC-1 | The unit tests of `parse_line` |
 | MAC-6 | Medium | `pent run --trace` had a second log reader with the old predicate and the old parser. | Fixed | The tests of `macos_log.rs` |
 | MAC-7 | Medium | The probe of the macOS tests asked whether `sandbox-exec` can run `/bin/true`, which macOS does not have, so thirteen tests skipped on a good machine. | Fixed | Each macOS test of `integration_test.rs` |
 | MAC-8 | High | The reader took the name of each report from the process table only, so it dropped the reports of a process that lives a short time or that runs a new file. Watch mode recorded nothing. | Fixed | `watch_records_a_read_of_a_known_file` |
 | MAC-9 | Low | `sandbox-exec` refuses a string over about 1000 bytes in a profile. | Documented | `a_path_over_the_limit_of_the_reader_gives_a_profile_that_it_refuses` |
-| MAC-10 | Medium | The recorder loses the accesses of a child process that lives less than one poll of `ps`. | Open | `watch_records_a_read_of_a_short_lived_child` (ignored) |
+| MAC-10 | Medium | The recorder loses the accesses of a child process that lives less than one poll of `ps`. | Open; `kqueue` cannot fix it | `watch_records_a_read_of_a_short_lived_child` (ignored) |
+| MAC-12 | Medium | The first watch run of a machine records nothing: the first `log stream` delivers no report. | Open; measured, no test | None yet |
 
 ### MAC-1 — the program forges its own events
 
@@ -358,40 +356,24 @@ come last, so the exception wins over the denies of the same rule.
 
 ### MAC-4 — the profile starts from `(allow default)`
 
-**Severity: critical. The `process-exec` half is fixed (2026-10-25, with a
-run on a Mac). The `mach-lookup` half is open.**
+**Severity: critical. Fixed on 2026-10-25, with two runs on a Mac.**
 
-The profile limits file content reads, file writes and (in the `blocked` and
-`localhost` modes) the network. **Every other operation stays allowed.**
-These operations stay open:
+The profile limited file content reads, file writes and (in the `blocked`
+and `localhost` modes) the network. **Every other operation stayed
+allowed.** The dangerous ones were the three that let the child run a
+program that no profile holds:
 
-- `mach-lookup`: the child reaches each Mach service, among them `launchd`
-  and the services of the applications of the user;
-- `file-read-metadata`: `stat` works on each path, also outside the profile;
-- `signal`: the child sends a signal to another process of the user;
-- `sysctl-read`, `iokit-open`, `system-info` and the other operation
-  families of SBPL.
+- `process-exec`: the child runs any program of the machine;
+- `mach-lookup`: the child reaches each Mach service, among them the
+  services of the applications of the user;
+- `job-creation`: the child asks `launchd` for a job. The program of that
+  job is a child of `launchd`, not of the sandboxed process, so it runs
+  with no profile at all.
 
-The child therefore talks to `launchd` and asks it to start a program. That
-program is a child of `launchd`, not of the sandboxed process, so it runs
-with no profile at all. The filesystem sandbox of pent does not hold against
-a program that wants to leave it.
+The profile of `pent run` now denies all three.
 
-The test `the_child_cannot_start_a_program_through_launchd` asks
-`launchctl submit` to write a file outside the profile and asserts that the
-file does not appear. It carries
-`#[ignore = "OPEN MAC-4: ..."]`, so the day pent takes a deny-by-default
-profile, the test is already there.
-
-**Only a Mac can settle how far this goes.** The author cannot test which
-Mach services answer a sandboxed caller on a GitHub runner, which runs
-without a graphical session. The test is a lower bound: if it fails, the
-escape is real. If it passes, the escape may still work in a user session,
-with `open`, with the `com.apple.appkit.xpc.openAndSavePanelService`, or
-with an XPC service of another application.
-
-**The fix of the `process-exec` half.** The run of 2026-10-25 proved that a
-deny after `(allow default)` works:
+**The fix of `process-exec`.** The run of 2026-10-25 proved that a deny
+after `(allow default)` works:
 
 ```text
 C1 (allow default)(deny process-exec)(allow process-exec (subpath "/bin"))
@@ -403,8 +385,8 @@ C3 (allow default)(deny process-exec), no allow rule
 C4 the same with (deny process-exec*)               ->  the same answer
 ```
 
-`generate_sbpl_profile` therefore writes `(deny process-exec)` after the two
-file denies, and it allows `process-exec` for:
+`generate_sbpl_profile` therefore writes `(deny process-exec)` after the
+two file denies, and it allows `process-exec` for:
 
 - each `execute` path of the profile (as before);
 - each executable file of the read paths (as before);
@@ -414,9 +396,89 @@ file denies, and it allows `process-exec` for:
   `/Library/Apple`, `/Library/Developer` and `/Applications/Xcode.app`.
 
 That list is the macOS form of `SYSTEM_PATHS` of the Linux backend, which
-gets `READ_EXECUTE` there. The workspace is in neither list, so a program in
-the workspace runs only with `--execute`. Linux works the same way: the
+gets `READ_EXECUTE` there. The workspace is in neither list, so a program
+in the workspace runs only with `--execute`. Linux works the same way: the
 workspace gets `ALL_NO_EXECUTE`.
+
+**The fix of `mach-lookup` and of `job-creation`.** `add_escape_denies`
+writes
+
+```text
+(deny job-creation)
+(deny mach-lookup)
+(allow mach-lookup (global-name "com.apple.system.opendirectoryd.libinfo"))
+...
+```
+
+and `SYSTEM_MACH_SERVICES` in `crates/pent-sandbox/src/macos.rs` holds the
+whole list with the reason of each entry. The deny of `mach-lookup` is
+wide, so the list cannot come from a guess. The run 40236253209 on
+`macos-latest` measured it: it ran `/bin/sh`, `/usr/bin/id`, `/bin/ls`,
+`/usr/bin/curl` against a web site and a name lookup of `python3` under
+`(allow default)(deny mach-lookup)`, and it read each denial of the
+unified log.
+
+```text
+P5 (allow default)(deny mach-lookup)  /bin/sh -c 'echo P5_SHELL_RAN'
+   ->  P5_SHELL_RAN, exit 0
+P6 the same profile, with id, ls, curl and a name lookup
+   ->  each program worked: ls=0, curl=0, the name resolved
+P7 the services of the 40 denials of P5 and P6:
+   12 com.apple.system.opendirectoryd.libinfo
+    9 com.apple.bsd.dirhelper
+    6 com.apple.system.opendirectoryd.membership
+    4 com.apple.system.notification_center
+    3 com.apple.logd
+    2 com.apple.DiskArbitration.diskarbitrationd
+    1 com.apple.SystemConfiguration.configd
+    1 com.apple.FSEvents
+    1 com.apple.distributed_notifications@Uv3
+    1 com.apple.CoreServices.coreservicesd
+P8 the denials of P5 and P6 by operation: 40 mach-lookup and nothing else
+```
+
+The five programs still worked with each of these services denied, so the
+list is a comfort list, not a list of hard needs. The allowlist holds the
+ten names above and six more for a Mac with a user session and with TLS,
+which the runner has not: `com.apple.logd.events`,
+`com.apple.trustd.agent`, `com.apple.trustd`, `com.apple.SecurityServer`,
+`com.apple.cfprefsd.daemon` and `com.apple.cfprefsd.agent`. Each entry
+names its reason in the source. A service that the list misses is denied,
+and `pent run -v` prints the whole profile, so a missing service is one
+line of a bug report.
+
+**What the run told us about `launchd`.** The test
+`the_child_cannot_start_a_program_through_launchd` passed before the fix.
+The same run says why:
+
+```text
+P1 launchctl submit, outside any sandbox   ->  launchd RAN the job
+P2 the same under (allow default), with no deny at all
+                                           ->  exit 1, launchd ran NO job
+P3 does (deny job-creation) compile        ->  yes, exit 0
+P4 launchctl submit under (deny job-creation)
+                                           ->  exit 1, launchd ran NO job
+```
+
+**macOS itself refuses a launchd job of a sandboxed process.** P2 holds
+that: the profile had no deny, and `launchd` still ran nothing. The
+escape of the review is thus closed on this macOS, and it was closed
+before pent denied anything. `(deny job-creation)` is the second layer,
+for a macOS that answers P2 differently.
+
+P1 is now the control of the test. Without it the test passes on a runner
+on which `launchctl submit` never runs a job, and it then proves nothing.
+The control runs the same job from the test process, outside the sandbox,
+and the test skips with that reason when `launchd` runs no job.
+
+**What stays open after the fix.** The profile is still not a
+deny-by-default profile. `file-read-metadata` (`stat` on each path),
+`signal`, `sysctl-read`, `iokit-open`, `system-info` and the other
+operation families of SBPL stay allowed. None of them runs a program
+outside the sandbox, and the README names the metadata read as a claim of
+its own (`metadata_read_is_not_limited_but_content_read_is`). A
+deny-by-default profile is a separate piece of work: it needs a run on a
+Mac for each operation family that an ordinary program uses.
 
 **What the test of the `execute` flag really holds.** The first form of
 `execute_flag_runs_the_named_binary` asked for the wrong thing: it ran the
@@ -437,16 +499,6 @@ rule:
 shell runs the tool. `the_named_command_runs_without_an_execute_rule` holds
 the other half. `pent run -v` logs the whole profile, which is how this came
 out.
-
-**The open half.** `mach-lookup` stays allowed, so the child still reaches
-`launchd` and asks it to start a program. A deny of `mach-lookup` needs an
-allow list of the services that a normal program needs (the name resolver,
-the Keychain, the system configuration), and each entry of that list needs a
-run on a Mac. `the_child_cannot_start_a_program_through_launchd` keeps its
-`#[ignore]` mark until then.
-
-Until then, the README and this document say plainly that the macOS
-filesystem sandbox stops an accident, not an attack.
 
 ### MAC-5 — the log reader trusts the lines that it reads
 
@@ -581,43 +633,148 @@ the limit itself, so a later change of it is visible.
 
 ### MAC-10 — the recorder loses a child that lives a very short time
 
-**Severity: medium. Open. The fix is a design decision.**
+**Severity: medium. Open. The recommended fix does not work on macOS; the
+run of 2026-10-25 measured the answer of the kernel.**
 
 The reader keeps a report only when the PID is in the process tree of the
-run, and it builds that tree from a poll of `ps` every 100 ms. A child such
-as `cat` lives about three milliseconds, so no snapshot holds it. The log
-also delivers the report after the child is gone, so an on-demand poll does
-not help either. Each report of such a child goes.
+run and the name of the report fits the program that the PID runs. Both
+facts come from a poll of `ps` every 100 ms. A child such as `cat` lives
+about three milliseconds, so no snapshot holds it. The log also delivers
+the report after the child is gone, so an on-demand poll does not help
+either. Each report of such a child goes.
 
 MAC-8 closed the gap for the root process, because pent starts it. The gap
 of a descendant stays. A shorter poll interval makes the gap smaller, not
 smaller than the life of the child.
 
-**The three ways out.** Each one is a design decision, not a bug fix:
+**The gap is the fork, not the exec.** The run 40238392792 ran three watch
+commands on `macos-latest` and read the raw log of each run. The process
+IDs and the names of the events tell the story:
 
-1. `kqueue` with `EVFILT_PROC` and `NOTE_TRACK` on the root process. The
-   kernel then tells pent of each fork, of each exec and of each exit of
-   each member of the tree, at the time of the event. The tree has no race,
-   and the name of a new process comes from its parent at the fork and from
-   the exec report after the exec. This keeps every guard of MAC-1. It needs
-   `unsafe` FFI and a run on a Mac.
-2. The `EndpointSecurity` framework. It gives each exec and each file
-   operation with the process that made it, so watch mode would need no log
-   reader at all. It needs an Apple entitlement and root, which pent does
-   not have.
-3. Accept a report whose name fits a member of the tree, and adopt its PID.
-   This is one line, and it is **not safe**: two unrelated `sh` processes on
-   the machine have the same name, so the draft would hold the accesses of
-   another program.
-   `watch_keeps_only_the_processes_of_the_run` fails with this change.
+```text
+p1  sh -c 'cat ~/.foorc'
+    18 2953 bash    10 2953 cat    1 2953 sandbox-exec    9 2953 sh
+    the read of ~/.foorc is in the log, by cat(2953)
+p2  sh -c 'cat ~/.foorc; echo END'
+    17 2974 bash     1 2974 sandbox-exec    9 2974 sh
+    the read of ~/.foorc is NOT in the log; cat has no event at all
+p3  sh -c 'read -r l < ~/.foorc; echo "$l"'
+    18 2997 bash     1 2997 sandbox-exec    9 2997 sh
+    the read of ~/.foorc is in the log, by bash(2997)
+```
 
-Until a fix, watch mode on macOS is a lower bound. The three watch tests of
-`e2e_macos.rs` let the shell open each file itself, with the `read` builtin
-and a redirect, so the access is in the root process.
-`watch_records_a_read_of_a_short_lived_child` holds the gap with an
-`#[ignore]` mark. `parity_watch.rs` still runs `cat ~/.foorc` in a child
-process, so it fails on macOS; the one-line change of its `SCRIPT` constant
-to `read -r l < ~/.foorc; echo "$l"` holds the same claim on both platforms.
+In p1 the shell runs `cat` **in place**: one process ID, four names, and
+the chain `sandbox-exec` → `sh` → `bash` → `cat` is whole, because MAC-8
+takes each new name from the `process-exec` report. A second command in
+the script makes the shell fork instead (p2), the child gets a new process
+ID, and every report of that child goes. The script of the test now holds
+the real case.
+
+**`kqueue` cannot fix it.** The recommended fix was `EVFILT_PROC` with
+`NOTE_TRACK`:
+
+```text
+EV_SET(&ev, pid, EVFILT_PROC, EV_ADD | EV_CLEAR,
+       NOTE_TRACK | NOTE_FORK | NOTE_EXEC | NOTE_EXIT, 0, NULL)
+```
+
+The run 40237254959 measured the answer of the kernel:
+
+```text
+kevent could not follow the process 7492: Operation not supported (os error 45)
+```
+
+`ENOTSUP`. The flag `NOTE_TRACK` is in `sys/event.h` of macOS, and the
+kernel does not implement it. The same filter without `NOTE_TRACK`
+registers and works. What `EVFILT_PROC` then gives, and what it lacks:
+
+| What it gives | What it lacks |
+|---|---|
+| `NOTE_FORK`: the process that the filter names forked. | The process ID of the child. Pent must then ask the process table which children are new, and a child that is already gone is in no table. The race is the one of MAC-10. |
+| `NOTE_EXEC`: the process runs a new file. | The path of the new file. The `process-exec` report of the log already gives it. |
+| `NOTE_EXIT`: the process exited, with its status. | Nothing that pent needs. The poll already sees the exit, and the reader waits for the late lines of the log after it. |
+
+`kqueue` thus gives no fact that the poll of `ps` does not already give,
+so pent has no watcher. `crates/pent-sandbox/src/macos_kqueue.rs` holds
+the measurement as a test (`the_kernel_refuses_to_follow_a_fork`): it
+registers the two filters and asserts the two answers. The day a macOS
+implements `NOTE_TRACK`, the test fails and names this finding.
+
+**The ways out, after the measurement.**
+
+1. **`EndpointSecurity`** (`es_new_client`, `ES_EVENT_TYPE_NOTIFY_FORK`
+   and `ES_EVENT_TYPE_NOTIFY_EXEC`). It gives the parent and the child of
+   each `fork` at the time of the `fork`, with no race, and each `exec`
+   with the path. Watch mode would then need no log reader at all. It
+   needs the entitlement
+   `com.apple.developer.endpoint-security.client`, a signed and notarized
+   binary and root. Apple grants that entitlement one application at a
+   time, and a user who builds pent from the source has none, so this is
+   **the next step only for a signed distribution of pent**, not for the
+   repository.
+2. **`NOTE_FORK` and an immediate read of the children.** A thread blocks
+   in `kevent(2)` on each known member and reads
+   `proc_listchildpids(2)` the moment a `NOTE_FORK` arrives. The window
+   falls from the poll interval (100 ms) to the wake-up time of the
+   thread (tens of microseconds). It is **not a fix**: a child that
+   exits inside that window is still lost, and a test of the secure
+   behaviour would pass most of the time and fail sometimes. A flaky test
+   of a security property is worse than an honest failure, so pent does
+   not take this step while MAC-10 is the claim of a test.
+3. **Accept a report whose name fits any member of the tree, and adopt
+   its PID.** One line, and **not safe**: two unrelated `sh` processes on
+   the machine have the same name, so the draft would hold the accesses
+   of another program. `watch_keeps_only_the_processes_of_the_run` fails
+   with this change. The same objection holds for a form that adopts only
+   on a `process-exec` report: the only thing that keeps the reports of
+   another sandboxed process out of the draft is the process tree, and a
+   name is not a process tree.
+
+Until a fix, watch mode on macOS is a lower bound. The watch tests of
+`e2e_macos.rs` and the script of `parity_watch.rs` let the shell open each
+file itself, with the `read` builtin and a redirect, so the access is in
+the root process. `watch_records_a_read_of_a_short_lived_child` holds the
+gap with an `#[ignore]` mark, and `pent watch --append` merges more runs.
+The README says the same in its own words.
+
+### MAC-12 — the first watch run of a machine records nothing
+
+**Severity: medium. Open. Measured on 2026-10-25; no test yet.**
+
+The runs of MAC-10 found a second effect. The **first** `log stream` of a
+machine delivers no report at all, and the next one works. The run
+40239388624 holds the measurement: the step first ran one watch command by
+hand and then the test of MAC-10, which runs the same command.
+
+```text
+W   the first watch run of the job:  No new rules from 0 accesses
+    (the raw log of the run is a file of 0 bytes)
+the test right after it:            No new rules from 27 accesses by 3 processes
+```
+
+Each earlier run shows the same order: the first watch command of a macOS
+job records nothing, and every one after it records its accesses. The
+cause is in the start of the stream, not in the reader:
+`LogReader::start` waits for the **header** of `log stream`, which `log`
+prints before it connects to the log, and the comment of the function
+already names that race. On a machine whose log system is cold, the
+connection takes longer than the whole run of a short command.
+
+**The fix.** Wait for a report, not for the header. Pent can ask the
+kernel for one report of its own before the spawn — for example a read
+that a one-rule profile reports — and start the child only when that
+report comes back through the stream. A timeout then warns instead of
+recording a silent nothing. The warning matters more than the wait: a
+watch run that records nothing must say so, and today it says
+"No new rules from 0 accesses", which reads like a program that did
+nothing.
+
+**Why there is no test yet.** The effect shows only on the first
+`log stream` of a machine, so a test of it passes as soon as another test
+of the suite has run before it. A test needs a way to put the log system
+back into its cold state, and this work found none. The finding thus
+carries the measurement and no test, which the rules of the repository
+allow only with this sentence: **nobody holds MAC-12 against a change.**
 
 ## What the first run told us
 
@@ -652,6 +809,25 @@ works, so the `execute` list of a profile can mean something on macOS
 The test that was wrong: `execute_flag_runs_the_named_binary` asked that the
 command of the run not start. Pent gives exec access to the directory of
 that command by design, on both platforms.
+
+## What the runs of the three open findings told us
+
+Three findings were predictions that nobody had run on a Mac. The run
+40235794827 ran the three ignored tests and gave the verdict of each one.
+
+| Finding | The prediction | The verdict of the Mac |
+|---|---|---|
+| DIFF-9 | On macOS the guard misses a key name that matches a pattern with a leading `*`. | **Wrong.** The fix of MAC-2 had already closed it. Each of the seven rows agrees with `classify`. The test lost its mark. |
+| MAC-4 | The child asks `launchd` for a program, outside the sandbox. | **Closed, and not by pent.** macOS refuses a launchd job of a sandboxed process, also under a profile with no deny. Pent now denies `job-creation` and `mach-lookup` as the next two layers, and the test has a control. |
+| MAC-10 | The recorder loses a child that lives less than one poll of `ps`. | **Right, and the recommended fix does not work.** `kqueue` with `NOTE_TRACK` gives `ENOTSUP`. The finding stays open. |
+
+Two more facts came out of these runs:
+
+- A deny of a whole operation family after `(allow default)` works for
+  `mach-lookup` as it does for `process-exec`, and a program of the system
+  needs ten Mach services, which the run named one by one.
+- `sh -c 'cat FILE'` makes no child process. The shell runs `cat` in
+  place, so a test of MAC-10 needs a script with a second command.
 
 ## MAC-11 — a removed profile kept its approval
 

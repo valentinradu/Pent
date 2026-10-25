@@ -153,7 +153,11 @@ of the program, so their events still reach the recorder.
 **macOS (filesystem).** A Seatbelt profile that allows each operation
 `(with report)`, plus the guard denies. Pent reads the reports from
 `log stream` and keeps only the PIDs of the process tree. macOS limits the rate
-of the reports, so the result is a lower bound. `--append` merges more runs.
+of the reports, so the result is a lower bound. The tree comes from a poll of
+`ps` every 100 ms, so a child that forks and exits inside one poll leaves no
+name and the recorder drops its reports (MAC-10 in
+`docs/security/macos.md`); a program that the root runs in place keeps the
+PID of the root and has no such gap. `--append` merges more runs.
 
 **Network (both platforms).** By default the proxy runs in observe mode: it
 allows each request and emits `WatchEvent::Dns` and `WatchEvent::Connect` with

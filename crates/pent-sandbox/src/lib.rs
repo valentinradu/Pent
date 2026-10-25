@@ -45,6 +45,13 @@ mod macos;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod macos_log;
 
+// The measurement of `kqueue` for MAC-10. The module holds no production
+// code: `kqueue` gives no fact that the poll of the process table does not
+// already give (see the comment of the module). The test holds the answer
+// of the kernel, so a later macOS that follows a `fork` is visible.
+#[cfg(all(target_os = "macos", test))]
+mod macos_kqueue;
+
 #[cfg(target_os = "linux")]
 mod linux;
 

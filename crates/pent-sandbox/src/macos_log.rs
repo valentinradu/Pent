@@ -73,7 +73,8 @@
 //!   never reaches the process table, and pent knows no name of it, so its
 //!   reports go. The root process is safe, because pent knows its names.
 //!   macOS watch mode is a lower bound for this reason; `--append` merges
-//!   more runs. See MAC-8 in `docs/security/macos.md`.
+//!   more runs. See MAC-10 in `docs/security/macos.md`, which holds the
+//!   measurement of each way out.
 //! - A file name whose first 16 bytes are the whole name of the record and
 //!   whose rest holds a marker is refused, also when it is honest. Such a
 //!   name is a forgery or a name that nobody needs.

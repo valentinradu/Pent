@@ -236,6 +236,10 @@ pub fn generate_sbpl_profile(config: &SandboxConfig) -> Result<String, SandboxEr
     // program, and an `(allow process-exec (subpath ...))` after it lets
     // the programs of that directory run.
     profile.push_str("(deny process-exec)\n");
+    // A program that cannot run a file itself can ask another process to
+    // run one for it. The two routes out are a launchd job and a Mach
+    // service of another program, so the profile closes both (MAC-4).
+    add_escape_denies(&mut profile)?;
 
     // Expand paths from config
     let (traversal, read, execute, read_write) = config.paths.expand_paths();
@@ -438,6 +442,137 @@ fn add_system_exec_allows(profile: &mut String, report: Report) -> Result<(), Sa
             "subpath",
             dir,
             report,
+        )?;
+    }
+    Ok(())
+}
+
+/// The Mach services that the child may look up, and why each one is on
+/// the list.
+///
+/// `(deny mach-lookup)` closes the second route out of the sandbox: the
+/// child asks a service of another program to act for it, and that program
+/// runs with no profile. The deny is wide, so a program that needs a
+/// service of the system stops working. The list therefore holds the
+/// services that an ordinary program needs.
+///
+/// The first group comes from a measurement. The run of 2026-10-25 on
+/// `macos-latest` (run 40236253209) ran `/bin/sh`, `/usr/bin/id`,
+/// `/bin/ls`, `/usr/bin/curl` and a name lookup of `python3` under
+/// `(allow default)(deny mach-lookup)` and read each denial of the unified
+/// log. The number in the comment is the count of denials of that service.
+/// Each one of the five programs still worked, so the list is a comfort
+/// list, not a list of hard needs.
+///
+/// The second group holds the services that a Mac with a user session and
+/// with TLS needs. The runner has no such session, so no denial names
+/// them. Each entry says which program needs it.
+///
+/// A service that is not on the list stays denied, and `pent run -v` prints
+/// the profile, so a missing service is one line of a bug report.
+const SYSTEM_MACH_SERVICES: &[(&str, &str)] = &[
+    // The first group: the services that the measurement named.
+    (
+        "com.apple.system.opendirectoryd.libinfo",
+        "the user and group database (`getpwuid`, `getgrgid`); 12 denials",
+    ),
+    (
+        "com.apple.system.opendirectoryd.membership",
+        "the group membership of the user; 6 denials",
+    ),
+    (
+        "com.apple.bsd.dirhelper",
+        "the private temporary directory of the user \
+         (`confstr(_CS_DARWIN_USER_TEMP_DIR)`); 9 denials",
+    ),
+    (
+        "com.apple.system.notification_center",
+        "`notifyd`, which libSystem itself uses; 4 denials",
+    ),
+    ("com.apple.logd", "the unified log (`os_log`); 3 denials"),
+    (
+        "com.apple.DiskArbitration.diskarbitrationd",
+        "the list of the mounted volumes; 2 denials",
+    ),
+    (
+        "com.apple.SystemConfiguration.configd",
+        "the network configuration that `getaddrinfo` reads; 1 denial",
+    ),
+    (
+        "com.apple.CoreServices.coreservicesd",
+        "Launch Services and the database of the file types; 1 denial",
+    ),
+    (
+        "com.apple.FSEvents",
+        "the stream of the file system events, which a watcher of a \
+         project directory reads; 1 denial",
+    ),
+    (
+        "com.apple.distributed_notifications@Uv3",
+        "the distributed notification centre; 1 denial. The text after \
+         the `@` is a version, so a later macOS can ask for another name.",
+    ),
+    (
+        "com.apple.distributed_notifications@1v3",
+        "the earlier version of the name above",
+    ),
+    // The second group: a Mac with a user session and with TLS. The
+    // runner of the pipeline has neither, so no denial names these.
+    (
+        "com.apple.logd.events",
+        "the second port of `logd`, for a program that reads the log",
+    ),
+    (
+        "com.apple.trustd.agent",
+        "the trust evaluation of a certificate, which each TLS \
+         connection of `git`, of `curl` and of a package manager needs",
+    ),
+    ("com.apple.trustd", "the system form of the service above"),
+    (
+        "com.apple.SecurityServer",
+        "`securityd` and the Keychain, which `git` reads for a credential",
+    ),
+    (
+        "com.apple.cfprefsd.daemon",
+        "the settings of a program (`CFPreferences`)",
+    ),
+    (
+        "com.apple.cfprefsd.agent",
+        "the per-user form of the service above",
+    ),
+];
+
+/// Deny the two routes by which the child makes another process run a
+/// program for it.
+///
+/// `(deny process-exec)` stops the child from running a file itself. Two
+/// routes stay open after it:
+///
+/// - a launchd job. `(deny job-creation)` closes it. The run of 2026-10-25
+///   measured that macOS already refuses a job of a sandboxed process,
+///   also under a profile with no deny at all, so this rule is the second
+///   layer, not the only one.
+/// - a Mach service of another program. `(deny mach-lookup)` closes it,
+///   and [`SYSTEM_MACH_SERVICES`] names the services that an ordinary
+///   program needs.
+///
+/// The rules go after `(allow default)`, and the last matching rule wins,
+/// so each allow of a service comes after the deny.
+///
+/// # Errors
+/// Returns `SandboxError::InvalidConfig` if a name contains NUL or a
+/// newline. Each name of [`SYSTEM_MACH_SERVICES`] is a literal, so the
+/// error cannot occur.
+fn add_escape_denies(profile: &mut String) -> Result<(), SandboxError> {
+    profile.push_str("(deny job-creation)\n");
+    profile.push_str("(deny mach-lookup)\n");
+    for (name, _why) in SYSTEM_MACH_SERVICES {
+        push_rule(
+            profile,
+            RuleAction::Allow,
+            "mach-lookup",
+            "global-name",
+            name,
         )?;
     }
     Ok(())
@@ -1892,6 +2027,42 @@ mod tests {
             .contains(r#"(allow network-outbound (remote ip "localhost:4321") (with report))"#));
         assert!(profile.contains(r#"(allow network-outbound (subpath "/") (with report))"#));
         assert!(!profile.contains(".pent"), "watch mode has no run policy");
+    }
+
+    /// MAC-4. The run profile denies the three ways to run a program that
+    /// no profile holds, and each allow of a Mach service comes after the
+    /// deny, because the last matching rule wins.
+    #[test]
+    fn the_run_profile_denies_each_route_out_of_the_sandbox() {
+        let config = SandboxConfig::new("/w".into(), make_test_paths(), "/w".into());
+        let profile = generate_sbpl_profile(&config).unwrap();
+        for deny in [
+            "(deny process-exec)\n",
+            "(deny job-creation)\n",
+            "(deny mach-lookup)\n",
+        ] {
+            assert!(profile.contains(deny), "the profile has no {deny}{profile}");
+        }
+        let deny_at = profile.find("(deny mach-lookup)\n").unwrap();
+        assert!(!SYSTEM_MACH_SERVICES.is_empty(), "the allowlist is empty");
+        for (name, why) in SYSTEM_MACH_SERVICES {
+            let rule = format!("(allow mach-lookup (global-name \"{name}\"))\n");
+            let allow_at = profile.find(&rule);
+            assert!(
+                allow_at.is_some_and(|at| at > deny_at),
+                "the allow of {name} must come after the deny: {profile}"
+            );
+            assert!(!why.is_empty(), "the service {name} names no reason");
+        }
+    }
+
+    /// Watch mode observes; it must not deny a Mach service or a job.
+    #[test]
+    fn the_watch_profile_denies_no_mach_service() {
+        let config = SandboxConfig::new("/w".into(), make_test_paths(), "/w".into());
+        let profile = generate_watch_profile(&config, &[]).unwrap();
+        assert!(!profile.contains("(deny mach-lookup)"), "{profile}");
+        assert!(!profile.contains("(deny job-creation)"), "{profile}");
     }
 
     #[test]

@@ -50,6 +50,9 @@ mod macos {
     /// The time to wait for a line of the unified log.
     const LOG_TIMEOUT: Duration = Duration::from_secs(30);
 
+    /// The time to wait for a job of `launchd` to make its file.
+    const LAUNCHD_WAIT: Duration = Duration::from_secs(10);
+
     /// The shell of each test. The sandbox allows `/bin` by default.
     const SH: &str = "/bin/sh";
 
@@ -83,9 +86,28 @@ mod macos {
     }
 
     /// The text that a failed assertion of a watch test prints.
+    ///
+    /// The report holds three things, and each one tells a different
+    /// cause apart: the draft, the raw events of the run, and the
+    /// listing of the directory of the runs. An empty raw log with no
+    /// file means that pent never started a run; an empty raw log with a
+    /// file of zero bytes means that the reader got no report; a raw log
+    /// with events and no rule means that the summary dropped them.
     fn watch_report(env: &TestEnv, name: &str, draft: &str) -> String {
+        let dir = env.watch_dir(name);
+        let listing = match fs::read_dir(&dir) {
+            Ok(entries) => entries
+                .filter_map(Result::ok)
+                .map(|e| {
+                    let size = e.metadata().map_or(0, |m| m.len());
+                    format!("  {} ({size} bytes)\n", e.path().display())
+                })
+                .collect::<String>(),
+            Err(e) => format!("  cannot read {}: {e}\n", dir.display()),
+        };
         format!(
-            "--- draft {} ---\n{draft}\n--- raw watch events ---\n{}",
+            "--- draft {} ---\n{draft}\n--- the runs of {name} ---\n{listing}\
+             --- raw watch events ---\n{}",
             env.draft_path(name).display(),
             env.watch_events(name)
         )
@@ -431,19 +453,25 @@ mod macos {
 
     /// A read of a child process that lives a very short time.
     ///
-    /// OPEN MAC-10. The reader keeps a report only when the PID is in the
-    /// process tree of the run, and it builds that tree from a poll of
-    /// `ps` every 100 ms. A child such as `cat` lives about three
-    /// milliseconds, so no snapshot holds it, and each report of it goes.
-    /// The root process has no such gap: pent starts it and knows its
-    /// names.
+    /// OPEN MAC-10. The reader keeps a report only when the process is a
+    /// member of the tree of the run and the name of the report fits the
+    /// program that the process runs. Both facts come from a poll of `ps`
+    /// every 100 ms, and a child such as `cat` lives about three
+    /// milliseconds, so no poll holds it.
     ///
-    /// The fix needs a source of the tree that does not poll, for example
-    /// `kqueue` with `EVFILT_PROC` and `NOTE_TRACK`, which tells pent of
-    /// each fork of each member. That is a design decision, so this test
-    /// holds the gap until then.
+    /// The script runs `cat` and then a second command, so the shell
+    /// forks for `cat` instead of running it in place. The run of
+    /// 2026-10-25 showed that `sh -c 'cat FILE'` alone makes **no**
+    /// child: the shell runs `cat` with the process ID of the root, and
+    /// the recorder keeps each access of it. The fork is the gap, not the
+    /// exec.
+    ///
+    /// Read the summary in the message of the failure. "27 accesses by 3
+    /// processes" is MAC-10: the root is there and the child is not.
+    /// "0 accesses" is MAC-12: this is the first watch run of the machine,
+    /// and the first `log stream` gives no report at all.
     #[test]
-    #[ignore = "OPEN MAC-10: the recorder misses a child that lives less than one ps poll"]
+    #[ignore = "OPEN MAC-10: the recorder misses a child that lives less than one ps poll; kqueue NOTE_TRACK gives ENOTSUP, so the next step is EndpointSecurity"]
     fn watch_records_a_read_of_a_short_lived_child() -> TestResult {
         if !ready("watch_records_a_child_read", &[SH, "/bin/cat"]) {
             return Ok(());
@@ -459,16 +487,18 @@ mod macos {
             "--",
             SH,
             "-c",
-            "cat ~/.foorc",
+            "cat ~/.foorc; echo END",
         ])?;
-        assert_eq!(stdout(&out), "foo\n", "stderr: {}", stderr(&out));
+        assert_eq!(stdout(&out), "foo\nEND\n", "stderr: {}", stderr(&out));
 
         let draft = draft_with_events(&env, "c")?;
         let read = rules(&draft, "filesystem", "read")?;
         let read_write = rules(&draft, "filesystem", "read_write")?;
         assert!(
             read.contains("~/.foorc") || read_write.contains("~/.foorc"),
-            "the recorder lost the read of the child process\n{}",
+            "the recorder lost the read of the child process\n\
+             --- the summary of the run ---\n{}\n{}",
+            stderr(&out),
             watch_report(&env, "c", &draft)
         );
         Ok(())
@@ -718,8 +748,8 @@ mod macos {
     // ── the findings of the review ───────────────────────────────────────────
     //
     // Each test below states the secure behaviour. See
-    // `docs/security/macos.md`. MAC-1, MAC-2 and MAC-3 have a fix, so these
-    // tests run in the normal suite. MAC-4 has no fix yet, so its test
+    // `docs/security/macos.md`. MAC-1, MAC-2, MAC-3 and MAC-4 have a fix,
+    // so these tests run in the normal suite. MAC-10 has none, so its test
     // keeps the `ignore` mark; `--include-ignored` shows the failure.
 
     /// MAC-1. The watched program writes its own Seatbelt reports into the
@@ -818,17 +848,66 @@ mod macos {
         Ok(())
     }
 
-    /// MAC-4. The profile starts from `(allow default)`, so it does not
-    /// limit a Mach service lookup. The child asks `launchd` to run a
-    /// program, and that program runs outside the sandbox.
+    /// Ask `launchd` to run a job that makes `target`, and return true
+    /// when the file appears. The caller is outside the sandbox.
+    ///
+    /// This is the control of the test below. A runner on which
+    /// `launchctl submit` never runs a job passes the assertion of that
+    /// test for the wrong reason.
+    fn launchd_runs_a_job(target: &std::path::Path, label: &str) -> Result<bool, BoxError> {
+        let script = format!("touch '{}'", target.display());
+        let submit = std::process::Command::new("/bin/launchctl")
+            .args(["submit", "-l", label, "--", SH, "-c", &script])
+            .output()?;
+        let deadline = std::time::Instant::now() + LAUNCHD_WAIT;
+        while !target.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let ran = target.exists();
+        // The job must go, also when it never ran.
+        let removed = std::process::Command::new("/bin/launchctl")
+            .args(["remove", label])
+            .output()?;
+        if !ran {
+            eprintln!(
+                "launchctl submit made no job: submit={:?} stderr={} remove={:?}",
+                submit.status,
+                String::from_utf8_lossy(&submit.stderr).trim(),
+                removed.status
+            );
+        }
+        Ok(ran)
+    }
+
+    /// MAC-4. The child must not make `launchd` run a program for it: such
+    /// a program is a child of `launchd` and runs with no profile.
+    ///
+    /// The profile of `pent run` denies `job-creation` and `mach-lookup`,
+    /// which are the two routes to another process that runs a file.
+    ///
+    /// The run of 2026-10-25 on `macos-latest` (run 40236253209) measured
+    /// that macOS itself refuses a job of a sandboxed process, also under
+    /// `(allow default)` with no deny at all. The denies of pent are the
+    /// second layer. The control below keeps the test honest: it holds
+    /// that `launchctl submit` does run a job on this machine.
     #[test]
-    #[ignore = "OPEN MAC-4: the profile starts from (allow default); launchd runs a program for the child"]
     fn the_child_cannot_start_a_program_through_launchd() -> TestResult {
-        if !ready("launchd_escape", &[SH, "/bin/launchctl"]) {
+        let test = "launchd_escape";
+        if !ready(test, &[SH, "/bin/launchctl"]) {
             return Ok(());
         }
         let env = TestEnv::new()?;
         env.install_profile("p", "")?;
+        let control = env.root.join("control");
+        let control_label = format!("pent-control-{}", std::process::id());
+        if !launchd_runs_a_job(&control, &control_label)? {
+            skip(
+                test,
+                "launchctl submit runs no job on this machine, so the test \
+                 cannot show the escape",
+            );
+            return Ok(());
+        }
         let escaped = env.root.join("escaped");
         let label = format!("pent-test-{}", std::process::id());
         let script = format!(

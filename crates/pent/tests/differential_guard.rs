@@ -14,8 +14,9 @@
 //!
 //! The same table runs on Linux and on macOS. A row carries one
 //! disagreement identifier for each platform, because the two kernel
-//! backends enforce the guard in different ways. The macOS half runs only
-//! in the pipeline; nobody has run it on a Mac yet.
+//! backends enforce the guard in different ways. The macOS half runs in
+//! the pipeline, on `macos-latest`. Every row agrees there since
+//! 2026-10-25 (DIFF-9).
 //!
 //! A test skips (it prints `SKIP` and passes) when the sandbox or a tool
 //! is absent. Set `PENT_REQUIRE_ALL_TESTS=1` to make each skip a failure.
@@ -242,28 +243,38 @@ printf 'rc=%s\n' "$?"
         run_rows(test, &guard_rows(&["key-made-during-the-run"]))
     }
 
-    /// On macOS the guard must also hide a key whose name matches a
-    /// suffix pattern. The backend builds a regular expression from the
-    /// prefix form only.
+    /// DIFF-9. The guard must hide a key whose name matches a pattern
+    /// with a leading `*`, which is a file name suffix. The macOS backend
+    /// translates that form (`name_pattern_regex`), and a character with
+    /// a meaning in a regular expression matches only itself.
+    ///
+    /// The run of 2026-10-25 on a Mac proved each of the seven rows, so
+    /// the test has no `ignore` mark any more.
     #[test]
     #[cfg(target_os = "macos")]
-    #[ignore = "OPEN DIFF-9: on macOS the guard misses a key name that matches a suffix pattern"]
     fn diff_9_a_suffix_pattern_on_macos() -> TestResult {
         let test = "guard_diff_9_suffix_pattern";
         if !ready(test) {
             return Ok(());
         }
-        run_rows(test, &super::differential::guard_open("DIFF-9"))
+        run_rows(
+            test,
+            &guard_rows(&[
+                "key-suffix-rsa",
+                "key-suffix-pem",
+                "key-suffix-key",
+                "key-name-with-a-dot",
+                "key-name-with-a-plus",
+                "key-name-with-brackets",
+                "key-name-with-a-star",
+            ]),
+        )
     }
 
     /// Each disagreement of the table has an ignored test in this file.
     #[test]
     fn every_open_row_has_a_test() {
-        let expected: Vec<&str> = if cfg!(target_os = "macos") {
-            vec!["DIFF-9"]
-        } else {
-            Vec::new()
-        };
+        let expected: Vec<&str> = Vec::new();
         assert_eq!(
             guard_open_ids(),
             expected,

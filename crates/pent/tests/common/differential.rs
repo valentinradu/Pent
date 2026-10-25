@@ -683,50 +683,43 @@ pub const GUARD_CASES: &[GuardCase] = &[
         ..GUARD
     },
     // A pattern with a leading `*` is a file name suffix. The macOS
-    // backend builds a regular expression from the prefix form only, so
-    // these rules have no effect there (H-13 of
-    // `docs/security/watch-and-profiles.md`).
+    // backend translates this form too (`name_pattern_regex`), so these
+    // rows agree on both platforms. DIFF-9 held the gap until the run of
+    // 2026-10-25 on a Mac proved the translation.
     GuardCase {
         id: "key-suffix-rsa",
         path: ".ssh/github_rsa",
-        open_macos: Some("DIFF-9"),
         ..GUARD
     },
     GuardCase {
         id: "key-suffix-pem",
         path: ".ssh/work.pem",
-        open_macos: Some("DIFF-9"),
         ..GUARD
     },
     GuardCase {
         id: "key-suffix-key",
         path: ".ssh/deploy_key",
-        open_macos: Some("DIFF-9"),
         ..GUARD
     },
     // Names that hold a character of a regular expression.
     GuardCase {
         id: "key-name-with-a-dot",
         path: ".ssh/a.b.key",
-        open_macos: Some("DIFF-9"),
         ..GUARD
     },
     GuardCase {
         id: "key-name-with-a-plus",
         path: ".ssh/x+y_rsa",
-        open_macos: Some("DIFF-9"),
         ..GUARD
     },
     GuardCase {
         id: "key-name-with-brackets",
         path: ".ssh/k[1].key",
-        open_macos: Some("DIFF-9"),
         ..GUARD
     },
     GuardCase {
         id: "key-name-with-a-star",
         path: ".ssh/all*_rsa",
-        open_macos: Some("DIFF-9"),
         ..GUARD
     },
     // Depth.
