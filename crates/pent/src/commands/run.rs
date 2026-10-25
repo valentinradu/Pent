@@ -793,20 +793,31 @@ fn proxy_trace_line(event: TraceEvent) -> TraceLine {
 /// Compute a fix hint for a proxy violation message.
 #[cfg(any(test, not(target_os = "macos")))]
 fn proxy_violation_fix(violation: &str) -> String {
-    if let Some(rest) = violation.strip_prefix("network: DNS query for \"") {
-        // Extract domain from: network: DNS query for "domain" blocked ...
-        if let Some((domain, _)) = rest.split_once('"') {
+    let Some(rest) = violation.strip_prefix("network: ") else {
+        return "review your pent config".to_string();
+    };
+    // The message names the domain in quotes, for example:
+    //   DNS query for "x.com" (A) blocked: the domain is not in the allowlist
+    //   SOCKS5 connection to "x.com" port 443 blocked: the domain is not in ...
+    let quoted_domain = rest
+        .split_once('"')
+        .and_then(|(_, tail)| tail.split_once('"'))
+        .map(|(domain, _)| domain);
+    if rest.contains("the domain is not in the allowlist") {
+        if let Some(domain) = quoted_domain {
             return format!(
                 "add \"{domain}\" to domain_allowlist in the [proxy] section of your pent config"
             );
         }
     }
-    if violation.starts_with("network:") {
-        return "make sure that the process uses DNS names and that the domain is in \
-                domain_allowlist in the [proxy] section of your pent config"
+    if rest.contains("the domain resolves to the") || rest.contains("blocked: the address is") {
+        return "the destination address is not public; if you trust it, set \
+                private_destinations = \"allow\" in the [proxy] section of your pent config"
             .to_string();
     }
-    "review your pent config".to_string()
+    "make sure that the process uses DNS names and that the domain is in \
+     domain_allowlist in the [proxy] section of your pent config"
+        .to_string()
 }
 
 // ── macOS trace ──────────────────────────────────────────────────────────────
@@ -1453,9 +1464,27 @@ mod tests {
     // ── trace log ────────────────────────────────────────────────────────────
 
     #[test]
+    fn proxy_fix_names_the_domain_for_connect() {
+        let fix = proxy_violation_fix(
+            "network: SOCKS5 connection to \"evil.example\" port 443 blocked: \
+             the domain is not in the allowlist",
+        );
+        assert!(fix.contains("add \"evil.example\" to domain_allowlist"), "{fix}");
+    }
+
+    #[test]
+    fn proxy_fix_names_private_destinations() {
+        let fix = proxy_violation_fix(
+            "network: CONNECT connection to \"intra.example\" port 443 blocked: \
+             the domain resolves to the private address 10.0.0.5",
+        );
+        assert!(fix.contains("private_destinations"), "{fix}");
+    }
+
+    #[test]
     fn proxy_fix_names_the_domain() {
         let fix = proxy_violation_fix(
-            "network: DNS query for \"evil.example\" blocked — domain not in allowlist",
+            "network: DNS query for \"evil.example\" (A) blocked: the domain is not in the allowlist",
         );
         assert_eq!(
             fix,

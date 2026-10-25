@@ -324,6 +324,20 @@ pub struct SandboxSettings {
     pub mounts: Vec<Mount>,
 }
 
+/// The proxy policy for destination addresses that are not public.
+///
+/// These addresses are loopback, private (RFC 1918), CGNAT, link-local,
+/// unique local and multicast addresses.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PrivateDestinations {
+    /// The proxy rejects these addresses, also for an allowed domain.
+    #[default]
+    Deny,
+    /// The proxy connects to these addresses for an allowed domain.
+    Allow,
+}
+
 /// TOML `[proxy]` section.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -349,6 +363,12 @@ pub struct ProxySettings {
     /// TCP idle timeout in seconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tcp_idle_timeout_secs: Option<u64>,
+
+    /// The policy for destinations that are not public. The default is
+    /// `"deny"`. Set `"allow"` when an allowed domain resolves to an
+    /// internal address (for example a company registry on `10.x`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_destinations: Option<PrivateDestinations>,
 }
 
 /// Top-level pent configuration, corresponding to `pent.toml`.
@@ -493,6 +513,9 @@ impl PentConfig {
         if other.proxy.tcp_idle_timeout_secs.is_some() {
             self.proxy.tcp_idle_timeout_secs = other.proxy.tcp_idle_timeout_secs;
         }
+        if other.proxy.private_destinations.is_some() {
+            self.proxy.private_destinations = other.proxy.private_destinations;
+        }
         self
     }
 }
@@ -553,6 +576,23 @@ mod tests {
         assert_eq!(config.sandbox.paths.read, vec!["/usr/lib"]);
         assert_eq!(config.sandbox.paths.execute, vec!["/usr/bin"]);
         assert_eq!(config.sandbox.paths.read_write, vec!["/tmp"]);
+    }
+
+    #[test]
+    fn test_private_destinations_parse_and_merge() {
+        let global = PentConfig::parse("[proxy]\nprivate_destinations = \"allow\"\n");
+        assert!(global.is_ok(), "{global:?}");
+        let Ok(global) = global else { return };
+        assert_eq!(
+            global.proxy.private_destinations,
+            Some(PrivateDestinations::Allow)
+        );
+        let merged = global.merge(PentConfig::default());
+        assert_eq!(
+            merged.proxy.private_destinations,
+            Some(PrivateDestinations::Allow)
+        );
+        assert!(PentConfig::parse("[proxy]\nprivate_destinations = \"maybe\"\n").is_err());
     }
 
     #[test]

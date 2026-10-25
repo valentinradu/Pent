@@ -59,7 +59,9 @@ On Linux, Pent combines three kernel mechanisms. **Landlock LSM** restricts file
 
 ### Built-in proxy
 
-Pent includes a DNS and TCP proxy. The DNS side returns `NXDOMAIN` for disallowed domains. The TCP side only forwards connections when the destination IP resolves to an allowed domain.
+Pent includes a DNS and TCP proxy. The DNS side returns `NXDOMAIN` for disallowed domains. The TCP side only forwards connections when the destination IP resolves to an allowed domain. On ports 443 and 80, the proxy also checks the TLS server name or the HTTP `Host` header against the allowlist.
+
+The proxy rejects destinations that are not public (loopback, private, CGNAT, link-local and unique local addresses), also for an allowed domain. If an allowed domain resolves to an internal address that you trust, set `private_destinations = "allow"` in the `[proxy]` section.
 
 ### Network mode
 

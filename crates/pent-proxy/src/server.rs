@@ -457,6 +457,12 @@ impl TryFrom<&pent_settings::ProxySettings> for ProxyConfig {
         if let Some(t) = settings.tcp_idle_timeout_secs {
             config.tcp_idle_timeout = std::time::Duration::from_secs(t);
         }
+        if let Some(policy) = settings.private_destinations {
+            config.private_destinations = match policy {
+                pent_settings::PrivateDestinations::Deny => PrivateDestinations::Deny,
+                pent_settings::PrivateDestinations::Allow => PrivateDestinations::Allow,
+            };
+        }
         if let Some(upstream) = &settings.upstream_dns {
             let addrs = upstream
                 .iter()

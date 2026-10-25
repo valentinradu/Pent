@@ -5,7 +5,7 @@ use std::str::FromStr;
 
 use pent_settings::{
     build_profiles_config, is_profile_likely_active, profile_deps_transitive, ConfigLoader,
-    LoadedConfig, NetworkMode, PentConfig, Profile, ProjectConfigStatus, TrustError, TrustStatus,
+    LoadedConfig, NetworkMode, PentConfig, PrivateDestinations, Profile, ProjectConfigStatus, TrustError, TrustStatus,
     TrustStore,
 };
 
@@ -418,6 +418,13 @@ fn describe_additions(project: &PentConfig, global: &PentConfig) -> Vec<String> 
     if let Some(dns) = &project.proxy.upstream_dns {
         if global.proxy.upstream_dns.as_ref() != Some(dns) {
             lines.push(format!("proxy.upstream_dns = {dns:?}"));
+        }
+    }
+    if let Some(policy) = project.proxy.private_destinations {
+        if policy == PrivateDestinations::Allow
+            && global.proxy.private_destinations != Some(PrivateDestinations::Allow)
+        {
+            lines.push("proxy.private_destinations = \"allow\"".to_string());
         }
     }
     let scalars = [
