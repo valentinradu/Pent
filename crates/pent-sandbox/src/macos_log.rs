@@ -48,11 +48,16 @@
 //! - Pent itself. It starts the root process, so it knows the two names of
 //!   that process: `sandbox-exec` and the command
 //!   ([`ProcessTree::with_names`]).
-//! - The process table. The poll of the tree reads `comm` for each PID, so
-//!   the reader knows the file that each PID runs.
+//! - The process tree in the kernel. Each poll walks the tree of the run
+//!   and reads the path of the program of each member
+//!   ([`crate::macos_proctable`]), so the reader knows the file that each
+//!   PID runs.
+//! - The parent of a `fork`. A `fork` copies the program of the parent, so
+//!   a child takes each name of its parent until it runs a new file
+//!   ([`ProcessTree::inherit_names`]).
 //! - The exec reports. The kernel writes the path of the program in each
 //!   `process-exec` report, and a process that runs a new file keeps its
-//!   PID ([`ProcessTree::learn_exec`]).
+//!   PID ([`ProcessTree::learn_name`]).
 //!
 //! A PID can thus have more than one name, and the reader drops a report
 //! whose name fits none of them ([`names_agree`]).
@@ -69,12 +74,12 @@
 //!
 //! What the check does not hold:
 //!
-//! - A descendant that exits and that its parent reaps between two polls
-//!   never reaches the process table, and pent knows no name of it, so its
-//!   reports go. The root process is safe, because pent knows its names.
-//!   macOS watch mode is a lower bound for this reason; `--append` merges
-//!   more runs. See MAC-10 in `docs/security/macos.md`, which holds the
-//!   measurement of each way out.
+//! - A descendant that forks, runs and exits between two polls never
+//!   reaches a snapshot, and pent knows neither its PID nor a name of it,
+//!   so its reports go. The root process is safe, because pent knows its
+//!   names. macOS watch mode is a lower bound for this reason;
+//!   `--append` merges more runs. See MAC-10 in `docs/security/macos.md`,
+//!   which holds the measurement of the window that stays.
 //! - A file name whose first 16 bytes are the whole name of the record and
 //!   whose rest holds a marker is refused, also when it is honest. Such a
 //!   name is a forgery or a name that nobody needs.
@@ -326,9 +331,13 @@ pub(crate) fn to_event(record: &SeatbeltRecord, mode: &RecordMode) -> Option<Wat
     Some(event)
 }
 
-/// One row of `ps -A -o pid=,ppid=,stat=,comm=`.
+/// One process of a snapshot of the process tree.
+///
+/// [`crate::macos_proctable::snapshot`] makes the rows on macOS. The tests
+/// make them with [`parse_proc_table`], which reads the same fields from a
+/// text table.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PsRow {
+pub(crate) struct ProcRow {
     /// The process ID.
     pub(crate) pid: u32,
     /// The parent process ID.
@@ -336,12 +345,13 @@ pub(crate) struct PsRow {
     /// True if the process exited and its parent did not reap it yet.
     pub(crate) zombie: bool,
     /// The file name of the program that the process runs, without the
-    /// directory. It is empty when the row has no command column.
+    /// directory. It is empty when the kernel gives no program.
     pub(crate) name: String,
 }
 
 /// Split the first field from `text`. Return the field and the rest
 /// without its leading spaces.
+#[cfg(test)]
 fn next_field(text: &str) -> Option<(&str, &str)> {
     let text = text.trim_start();
     if text.is_empty() {
@@ -358,13 +368,18 @@ fn file_name_of(path: &str) -> &str {
     path.rsplit_once('/').map_or(path, |(_, name)| name)
 }
 
-/// Parse the output of `ps -A -o pid=,ppid=,stat=,comm=`.
+/// Read a process table in the form `<pid> <ppid> <state> <program>`.
 ///
-/// A row without a state column is a live process. The command is the
-/// last column, and it holds the whole path of the program, which can
-/// hold spaces (`/Applications/X.app/Contents/MacOS/Code Helper (GPU)`),
-/// so the row keeps the rest of the line as the command.
-pub(crate) fn parse_ps_output(output: &str) -> Vec<PsRow> {
+/// This is how a test writes a snapshot. The form is the output of
+/// `ps -A -o pid=,ppid=,stat=,comm=`, which the reader used before the
+/// run 40246227819 measured that a fork of `ps` costs 35 ms (see
+/// [`crate::macos_proctable`]). A row without a state column is a live
+/// process. The program is the last column and it holds the whole path,
+/// which can hold spaces
+/// (`/Applications/X.app/Contents/MacOS/Code Helper (GPU)`), so the row
+/// keeps the rest of the line as the program.
+#[cfg(test)]
+pub(crate) fn parse_proc_table(output: &str) -> Vec<ProcRow> {
     output
         .lines()
         .filter_map(|line| {
@@ -373,7 +388,7 @@ pub(crate) fn parse_ps_output(output: &str) -> Vec<PsRow> {
             let pid = pid.parse().ok()?;
             let ppid = ppid.parse().ok()?;
             let (stat, command) = next_field(rest).unwrap_or(("", ""));
-            Some(PsRow {
+            Some(ProcRow {
                 pid,
                 ppid,
                 zombie: stat.starts_with('Z'),
@@ -431,11 +446,11 @@ impl ProcessTree {
     /// Create a tree with only `root`, and with the names of the programs
     /// that `root` runs.
     ///
-    /// The process table is one source of the name of a process, and it
-    /// misses a process that lives less than one poll interval. Pent
-    /// itself is the second source: it starts the root process, so it
-    /// knows the program of the root before the first poll. See MAC-8 in
-    /// `docs/security/macos.md`.
+    /// The poll of the process tree is one source of the name of a
+    /// process, and it misses a process that lives less than one poll
+    /// interval. Pent itself is the second source: it starts the root
+    /// process, so it knows the program of the root before the first
+    /// poll. See MAC-8 in `docs/security/macos.md`.
     pub(crate) fn with_names(root: u32, names: &[String]) -> Self {
         let root_names: HashSet<String> = names.iter().filter(|n| !n.is_empty()).cloned().collect();
         let mut map = HashMap::new();
@@ -451,15 +466,15 @@ impl ProcessTree {
 
     /// Record that `pid` runs the program `name` from now on.
     ///
-    /// The source is an accepted `process-exec` report: the kernel writes
-    /// the path of the program that the process runs, and a process that
-    /// runs a new file keeps its PID. The kernel chooses that path, not
-    /// the program, so the name is as good as the one of the process
-    /// table. Pent adds the name, and does not remove the earlier one: a
-    /// report of the same PID can arrive before or after the exec.
+    /// The source is a `process-exec` report: the kernel writes the path
+    /// of the program that the process runs, and a process that runs a new
+    /// file keeps its PID. The kernel chooses that path, not the program,
+    /// so the name is as good as the one of the process table. Pent adds
+    /// the name, and does not remove the earlier one: a report of the same
+    /// PID can arrive before or after the exec.
     ///
     /// A PID outside the tree learns nothing.
-    pub(crate) fn learn_exec(&mut self, pid: u32, name: &str) {
+    pub(crate) fn learn_name(&mut self, pid: u32, name: &str) {
         if name.is_empty() || !self.known.contains(&pid) {
             return;
         }
@@ -471,14 +486,47 @@ impl ProcessTree {
         self.known.contains(&pid)
     }
 
+    /// The members of the tree that the last snapshot found live.
+    ///
+    /// The walk of the next snapshot starts at these process IDs
+    /// ([`crate::macos_proctable::snapshot`]). A dead member is never a
+    /// start of the walk, so a process that takes the PID of a dead member
+    /// brings none of its children into the tree.
+    pub(crate) fn live_members(&self) -> Vec<u32> {
+        self.known
+            .iter()
+            .copied()
+            .filter(|pid| !self.dead.contains(pid))
+            .collect()
+    }
+
+    /// Give `child` each name of `parent`.
+    ///
+    /// A `fork` copies the program of the parent, so the child runs that
+    /// program until it runs a new file. The kernel gives the link between
+    /// the two processes, and pent reads each name of the parent from the
+    /// kernel too, so this name is a source that the program does not
+    /// choose (FUZZ-1).
+    ///
+    /// Without this step, the reader drops each report of a child between
+    /// the `fork` and the `process-exec` report of it, because the
+    /// snapshot that found the child named the program of the parent and
+    /// the report names it too.
+    fn inherit_names(&mut self, parent: u32, child: u32) {
+        let Some(names) = self.names.get(&parent).cloned() else {
+            return;
+        };
+        self.names.entry(child).or_default().extend(names);
+    }
+
     /// Return true when `name`, the process name of a Seatbelt report, is
     /// the name of the program that `pid` runs.
     ///
     /// The program chooses the text of its own name, so the name in a
-    /// report proves nothing by itself. The process table is the second
-    /// source: it tells which file each PID runs. A report whose name does
-    /// not fit that file is a forgery, and a report of a PID whose name
-    /// pent never read cannot be checked. Both are dropped (FUZZ-1 in
+    /// report proves nothing by itself. The kernel is the second source:
+    /// it tells which file each PID runs. A report whose name does not fit
+    /// that file is a forgery, and a report of a PID whose name pent never
+    /// read cannot be checked. Both are dropped (FUZZ-1 in
     /// `docs/security/fuzzing.md`).
     pub(crate) fn name_fits(&self, pid: u32, name: &str) -> bool {
         self.names
@@ -486,18 +534,20 @@ impl ProcessTree {
             .is_some_and(|known| known.iter().any(|known| names_agree(name, known.as_str())))
     }
 
-    /// Update the tree from a snapshot of the process table.
+    /// Update the tree from a snapshot of the process tree.
     ///
     /// Add the children of each live member, mark the members that are not
-    /// in the table (or are zombies) as dead, and return true if a member is
-    /// still live.
+    /// in the snapshot (or are zombies) as dead, and return true if a
+    /// member is still live.
     ///
-    /// The snapshot also gives the name of the program of each member. A
-    /// process that runs a new file keeps its PID, so the newest snapshot
-    /// wins (see [`ProcessTree::name_fits`]).
-    pub(crate) fn update(&mut self, rows: &[PsRow]) -> bool {
-        let mut children: HashMap<u32, Vec<&PsRow>> = HashMap::new();
-        let mut present: HashMap<u32, &PsRow> = HashMap::new();
+    /// The snapshot also gives the name of the program of each member, and
+    /// a new child takes each name of its parent
+    /// ([`ProcessTree::inherit_names`]). A process that runs a new file
+    /// keeps its PID, so each name of a PID stays (see
+    /// [`ProcessTree::name_fits`]).
+    pub(crate) fn update(&mut self, rows: &[ProcRow]) -> bool {
+        let mut children: HashMap<u32, Vec<&ProcRow>> = HashMap::new();
+        let mut present: HashMap<u32, &ProcRow> = HashMap::new();
         for row in rows {
             children.entry(row.ppid).or_default().push(row);
             present.insert(row.pid, row);
@@ -515,10 +565,13 @@ impl ProcessTree {
             for child in children.get(&pid).map_or(&[][..], Vec::as_slice) {
                 if child.zombie {
                     // A short-lived child: record its PID for the filter.
-                    self.known.insert(child.pid);
+                    if self.known.insert(child.pid) {
+                        self.inherit_names(pid, child.pid);
+                    }
                     continue;
                 }
                 if self.known.insert(child.pid) || self.dead.remove(&child.pid) {
+                    self.inherit_names(pid, child.pid);
                     live.push(child.pid);
                     queue.push(child.pid);
                 }
@@ -548,26 +601,58 @@ pub(crate) use runtime::LogReader;
 
 #[cfg(target_os = "macos")]
 mod runtime {
+    use std::collections::HashSet;
     use std::io::BufRead as _;
     use std::process::{Child, Command, Stdio};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
     use std::sync::{Arc, Mutex, MutexGuard};
     use std::time::{Duration, Instant};
 
     use pent_profile::WatchEvent;
 
-    use super::{file_name_of, parse_line, parse_ps_output, to_event, ProcessTree, RecordMode};
+    use super::{file_name_of, parse_line, to_event, ProcessTree, RecordMode};
+    use crate::macos_kqueue::ForkWatch;
+    use crate::macos_proctable::snapshot;
     use crate::SandboxError;
 
     /// The time to wait for `log stream` to print its header.
     const READY_TIMEOUT: Duration = Duration::from_secs(3);
     /// The interval of the process-tree poll.
-    const POLL_INTERVAL: Duration = Duration::from_millis(100);
+    ///
+    /// The poll reads the tree in the process, so one snapshot costs tens
+    /// of microseconds (see [`crate::macos_proctable`]). The limit is the
+    /// clock of the machine and not the cost: the run 40246732816 on
+    /// `macos-latest` measured that a sleep of one millisecond gives a
+    /// real interval of about five milliseconds on that runner, with
+    /// `nanosleep`, with `select` and with `mach_wait_until` alike. Pent
+    /// asks for the shortest interval that it can use, and a machine with
+    /// a finer clock then polls more often. See MAC-10 in
+    /// `docs/security/macos.md`.
+    const POLL_INTERVAL: Duration = Duration::from_millis(1);
     /// The minimum time between two process-tree refreshes on demand.
-    const MIN_REFRESH_GAP: Duration = Duration::from_millis(50);
-    /// The time to read late log lines after the last process of the tree
-    /// exits.
+    const MIN_REFRESH_GAP: Duration = Duration::from_millis(1);
+    /// The time to read late log lines after the drain saw its own report,
+    /// and the whole drain time when the probe of the drain cannot run.
     const DRAIN_GRACE: Duration = Duration::from_millis(500);
+    /// The time limit of the drain.
+    const DRAIN_LIMIT: Duration = Duration::from_secs(5);
+
+    /// The Seatbelt profile of the warm-up probe (MAC-12).
+    ///
+    /// The deny of `process-exec` stops the program of the probe before it
+    /// runs, and the kernel writes one Seatbelt report with the process ID
+    /// of the probe. The profile names no path, so it needs no escaping
+    /// and it cannot hit the length limit of the reader (MAC-9).
+    const PROBE_PROFILE: &str = "(version 1)(allow default)(deny process-exec)";
+    /// The program of the warm-up probe. It never runs: the profile denies
+    /// the `exec` of it. macOS has no `/bin/true`, so the path is this one
+    /// (MAC-7).
+    const PROBE_PROGRAM: &str = "/usr/bin/true";
+    /// The time between two warm-up probes.
+    const PROBE_GAP: Duration = Duration::from_millis(250);
+    /// The time limit of the warm-up.
+    const WARM_UP_LIMIT: Duration = Duration::from_secs(10);
 
     /// The `log stream` predicate.
     ///
@@ -594,45 +679,27 @@ mod runtime {
     }
 
     impl Tree {
-        /// Read the process table and update the tree. Return true if a
-        /// member is still live.
+        /// Return true if the next walk is due, and record its time.
         ///
-        /// If `ps` fails, keep the tree and return true: the poll tries
-        /// again, and the drain does not start too early.
-        fn refresh(&mut self) -> bool {
-            self.last_refresh = Some(Instant::now());
-            match Command::new("/bin/ps")
-                .args(["-A", "-o", "pid=,ppid=,stat=,comm="])
-                .stderr(Stdio::null())
-                .output()
-            {
-                Ok(out) => self
-                    .tree
-                    .update(&parse_ps_output(&String::from_utf8_lossy(&out.stdout))),
-                Err(e) => {
-                    tracing::debug!(error = %e, "ps failed");
-                    true
-                }
-            }
-        }
-
-        /// Return true if `pid` is in the tree and `name` is the name of
-        /// the program that `pid` runs. Refresh first when the tree does
-        /// not answer both and the last refresh is not too recent: the
-        /// process can be new, or it can have run a new file after the
-        /// last poll.
-        fn accepts(&mut self, pid: u32, name: &str) -> bool {
-            if self.tree.contains(pid) && self.tree.name_fits(pid, name) {
-                return true;
-            }
+        /// A report of a process that the tree does not hold is the reason
+        /// to walk again at once: the process can be new, or it can have
+        /// run a new file after the last walk. The gap bounds the cost for
+        /// a log that holds the reports of many other processes of the
+        /// machine.
+        fn walk_is_due(&mut self) -> bool {
             if self
                 .last_refresh
                 .is_none_or(|t| t.elapsed() >= MIN_REFRESH_GAP)
             {
-                // The poll thread uses the result for the liveness check;
-                // here only the new PIDs and the new names matter.
-                let _alive = self.refresh();
+                self.last_refresh = Some(Instant::now());
+                return true;
             }
+            false
+        }
+
+        /// Return true if `pid` is in the tree and `name` is the name of
+        /// the program that `pid` runs.
+        fn fits(&self, pid: u32, name: &str) -> bool {
             self.tree.contains(pid) && self.tree.name_fits(pid, name)
         }
     }
@@ -644,57 +711,118 @@ mod runtime {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// Walk the process tree in the kernel and update the tree of the run.
+    /// Return true if a member is still live.
+    ///
+    /// The walk itself runs **outside** the lock. Each report of another
+    /// sandboxed process of the machine makes the filter thread ask for a
+    /// walk, and a walk under the lock would keep the poll thread of the
+    /// tree out while it runs.
+    fn refresh(tree: &Mutex<Tree>) -> bool {
+        let roots = {
+            let mut guard = lock(tree);
+            guard.last_refresh = Some(Instant::now());
+            guard.tree.live_members()
+        };
+        let rows = snapshot(&roots);
+        lock(tree).tree.update(&rows)
+    }
+
+    /// Walk the tree again when the last walk is not too recent.
+    fn refresh_on_demand(tree: &Mutex<Tree>) {
+        if lock(tree).walk_is_due() {
+            // The poll thread uses the result for the liveness check;
+            // here only the new PIDs and the new names matter.
+            let _alive = refresh(tree);
+        }
+    }
+
+    /// Return true if `pid` is in the tree and `name` is the name of the
+    /// program that `pid` runs.
+    fn accepts(tree: &Mutex<Tree>, pid: u32, name: &str) -> bool {
+        if lock(tree).fits(pid, name) {
+            return true;
+        }
+        refresh_on_demand(tree);
+        lock(tree).fits(pid, name)
+    }
+
+    /// Return true if `pid` is a member of the tree, live or dead.
+    fn member(tree: &Mutex<Tree>, pid: u32) -> bool {
+        if lock(tree).tree.contains(pid) {
+            return true;
+        }
+        refresh_on_demand(tree);
+        lock(tree).tree.contains(pid)
+    }
+
     /// A running `log stream` process that reads Seatbelt reports.
     pub(crate) struct LogReader {
         log_proc: Option<Child>,
         lines: Option<Receiver<String>>,
     }
 
+    /// The reason that a `log stream` which cannot run gives.
+    fn unavailable(reason: String) -> SandboxError {
+        SandboxError::SandboxUnavailable {
+            reason,
+            remediation: "Make sure that /usr/bin/log works (run `log stream` in a terminal)"
+                .to_string(),
+        }
+    }
+
+    /// Start `log stream` and read its output on a thread.
+    ///
+    /// # Errors
+    /// Returns `SandboxUnavailable` if `log stream` cannot start or has no
+    /// output pipe.
+    fn spawn_stream() -> Result<(Child, Receiver<String>), SandboxError> {
+        let mut log_proc = Command::new("/usr/bin/log")
+            .args([
+                "stream",
+                "--predicate",
+                PREDICATE,
+                "--style",
+                // syslog avoids the column-width truncation of the
+                // "compact" style, which cuts off long paths.
+                "syslog",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| unavailable(format!("could not start `log stream`: {e}")))?;
+        let Some(stdout) = log_proc.stdout.take() else {
+            stop_log_process(&mut log_proc);
+            return Err(unavailable("`log stream` has no output pipe".to_string()));
+        };
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                if tx.send(line).is_err() {
+                    // The reader is gone; stop the read.
+                    break;
+                }
+            }
+        });
+        Ok((log_proc, rx))
+    }
+
     impl LogReader {
-        /// Start `log stream` and wait until it prints its header.
+        /// Start `log stream` and wait until it delivers a report.
         ///
         /// Start the reader before the child, so that the log does not miss
-        /// the first reports. A small race stays: `log stream` prints its
-        /// header just before it connects to the log.
+        /// the first reports. The header of `log stream` proves nothing:
+        /// `log` prints it before it connects to the log. The reader
+        /// therefore makes a report of its own and waits for it
+        /// ([`warm_up`], MAC-12).
         ///
         /// # Errors
         /// Returns `SandboxUnavailable` if `log stream` cannot start or stops
         /// before its header.
         pub(crate) fn start() -> Result<Self, SandboxError> {
-            let unavailable = |reason: String| SandboxError::SandboxUnavailable {
-                reason,
-                remediation: "Make sure that /usr/bin/log works (run `log stream` in a terminal)"
-                    .to_string(),
-            };
-            let mut log_proc = Command::new("/usr/bin/log")
-                .args([
-                    "stream",
-                    "--predicate",
-                    PREDICATE,
-                    "--style",
-                    // syslog avoids the column-width truncation of the
-                    // "compact" style, which cuts off long paths.
-                    "syslog",
-                ])
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn()
-                .map_err(|e| unavailable(format!("could not start `log stream`: {e}")))?;
-            let Some(stdout) = log_proc.stdout.take() else {
-                stop_log_process(&mut log_proc);
-                return Err(unavailable("`log stream` has no output pipe".to_string()));
-            };
-            let (tx, rx) = std::sync::mpsc::channel::<String>();
-            std::thread::spawn(move || {
-                for line in std::io::BufReader::new(stdout).lines() {
-                    let Ok(line) = line else { break };
-                    if tx.send(line).is_err() {
-                        // The reader is gone; stop the read.
-                        break;
-                    }
-                }
-            });
+            let (mut log_proc, rx) = spawn_stream()?;
             match rx.recv_timeout(READY_TIMEOUT) {
                 // The first line is the header of `log stream`.
                 Ok(_header) => {}
@@ -706,6 +834,7 @@ mod runtime {
                     return Err(unavailable("`log stream` stopped".to_string()));
                 }
             }
+            let _warm = warm_up(&rx);
             Ok(Self {
                 log_proc: Some(log_proc),
                 lines: Some(rx),
@@ -740,25 +869,255 @@ mod runtime {
                 last_refresh: None,
             }));
 
-            // Poll the process tree, so that short-lived descendants are
+            // Follow the process tree, so that short-lived descendants are
             // known before their reports arrive. When the tree is empty,
             // wait for late lines, then stop `log stream`. Its output then
             // ends, the filter thread ends, and the event channel closes.
+            let mark = Arc::new(DrainMark::new());
             {
                 let tree = Arc::clone(&tree);
+                let mark = Arc::clone(&mark);
                 std::thread::spawn(move || {
                     let mut log_proc = log_proc;
-                    while lock(&tree).refresh() {
-                        std::thread::sleep(POLL_INTERVAL);
-                    }
-                    std::thread::sleep(DRAIN_GRACE);
+                    follow_tree(&tree);
+                    drain_the_log(&mark);
                     stop_log_process(&mut log_proc);
                 });
             }
 
-            std::thread::spawn(move || filter_lines(&lines, &tree, &mode, &tx));
+            std::thread::spawn(move || filter_lines(&lines, &tree, &mode, &mark, &tx));
             rx
         }
+    }
+
+    /// The mark that the drain of the log waits for.
+    ///
+    /// The log delivers a report about forty milliseconds after the
+    /// access, so the reader must keep the stream open after the last
+    /// process of the run exits. A fixed wait is a guess: the run
+    /// 40250412230 lost the last two accesses of a watch run with a wait
+    /// of 500 ms, while the same command kept them in each run before it.
+    ///
+    /// The drain therefore makes one Seatbelt report of its own, as the
+    /// warm-up does, and waits for it. The kernel writes the reports in
+    /// order, and the probe of the drain runs after the last process of
+    /// the run exits, so a stream that delivers the report of the probe
+    /// has delivered each earlier report of the run.
+    struct DrainMark {
+        /// The process ID of the probe that the drain waits for. Zero
+        /// means that the drain waits for nothing.
+        probe: AtomicU32,
+        /// True when the filter thread read a report of that process ID.
+        seen: AtomicBool,
+    }
+
+    impl DrainMark {
+        /// A mark that waits for nothing.
+        const fn new() -> Self {
+            Self {
+                probe: AtomicU32::new(0),
+                seen: AtomicBool::new(false),
+            }
+        }
+
+        /// Record that a report of `pid` arrived, when the drain waits for
+        /// that PID.
+        fn note(&self, pid: u32) {
+            if pid != 0 && self.probe.load(Ordering::Relaxed) == pid {
+                self.seen.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Keep `log stream` open until it delivers a report of pent itself.
+    ///
+    /// See [`DrainMark`]. A drain that passes its limit gives a warning:
+    /// the record can then miss the last accesses of the run.
+    fn drain_the_log(mark: &DrainMark) {
+        let start = Instant::now();
+        while start.elapsed() < DRAIN_LIMIT {
+            let Ok(pid) = run_probe() else {
+                // Without a probe the drain can only wait.
+                std::thread::sleep(DRAIN_GRACE);
+                return;
+            };
+            mark.seen.store(false, Ordering::Relaxed);
+            mark.probe.store(pid, Ordering::Relaxed);
+            let waited = Instant::now();
+            while waited.elapsed() < PROBE_GAP {
+                if mark.seen.load(Ordering::Relaxed) {
+                    // The stream has reached the present. Give the late
+                    // lines of the kernel a last moment, because the
+                    // unified log keeps no strict order.
+                    std::thread::sleep(DRAIN_GRACE);
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        tracing::warn!(
+            limit_s = DRAIN_LIMIT.as_secs(),
+            "`log stream` delivered no report of pent itself at the end of the \
+             run; the record can miss the last accesses"
+        );
+    }
+
+    /// Follow the process tree of the run until nothing of it is live.
+    ///
+    /// The loop walks the tree, then waits for the next `fork`, `exec` or
+    /// `exit` of a member ([`ForkWatch`]). A `fork` wakes it in
+    /// microseconds, so the walk finds the child while the child still
+    /// lives; without the wake the loop would wait for a timer, which a
+    /// runner turns into tens of milliseconds and which the child of a
+    /// `fork` does not survive (MAC-10).
+    ///
+    /// [`POLL_INTERVAL`] is the limit of the wait, not the interval of a
+    /// poll: the loop walks the tree also when no event comes, so a macOS
+    /// that gives no `EVFILT_PROC` event at all keeps the old behaviour.
+    fn follow_tree(tree: &Mutex<Tree>) {
+        let watch = match ForkWatch::new() {
+            Ok(watch) => Some(watch),
+            Err(e) => {
+                tracing::debug!(error = %e, "the kernel gave no kqueue; the tree follows a timer");
+                None
+            }
+        };
+        let mut followed: HashSet<u32> = HashSet::new();
+        let start = Instant::now();
+        let mut walks = 0usize;
+        let mut wakes = 0usize;
+        while refresh(tree) {
+            // Follow each member that the watch does not follow yet. A
+            // member that is already gone gives `ESRCH`, and the walk
+            // above has its reports either way.
+            if let Some(watch) = watch.as_ref() {
+                for pid in lock(tree).tree.live_members() {
+                    if followed.insert(pid) {
+                        if let Err(e) = watch.follow(pid) {
+                            tracing::debug!(pid, error = %e, "the watch cannot follow the process");
+                        }
+                    }
+                }
+            }
+            walks = walks.saturating_add(1);
+            match watch.as_ref() {
+                Some(watch) => {
+                    if watch.wait(POLL_INTERVAL) > 0 {
+                        wakes = wakes.saturating_add(1);
+                    }
+                }
+                None => std::thread::sleep(POLL_INTERVAL),
+            }
+        }
+        tracing::debug!(
+            walks,
+            wakes,
+            followed = followed.len(),
+            took_ms = start.elapsed().as_millis(),
+            "the run of the process tree ended"
+        );
+    }
+
+    /// The answer of the warm-up (MAC-12).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum WarmUp {
+        /// A report of a probe came back through the stream. The stream
+        /// delivers the reports of the kernel from now on.
+        Ready,
+        /// No report of a probe came back inside [`WARM_UP_LIMIT`].
+        TimedOut,
+    }
+
+    /// Run one probe and return its process ID.
+    ///
+    /// The probe is a sandboxed program that the profile stops at its
+    /// `exec`, so the kernel writes one Seatbelt report of it. Nothing
+    /// else of the probe reaches the machine: the program never runs.
+    ///
+    /// # Errors
+    /// Returns the error of the spawn or of the wait.
+    fn run_probe() -> std::io::Result<u32> {
+        let mut child = Command::new("/usr/bin/sandbox-exec")
+            .args(["-p", PROBE_PROFILE, PROBE_PROGRAM])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let pid = child.id();
+        // The profile denies the `exec`, so the probe exits at once.
+        let _status = child.wait()?;
+        Ok(pid)
+    }
+
+    /// Wait until the stream delivers a Seatbelt report of pent itself.
+    ///
+    /// MAC-12. `log stream` prints its header before it connects to the
+    /// log, so the header proves nothing. The run 40246227819 on
+    /// `macos-latest` measured what that costs: the **first** `log stream`
+    /// of a machine lost a report that a probe made 17 ms after the
+    /// header, and it lost it for the whole 30 s of the measurement. Each
+    /// stream after the first one lost none. A watch run of a short
+    /// command on a new machine thus recorded nothing, and the user read
+    /// "No new rules from 0 accesses", which reads like a program that
+    /// did nothing.
+    ///
+    /// The warm-up makes a report of its own and waits for it. One probe
+    /// is not enough, because a probe that runs while the stream is still
+    /// cold is lost with it; the warm-up therefore runs a new probe every
+    /// [`PROBE_GAP`] until one of them comes back. The run 40246732816
+    /// measured the cost: the first stream of a machine needed two probes
+    /// and 316 ms, and each stream after it needed one probe and 46 ms.
+    ///
+    /// A warm-up that passes its limit gives a warning and no error: a
+    /// run that records too little is better than a run that does not
+    /// start. The lines that the warm-up reads come from before the
+    /// child, so dropping them loses nothing.
+    pub(crate) fn warm_up(lines: &Receiver<String>) -> WarmUp {
+        let start = Instant::now();
+        let mut probes: Vec<u32> = Vec::new();
+        let mut next_probe = Instant::now();
+        while start.elapsed() < WARM_UP_LIMIT {
+            if Instant::now() >= next_probe {
+                match run_probe() {
+                    Ok(pid) => probes.push(pid),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "the warm-up probe of the log reader did not run; \
+                             the record can miss the first accesses"
+                        );
+                        return WarmUp::TimedOut;
+                    }
+                }
+                next_probe = Instant::now() + PROBE_GAP;
+            }
+            let left = WARM_UP_LIMIT.saturating_sub(start.elapsed());
+            let wait = left.min(PROBE_GAP);
+            match lines.recv_timeout(wait) {
+                Ok(line) => {
+                    let Some(record) = parse_line(&line) else {
+                        continue;
+                    };
+                    if probes.contains(&record.pid) {
+                        tracing::debug!(
+                            probes = probes.len(),
+                            took_ms = start.elapsed().as_millis(),
+                            "the log stream delivers the reports of the kernel"
+                        );
+                        return WarmUp::Ready;
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        tracing::warn!(
+            probes = probes.len(),
+            limit_s = WARM_UP_LIMIT.as_secs(),
+            "`log stream` delivered no report of pent itself inside the limit; \
+             this run can record no access at all (MAC-12)"
+        );
+        WarmUp::TimedOut
     }
 
     /// Send one event for each log line of the process tree.
@@ -766,30 +1125,45 @@ mod runtime {
         lines: &Receiver<String>,
         tree: &Mutex<Tree>,
         mode: &RecordMode,
+        mark: &DrainMark,
         tx: &Sender<WatchEvent>,
     ) {
         for line in lines {
             let Some(record) = parse_line(&line) else {
                 continue;
             };
+            // The drain at the end of the run waits for the report of a
+            // probe of pent, whose PID is in no process tree of the run.
+            mark.note(record.pid);
+            // The report of an exec names the program that the process
+            // runs from now on. The kernel writes that path, so the name
+            // is a source that the program does not choose, and it is as
+            // good as the one of a snapshot. The reader takes it **before**
+            // the check of the name below: a process that runs a new file
+            // between two snapshots has a name that no snapshot holds yet,
+            // and the check would drop the exec report itself and with it
+            // every later report of that process (MAC-8 and MAC-10).
+            //
+            // The membership in the tree still comes from the kernel walk
+            // alone. A name is not a process tree: two unrelated programs
+            // of a machine have the same name, so a report whose PID the
+            // tree does not hold teaches nothing
+            // (`watch_keeps_only_the_processes_of_the_run`).
+            if record.operation.starts_with("process-exec")
+                && record.target.starts_with('/')
+                && member(tree, record.pid)
+            {
+                lock(tree)
+                    .tree
+                    .learn_name(record.pid, file_name_of(&record.target));
+            }
             // The reports of other sandboxed processes on the system are
             // also in the log. Keep only our process tree, and only a
             // report whose process name fits the program that the PID
             // runs: the program chooses the text of its own name, so a
             // name that does not fit is a forgery (FUZZ-1).
-            if !lock(tree).accepts(record.pid, &record.process) {
+            if !accepts(tree, record.pid, &record.process) {
                 continue;
-            }
-            // The report of an exec names the program that the process
-            // runs from now on. The kernel writes that path, so the name
-            // is a source that the program does not choose. Without it,
-            // each report after the first exec of a process has a name
-            // that no snapshot of the process table holds yet, and the
-            // reader drops it (MAC-8).
-            if record.operation.starts_with("process-exec") && record.target.starts_with('/') {
-                lock(tree)
-                    .tree
-                    .learn_exec(record.pid, file_name_of(&record.target));
             }
             let Some(event) = to_event(&record, mode) else {
                 continue;
@@ -816,6 +1190,108 @@ mod runtime {
         }
         if let Err(e) = log_proc.wait() {
             tracing::debug!(error = %e, "could not reap `log stream`");
+        }
+    }
+
+    #[cfg(test)]
+    #[allow(
+        clippy::panic,
+        reason = "a stream that gives no report must fail the test with its reason"
+    )]
+    mod tests {
+        use super::{
+            spawn_stream, stop_log_process, warm_up, LogReader, RecordMode, WarmUp, READY_TIMEOUT,
+        };
+        use std::time::Instant;
+
+        /// MAC-12. A `log stream` that pent has just started must deliver
+        /// a report of the kernel before pent starts the child.
+        ///
+        /// Before the warm-up, the **first** stream of a machine
+        /// delivered no report at all, so the first watch run of a machine
+        /// recorded nothing and the user saw an empty draft. The warm-up
+        /// makes a report of its own and waits for it, so this test holds
+        /// the property that MAC-12 broke.
+        ///
+        /// The test prints the time that the warm-up took. On a runner the
+        /// first stream of the machine needs about 300 ms and each stream
+        /// after it about 50 ms.
+        #[test]
+        fn the_warm_up_sees_a_report_of_its_own_probe() {
+            let Ok((mut log_proc, lines)) = spawn_stream() else {
+                panic!("`log stream` did not start");
+            };
+            // The header, as `LogReader::start` reads it.
+            let _header = lines.recv_timeout(READY_TIMEOUT);
+            let start = Instant::now();
+            let answer = warm_up(&lines);
+            stop_log_process(&mut log_proc);
+            println!(
+                "the warm-up of the log reader took {} ms",
+                start.elapsed().as_millis()
+            );
+            assert_eq!(
+                answer,
+                WarmUp::Ready,
+                "the stream delivered no report of the probe of pent inside \
+                 the limit, so a watch run of this machine records nothing \
+                 (MAC-12 in docs/security/macos.md)"
+            );
+        }
+
+        /// The reader of a short command must see the accesses of that
+        /// command.
+        ///
+        /// `LogReader::start` warms the stream up, so the reader is
+        /// connected when the child starts. The test runs the reader over
+        /// a sandboxed program that reads one file and asserts that the
+        /// read reaches the event channel.
+        #[test]
+        fn the_reader_keeps_the_access_of_a_short_command() {
+            let dir = match tempfile::tempdir() {
+                Ok(dir) => dir,
+                Err(e) => panic!("the test could not make a directory: {e}"),
+            };
+            let file = dir.path().join("known.txt");
+            if let Err(e) = std::fs::write(&file, "KNOWN\n") {
+                panic!("the test could not write its file: {e}");
+            }
+            // The kernel reports the resolved path, and on macOS the
+            // temporary directory is below a symbolic link, so the rule
+            // needs the resolved form too.
+            let real = match std::fs::canonicalize(dir.path()) {
+                Ok(path) => path,
+                Err(e) => panic!("the test could not resolve its directory: {e}"),
+            };
+            let Ok(reader) = LogReader::start() else {
+                panic!("the log reader did not start");
+            };
+            let profile = format!(
+                "(version 1)\n(allow default)\n(allow file-read-data (subpath \"{}\") \
+                 (with report))\n",
+                real.display()
+            );
+            let child = std::process::Command::new("/usr/bin/sandbox-exec")
+                .args(["-p", &profile, "/bin/cat"])
+                .arg(&file)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+            let Ok(mut child) = child else {
+                panic!("the test could not start sandbox-exec");
+            };
+            let names = vec!["sandbox-exec".to_string(), "cat".to_string()];
+            let events = reader.attach(child.id(), &names, RecordMode::Run);
+            let _status = child.wait();
+            let seen: Vec<_> = events.iter().collect();
+            assert!(
+                seen.iter()
+                    .any(|event| format!("{event:?}").contains("known.txt")),
+                "the reader kept no event of the file that the program read; \
+                 it saw {} events: {seen:?}",
+                seen.len()
+            );
         }
     }
 }
@@ -1003,7 +1479,7 @@ mod tests {
         let r = record("Sandbox: other(1234) deny(1) file-read-data /etc/passwd");
         assert_eq!(r.pid, 1234);
         let mut tree = ProcessTree::with_names(10, &[]);
-        assert!(tree.update(&parse_ps_output("10 1 S\n")));
+        assert!(tree.update(&parse_proc_table("10 1 S\n")));
         assert!(tree.contains(10));
         assert!(!tree.contains(r.pid));
     }
@@ -1091,9 +1567,9 @@ mod tests {
         );
     }
 
-    /// A row of `PsRow` with the fields that the test names.
-    fn ps_row(pid: u32, ppid: u32, zombie: bool, name: &str) -> PsRow {
-        PsRow {
+    /// A row of [`ProcRow`] with the fields that the test names.
+    fn proc_row(pid: u32, ppid: u32, zombie: bool, name: &str) -> ProcRow {
+        ProcRow {
             pid,
             ppid,
             zombie,
@@ -1102,8 +1578,8 @@ mod tests {
     }
 
     #[test]
-    fn parses_ps_rows() {
-        let rows = parse_ps_output(
+    fn parses_a_process_table() {
+        let rows = parse_proc_table(
             "  1     0 Ss /sbin/launchd\n\
              10     1 S+ /bin/sh\n\
              11    10 Z+ /usr/bin/cat\n\
@@ -1114,11 +1590,11 @@ mod tests {
         assert_eq!(
             rows,
             vec![
-                ps_row(1, 0, false, "launchd"),
-                ps_row(10, 1, false, "sh"),
-                ps_row(11, 10, true, "cat"),
-                ps_row(12, 10, false, ""),
-                ps_row(13, 10, false, "Code Helper (GPU)"),
+                proc_row(1, 0, false, "launchd"),
+                proc_row(10, 1, false, "sh"),
+                proc_row(11, 10, true, "cat"),
+                proc_row(12, 10, false, ""),
+                proc_row(13, 10, false, "Code Helper (GPU)"),
             ]
         );
     }
@@ -1129,7 +1605,7 @@ mod tests {
     #[test]
     fn the_name_of_a_report_must_fit_the_program() {
         let mut tree = ProcessTree::with_names(10, &[]);
-        let _live = tree.update(&parse_ps_output(
+        let _live = tree.update(&parse_proc_table(
             "10 1 S /bin/sh\n\
              11 10 S /usr/bin/cat\n\
              12 10 S /Applications/X.app/Contents/MacOS/Code Helper (GPU)\n",
@@ -1185,14 +1661,14 @@ mod tests {
         let names = ["sh".to_string()];
         let mut tree = ProcessTree::with_names(10, &names);
         assert!(!tree.name_fits(10, "bash"));
-        tree.learn_exec(10, "bash");
+        tree.learn_name(10, "bash");
         assert!(tree.name_fits(10, "bash"), "the new name must fit");
         assert!(tree.name_fits(10, "sh"), "the old name must stay");
         // A PID outside the tree learns nothing.
-        tree.learn_exec(99, "bash");
+        tree.learn_name(99, "bash");
         assert!(!tree.name_fits(99, "bash"));
         // The process table adds a name, it does not replace one.
-        let _live = tree.update(&parse_ps_output("10 1 S /bin/zsh\n"));
+        let _live = tree.update(&parse_proc_table("10 1 S /bin/zsh\n"));
         assert!(tree.name_fits(10, "zsh"));
         assert!(tree.name_fits(10, "bash"));
     }
@@ -1201,41 +1677,87 @@ mod tests {
     fn tree_follows_descendants_and_ends() {
         let mut tree = ProcessTree::with_names(10, &[]);
         // 10 -> 11 -> 12; 20 is not ours.
-        let rows = parse_ps_output("10 1 S\n11 10 S\n12 11 S\n20 1 S\n");
+        let rows = parse_proc_table("10 1 S\n11 10 S\n12 11 S\n20 1 S\n");
         assert!(tree.update(&rows));
         assert!(tree.contains(12));
         assert!(!tree.contains(20));
 
         // The root exits; 12 lives on, reparented to launchd.
-        let rows = parse_ps_output("12 1 S\n20 1 S\n");
+        let rows = parse_proc_table("12 1 S\n20 1 S\n");
         assert!(tree.update(&rows));
         assert!(tree.contains(10), "dead PIDs stay known for late lines");
 
         // 12 becomes a zombie: the tree is empty.
-        let rows = parse_ps_output("12 1 Z\n20 1 S\n");
+        let rows = parse_proc_table("12 1 Z\n20 1 S\n");
         assert!(!tree.update(&rows));
+    }
+
+    /// MAC-10. A `fork` copies the program of the parent, so a child that
+    /// a snapshot finds between the `fork` and the `exec` runs the program
+    /// of its parent. The reports of that child then have the name of the
+    /// parent, and the reader must keep them.
+    #[test]
+    fn a_forked_child_takes_the_names_of_its_parent() {
+        let names = ["sandbox-exec".to_string(), "sh".to_string()];
+        let mut tree = ProcessTree::with_names(10, &names);
+        // The snapshot finds the child; the kernel still names the
+        // program of the parent, because the child did not exec yet.
+        let _live = tree.update(&parse_proc_table("10 1 S /bin/sh\n11 10 S /bin/sh\n"));
+        assert!(tree.name_fits(11, "sh"), "the name of the parent must fit");
+        assert!(
+            tree.name_fits(11, "sandbox-exec"),
+            "each name of the parent must fit"
+        );
+        assert!(!tree.name_fits(11, "cat"), "a name of nobody must not fit");
+        // The child runs a new file. The kernel names it in the report.
+        tree.learn_name(11, "cat");
+        assert!(tree.name_fits(11, "cat"));
+        // A child of a parent whose program pent never read learns no
+        // name, so the check still refuses its reports.
+        let mut blind = ProcessTree::with_names(20, &[]);
+        let _live = blind.update(&parse_proc_table("20 1 S\n21 20 S\n"));
+        assert!(!blind.name_fits(21, "sh"));
+    }
+
+    /// The walk of the next snapshot starts at each live member, and a
+    /// dead member is never a start of it.
+    #[test]
+    fn the_live_members_are_the_start_of_the_next_walk() {
+        let mut tree = ProcessTree::with_names(10, &[]);
+        let _live = tree.update(&parse_proc_table("10 1 S\n11 10 S\n"));
+        let mut live = tree.live_members();
+        live.sort_unstable();
+        assert_eq!(live, vec![10, 11]);
+        // The child exits. The tree keeps its PID for a late log line,
+        // and the walk does not start at it any more.
+        let _live = tree.update(&parse_proc_table("10 1 S\n"));
+        assert_eq!(tree.live_members(), vec![10]);
+        assert!(tree.contains(11));
+        // Nothing of the run is live: the walk has no start.
+        let _live = tree.update(&parse_proc_table(""));
+        assert!(tree.live_members().is_empty());
     }
 
     #[test]
     fn tree_ignores_reused_pid() {
         let mut tree = ProcessTree::with_names(10, &[]);
-        assert!(tree.update(&parse_ps_output("10 1 S\n")));
-        assert!(!tree.update(&parse_ps_output("")));
+        assert!(tree.update(&parse_proc_table("10 1 S\n")));
+        assert!(!tree.update(&parse_proc_table("")));
         // An unrelated process gets PID 10 again.
-        assert!(!tree.update(&parse_ps_output("10 1 S\n")));
+        assert!(!tree.update(&parse_proc_table("10 1 S\n")));
     }
 
     #[test]
     fn tree_records_zombie_children() {
         let mut tree = ProcessTree::with_names(10, &[]);
-        assert!(tree.update(&parse_ps_output("10 1 S\n11 10 Z\n")));
+        assert!(tree.update(&parse_proc_table("10 1 S\n11 10 Z\n")));
         assert!(tree.contains(11));
     }
 
     #[test]
     fn tree_without_root_is_empty() {
         let mut tree = ProcessTree::with_names(10, &[]);
-        assert!(!tree.update(&parse_ps_output("20 1 S\n")));
+        assert!(!tree.update(&parse_proc_table("20 1 S\n")));
     }
 }
 
@@ -1484,7 +2006,7 @@ mod log_properties {
         );
     }
 
-    /// `parse_ps_output` must take only rows with two numbers, and
+    /// [`parse_proc_table`] must take only rows with two numbers, and
     /// `ProcessTree::update` must always stop, also for a process table
     /// with a cycle.
     #[test]
@@ -1502,7 +2024,7 @@ mod log_properties {
             if rng.one_in(4) {
                 text.push_str("not a row\n");
             }
-            let rows = parse_ps_output(&text);
+            let rows = parse_proc_table(&text);
             assert!(
                 rows.len() <= text.lines().count(),
                 "the parser made rows out of nothing"
@@ -1560,7 +2082,7 @@ mod log_properties {
         // a crafted name of one component looks like this one; the check
         // works on the file name that `ps` gives either way.
         let mut tree = ProcessTree::with_names(1234, &[]);
-        let _live = tree.update(&parse_ps_output(
+        let _live = tree.update(&parse_proc_table(
             "1234 1 S /tmp/a(1234) deny(1) file-read-data x\n\
              1235 1234 S /bin/cat\n",
         ));

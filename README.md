@@ -99,17 +99,17 @@ None of the operation families that stay allowed runs a program outside the sand
 
 The macOS backend also ignores `[[sandbox.mounts]]`. Use a profile rule (or `--read`, `--write`) to give access to a path on macOS.
 
-### macOS: watch mode records the root process, not every forked child
+### macOS: watch mode is a lower bound for a child that lives microseconds
 
 The macOS test suite ran on a Mac for the first time on 2026-10-25. The profile forms and the reader of the unified log hold, with these results.
 
-Watch mode reads the Seatbelt reports of the kernel from the unified log. To tell a real report from a line that the watched program writes itself, Pent checks the name of each report against the program that the process runs, and it reads the process tree from `ps`. A child process that lives less than one poll of `ps` (about 100 ms) never reaches that tree, so Pent loses its accesses. The root process of the run has no such gap, and a program that the root runs **in place** has none either: it keeps the process ID of the root, and Pent learns its name from the exec report of the kernel. A shell that runs one command (`sh -c 'cat FILE'`) works this way. A shell that runs two forks for the first one, and that child is the gap.
+Watch mode reads the Seatbelt reports of the kernel from the unified log. To tell a real report from a line that the watched program writes itself, Pent checks the name of each report against the program that the process runs, and it reads the process tree from the kernel. A child process that forks and exits before Pent reads the tree never reaches that tree, so Pent loses its accesses. The root process of the run has no such gap, and a program that the root runs **in place** has none either: it keeps the process ID of the root, and Pent learns its name from the exec report of the kernel.
 
-A run on a Mac measured the recommended fix and it does not work: `kqueue` with `EVFILT_PROC` and `NOTE_TRACK` answers `ENOTSUP`, so the kernel of macOS never names the child of a fork. The next step needs the `EndpointSecurity` framework, which needs an Apple entitlement that a tool you build yourself cannot have.
+Pent closes most of that window. It asks the kernel for an event on each `fork` of each member of the tree (`kqueue` with `EVFILT_PROC` and `NOTE_FORK`), so it reads the tree the moment a member forks and not at the next tick of a timer. A run on `macos-latest` measured the result: with a timer the recorder kept the accesses of a forked `cat` in 0 of 40 runs, and with the event in 47 of 47 runs.
 
-The first watch run of a machine also records nothing, because the first `log stream` delivers no report: run `pent watch` a second time if the summary says "No new rules from 0 accesses" (MAC-12).
+The window is smaller and not closed, so **watch mode on macOS stays a lower bound**: the draft can miss an access of a child that exits inside the window, and `pent watch --append` merges more runs. Linux has no such gap, because the Linux recorder reads each access from the kernel through seccomp. A guarantee on macOS needs the `EndpointSecurity` framework, which names the child of each `fork` with no race and which needs an Apple entitlement that a tool you build yourself cannot have. The finding is MAC-10 in [docs/security/macos.md](docs/security/macos.md), with the tests and the numbers.
 
-Watch mode on macOS is therefore a lower bound: the draft can miss an access of a forked short-lived child, and `pent watch --append` merges more runs. Linux has no such gap, because the Linux recorder reads each access from the kernel through seccomp. The finding is MAC-10 in [docs/security/macos.md](docs/security/macos.md), with the test that states the secure behaviour.
+Before Pent starts your program, it makes one Seatbelt report of its own and waits for it. The first `log stream` of a machine delivers no report for its first moments, and without this wait the first watch run of a machine recorded nothing (MAC-12). The wait costs about 300 ms on the first run of a machine and about 50 ms after it. If it passes its limit of ten seconds, Pent warns you that the run can record no access at all.
 
 ### Linux: requirements and Unix sockets
 
