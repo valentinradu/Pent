@@ -45,6 +45,11 @@ mod macos;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod macos_log;
 
+// The snapshot of the process tree, which the log reader needs. The two
+// calls of `libproc` exist only on macOS.
+#[cfg(target_os = "macos")]
+mod macos_proctable;
+
 // The measurement of `kqueue` for MAC-10. The module holds no production
 // code: `kqueue` gives no fact that the poll of the process table does not
 // already give (see the comment of the module). The test holds the answer

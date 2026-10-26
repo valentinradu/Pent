@@ -455,9 +455,9 @@ mod macos {
     ///
     /// OPEN MAC-10. The reader keeps a report only when the process is a
     /// member of the tree of the run and the name of the report fits the
-    /// program that the process runs. Both facts come from a poll of `ps`
-    /// every 100 ms, and a child such as `cat` lives about three
-    /// milliseconds, so no poll holds it.
+    /// program that the process runs. Both facts come from a poll of the
+    /// process tree, and the child of the fork lives about six
+    /// milliseconds, so a poll misses it part of the time.
     ///
     /// The script runs `cat` and then a second command, so the shell
     /// forks for `cat` instead of running it in place. The run of
@@ -466,12 +466,17 @@ mod macos {
     /// the recorder keeps each access of it. The fork is the gap, not the
     /// exec.
     ///
+    /// One run is thus not a property: the test keeps its mark.
+    /// `watch_keeps_the_read_of_a_short_lived_child_most_of_the_time`
+    /// measures the rate over many runs, and that rate is the number of
+    /// MAC-10 in `docs/security/macos.md`.
+    ///
     /// Read the summary in the message of the failure. "27 accesses by 3
     /// processes" is MAC-10: the root is there and the child is not.
-    /// "0 accesses" is MAC-12: this is the first watch run of the machine,
-    /// and the first `log stream` gives no report at all.
+    /// "0 accesses" is MAC-12: the stream of the log delivered no report
+    /// at all, so the warm-up of the reader did not work.
     #[test]
-    #[ignore = "OPEN MAC-10: the recorder misses a child that lives less than one ps poll; kqueue NOTE_TRACK gives ENOTSUP, so the next step is EndpointSecurity"]
+    #[ignore = "OPEN MAC-10: the poll of the process tree sees the child of a fork about three times out of four, so one run is not a property; watch_keeps_the_read_of_a_short_lived_child_most_of_the_time holds the rate"]
     fn watch_records_a_read_of_a_short_lived_child() -> TestResult {
         if !ready("watch_records_a_child_read", &[SH, "/bin/cat"]) {
             return Ok(());
@@ -500,6 +505,121 @@ mod macos {
              --- the summary of the run ---\n{}\n{}",
             stderr(&out),
             watch_report(&env, "c", &draft)
+        );
+        Ok(())
+    }
+
+    /// The number of runs that the residual measurement of MAC-10 makes.
+    ///
+    /// The runner of 2026-10-26 keeps the read of the child in about three
+    /// runs out of four. With twelve runs, a recorder that lost each one
+    /// would be a chance of about one in seventy million, so the floor of
+    /// the assertion below cannot fail by chance.
+    const CHILD_RUNS: usize = 12;
+
+    /// The residual window of MAC-10, as a rate.
+    ///
+    /// The recorder knows a child only when a poll of the process tree
+    /// sees it. The child of `sh -c 'cat FILE; echo END'` lives about six
+    /// milliseconds (the run 40246732816 measured it), and the poll of
+    /// pent asks for one millisecond, which a runner turns into about
+    /// five. The recorder thus keeps the accesses of the child most of the
+    /// time and not every time.
+    ///
+    /// The test runs the same watch command [`CHILD_RUNS`] times, counts
+    /// the runs whose draft holds the read, and **prints the rate**. The
+    /// number in MAC-10 of `docs/security/macos.md` comes from this test.
+    ///
+    /// The assertion is a floor, not the rate: a rate is not a property of
+    /// the machine, and a test of a security property must not fail by
+    /// chance. Before the fix the rate was zero, so the floor holds the
+    /// whole value of the fix.
+    #[test]
+    fn watch_keeps_the_read_of_a_short_lived_child_most_of_the_time() -> TestResult {
+        if !ready("watch_child_read_rate", &[SH, "/bin/cat"]) {
+            return Ok(());
+        }
+        let mut kept = 0usize;
+        let mut reports = String::new();
+        for _run in 0..CHILD_RUNS {
+            let env = TestEnv::new()?;
+            env.write_home(".foorc", "foo\n")?;
+            let out = env.pent_ok(&[
+                "watch",
+                "--yes",
+                "--profile",
+                "r",
+                "--",
+                SH,
+                "-c",
+                "cat ~/.foorc; echo END",
+            ])?;
+            assert_eq!(stdout(&out), "foo\nEND\n", "stderr: {}", stderr(&out));
+            let draft = fs::read_to_string(env.draft_path("r")).unwrap_or_default();
+            let read = rules(&draft, "filesystem", "read").unwrap_or_default();
+            let read_write = rules(&draft, "filesystem", "read_write").unwrap_or_default();
+            if read.contains("~/.foorc") || read_write.contains("~/.foorc") {
+                kept = kept.saturating_add(1);
+            } else if reports.is_empty() {
+                // The first run that lost the read, for the message below.
+                reports = watch_report(&env, "r", &draft);
+            }
+        }
+        println!(
+            "MAC-10: the recorder kept the read of the short-lived child in \
+             {kept} of {CHILD_RUNS} runs"
+        );
+        assert!(
+            kept > 0,
+            "the recorder lost the read of the child in every one of \
+             {CHILD_RUNS} runs. Before the fix of 2026-10-26 the rate was \
+             zero, so this is a regression of MAC-10 in \
+             docs/security/macos.md.\n{reports}"
+        );
+        Ok(())
+    }
+
+    /// MAC-12. The first watch run of a machine must record an access.
+    ///
+    /// `log stream` prints its header before it connects to the log, so
+    /// the header proves nothing. On a machine whose log system is cold,
+    /// the **first** stream delivered no report at all, and the first
+    /// watch run of that machine wrote an empty draft. A user who tried
+    /// pent for the first time saw nothing and concluded that pent does
+    /// not work.
+    ///
+    /// `LogReader::start` now makes a Seatbelt report of its own and waits
+    /// for it before pent starts the child
+    /// (`crates/pent-sandbox/src/macos_log.rs`). The command of this test
+    /// is as short as a command can be, so it ends long before a cold
+    /// stream would deliver anything.
+    ///
+    /// A test cannot put the log system of a machine back into its cold
+    /// state, so no single test can name the moment. Two things hold the
+    /// finding instead: each job of the pipeline runs on a new machine, so
+    /// the first watch run of the job is the cold case; and the unit test
+    /// `the_warm_up_sees_a_report_of_its_own_probe` of `macos_log.rs`
+    /// holds the mechanism on each stream that pent starts.
+    #[test]
+    fn the_first_watch_run_of_a_machine_records_an_access() -> TestResult {
+        if !ready("first_watch_run", &["/bin/cat"]) {
+            return Ok(());
+        }
+        let env = TestEnv::new()?;
+        let known = env.write_home("first.txt", "FIRST\n")?;
+        let known = known.to_str().ok_or("the path is not UTF-8")?;
+        let out = env.pent_ok(&["watch", "--yes", "--profile", "m", "--", "/bin/cat", known])?;
+        assert_eq!(stdout(&out), "FIRST\n", "stderr: {}", stderr(&out));
+
+        let draft = draft_with_events(&env, "m")?;
+        let read = rules(&draft, "filesystem", "read")?;
+        let read_write = rules(&draft, "filesystem", "read_write")?;
+        assert!(
+            read.contains("~/first.txt") || read_write.contains("~/first.txt"),
+            "the run recorded no access. If this is the first watch run of \
+             this machine, the warm-up of the log reader did not work and \
+             MAC-12 is open again.\n{}",
+            watch_report(&env, "m", &draft)
         );
         Ok(())
     }
