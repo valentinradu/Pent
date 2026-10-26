@@ -151,6 +151,13 @@ On a host with `systemd-resolved` (Ubuntu, Fedora and most other distributions),
 
 Two cases give the child no resolver at all. The first: a link inside `/run` or `/tmp` that points out of these directories, or a chain of more than eight links. The second: a host with no `/etc/resolv.conf` at all. Pent does not write in `/etc` of your host, so it leaves the path absent. In both cases every name lookup of the child fails, and Pent writes a warning. The sandbox stays closed, and a program that needs a name reports an error.
 
+## Changelog
+
+[CHANGELOG.md](CHANGELOG.md) holds the changes of each release. The
+release 0.1.0 replaces the profiles that a user wrote by hand with profiles
+that pent records, and it removes the project configuration, so read it
+before you upgrade.
+
 ## Installation
 
 Pent needs no root and no capability. The packages do not run `setcap`.
