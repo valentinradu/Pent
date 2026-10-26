@@ -48,21 +48,18 @@ cannot stay green while the sandbox never ran.
 
 The reports hold the full list. Each finding that is open has a test in the
 tree that states the secure behaviour and fails, so `--include-ignored`
-names every one of them. Three are open today:
+names every one of them. No finding is open today.
 
-| Finding | Report | Why it is open |
-|---------|--------|----------------|
-| MAC-10 | [macos.md](macos.md) | The macOS recorder learns the name of a process from a poll, so it loses a child that lives less than one poll. The way out is `kqueue` with `EVFILT_PROC`. |
-| MAC-4 (in part) | [macos.md](macos.md) | `process-exec` is denied now, so an `execute` rule means something. A lookup of a Mach service, and launchd with it, stays open. |
-| DIFF-9 | [differential.md](differential.md) | A guard pattern with a leading `*` on macOS. |
-
-Each one is macOS. Every finding of the Linux sandbox, of the network and of
-the profile pipeline has a fix and a regression test.
+Each one has a fix, and the test that found it stays as a regression test.
+The reports hold the detail, and `docs/security/macos.md` holds the limits
+that stay inside a fix: the window of a few milliseconds of MAC-10, and the
+operation families of SBPL that the macOS profile still allows (MAC-4).
 
 The tests run on Linux and on macOS in the pipeline, with
-`PENT_REQUIRE_ALL_TESTS=1`, so a skip is a failure. One job stays red: `pent
-run` cannot mount a private `/proc` inside a container, because a container
-runtime masks paths below `/proc`.
+`PENT_REQUIRE_ALL_TESTS=1`, so a skip is a failure, and every job is green.
+The container job runs twice: one run keeps the masks of the runtime, where
+the kernel refuses a private `/proc` and pent says so, and one run gives the
+container no mask, where the protection holds.
 
 ## The limits that pent cannot remove
 

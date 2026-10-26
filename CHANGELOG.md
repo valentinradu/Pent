@@ -100,12 +100,12 @@ are in [`docs/security`](docs/security/). Among them:
 
 ### Known limits
 
-- **macOS, MAC-10.** The recorder learns the name of a process from a poll,
-  so a watch run can miss a program that lives less than one interval. The
-  kernel interface that would fix it (`kqueue` with `NOTE_TRACK`) answers
-  `ENOTSUP`, and the one that remains needs an Apple entitlement.
-- **macOS, MAC-12.** The first `log stream` of a machine delivers nothing,
-  so the first watch run of a machine can record no access. Run it again.
+- **macOS.** A watch run can still lose the accesses of a program that
+  forks and exits within a few milliseconds. The recorder wakes on the fork
+  itself, so the window is a few milliseconds and no longer a poll
+  interval, and a measured run keeps the access in each of 47 tries. The
+  window cannot close while a program that has already exited is invisible
+  to the kernel interface that pent may use.
 - Landlock does not control a connection to a Unix socket that has a path.
   Pent performs each permitted connection itself and hides the sockets that
   no rule names, which covers the ones it knows.
