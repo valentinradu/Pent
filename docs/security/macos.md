@@ -8,7 +8,7 @@ on `macos-latest` (run 40249482241):
 
 | Suite | Result |
 |---|---|
-| `e2e_macos` | 20 passed, 0 ignored |
+| `e2e_macos` | 19 passed, 0 ignored |
 | `e2e_macos_network` | 4 passed |
 | `integration_test` (the thirteen tests of MAC-7) | 20 passed |
 | `differential_guard` | each row agrees (DIFF-9) |
@@ -20,7 +20,7 @@ before pent starts the child.
 
 **MAC-10 is a window and no longer a loss.** The recorder kept the
 accesses of a child that forks and exits in 0 of 40 runs before the work
-of 2026-10-26 and in 22 of 22 runs after it. The window is not closed: it
+of 2026-10-26 and in 47 of 47 runs after it. The window is not closed: it
 is now the time between the `fork` and the walk of the process tree that
 the `fork` wakes, and the section of MAC-10 holds the measurement of it.
 
@@ -803,16 +803,23 @@ behaviour of a timer.
 `macos-latest`:
 
 ```text
-MAC-12: the first watch run of this machine recorded the read
-the run of the process tree ended  walks=15 wakes=6 followed=2 took_ms=18
-...  (ten runs, each one the same)
-MAC-10: the recorder kept the read of the child in 10 of 10 runs
-MAC-10: the recorder kept the read of the short-lived child in 12 of 12 runs
+the run 40249482241
+  MAC-12: the first watch run of this machine recorded the read
+  the run of the process tree ended  walks=15 wakes=6 followed=2 took_ms=18
+  ...  (ten runs of the pipeline step, each one the same)
+  MAC-10: the recorder kept the read of the child in 10 of 10 runs
+  MAC-10: the recorder kept the read of the short-lived child in 12 of 12 runs
+the run 40250412230
+  MAC-10: the recorder kept the read of the short-lived child in 12 of 12 runs
+the run 40251022715
+  MAC-10: the recorder kept the read of the short-lived child in 12 of 12 runs
+  the fork woke the watch after 4 ms
 ```
 
-**22 of 22 runs, against 0 of 40 before the work.** `followed=2` says that
-the walk found the child and not only the root. The mark `#[ignore]` of
-`watch_records_a_read_of_a_short_lived_child` is gone.
+**47 of 47 runs, against 0 of 40 before the work.** `followed=2` says that
+the walk found the child and not only the root. The one-run test
+`watch_records_a_read_of_a_short_lived_child` passed in each of the three
+runs, so its mark `#[ignore]` is gone.
 
 The window that stays is the time between the `fork` and the walk that the
 wake of `kevent(2)` starts. The test `a_fork_wakes_the_watch_at_once`
