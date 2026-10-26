@@ -341,10 +341,11 @@ mod macos {
     ///
     /// The shell reads and writes the files itself, with the `read`
     /// builtin and a redirect. A `cat` in the script would run in a child
-    /// process, and the macOS recorder misses a child that lives less than
-    /// one poll of the process table (OPEN MAC-10 in
-    /// `docs/security/macos.md`;
-    /// `watch_records_a_read_of_a_short_lived_child` holds that case).
+    /// process, which the macOS recorder keeps most of the time and not
+    /// every time (MAC-10 in `docs/security/macos.md`;
+    /// `watch_records_a_read_of_a_short_lived_child` and
+    /// `watch_keeps_the_read_of_a_short_lived_child_most_of_the_time` hold
+    /// that case).
     #[test]
     fn watch_trust_run_gives_the_recorded_accesses() -> TestResult {
         if !ready("watch_trust_run", &[SH]) {
@@ -453,30 +454,31 @@ mod macos {
 
     /// A read of a child process that lives a very short time.
     ///
-    /// OPEN MAC-10. The reader keeps a report only when the process is a
-    /// member of the tree of the run and the name of the report fits the
-    /// program that the process runs. Both facts come from a poll of the
-    /// process tree, and the child of the fork lives about six
-    /// milliseconds, so a poll misses it part of the time.
+    /// MAC-10. The reader keeps a report only when the process is a member
+    /// of the tree of the run and the name of the report fits the program
+    /// that the process runs. Both facts come from a walk of the process
+    /// tree, and the child of the fork lives about six milliseconds.
     ///
-    /// The script runs `cat` and then a second command, so the shell
-    /// forks for `cat` instead of running it in place. The run of
-    /// 2026-10-25 showed that `sh -c 'cat FILE'` alone makes **no**
-    /// child: the shell runs `cat` with the process ID of the root, and
-    /// the recorder keeps each access of it. The fork is the gap, not the
-    /// exec.
+    /// The script runs `cat` and then a second command, so the shell forks
+    /// for `cat` instead of running it in place. The run of 2026-10-25
+    /// showed that `sh -c 'cat FILE'` alone makes **no** child: the shell
+    /// runs `cat` with the process ID of the root, and the recorder keeps
+    /// each access of it. The fork is the gap, not the exec.
     ///
-    /// One run is thus not a property: the test keeps its mark.
+    /// The test had the mark `#[ignore]` until 2026-10-26, because the
+    /// walk followed a timer and never saw the child. The walk now starts
+    /// the moment the kernel says that a member forked, so the test
+    /// passes. It is a lower bound of the property and not the property:
     /// `watch_keeps_the_read_of_a_short_lived_child_most_of_the_time`
     /// measures the rate over many runs, and that rate is the number of
-    /// MAC-10 in `docs/security/macos.md`.
+    /// MAC-10 in `docs/security/macos.md`. A single failure here is a
+    /// slower machine; a low rate there is a regression.
     ///
     /// Read the summary in the message of the failure. "27 accesses by 3
     /// processes" is MAC-10: the root is there and the child is not.
     /// "0 accesses" is MAC-12: the stream of the log delivered no report
     /// at all, so the warm-up of the reader did not work.
     #[test]
-    #[ignore = "OPEN MAC-10: the poll of the process tree sees the child of a fork about three times out of four, so one run is not a property; watch_keeps_the_read_of_a_short_lived_child_most_of_the_time holds the rate"]
     fn watch_records_a_read_of_a_short_lived_child() -> TestResult {
         if !ready("watch_records_a_child_read", &[SH, "/bin/cat"]) {
             return Ok(());
@@ -700,8 +702,8 @@ mod macos {
         env.write_home(".zshrc", "z\n")?;
 
         // The shell opens each file itself. A `cat` would run in a child
-        // process, and the macOS recorder misses a child that lives less
-        // than one poll of the process table (OPEN MAC-10).
+        // process, which the macOS recorder keeps most of the time and
+        // not every time (MAC-10).
         let script = "k=''; read -r k < ~/.ssh/id_x 2>/dev/null; \
                       echo \"key=[$k]\"; \
                       p=''; read -r p < ~/.ssh/id_x.pub 2>/dev/null; \
@@ -759,8 +761,8 @@ mod macos {
         fs::write(&outside, "secret\n")?;
         // The shell opens the file itself, so the denial comes from the
         // root process of the run. A `cat` would run in a child process,
-        // and the macOS recorder misses a child that lives less than one
-        // poll of the process table (OPEN MAC-10).
+        // which the macOS recorder keeps most of the time and not every
+        // time (MAC-10).
         let script = format!(
             "s=''; read -r s < '{}' 2>/dev/null; echo \"$s\"; \
              curl -sS -o /dev/null --max-time 20 https://denied.example; true",
@@ -868,9 +870,10 @@ mod macos {
     // ── the findings of the review ───────────────────────────────────────────
     //
     // Each test below states the secure behaviour. See
-    // `docs/security/macos.md`. MAC-1, MAC-2, MAC-3 and MAC-4 have a fix,
-    // so these tests run in the normal suite. MAC-10 has none, so its test
-    // keeps the `ignore` mark; `--include-ignored` shows the failure.
+    // `docs/security/macos.md`. Each finding has a fix, so each test runs
+    // in the normal suite. MAC-10 stays open as a window and not as a
+    // failure: `watch_keeps_the_read_of_a_short_lived_child_most_of_the_time`
+    // measures what the window still costs.
 
     /// MAC-1. The watched program writes its own Seatbelt reports into the
     /// unified log with `/usr/bin/logger`. The reader takes only the

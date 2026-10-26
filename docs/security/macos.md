@@ -3,21 +3,26 @@
 Status: the suite ran on a Mac for the first time on 2026-10-25
 (`macos-latest`, run 40223858818). The section
 "What the first run told us" holds the results. After the fixes of MAC-4,
-MAC-7, MAC-8, MAC-9 and MAC-11, each macOS suite is green on
-`macos-latest`:
+MAC-7, MAC-8, MAC-9, MAC-10, MAC-11 and MAC-12, each macOS suite is green
+on `macos-latest` (run 40249482241):
 
 | Suite | Result |
 |---|---|
-| `e2e_macos` | 16 passed, 1 ignored (MAC-10) |
+| `e2e_macos` | 20 passed, 0 ignored |
 | `e2e_macos_network` | 4 passed |
 | `integration_test` (the thirteen tests of MAC-7) | 20 passed |
 | `differential_guard` | each row agrees (DIFF-9) |
 | `pent-sandbox` unit and oracle tests | each test passed |
 
-Two findings stay open. MAC-10 is the one that the review named: the runs
-of 2026-10-25 measured each way out of it, and the section of MAC-10 holds
-the numbers. MAC-12 is new: the same runs showed that the first watch run
-of a machine records nothing.
+**MAC-12 is closed.** The first watch run of a machine records its
+accesses: the reader makes a Seatbelt report of its own and waits for it
+before pent starts the child.
+
+**MAC-10 is a window and no longer a loss.** The recorder kept the
+accesses of a child that forks and exits in 0 of 40 runs before the work
+of 2026-10-26 and in 22 of 22 runs after it. The window is not closed: it
+is now the time between the `fork` and the walk of the process tree that
+the `fork` wakes, and the section of MAC-10 holds the measurement of it.
 
 ## What this document is
 
@@ -43,15 +48,18 @@ MAC-10 (a child process that lives a very short time).
 |---|---|
 | `crates/pent-sandbox/src/macos.rs` (`mod tests`) | The text of the generated SBPL profile. These tests run on Linux. |
 | `crates/pent-sandbox/src/macos.rs` (`mod tests::oracle`) | The generated SBPL profile, with `sandbox-exec` as the oracle. These tests run on a Mac only. |
-| `crates/pent-sandbox/src/macos_log.rs` (`mod tests`) | The parser of the Seatbelt reports. These tests run on Linux. |
-| `crates/pent/tests/e2e_macos.rs` | The filesystem sandbox, watch mode, the guard, `--trace`, the forged log line |
+| `crates/pent-sandbox/src/macos_log.rs` (`mod tests`) | The parser of the Seatbelt reports and the process tree of a run. These tests run on Linux. |
+| `crates/pent-sandbox/src/macos_log.rs` (`mod runtime::tests`) | The warm-up of the log reader (MAC-12) and the reader of a short command. These tests run on a Mac only. |
+| `crates/pent-sandbox/src/macos_proctable.rs` (`mod tests`) | The walk of the process tree: the two calls of `libproc` and the answer of the kernel for the children of a process. These tests run on a Mac only. |
+| `crates/pent-sandbox/src/macos_kqueue.rs` (`mod tests`) | The answer of the kernel for `NOTE_TRACK`, and the wake of a `fork` (MAC-10). These tests run on a Mac only. |
+| `crates/pent/tests/e2e_macos.rs` | The filesystem sandbox, watch mode, the guard, `--trace`, the forged log line, the rate of MAC-10, the first watch run of a machine |
 | `crates/pent/tests/e2e_macos_network.rs` | Proxy mode: the allowlist, the direct connection, the environment, the review |
 | `crates/pent/tests/parity_watch.rs` | The same command gives the same rules on Linux and on macOS |
 
 ```bash
 make e2e-macos                      # the macOS suites, a skip is a failure
 cargo test --workspace -- --nocapture
-cargo test --workspace -- --include-ignored   # also the open findings
+cargo test --workspace -- --include-ignored   # no macOS test has a mark
 ```
 
 ## Skips
@@ -137,12 +145,19 @@ event means the log has no report; a raw event with no rule means the
 summary drops it.
 
 Each watch test lets the shell open its files itself, because the recorder
-loses the accesses of a child process that lives a very short time
-(MAC-10). `watch_records_a_read_of_a_short_lived_child` holds that gap. The
-run of 2026-10-25 showed that `sh -c 'cat FILE'` alone makes no child: the
-shell runs `cat` with the process ID of the root, and the recorder keeps
-each access. The script of that test runs a second command, so the shell
-forks.
+keeps the accesses of a child process that lives a very short time most of
+the time and not every time (MAC-10). Two tests hold that case:
+`watch_records_a_read_of_a_short_lived_child` for one run, and
+`watch_keeps_the_read_of_a_short_lived_child_most_of_the_time` for the
+rate over twelve runs. The run of 2026-10-25 showed that
+`sh -c 'cat FILE'` alone makes no child: the shell runs `cat` with the
+process ID of the root, and the recorder keeps each access. The script of
+both tests runs a second command, so the shell forks.
+
+`the_first_watch_run_of_a_machine_records_an_access` holds MAC-12 from the
+side of the user, and `the_warm_up_sees_a_report_of_its_own_probe` in
+`macos_log.rs` holds the mechanism of the fix on each stream that pent
+starts.
 
 ### E. The event log cannot be forged
 
@@ -176,10 +191,10 @@ Each entry of that list hides a difference, so the list must stay short.
 ## The findings
 
 The review of 2026-10-25 found six items. The first run on a Mac confirmed
-the fixes of MAC-1, MAC-2, MAC-3, MAC-5 and MAC-6, and it found five more
-items: MAC-7, MAC-8, MAC-9, MAC-10 and MAC-11. Ten of the eleven have a
-fix. MAC-10 stays open, and its section holds the measurement of each way
-out.
+the fixes of MAC-1, MAC-2, MAC-3, MAC-5 and MAC-6, and it found six more
+items: MAC-7, MAC-8, MAC-9, MAC-10, MAC-11 and MAC-12. Each of the twelve
+has a fix. MAC-10 keeps a window that nobody has closed, and its section
+holds the measurement of that window and of each way out.
 
 | ID | Severity | One line | Status | Test |
 |----|----------|----------|--------|------|
@@ -192,8 +207,8 @@ out.
 | MAC-7 | Medium | The probe of the macOS tests asked whether `sandbox-exec` can run `/bin/true`, which macOS does not have, so thirteen tests skipped on a good machine. | Fixed | Each macOS test of `integration_test.rs` |
 | MAC-8 | High | The reader took the name of each report from the process table only, so it dropped the reports of a process that lives a short time or that runs a new file. Watch mode recorded nothing. | Fixed | `watch_records_a_read_of_a_known_file` |
 | MAC-9 | Low | `sandbox-exec` refuses a string over about 1000 bytes in a profile. | Documented | `a_path_over_the_limit_of_the_reader_gives_a_profile_that_it_refuses` |
-| MAC-10 | Medium | The recorder loses the accesses of a child process that lives less than one poll of `ps`. | Open; `kqueue` cannot fix it | `watch_records_a_read_of_a_short_lived_child` (ignored) |
-| MAC-12 | Medium | The first watch run of a machine records nothing: the first `log stream` delivers no report. | Open; measured, no test | None yet |
+| MAC-10 | Medium | The recorder loses the accesses of a child process that forks and exits between two polls of `ps`. | Fixed as far as macOS allows; a window of microseconds stays | `watch_records_a_read_of_a_short_lived_child`, `watch_keeps_the_read_of_a_short_lived_child_most_of_the_time` |
+| MAC-12 | Medium | The first watch run of a machine records nothing: the first `log stream` delivers no report. | Fixed; the fix ran on a cold machine | `the_first_watch_run_of_a_machine_records_an_access`, `the_warm_up_sees_a_report_of_its_own_probe` |
 
 ### MAC-1 — the program forges its own events
 
@@ -246,13 +261,22 @@ user is asked to trust.
 3. The filter by the process tree stays.
 
 4. The name of the process must fit the program that the PID runs. The
-   reader has three sources of that name, and the program chooses none of
-   them: pent itself for the root process, the poll of the process table,
-   and the `process-exec` reports (MAC-8). The reader drops a report whose
-   name fits none of the names of the PID. This closes FUZZ-1
-   (`docs/security/fuzzing.md`), where the program chooses its own name and
-   puts a second marker in the line. A report of a PID whose program the
-   reader never read cannot be checked, so it goes too.
+   reader has four sources of that name, and the program chooses none of
+   them: pent itself for the root process; the walk of the process tree,
+   which reads the whole path of the program of each member with
+   `proc_pidpath`; the parent of a `fork`, whose program the child runs
+   until it runs a new file; and the `process-exec` reports (MAC-8 and
+   MAC-10). The reader drops a report whose name fits none of the names of
+   the PID. This closes FUZZ-1 (`docs/security/fuzzing.md`), where the
+   program chooses its own name and puts a second marker in the line. A
+   report of a PID whose program the reader never read cannot be checked,
+   so it goes too.
+
+   The walk takes the **whole** path of the program and not the 16 bytes
+   of `p_comm`. The check of FUZZ-1 needs the whole name: it refuses a
+   name whose first 16 bytes are the name of the report and whose rest
+   holds a marker, and a source that gives only 16 bytes could not tell
+   that name from an honest one.
 
 **What a program can still do.** Watch mode reports each access of the
 program, so the program can put a path of its choice in the draft when it
@@ -579,8 +603,8 @@ causes were the log and the parser. The run settles both:
 
 The cause is guard 4 of the reader (see MAC-1). It accepts a report only
 when the name of the report fits the program that the process table gives
-for that PID, and `ProcessTree` filled that name from a poll of `ps` every
-100 ms. The poll has two gaps:
+for that PID, and `ProcessTree` filled that name from a poll of the
+process table every 100 ms. The poll had two gaps:
 
 - A process that lives less than one poll interval never reaches the table,
   so the reader knows no name for it. `pent watch -- /bin/cat known.txt`
@@ -595,7 +619,7 @@ choose either:
 - Pent starts the root process, so it knows its two names: `sandbox-exec`
   (the front end) and the command (`ProcessTree::with_names`).
 - Each `process-exec` report holds the path of the new program, and the
-  kernel writes that path. `ProcessTree::learn_exec` adds the file name of
+  kernel writes that path. `ProcessTree::learn_name` adds the file name of
   it to the names of the PID.
 
 A PID now has a set of names, and an older name stays valid: a report can
@@ -633,19 +657,17 @@ the limit itself, so a later change of it is visible.
 
 ### MAC-10 — the recorder loses a child that lives a very short time
 
-**Severity: medium. Open. The recommended fix does not work on macOS; the
-run of 2026-10-25 measured the answer of the kernel.**
+**Severity: medium. Fixed on 2026-10-26 as far as macOS allows. A window
+of microseconds stays, and the runs below measure it.**
 
 The reader keeps a report only when the PID is in the process tree of the
 run and the name of the report fits the program that the PID runs. Both
-facts come from a poll of `ps` every 100 ms. A child such as `cat` lives
-about three milliseconds, so no snapshot holds it. The log also delivers
-the report after the child is gone, so an on-demand poll does not help
-either. Each report of such a child goes.
+facts came from a poll of `ps` every 100 ms. A child such as `cat` lives
+about six milliseconds, so no snapshot held it, and each report of such a
+child went.
 
-MAC-8 closed the gap for the root process, because pent starts it. The gap
-of a descendant stays. A shorter poll interval makes the gap smaller, not
-smaller than the life of the child.
+MAC-8 closed the gap for the root process, because pent starts it. This
+section is the gap of a descendant.
 
 **The gap is the fork, not the exec.** The run 40238392792 ran three watch
 commands on `macos-latest` and read the raw log of each run. The process
@@ -667,11 +689,11 @@ In p1 the shell runs `cat` **in place**: one process ID, four names, and
 the chain `sandbox-exec` → `sh` → `bash` → `cat` is whole, because MAC-8
 takes each new name from the `process-exec` report. A second command in
 the script makes the shell fork instead (p2), the child gets a new process
-ID, and every report of that child goes. The script of the test now holds
-the real case.
+ID, and every report of that child went. The script of the tests holds the
+real case.
 
-**`kqueue` cannot fix it.** The recommended fix was `EVFILT_PROC` with
-`NOTE_TRACK`:
+**`kqueue` cannot name the child of a fork.** The recommended fix was
+`EVFILT_PROC` with `NOTE_TRACK`:
 
 ```text
 EV_SET(&ev, pid, EVFILT_PROC, EV_ADD | EV_CLEAR,
@@ -690,61 +712,170 @@ registers and works. What `EVFILT_PROC` then gives, and what it lacks:
 
 | What it gives | What it lacks |
 |---|---|
-| `NOTE_FORK`: the process that the filter names forked. | The process ID of the child. Pent must then ask the process table which children are new, and a child that is already gone is in no table. The race is the one of MAC-10. |
+| `NOTE_FORK`: the process that the filter names forked. | The process ID of the child. Pent must then ask the kernel which children are new, and a child that is already gone is in no answer. |
 | `NOTE_EXEC`: the process runs a new file. | The path of the new file. The `process-exec` report of the log already gives it. |
-| `NOTE_EXIT`: the process exited, with its status. | Nothing that pent needs. The poll already sees the exit, and the reader waits for the late lines of the log after it. |
+| `NOTE_EXIT`: the process exited, with its status. | Nothing that pent needs. The walk already sees the exit, and the reader waits for the late lines of the log after it. |
 
-`kqueue` thus gives no fact that the poll of `ps` does not already give,
-so pent has no watcher. `crates/pent-sandbox/src/macos_kqueue.rs` holds
-the measurement as a test (`the_kernel_refuses_to_follow_a_fork`): it
-registers the two filters and asserts the two answers. The day a macOS
-implements `NOTE_TRACK`, the test fails and names this finding.
+`crates/pent-sandbox/src/macos_kqueue.rs` holds the measurement as a test
+(`the_kernel_refuses_to_follow_a_fork`): it registers the two filters and
+asserts the two answers. The day a macOS implements `NOTE_TRACK`, the test
+fails and names this finding.
 
-**The ways out, after the measurement.**
+**The four steps of the fix.** The runs of 2026-10-26 measured each one.
 
-1. **`EndpointSecurity`** (`es_new_client`, `ES_EVENT_TYPE_NOTIFY_FORK`
-   and `ES_EVENT_TYPE_NOTIFY_EXEC`). It gives the parent and the child of
-   each `fork` at the time of the `fork`, with no race, and each `exec`
-   with the path. Watch mode would then need no log reader at all. It
-   needs the entitlement
-   `com.apple.developer.endpoint-security.client`, a signed and notarized
-   binary and root. Apple grants that entitlement one application at a
-   time, and a user who builds pent from the source has none, so this is
-   **the next step only for a signed distribution of pent**, not for the
-   repository.
-2. **`NOTE_FORK` and an immediate read of the children.** A thread blocks
-   in `kevent(2)` on each known member and reads
-   `proc_listchildpids(2)` the moment a `NOTE_FORK` arrives. The window
-   falls from the poll interval (100 ms) to the wake-up time of the
-   thread (tens of microseconds). It is **not a fix**: a child that
-   exits inside that window is still lost, and a test of the secure
-   behaviour would pass most of the time and fail sometimes. A flaky test
-   of a security property is worse than an honest failure, so pent does
-   not take this step while MAC-10 is the claim of a test.
-3. **Accept a report whose name fits any member of the tree, and adopt
-   its PID.** One line, and **not safe**: two unrelated `sh` processes on
-   the machine have the same name, so the draft would hold the accesses
-   of another program. `watch_keeps_only_the_processes_of_the_run` fails
-   with this change. The same objection holds for a form that adopts only
-   on a `process-exec` report: the only thing that keeps the reports of
-   another sandboxed process out of the draft is the process tree, and a
-   name is not a process tree.
+**1. The poll must not fork `ps`.** The run 40246227819 measured the cost
+of one snapshot of the process table on `macos-latest`:
 
-Until a fix, watch mode on macOS is a lower bound. The watch tests of
-`e2e_macos.rs` and the script of `parity_watch.rs` let the shell open each
-file itself, with the `read` builtin and a redirect, so the access is in
-the root process. `watch_records_a_read_of_a_short_lived_child` holds the
-gap with an `#[ignore]` mark, and `pent watch --append` merges more runs.
-The README says the same in its own words.
+| The source of the table | The cost of one snapshot |
+|---|---|
+| a fork of `/bin/ps -A -o pid=,ppid=,stat=,comm=` | 35.3 ms of wall time, 34.0 ms of processor time |
+| `sysctl(CTL_KERN, KERN_PROC, KERN_PROC_ALL)`, 561 processes | 0.107 ms |
+| `proc_listchildpids` of one process | 0.0056 ms |
+
+A fork of `ps` costs **six times the whole life of the child** that the
+recorder loses, so the poll could never run often enough. The number also
+says what the old poll cost: a snapshot every 100 ms burned a third of a
+core.
+
+`crates/pent-sandbox/src/macos_proctable.rs` now walks the tree of the run
+in the process, with `proc_listchildpids` for the children of each member
+and `proc_pidinfo` and `proc_pidpath` for the parent, the state and the
+program of each one. The cost follows the size of the tree of the run and
+not the size of the machine, which is why the walk is cheaper than the
+whole table of `sysctl`. The name comes from `proc_pidpath`, which gives
+the whole path; the 16 bytes of `p_comm` would break the check of FUZZ-1
+(see MAC-1, guard 4).
+
+**2. A report of a PID that the tree does not hold makes a walk at once.**
+The reader did this already, with a gap of 50 ms between two walks. The
+gap is now one millisecond, which the cheap walk allows, and the walk runs
+outside the lock of the tree: a log that holds the reports of many other
+sandboxed processes of the machine made the filter thread ask for a walk
+very often, and a walk under the lock kept the follower of the tree out
+while it ran.
+
+A report arrives about 40 ms after the access, so this step does not catch
+the child of a fork. It catches a process that lives long enough to make a
+report before the first walk that holds it.
+
+**3. A `process-exec` report comes from the kernel, so pent trusts its
+name.** `ProcessTree::learn_name` did this already, but `filter_lines`
+called it **after** the check of the name, so the check dropped the exec
+report itself and with it every later report of that process. A process
+that forks and then runs a new file has a name that no earlier walk holds:
+the walk that found it named the program of the parent. The reader now
+takes the name of the exec report first and checks the name after it.
+
+The membership in the tree still comes from the walk alone. A name is not
+a process tree: two unrelated programs of a machine have the same name, so
+a report whose PID the tree does not hold teaches nothing. A `fork` is a
+second source of a name that the kernel gives: the child runs the program
+of its parent until it runs a new file, so a new member takes each name of
+its parent (`ProcessTree::inherit_names`).
+
+**4. The walk starts the moment a member forks.** The three steps above
+were not enough. The run 40247935168 measured why:
+
+```text
+a sleep of  1 ms with nanosleep       gives   4.9 ms
+a sleep of  5 ms with nanosleep       gives  18.1 ms
+a sleep of 10 ms with nanosleep       gives  34.6 ms
+a sleep of  1 ms with mach_wait_until gives   4.9 ms
+a sleep of  5 ms with mach_wait_until gives  21.3 ms
+a sleep of  1 ms with select          gives   4.9 ms
+```
+
+The clock of a runner gives no interval under about five milliseconds,
+with `nanosleep`, with `select` and with `mach_wait_until` alike, and the
+interactive quality of service changes nothing. The child of the fork
+lives 6.16 ms on average (2.56 ms at least, 12.14 ms at most, over 30
+runs), and the runner is busy with the other tests, so the walk on a timer
+**kept the accesses of that child in 0 of 12 watch runs**.
+
+The follower of the tree therefore blocks in `kevent(2)` and not in a
+sleep (`ForkWatch` in `macos_kqueue.rs`). `NOTE_FORK` names no child, but
+it says **when** a member forked, and it says it at once, so the walk runs
+while the child still lives. The limit of the wait stays at one
+millisecond, so a macOS that gives no `EVFILT_PROC` event keeps the
+behaviour of a timer.
+
+**The residual window.** The run 40249482241 measured it on
+`macos-latest`:
+
+```text
+MAC-12: the first watch run of this machine recorded the read
+the run of the process tree ended  walks=15 wakes=6 followed=2 took_ms=18
+...  (ten runs, each one the same)
+MAC-10: the recorder kept the read of the child in 10 of 10 runs
+MAC-10: the recorder kept the read of the short-lived child in 12 of 12 runs
+```
+
+**22 of 22 runs, against 0 of 40 before the work.** `followed=2` says that
+the walk found the child and not only the root. The mark `#[ignore]` of
+`watch_records_a_read_of_a_short_lived_child` is gone.
+
+The window that stays is the time between the `fork` and the walk that the
+wake of `kevent(2)` starts. The test `a_fork_wakes_the_watch_at_once`
+measures the wake, and the rate test
+`watch_keeps_the_read_of_a_short_lived_child_most_of_the_time` measures
+the whole chain over twelve runs and **prints the rate**. The assertion of
+that test is a floor and not the rate: a rate is not a property of a
+machine, and a test of a security property must not fail by chance. The
+number in this section comes from the line that the test prints.
+
+Two limits of the window are known:
+
+- **A zombie is invisible.** The run 40246732816 measured that
+  `proc_listchildpids` does not name a child that exited and that nobody
+  reaped, and that `proc_pidinfo` and `proc_pidpath` give nothing for one.
+  The window therefore ends at the exit of the child and not at the moment
+  that its parent reaps it.
+- **The wake needs a thread.** A machine under a heavy load can hold the
+  woken thread back past the life of the child.
+
+**What stays open.** Watch mode on macOS is still a lower bound, and
+`pent watch --append` merges more runs. The one way to a guarantee is
+**`EndpointSecurity`** (`es_new_client`, `ES_EVENT_TYPE_NOTIFY_FORK` and
+`ES_EVENT_TYPE_NOTIFY_EXEC`). It gives the parent and the child of each
+`fork` at the time of the `fork`, with no race, and watch mode would then
+need no walk at all. It needs the entitlement
+`com.apple.developer.endpoint-security.client`, a signed and notarized
+binary and root. Apple grants that entitlement one application at a time,
+and a user who builds pent from the source has none, so this is **the next
+step only for a signed distribution of pent**, not for the repository.
+
+One way out stays refused: **accept a report whose name fits any member of
+the tree, and adopt its PID**. It is one line, and it is not safe: two
+unrelated `sh` processes on the machine have the same name, so the draft
+would hold the accesses of another program.
+`watch_keeps_only_the_processes_of_the_run` fails with this change. The
+same objection holds for a form that adopts only on a `process-exec`
+report.
+
+**One number of the kernel that the manual page does not give.**
+`proc_listchildpids` returns the number of **process IDs** and not the
+number of bytes. The first form of the walk divided the answer by four and
+found no child at all, which the test
+`the_walk_finds_a_child_and_a_grandchild` showed with a live child of the
+test process. The walk no longer depends on the reading: it takes the
+larger one and asks the kernel for the parent of each candidate, so an
+entry that the call never wrote cannot become a member of the tree.
+`the_answer_of_the_kernel_for_the_children` prints the answer beside the
+number of children:
+
+```text
+proc_listchildpids answered 4 for 4 children; the first entries of the
+buffer are [4444, 4443, 4442, 4438]
+```
 
 ### MAC-12 — the first watch run of a machine records nothing
 
-**Severity: medium. Open. Measured on 2026-10-25; no test yet.**
+**Severity: medium. Fixed on 2026-10-26; the fix ran on a cold machine.**
 
 The runs of MAC-10 found a second effect. The **first** `log stream` of a
-machine delivers no report at all, and the next one works. The run
-40239388624 holds the measurement: the step first ran one watch command by
-hand and then the test of MAC-10, which runs the same command.
+machine delivered no report at all, and the next one worked. The run
+40239388624 holds the first measurement: the step first ran one watch
+command by hand and then the test of MAC-10, which runs the same command.
 
 ```text
 W   the first watch run of the job:  No new rules from 0 accesses
@@ -752,29 +883,93 @@ W   the first watch run of the job:  No new rules from 0 accesses
 the test right after it:            No new rules from 27 accesses by 3 processes
 ```
 
-Each earlier run shows the same order: the first watch command of a macOS
-job records nothing, and every one after it records its accesses. The
-cause is in the start of the stream, not in the reader:
-`LogReader::start` waits for the **header** of `log stream`, which `log`
-prints before it connects to the log, and the comment of the function
-already names that race. On a machine whose log system is cold, the
-connection takes longer than the whole run of a short command.
+Each earlier run showed the same order: the first watch command of a macOS
+job recorded nothing, and every one after it recorded its accesses. A user
+who tried pent for the first time saw an empty draft and concluded that
+pent does not work.
 
-**The fix.** Wait for a report, not for the header. Pent can ask the
-kernel for one report of its own before the spawn — for example a read
-that a one-rule profile reports — and start the child only when that
-report comes back through the stream. A timeout then warns instead of
-recording a silent nothing. The warning matters more than the wait: a
-watch run that records nothing must say so, and today it says
+**The cause is the start of the stream.** `LogReader::start` waited for the
+**header** of `log stream`, which `log` prints before it connects to the
+log. The run 40246227819 measured how little the header says. The step
+started a stream, waited for the header, then ran a sandboxed probe that
+made one allow report and one deny report, and waited 30 s for each one:
+
+```text
+round 0 (the first stream of the machine):
+    header 17 ms, allow report never, deny report never, 17 lines
+round 1: header 18 ms, allow report 43 ms, deny report 43 ms
+round 2: header 11 ms, allow report 35 ms, deny report 35 ms
+```
+
+Round 0 is the whole finding. The header came after 17 ms, the stream even
+carried 17 lines of other processes later, and **neither report of the
+probe ever arrived**. A cold stream drops the reports of its first
+moments, so a watch run of a short command on a new machine records
+nothing.
+
+**The fix: wait for a report, not for the header.** `LogReader::start`
+now makes a Seatbelt report of its own and waits until that report comes
+back through the stream. The probe is
+
+```text
+/usr/bin/sandbox-exec -p '(version 1)(allow default)(deny process-exec)' /usr/bin/true
+```
+
+The profile stops the program at its `exec`, so the kernel writes one
+report with the process ID of the probe and the program never runs. The
+profile names no path, so it needs no escaping and it cannot hit the
+length limit of the reader (MAC-9). The warm-up parses each line with the
+hardened `parse_line` and accepts a report whose PID is the PID of one of
+its own probes.
+
+**One probe is not enough.** The measurement of round 0 shows why: a probe
+that runs while the stream is still cold is lost with the stream, and
+waiting longer does not bring it back. The warm-up therefore runs a **new
+probe every 250 ms** until one of them comes back. The run 40246732816
+measured the cost:
+
+```text
+MAC12 round 0: header 58 ms, 2 probes, the report of probe 1 arrived after 316 ms
+MAC12 round 1: header 28 ms, 1 probes, the report of probe 0 arrived after  46 ms
+```
+
+The first stream of a machine needs about 300 ms and two probes. Each
+stream after it needs about 50 ms and one probe. The unit test
+`the_warm_up_sees_a_report_of_its_own_probe` prints the number of each
+run; on a warm machine it reads 9 ms.
+
+A warm-up that passes its limit of ten seconds gives a **warning** and no
+error:
+
+```text
+`log stream` delivered no report of pent itself inside the limit;
+this run can record no access at all (MAC-12)
+```
+
+A run that records too little is better than a run that does not start,
+and a run that records nothing must say so. Before the fix it said
 "No new rules from 0 accesses", which reads like a program that did
 nothing.
 
-**Why there is no test yet.** The effect shows only on the first
-`log stream` of a machine, so a test of it passes as soon as another test
-of the suite has run before it. A test needs a way to put the log system
-back into its cold state, and this work found none. The finding thus
-carries the measurement and no test, which the rules of the repository
-allow only with this sentence: **nobody holds MAC-12 against a change.**
+**The proof on a cold machine.** A test cannot put the log system of a
+machine back into its cold state, and this work found no way to do it.
+Each job of the pipeline runs on a new machine, so the pipeline has the
+cold case once per job, and a temporary step of `.github/workflows/ci.yml`
+took it: the step ran one watch command before every other step that
+touches the log, as the very first `log stream` of the machine. The runs
+40247935168, 40248760059 and 40249482241 each answered
+
+```text
+MAC-12: the first watch run of this machine recorded the read
+```
+
+The step is gone again. Two tests hold the finding from now on:
+`the_first_watch_run_of_a_machine_records_an_access` in `e2e_macos.rs`
+records an access of a command as short as a command can be, and
+`the_warm_up_sees_a_report_of_its_own_probe` in `macos_log.rs` holds the
+mechanism on each stream that pent starts. The first test cannot name the
+moment of the cold machine, so it is the weaker of the two; the unit test
+fails on any stream whose reports never arrive.
 
 ## What the first run told us
 
@@ -819,7 +1014,7 @@ Three findings were predictions that nobody had run on a Mac. The run
 |---|---|---|
 | DIFF-9 | On macOS the guard misses a key name that matches a pattern with a leading `*`. | **Wrong.** The fix of MAC-2 had already closed it. Each of the seven rows agrees with `classify`. The test lost its mark. |
 | MAC-4 | The child asks `launchd` for a program, outside the sandbox. | **Closed, and not by pent.** macOS refuses a launchd job of a sandboxed process, also under a profile with no deny. Pent now denies `job-creation` and `mach-lookup` as the next two layers, and the test has a control. |
-| MAC-10 | The recorder loses a child that lives less than one poll of `ps`. | **Right, and the recommended fix does not work.** `kqueue` with `NOTE_TRACK` gives `ENOTSUP`. The finding stays open. |
+| MAC-10 | The recorder loses a child that lives less than one poll of `ps`. | **Right, and the recommended fix does not work.** `kqueue` with `NOTE_TRACK` gives `ENOTSUP`. `NOTE_FORK` without it still says **when** a member forks, which the fix of 2026-10-26 uses: the recorder keeps the accesses of such a child in 22 of 22 runs, against 0 of 40 before. A window of microseconds stays. |
 
 Two more facts came out of these runs:
 

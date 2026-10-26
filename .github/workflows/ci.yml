@@ -78,57 +78,6 @@ jobs:
       - name: Build
         run: cargo build --workspace --tests
 
-      # TEMPORARY. The proof of MAC-12 on a cold machine. It must be the
-      # first step of the job that touches the unified log, because the
-      # first `log stream` of a machine is the one that loses the reports.
-      # The tests of the next step each start a stream of their own, so by
-      # then the machine is warm and no test can hold this case. Remove
-      # this step with the fix.
-      - name: The first watch run of this machine (temporary)
-        if: runner.os == 'macOS'
-        run: |
-          cargo build -p pent --bin pent
-          home="$RUNNER_TEMP/cold/home"
-          mkdir -p "$home" "$RUNNER_TEMP/cold/ws"
-          echo COLD > "$home/cold.txt"
-          HOME="$home" \
-          XDG_CONFIG_HOME="$home/.config" \
-          XDG_STATE_HOME="$home/.local/state" \
-            ./target/debug/pent watch --yes --profile cold -- \
-            /bin/cat "$home/cold.txt" || true
-          draft="$home/.local/state/pent/drafts/cold.toml"
-          echo "--- the draft of the first watch run of this machine ---"
-          cat "$draft" 2>/dev/null || echo "there is no draft"
-          echo "--- the raw events ---"
-          cat "$home/.local/state/pent/watch/cold/"* 2>/dev/null \
-            | head -40 || echo "there are no raw events"
-          if grep -q "cold.txt" "$draft" 2>/dev/null; then
-            echo "MAC-12: the first watch run of this machine recorded the read"
-          else
-            echo "MAC-12: the first watch run of this machine recorded NOTHING"
-            exit 1
-          fi
-          echo "=== MAC-10: ten runs of the forked child, with the counters ==="
-          echo FORKED > "$home/forked.txt"
-          kept=0
-          for i in 1 2 3 4 5 6 7 8 9 10; do
-            rm -rf "$home/.local/state/pent/drafts" \
-                   "$home/.local/state/pent/watch"
-            HOME="$home" \
-            XDG_CONFIG_HOME="$home/.config" \
-            XDG_STATE_HOME="$home/.local/state" \
-              ./target/debug/pent watch --yes -v --profile forked -- \
-              /bin/sh -c "cat $home/forked.txt; echo END" \
-              > "$RUNNER_TEMP/forked-$i.out" 2>&1 || true
-            grep -o "the run of the process tree ended.*" \
-              "$RUNNER_TEMP/forked-$i.out" | head -1 || true
-            if grep -q "forked.txt" \
-                "$home/.local/state/pent/drafts/forked.toml" 2>/dev/null; then
-              kept=$((kept + 1))
-            fi
-          done
-          echo "MAC-10: the recorder kept the read of the child in $kept of 10 runs"
-
       # The whole workspace, in debug. The macOS suites (e2e_macos,
       # e2e_macos_network, parity_watch) are part of the workspace, so this
       # one command runs them too. --nocapture keeps the profile and the log
