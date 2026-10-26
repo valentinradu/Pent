@@ -601,6 +601,7 @@ pub(crate) use runtime::LogReader;
 
 #[cfg(target_os = "macos")]
 mod runtime {
+    use std::collections::HashSet;
     use std::io::BufRead as _;
     use std::process::{Child, Command, Stdio};
     use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
@@ -610,6 +611,7 @@ mod runtime {
     use pent_profile::WatchEvent;
 
     use super::{file_name_of, parse_line, to_event, ProcessTree, RecordMode};
+    use crate::macos_kqueue::ForkWatch;
     use crate::macos_proctable::snapshot;
     use crate::SandboxError;
 
@@ -674,48 +676,28 @@ mod runtime {
     }
 
     impl Tree {
-        /// Walk the process tree in the kernel and update the tree of the
-        /// run. Return true if a member is still live.
-        fn refresh(&mut self) -> bool {
-            self.last_refresh = Some(Instant::now());
-            self.tree.update(&snapshot(&self.tree.live_members()))
-        }
-
-        /// Walk the tree again when the last walk is not too recent.
+        /// Return true if the next walk is due, and record its time.
         ///
-        /// A report of a process that the tree does not hold is the
-        /// reason to look again at once: the process can be new, or it
-        /// can have run a new file after the last poll. The walk costs
-        /// tens of microseconds, so the gap only bounds the cost of a log
-        /// that holds the reports of many other processes.
-        fn refresh_on_demand(&mut self) {
+        /// A report of a process that the tree does not hold is the reason
+        /// to walk again at once: the process can be new, or it can have
+        /// run a new file after the last walk. The gap bounds the cost for
+        /// a log that holds the reports of many other processes of the
+        /// machine.
+        fn walk_is_due(&mut self) -> bool {
             if self
                 .last_refresh
                 .is_none_or(|t| t.elapsed() >= MIN_REFRESH_GAP)
             {
-                // The poll thread uses the result for the liveness check;
-                // here only the new PIDs and the new names matter.
-                let _alive = self.refresh();
+                self.last_refresh = Some(Instant::now());
+                return true;
             }
+            false
         }
 
         /// Return true if `pid` is in the tree and `name` is the name of
         /// the program that `pid` runs.
-        fn accepts(&mut self, pid: u32, name: &str) -> bool {
-            if self.tree.contains(pid) && self.tree.name_fits(pid, name) {
-                return true;
-            }
-            self.refresh_on_demand();
+        fn fits(&self, pid: u32, name: &str) -> bool {
             self.tree.contains(pid) && self.tree.name_fits(pid, name)
-        }
-
-        /// Return true if `pid` is a member of the tree, live or dead.
-        fn member(&mut self, pid: u32) -> bool {
-            if self.tree.contains(pid) {
-                return true;
-            }
-            self.refresh_on_demand();
-            self.tree.contains(pid)
         }
     }
 
@@ -724,6 +706,51 @@ mod runtime {
         // refresh; the set of PIDs is still valid.
         tree.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Walk the process tree in the kernel and update the tree of the run.
+    /// Return true if a member is still live.
+    ///
+    /// The walk itself runs **outside** the lock. Each report of another
+    /// sandboxed process of the machine makes the filter thread ask for a
+    /// walk, and a walk under the lock would keep the poll thread of the
+    /// tree out while it runs.
+    fn refresh(tree: &Mutex<Tree>) -> bool {
+        let roots = {
+            let mut guard = lock(tree);
+            guard.last_refresh = Some(Instant::now());
+            guard.tree.live_members()
+        };
+        let rows = snapshot(&roots);
+        lock(tree).tree.update(&rows)
+    }
+
+    /// Walk the tree again when the last walk is not too recent.
+    fn refresh_on_demand(tree: &Mutex<Tree>) {
+        if lock(tree).walk_is_due() {
+            // The poll thread uses the result for the liveness check;
+            // here only the new PIDs and the new names matter.
+            let _alive = refresh(tree);
+        }
+    }
+
+    /// Return true if `pid` is in the tree and `name` is the name of the
+    /// program that `pid` runs.
+    fn accepts(tree: &Mutex<Tree>, pid: u32, name: &str) -> bool {
+        if lock(tree).fits(pid, name) {
+            return true;
+        }
+        refresh_on_demand(tree);
+        lock(tree).fits(pid, name)
+    }
+
+    /// Return true if `pid` is a member of the tree, live or dead.
+    fn member(tree: &Mutex<Tree>, pid: u32) -> bool {
+        if lock(tree).tree.contains(pid) {
+            return true;
+        }
+        refresh_on_demand(tree);
+        lock(tree).tree.contains(pid)
     }
 
     /// A running `log stream` process that reads Seatbelt reports.
@@ -839,7 +866,7 @@ mod runtime {
                 last_refresh: None,
             }));
 
-            // Poll the process tree, so that short-lived descendants are
+            // Follow the process tree, so that short-lived descendants are
             // known before their reports arrive. When the tree is empty,
             // wait for late lines, then stop `log stream`. Its output then
             // ends, the filter thread ends, and the event channel closes.
@@ -847,9 +874,7 @@ mod runtime {
                 let tree = Arc::clone(&tree);
                 std::thread::spawn(move || {
                     let mut log_proc = log_proc;
-                    while lock(&tree).refresh() {
-                        std::thread::sleep(POLL_INTERVAL);
-                    }
+                    follow_tree(&tree);
                     std::thread::sleep(DRAIN_GRACE);
                     stop_log_process(&mut log_proc);
                 });
@@ -858,6 +883,62 @@ mod runtime {
             std::thread::spawn(move || filter_lines(&lines, &tree, &mode, &tx));
             rx
         }
+    }
+
+    /// Follow the process tree of the run until nothing of it is live.
+    ///
+    /// The loop walks the tree, then waits for the next `fork`, `exec` or
+    /// `exit` of a member ([`ForkWatch`]). A `fork` wakes it in
+    /// microseconds, so the walk finds the child while the child still
+    /// lives; without the wake the loop would wait for a timer, which a
+    /// runner turns into tens of milliseconds and which the child of a
+    /// `fork` does not survive (MAC-10).
+    ///
+    /// [`POLL_INTERVAL`] is the limit of the wait, not the interval of a
+    /// poll: the loop walks the tree also when no event comes, so a macOS
+    /// that gives no `EVFILT_PROC` event at all keeps the old behaviour.
+    fn follow_tree(tree: &Mutex<Tree>) {
+        let watch = match ForkWatch::new() {
+            Ok(watch) => Some(watch),
+            Err(e) => {
+                tracing::debug!(error = %e, "the kernel gave no kqueue; the tree follows a timer");
+                None
+            }
+        };
+        let mut followed: HashSet<u32> = HashSet::new();
+        let start = Instant::now();
+        let mut walks = 0usize;
+        let mut wakes = 0usize;
+        while refresh(tree) {
+            // Follow each member that the watch does not follow yet. A
+            // member that is already gone gives `ESRCH`, and the walk
+            // above has its reports either way.
+            if let Some(watch) = watch.as_ref() {
+                for pid in lock(tree).tree.live_members() {
+                    if followed.insert(pid) {
+                        if let Err(e) = watch.follow(pid) {
+                            tracing::debug!(pid, error = %e, "the watch cannot follow the process");
+                        }
+                    }
+                }
+            }
+            walks = walks.saturating_add(1);
+            match watch.as_ref() {
+                Some(watch) => {
+                    if watch.wait(POLL_INTERVAL) > 0 {
+                        wakes = wakes.saturating_add(1);
+                    }
+                }
+                None => std::thread::sleep(POLL_INTERVAL),
+            }
+        }
+        tracing::debug!(
+            walks,
+            wakes,
+            followed = followed.len(),
+            took_ms = start.elapsed().as_millis(),
+            "the run of the process tree ended"
+        );
     }
 
     /// The answer of the warm-up (MAC-12).
@@ -987,20 +1068,20 @@ mod runtime {
             // of a machine have the same name, so a report whose PID the
             // tree does not hold teaches nothing
             // (`watch_keeps_only_the_processes_of_the_run`).
-            if record.operation.starts_with("process-exec") && record.target.starts_with('/') {
-                let mut guard = lock(tree);
-                if guard.member(record.pid) {
-                    guard
-                        .tree
-                        .learn_name(record.pid, file_name_of(&record.target));
-                }
+            if record.operation.starts_with("process-exec")
+                && record.target.starts_with('/')
+                && member(tree, record.pid)
+            {
+                lock(tree)
+                    .tree
+                    .learn_name(record.pid, file_name_of(&record.target));
             }
             // The reports of other sandboxed processes on the system are
             // also in the log. Keep only our process tree, and only a
             // report whose process name fits the program that the PID
             // runs: the program chooses the text of its own name, so a
             // name that does not fit is a forgery (FUZZ-1).
-            if !lock(tree).accepts(record.pid, &record.process) {
+            if !accepts(tree, record.pid, &record.process) {
                 continue;
             }
             let Some(event) = to_event(&record, mode) else {

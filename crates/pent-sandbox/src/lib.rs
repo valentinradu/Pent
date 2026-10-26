@@ -50,11 +50,11 @@ mod macos_log;
 #[cfg(target_os = "macos")]
 mod macos_proctable;
 
-// The measurement of `kqueue` for MAC-10. The module holds no production
-// code: `kqueue` gives no fact that the poll of the process table does not
-// already give (see the comment of the module). The test holds the answer
-// of the kernel, so a later macOS that follows a `fork` is visible.
-#[cfg(all(target_os = "macos", test))]
+// The `kqueue` watch of a `fork`, which wakes the follower of the process
+// tree the moment a member forks (MAC-10). The module also holds the
+// measurement of `NOTE_TRACK` as a test, so a later macOS that follows a
+// `fork` itself is visible.
+#[cfg(target_os = "macos")]
 mod macos_kqueue;
 
 #[cfg(target_os = "linux")]
