@@ -1622,13 +1622,22 @@ fn locked_mount_flags(path: &std::ffi::CStr) -> std::io::Result<libc::c_ulong> {
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let st = unsafe { st.assume_init() };
     let f = st.f_flag;
+    // The `ST_*` values come from the kernel, so they are the same for
+    // each C library. `libc` does not give `ST_RELATIME` a name for musl,
+    // thus pent writes the values itself and no target is left out.
+    const ST_NOSUID: libc::c_ulong = 2;
+    const ST_NODEV: libc::c_ulong = 4;
+    const ST_NOEXEC: libc::c_ulong = 8;
+    const ST_NOATIME: libc::c_ulong = 1024;
+    const ST_NODIRATIME: libc::c_ulong = 2048;
+    const ST_RELATIME: libc::c_ulong = 4096;
     let pairs: [(libc::c_ulong, libc::c_ulong); 6] = [
-        (libc::ST_NOSUID, libc::MS_NOSUID),
-        (libc::ST_NODEV, libc::MS_NODEV),
-        (libc::ST_NOEXEC, libc::MS_NOEXEC),
-        (libc::ST_NOATIME, libc::MS_NOATIME),
-        (libc::ST_NODIRATIME, libc::MS_NODIRATIME),
-        (libc::ST_RELATIME, libc::MS_RELATIME),
+        (ST_NOSUID, libc::MS_NOSUID),
+        (ST_NODEV, libc::MS_NODEV),
+        (ST_NOEXEC, libc::MS_NOEXEC),
+        (ST_NOATIME, libc::MS_NOATIME),
+        (ST_NODIRATIME, libc::MS_NODIRATIME),
+        (ST_RELATIME, libc::MS_RELATIME),
     ];
     Ok(pairs
         .iter()
