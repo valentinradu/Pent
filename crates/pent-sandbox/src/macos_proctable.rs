@@ -40,10 +40,10 @@ use std::collections::HashSet;
 
 use crate::macos_log::ProcRow;
 
-/// The number of children that one call of [`children_of`] reads.
+/// The number of entries that one call of [`list_children`] can hold.
 ///
 /// A process with more children than this loses the rest of them for one
-/// poll. The next poll reads them again, because the walk starts from each
+/// walk. The next walk reads them again, because the walk starts from each
 /// live member.
 const MAX_CHILDREN: usize = 1024;
 
@@ -118,28 +118,48 @@ fn row_of(pid: u32) -> Option<ProcRow> {
     })
 }
 
-/// The process IDs of the direct children of `pid`.
-fn children_of(pid: u32) -> Vec<u32> {
-    let Ok(raw) = i32::try_from(pid) else {
-        return Vec::new();
-    };
+/// The answer of `proc_listchildpids` for `pid`: the raw return value and
+/// the buffer that the call filled.
+///
+/// The manual page of `proc_listchildpids` does not say whether the return
+/// value counts the bytes or the process IDs, and the two readings differ
+/// by a factor of four. The run 40248760059 measured the answer of a
+/// runner, and [`tests::the_answer_of_the_kernel_for_the_children`] prints
+/// it, so a reader of the test does not need the manual page.
+///
+/// [`children_of`] therefore takes the **larger** reading: it reads as
+/// many entries of the buffer as the return value names, up to the length
+/// of the buffer. Each entry that it then keeps must be a process whose
+/// parent is `pid`, which the kernel answers for each entry one by one, so
+/// an entry that the call never wrote cannot become a member of the tree.
+fn list_children(pid: u32) -> Option<(usize, Vec<i32>)> {
+    let raw = i32::try_from(pid).ok()?;
     let mut kids = vec![0i32; MAX_CHILDREN];
-    let Ok(bytes) = i32::try_from(std::mem::size_of_val(kids.as_slice())) else {
-        return Vec::new();
-    };
+    let bytes = i32::try_from(std::mem::size_of_val(kids.as_slice())).ok()?;
     // SAFETY: `kids` holds `bytes` bytes and lives over the whole call.
-    // The call writes at most `bytes` bytes into it and returns the number
-    // of bytes that it wrote, or a value that is not positive.
+    // The call writes at most `bytes` bytes into it and returns a count,
+    // or a value that is not positive.
     let got =
         unsafe { libc::proc_listchildpids(raw, kids.as_mut_ptr().cast::<libc::c_void>(), bytes) };
-    let Ok(got) = usize::try_from(got) else {
+    let got = usize::try_from(got).ok()?;
+    Some((got, kids))
+}
+
+/// The process IDs of the direct children of `pid`.
+///
+/// The kernel answers each candidate: a child counts only when the kernel
+/// gives a row for it and that row names `pid` as the parent.
+fn children_of(pid: u32) -> Vec<u32> {
+    let Some((got, kids)) = list_children(pid) else {
         return Vec::new();
     };
-    let count = (got / std::mem::size_of::<i32>()).min(kids.len());
+    let count = got.min(kids.len());
     kids.get(..count)
         .unwrap_or(&[])
         .iter()
         .filter_map(|raw| u32::try_from(*raw).ok())
+        .filter(|child| *child != 0)
+        .filter(|child| row_of(*child).is_some_and(|row| row.ppid == pid))
         .collect()
 }
 
@@ -149,6 +169,12 @@ fn children_of(pid: u32) -> Vec<u32> {
 /// A child whose row the kernel refuses is a child that exited between the
 /// two calls. The walk keeps its process ID with the state "zombie", so
 /// that the reader knows the process ID and drops no report of it.
+///
+/// The walk cannot find a child that is **already** a zombie: the run
+/// 40246732816 measured that `proc_listchildpids` does not name a zombie
+/// and that `proc_pidinfo` and `proc_pidpath` give nothing for one. The
+/// window of MAC-10 therefore ends at the exit of the child and not at the
+/// moment that its parent reaps it.
 pub(crate) fn snapshot(roots: &[u32]) -> Vec<ProcRow> {
     let mut seen: HashSet<u32> = HashSet::new();
     let mut queue: Vec<(u32, Option<u32>)> = roots.iter().map(|pid| (*pid, None)).collect();
@@ -216,6 +242,45 @@ mod tests {
         );
         assert_eq!(program_of(me).as_deref(), Some(mine.name.as_str()));
         assert_eq!(row_of(me).map(|row| row.pid), Some(me));
+    }
+
+    /// What the kernel answers for the children of a process.
+    ///
+    /// The manual page does not say whether the answer counts the bytes or
+    /// the process IDs. This test starts one child and prints the answer
+    /// beside the number of children, so a reader learns which one it is.
+    /// [`super::children_of`] does not depend on the answer: it asks the
+    /// kernel for the parent of each candidate.
+    #[test]
+    fn the_answer_of_the_kernel_for_the_children() {
+        let child = std::process::Command::new("/bin/sleep")
+            .arg("5")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        let Ok(mut child) = child else {
+            panic!("the test could not start /bin/sleep");
+        };
+        let answer = super::list_children(std::process::id());
+        let found = children_of(std::process::id());
+        let _ = child.kill();
+        let _ = child.wait();
+        let Some((got, kids)) = answer else {
+            panic!("the kernel gave no answer for the children of this process");
+        };
+        let first: Vec<i32> = kids.get(..4).unwrap_or(&[]).to_vec();
+        println!(
+            "proc_listchildpids answered {got} for {} children; the first \
+             entries of the buffer are {first:?}; children_of gave {found:?}",
+            found.len()
+        );
+        assert!(
+            found.contains(&child.id()),
+            "the kernel did not name the child {} of this process; the answer \
+             was {got} and the buffer began with {first:?}",
+            child.id()
+        );
     }
 
     /// The walk must find a child, its parent and the program of it.
