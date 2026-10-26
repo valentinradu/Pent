@@ -44,6 +44,7 @@ mod net_table {
     const PROBE: &str = r#"printf 'PENT_CHILD_RAN\n'
 if getent hosts "$1" > /dev/null 2>&1; then printf 'DNS=yes\n'; else printf 'DNS=no\n'; fi
 code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 "$2" 2>&1)
+printf 'CURL=%s\n' "$?"
 printf 'CODE=%s\n' "$code"
 "#;
 
@@ -53,8 +54,31 @@ printf 'CODE=%s\n' "$code"
         format!("[network]\ndomains = [{}]\n", list.join(", "))
     }
 
+    /// The HTTP code that the proxy answered, from either shape of the
+    /// output of curl: the field `%{http_code}`, or the text that curl
+    /// prints when the proxy refuses the tunnel.
+    fn proxy_answer(text: &str) -> Option<u16> {
+        let field = text
+            .lines()
+            .find_map(|l| l.strip_prefix("CODE="))
+            .map(str::trim)
+            .unwrap_or_default();
+        if let Ok(code) = field.parse::<u16>() {
+            if (100..600).contains(&code) {
+                return Some(code);
+            }
+        }
+        // "curl: (7) CONNECT tunnel failed, response 403"
+        let rest = field.split("response ").nth(1)?;
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        digits
+            .parse::<u16>()
+            .ok()
+            .filter(|c| (100..600).contains(c))
+    }
+
     /// The verdict of the two layers for one row.
-    fn layers(case: &NetCase) -> Result<(Verdict, Verdict, String), BoxError> {
+    fn layers(case: &NetCase) -> Result<(Verdict, Option<Verdict>, String), BoxError> {
         let env = TestEnv::new()?;
         env.install_profile("p", &profile(case))?;
         let out = env.pent(&[
@@ -81,20 +105,22 @@ printf 'CODE=%s\n' "$code"
         } else {
             Verdict::Deny
         };
-        // The proxy answers 403 for a domain that the allowlist does not
-        // hold and 400 for a destination that it refuses. Only a code
-        // below 400 is a connection that reached the host.
-        let code = text
-            .lines()
-            .find_map(|l| l.strip_prefix("CODE="))
-            .unwrap_or("")
-            .trim()
-            .parse::<u16>()
-            .unwrap_or(0);
-        let connect = if (200..400).contains(&code) {
-            Verdict::Allow
-        } else {
-            Verdict::Deny
+        // The proxy answers with an HTTP code, and that answer is its
+        // decision. Curl shows the code in two shapes: the field
+        // `%{http_code}` when the request went through the tunnel, and the
+        // text "response <code>" when the proxy refused the tunnel itself
+        // and curl stopped with the status 7. Read both.
+        //
+        // With no answer at all the request never reached the proxy, and
+        // the row says nothing about the policy: the network of the
+        // machine failed. An earlier version read each missing field as a
+        // denial, so a network that hiccupped looked like a disagreement
+        // of the three layers.
+        let answer = proxy_answer(&text);
+        let connect = match answer {
+            Some(code) if (200..400).contains(&code) => Some(Verdict::Allow),
+            Some(_) => Some(Verdict::Deny),
+            None => None,
         };
         Ok((dns, connect, text))
     }
@@ -113,8 +139,27 @@ printf 'CODE=%s\n' "$code"
             return Ok(());
         }
         let mut wrong = Vec::new();
+        let mut no_answer = Vec::new();
         for case in net_closed() {
-            let (dns, connect, text) = layers(case)?;
+            // The network of a machine can fail for a moment. A row whose
+            // request never reached the proxy says nothing about the
+            // policy, so the row runs again before the test gives up.
+            let mut attempt = 0;
+            let (dns, connect, text) = loop {
+                let got = layers(case)?;
+                attempt += 1;
+                if got.1.is_some() || attempt == 3 {
+                    break got;
+                }
+            };
+            let Some(connect) = connect else {
+                no_answer.push(format!(
+                    "  {}: the request never reached the proxy in {attempt} tries, \
+                     so the row says nothing about the policy\n{text}",
+                    case.id
+                ));
+                continue;
+            };
             if dns != case.dns {
                 wrong.push(format!(
                     "  {}: the profile says the DNS layer must {}, it does {}\n{text}",
@@ -136,6 +181,12 @@ printf 'CODE=%s\n' "$code"
             wrong.is_empty(),
             "{test}: the three layers disagree:\n{}",
             wrong.join("\n")
+        );
+        assert!(
+            no_answer.is_empty(),
+            "{test}: the network of this machine did not answer, so the test \
+             proves nothing. This is not a disagreement of the layers:\n{}",
+            no_answer.join("\n")
         );
         Ok(())
     }
