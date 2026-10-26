@@ -823,6 +823,18 @@ that test is a floor and not the rate: a rate is not a property of a
 machine, and a test of a security property must not fail by chance. The
 number in this section comes from the line that the test prints.
 
+**The end of a run needs the same probe.** The log delivers a report about
+forty milliseconds after the access, so the reader keeps `log stream` open
+after the last process of the run exits. A fixed wait of 500 ms was a
+guess, and the run 40250412230 showed that the guess fails: a watch run of
+`parity_watch.rs` lost its last two accesses, while the same command kept
+them in each run before it. The reader now makes one probe at the end of
+the run too and waits for its report: the kernel writes the reports in
+order, and the probe runs after the last process of the run exits, so a
+stream that delivers the report of the probe has delivered each earlier
+report of the run. The limit of that wait is five seconds, and a drain
+that passes it gives a warning.
+
 Two limits of the window are known:
 
 - **A zombie is invisible.** The run 40246732816 measured that

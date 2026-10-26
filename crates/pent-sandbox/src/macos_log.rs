@@ -604,6 +604,7 @@ mod runtime {
     use std::collections::HashSet;
     use std::io::BufRead as _;
     use std::process::{Child, Command, Stdio};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
     use std::sync::{Arc, Mutex, MutexGuard};
     use std::time::{Duration, Instant};
@@ -631,9 +632,11 @@ mod runtime {
     const POLL_INTERVAL: Duration = Duration::from_millis(1);
     /// The minimum time between two process-tree refreshes on demand.
     const MIN_REFRESH_GAP: Duration = Duration::from_millis(1);
-    /// The time to read late log lines after the last process of the tree
-    /// exits.
+    /// The time to read late log lines after the drain saw its own report,
+    /// and the whole drain time when the probe of the drain cannot run.
     const DRAIN_GRACE: Duration = Duration::from_millis(500);
+    /// The time limit of the drain.
+    const DRAIN_LIMIT: Duration = Duration::from_secs(5);
 
     /// The Seatbelt profile of the warm-up probe (MAC-12).
     ///
@@ -870,19 +873,93 @@ mod runtime {
             // known before their reports arrive. When the tree is empty,
             // wait for late lines, then stop `log stream`. Its output then
             // ends, the filter thread ends, and the event channel closes.
+            let mark = Arc::new(DrainMark::new());
             {
                 let tree = Arc::clone(&tree);
+                let mark = Arc::clone(&mark);
                 std::thread::spawn(move || {
                     let mut log_proc = log_proc;
                     follow_tree(&tree);
-                    std::thread::sleep(DRAIN_GRACE);
+                    drain_the_log(&mark);
                     stop_log_process(&mut log_proc);
                 });
             }
 
-            std::thread::spawn(move || filter_lines(&lines, &tree, &mode, &tx));
+            std::thread::spawn(move || filter_lines(&lines, &tree, &mode, &mark, &tx));
             rx
         }
+    }
+
+    /// The mark that the drain of the log waits for.
+    ///
+    /// The log delivers a report about forty milliseconds after the
+    /// access, so the reader must keep the stream open after the last
+    /// process of the run exits. A fixed wait is a guess: the run
+    /// 40250412230 lost the last two accesses of a watch run with a wait
+    /// of 500 ms, while the same command kept them in each run before it.
+    ///
+    /// The drain therefore makes one Seatbelt report of its own, as the
+    /// warm-up does, and waits for it. The kernel writes the reports in
+    /// order, and the probe of the drain runs after the last process of
+    /// the run exits, so a stream that delivers the report of the probe
+    /// has delivered each earlier report of the run.
+    struct DrainMark {
+        /// The process ID of the probe that the drain waits for. Zero
+        /// means that the drain waits for nothing.
+        probe: AtomicU32,
+        /// True when the filter thread read a report of that process ID.
+        seen: AtomicBool,
+    }
+
+    impl DrainMark {
+        /// A mark that waits for nothing.
+        const fn new() -> Self {
+            Self {
+                probe: AtomicU32::new(0),
+                seen: AtomicBool::new(false),
+            }
+        }
+
+        /// Record that a report of `pid` arrived, when the drain waits for
+        /// that PID.
+        fn note(&self, pid: u32) {
+            if pid != 0 && self.probe.load(Ordering::Relaxed) == pid {
+                self.seen.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Keep `log stream` open until it delivers a report of pent itself.
+    ///
+    /// See [`DrainMark`]. A drain that passes its limit gives a warning:
+    /// the record can then miss the last accesses of the run.
+    fn drain_the_log(mark: &DrainMark) {
+        let start = Instant::now();
+        while start.elapsed() < DRAIN_LIMIT {
+            let Ok(pid) = run_probe() else {
+                // Without a probe the drain can only wait.
+                std::thread::sleep(DRAIN_GRACE);
+                return;
+            };
+            mark.seen.store(false, Ordering::Relaxed);
+            mark.probe.store(pid, Ordering::Relaxed);
+            let waited = Instant::now();
+            while waited.elapsed() < PROBE_GAP {
+                if mark.seen.load(Ordering::Relaxed) {
+                    // The stream has reached the present. Give the late
+                    // lines of the kernel a last moment, because the
+                    // unified log keeps no strict order.
+                    std::thread::sleep(DRAIN_GRACE);
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        tracing::warn!(
+            limit_s = DRAIN_LIMIT.as_secs(),
+            "`log stream` delivered no report of pent itself at the end of the \
+             run; the record can miss the last accesses"
+        );
     }
 
     /// Follow the process tree of the run until nothing of it is live.
@@ -1048,12 +1125,16 @@ mod runtime {
         lines: &Receiver<String>,
         tree: &Mutex<Tree>,
         mode: &RecordMode,
+        mark: &DrainMark,
         tx: &Sender<WatchEvent>,
     ) {
         for line in lines {
             let Some(record) = parse_line(&line) else {
                 continue;
             };
+            // The drain at the end of the run waits for the report of a
+            // probe of pent, whose PID is in no process tree of the run.
+            mark.note(record.pid);
             // The report of an exec names the program that the process
             // runs from now on. The kernel writes that path, so the name
             // is a source that the program does not choose, and it is as
