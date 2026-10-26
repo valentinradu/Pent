@@ -1,4 +1,6 @@
-SHELL := /bin/bash
+# `env` finds bash on a system that does not keep it in /bin (NixOS, and
+# a minimal image). The recipes use bash, so the shell must be bash.
+SHELL := $(shell command -v bash 2>/dev/null || echo /bin/sh)
 .SHELLFLAGS := -eu -o pipefail -c
 
 DEFAULT_GOAL := help
