@@ -8,27 +8,27 @@ Codename: stable
 Architectures: amd64 arm64
 Components: main
 Description: Pent APT repository
-Date: Tue, 03 Mar 2026 03:58:25 +0000
+Date: Mon, 26 Oct 2026 09:25:16 +0000
 MD5Sum:
- a683140ef283336ce5b878984fd322e7             5830 Packages
- c5717f42fbb3f47026f5676dccbd4b60             1411 Packages.gz
- a95bad71d66aa08c3ee0241a839cb5b0              171 Release
+ 3fd11dbde62144bbde6d8ab3a70d621f             6996 Packages
+ c889f6f69172bfa1785abe169a80322a             1623 Packages.gz
+ f8d2c1bb0373f7636eb5de1155a97ea8              171 Release
 SHA1:
- 5fb4d61f611aec79b026beb10916d14b4acbe666             5830 Packages
- 709f95025e3cdf89bfa8715ea7658b5336ea69c4             1411 Packages.gz
- cd8885fe4b594a3316d48725f03ca780ec2aa24e              171 Release
+ 334eae29128384320b48c3b19ad77170e94a743c             6996 Packages
+ e4426a18a37bfd1e9968d264f32092a8281a03f7             1623 Packages.gz
+ 51e008f59de8005244c33e3b025984cf8fac1306              171 Release
 SHA256:
- 84b60f1963a9f3df5df26b7ca30609a448b8b8b8bec866036423ed1170367916             5830 Packages
- d9edad423296a8c8a544e7ebed5df7c737de3caf09a666abd3f3c7f91d544f62             1411 Packages.gz
- 9a75f839fe630e92e67ce62aaa32812e41be60e3725ef7b61fb1153026f49b23              171 Release
+ 4f18ccaa7c8d61b28d29d4184d6bc6d6c4b089e1e693ef2495aad8dfab3de583             6996 Packages
+ 74803ad63321cefaeba246d730d86d163be678bccc5ddaea0d4087325b985339             1623 Packages.gz
+ 165790e1288a31adb3fb517d2bf719136cadb9eac79ef79166c61d633ff4073c              171 Release
 SHA512:
- c83387ceed8f02436950e143e197c4c912659a19494aa3ddc9739a11461853ef48413b986d28803b46be1b5d1eda34ffe45daf637f12c3ba779e6855248117b0             5830 Packages
- 945dd1b85afbdb9b463dd34d3bdeac1362c49a33f606f83c9d47c6370666c39ad566cf8aeb3ff326a0cb9881fcffac464789e79fcd1c33f373cefeffc5a527d5             1411 Packages.gz
- fe6fceaae28a9d99a43ead7ed269dbc665205562e30c21a496d71f1077e304f192c151f977b2275e92d0b1942bf8bdfbdd458628c257c5b06d74c1f678428eeb              171 Release
+ 0a6ba5842611023488be2fa441ae85a5bf5e4c1be971acb4c8739d26787fbfb28699f503a3f32b8559e438d19d011f391e04791876ec0c5db91e50bfd192cf16             6996 Packages
+ 39f4ee94c9ac94de5df54d53dbc6f71a5f350cf2e6190762ed74e6452baefc8f4508a5a380749088b497b0fb23dcc0d361c2290163ef2cb57fa30716b410ed92             1623 Packages.gz
+ 1bea11895c78cd939244c8fde876da2adf684e446df1b8e438c19731a03674ed0ccd07f7c22b6f3432ae8eb9bea57ce80c4cbe549d62eb8de2a268de693e09ef              171 Release
 -----BEGIN PGP SIGNATURE-----
 
-iHUEARYKAB0WIQRNp7Vym4X0souOTxRtK9Lure/4yQUCaaZcYQAKCRBtK9Lure/4
-yZTHAQD8CCd21tda2QIXU5tzJwXDZ/8zB1/2wP86KcW6A4lP8wD+LwcKY+roGG7b
-xPETF1nVnE10ltT7kVdI2U4ocYH1XwM=
-=2Lec
+iHUEARYKAB0WIQRNp7Vym4X0souOTxRtK9Lure/4yQUCat8cfAAKCRBtK9Lure/4
+yUbCAP4lg7QRYhDRmBWiXT9ojX7e05d3SAC2UsQgckJnIpS67gD/YCdsCDvjArEn
+44vx2ouLois5qs+F9E3DkhAJ3KXLXQY=
+=7Knu
 -----END PGP SIGNATURE-----

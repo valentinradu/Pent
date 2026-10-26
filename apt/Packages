@@ -1,13 +1,13 @@
 Package: pent
 Version: 0.0.1
-Architecture: amd64
+Architecture: arm64
 Maintainer: Valentin Radu
-Installed-Size: 4193
-Filename: ./pent_0.0.1_amd64.deb
-Size: 1270668
-MD5sum: 386da1e9a75578d33ff003dc4e1d21a4
-SHA1: 8fac8b9289065c88b9783b01b40b9a92fc5e7602
-SHA256: b6fd077a86046b977cde876ef798a731eb3ed31de7fc4f05c5f126ee426c9822
+Installed-Size: 4158
+Filename: ./pent_0.0.1_arm64.deb
+Size: 1160624
+MD5sum: 57cb9081ec0421dd5f81830f3c86a020
+SHA1: 10c5476b26ad5a099c007ac0afaa2ab1ee0992f9
+SHA256: 6c171decef9078cebc8a4d7b92d2a9630052ea15f47101660dc819e1b255b5f8
 Section: utils
 Priority: optional
 Description: Run processes under filesystem and network containment
@@ -17,14 +17,14 @@ Description: Run processes under filesystem and network containment
 
 Package: pent
 Version: 0.0.1
-Architecture: arm64
+Architecture: amd64
 Maintainer: Valentin Radu
-Installed-Size: 4158
-Filename: ./pent_0.0.1_arm64.deb
-Size: 1160624
-MD5sum: 57cb9081ec0421dd5f81830f3c86a020
-SHA1: 10c5476b26ad5a099c007ac0afaa2ab1ee0992f9
-SHA256: 6c171decef9078cebc8a4d7b92d2a9630052ea15f47101660dc819e1b255b5f8
+Installed-Size: 4193
+Filename: ./pent_0.0.1_amd64.deb
+Size: 1270668
+MD5sum: 386da1e9a75578d33ff003dc4e1d21a4
+SHA1: 8fac8b9289065c88b9783b01b40b9a92fc5e7602
+SHA256: b6fd077a86046b977cde876ef798a731eb3ed31de7fc4f05c5f126ee426c9822
 Section: utils
 Priority: optional
 Description: Run processes under filesystem and network containment
@@ -68,23 +68,6 @@ Description: Run processes under filesystem and network containment
 
 Package: pent
 Version: 0.0.3
-Architecture: amd64
-Maintainer: Valentin Radu
-Installed-Size: 4193
-Filename: ./pent_0.0.3_amd64.deb
-Size: 1270300
-MD5sum: 7dbef538261a0421aa3970579ed7e311
-SHA1: 030cdc30288363be3d6f65231d6d2e5e102190d0
-SHA256: c4ebd3bb4b654acb8fa5fbb9815e8ee28029b1bd4c808aafa284972fcb0d145d
-Section: utils
-Priority: optional
-Description: Run processes under filesystem and network containment
- Wrap any process in a filesystem and network sandbox using native OS mechanisms
- (Linux Landlock + network namespaces) with a built-in DNS/TCP proxy for domain
- allowlisting.
-
-Package: pent
-Version: 0.0.3
 Architecture: arm64
 Maintainer: Valentin Radu
 Installed-Size: 4157
@@ -101,15 +84,15 @@ Description: Run processes under filesystem and network containment
  allowlisting.
 
 Package: pent
-Version: 0.0.4
-Architecture: arm64
+Version: 0.0.3
+Architecture: amd64
 Maintainer: Valentin Radu
-Installed-Size: 4158
-Filename: ./pent_0.0.4_arm64.deb
-Size: 1162432
-MD5sum: 75bebe0cfa6e02c1628aa761477a6615
-SHA1: 6fda56217c6ac67d0fba225bdc80b524edfebfd1
-SHA256: 00198842df4e7fd87b72ebe6d62996d49e91472c3998f7b33ef794e04a1ac557
+Installed-Size: 4193
+Filename: ./pent_0.0.3_amd64.deb
+Size: 1270300
+MD5sum: 7dbef538261a0421aa3970579ed7e311
+SHA1: 030cdc30288363be3d6f65231d6d2e5e102190d0
+SHA256: c4ebd3bb4b654acb8fa5fbb9815e8ee28029b1bd4c808aafa284972fcb0d145d
 Section: utils
 Priority: optional
 Description: Run processes under filesystem and network containment
@@ -135,15 +118,15 @@ Description: Run processes under filesystem and network containment
  allowlisting.
 
 Package: pent
-Version: 0.0.5
+Version: 0.0.4
 Architecture: arm64
 Maintainer: Valentin Radu
-Installed-Size: 4161
-Filename: ./pent_0.0.5_arm64.deb
-Size: 1162108
-MD5sum: 6fee727ac8915ea8f025ee3dd2d0cce9
-SHA1: b266886b052eaf97fbdcb2688d8ba8bd0fd05526
-SHA256: c4042bda8b027ecaa7f26d3d2b770fb1e75e6e10ee24f1e4e09a41def57fab8e
+Installed-Size: 4158
+Filename: ./pent_0.0.4_arm64.deb
+Size: 1162432
+MD5sum: 75bebe0cfa6e02c1628aa761477a6615
+SHA1: 6fda56217c6ac67d0fba225bdc80b524edfebfd1
+SHA256: 00198842df4e7fd87b72ebe6d62996d49e91472c3998f7b33ef794e04a1ac557
 Section: utils
 Priority: optional
 Description: Run processes under filesystem and network containment
@@ -161,6 +144,57 @@ Size: 1272060
 MD5sum: ee48363171635e99e62e46bdba5a76c9
 SHA1: 84e4d3747c631fcff38217c326726c3ba2067dfa
 SHA256: 96362dcc61f735b178c37d69b0433560e3a21eae49a43f6357044f3fb9ff213b
+Section: utils
+Priority: optional
+Description: Run processes under filesystem and network containment
+ Wrap any process in a filesystem and network sandbox using native OS mechanisms
+ (Linux Landlock + network namespaces) with a built-in DNS/TCP proxy for domain
+ allowlisting.
+
+Package: pent
+Version: 0.0.5
+Architecture: arm64
+Maintainer: Valentin Radu
+Installed-Size: 4161
+Filename: ./pent_0.0.5_arm64.deb
+Size: 1162108
+MD5sum: 6fee727ac8915ea8f025ee3dd2d0cce9
+SHA1: b266886b052eaf97fbdcb2688d8ba8bd0fd05526
+SHA256: c4042bda8b027ecaa7f26d3d2b770fb1e75e6e10ee24f1e4e09a41def57fab8e
+Section: utils
+Priority: optional
+Description: Run processes under filesystem and network containment
+ Wrap any process in a filesystem and network sandbox using native OS mechanisms
+ (Linux Landlock + network namespaces) with a built-in DNS/TCP proxy for domain
+ allowlisting.
+
+Package: pent
+Version: 0.1.0
+Architecture: arm64
+Maintainer: Valentin Radu
+Installed-Size: 6461
+Filename: ./pent_0.1.0_arm64.deb
+Size: 1589052
+MD5sum: 81d480a4034d2d9a19bdf72a8134e41e
+SHA1: e32de5b983be3641a9a635621bb34993fe7158e8
+SHA256: 50a91bf3f9255adf542abe18633fdc9843448d3c5eadd375901d729329fd5ed3
+Section: utils
+Priority: optional
+Description: Run processes under filesystem and network containment
+ Wrap any process in a filesystem and network sandbox using native OS mechanisms
+ (Linux Landlock + network namespaces) with a built-in DNS/TCP proxy for domain
+ allowlisting.
+
+Package: pent
+Version: 0.1.0
+Architecture: amd64
+Maintainer: Valentin Radu
+Installed-Size: 6633
+Filename: ./pent_0.1.0_amd64.deb
+Size: 1772664
+MD5sum: e0a74bdccd242beefc9823445316fe59
+SHA1: 174148760e9e68f50818731ce0f8dc3e66546e88
+SHA256: cab9eda5aecdd9e3ad589650d7450bbfcf8f03b4b1bf5d853972fccc6aff6372
 Section: utils
 Priority: optional
 Description: Run processes under filesystem and network containment
