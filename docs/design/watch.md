@@ -33,7 +33,7 @@ The commands and the results are the same on Linux and on macOS.
 | `pent profile list` | List the profiles and their trust status, and the drafts. |
 | `pent profile show NAME` | Print the profile. |
 | `pent profile rm NAME` | Remove the profile, its draft and its trust entry. |
-| `pent run [--profile NAME] [--read P] [--write P] [--execute P] [--unix-socket P] [--allow D] [--network M] [--trace] -- CMD...` | Run with the trusted profile. The flags add to the profile. They never replace it. |
+| `pent run [--profile NAME] [--read P] [--write P] [--execute P] [--unix-socket P] [--localhost PORT] [--allow D] [--network M] [--trace] -- CMD...` | Run with the trusted profile. The flags add to the profile. They never replace it. |
 | `pent config init/show/edit` | The global settings (`~/.config/pent/pent.toml`). |
 
 Removed: `pent config add`, `pent config rm`, `pent config trust`,
@@ -93,14 +93,15 @@ When the profile changed after the trust, the message says so.
 pent watch: claude
   Watch mode does not sandbox the program. It records what the program does.
   The program can read and change your files and use the network.
-  The network is open in this run. Use --allow DOMAIN or --network blocked to close it.
+  The network is open in this run. The ports on localhost are open too. Use --allow DOMAIN or --network blocked to close them.
   Pent blocks only the most dangerous accesses (credentials, persistence).
   If you do not trust this binary, run it in a VM or a container.
 Continue? [y/N]
 ```
 
 The third line appears only when the proxy observes. With `--allow` or
-`--network`, the proxy enforces the allowlist, so the line goes away.
+`--network`, the proxy enforces the allowlist and the ports on localhost
+close, so the line goes away.
 
 ### The guard
 
@@ -115,6 +116,13 @@ directories, because `$XDG_CONFIG_HOME` and `$XDG_STATE_HOME` can move them:
 | Persistence | write | a read-only bind mount | `(deny file-write* ...)` |
 | Pent's files | write | a read-only bind mount | `(deny file-write* ...)` |
 | Privilege escalation | exec | `NO_NEW_PRIVS` makes setuid fail | `NO_NEW_PRIVS` is not available; Seatbelt `(deny process-exec ...)` on the binary name |
+| Control port | connect to a port on localhost | the supervisor does not connect to the port of the host | `(deny network-outbound (remote ip "localhost:<port>"))` |
+
+The control ports are `pent_profile::CONTROL_PORTS`: 2375 and 2376 (the
+Docker API), 9222 (the debug port of a browser) and 9229 (the Node.js
+inspector). A program that reaches one of them can run code on the host. The
+proxy of a watch run refuses them too. A profile can still name such a port,
+and `pent run` then opens it.
 
 The recorder emits each blocked attempt with `Outcome::Blocked(class)`. The
 review asks the user about these items at the end. During the run, the program
@@ -145,6 +153,17 @@ after the check. Watch mode does not enforce the list: it marks each
 connection with the decision that `pent run` would make, and the review
 proposes the path (the `unix_sockets` key of the profile).
 
+The same trap serves a TCP connection to the loopback (`127.0.0.0/8`,
+`::1`). The child has its own network namespace, so its loopback is not
+the loopback of the host. When the child itself listens on the port, the
+call runs in its namespace and makes no event. Else the supervisor connects
+a socket of its own on the network of the host and gives it to the child,
+when the policy opens the port: each port in a default watch run, the
+ports of `network.localhost` in `pent run`. The event is
+`LocalhostConnect`. With `--allow` or `--network`, a watch run opens no
+port, and it records each attempt as denied. See
+`crates/pent-sandbox/src/linux_loopback.rs`.
+
 The child of a watch run also gets a PID namespace and a private `proc`,
 as a `pent run` child does, so the program sees only the processes of the
 sandbox. PID 1 of the namespace waits up to five seconds for the orphans
@@ -173,6 +192,17 @@ where the proxy listens on sockets that the child made (no privilege is
 necessary); on macOS `(deny network-outbound)` plus
 `(allow network-outbound (remote ip "localhost:<port>"))`. Pent sets
 `HTTPS_PROXY`, `HTTP_PROXY` and `ALL_PROXY` in both modes.
+
+**Localhost (both platforms).** The default run also opens each TCP port on
+the loopback of the host. In observe mode the proxy connects a request for
+`localhost` or for a loopback address. A direct connection (`NO_PROXY`
+names the loopback) goes through the supervisor on Linux (see the recorder
+above). On macOS the watch profile adds
+`(allow network-outbound (remote ip "localhost:*") (with report))` before
+the rule of the proxy port, which has no report, and `macos_log.rs` maps
+each report of a loopback target to a `LocalhostConnect` event. Nobody saw
+the form of such a report on a Mac yet; the test
+`a_listed_localhost_port_works_and_watch_records_it` checks it.
 
 ## The summary
 
@@ -207,6 +237,18 @@ Network rules:
    never makes a wildcard on a public suffix (`*.co.uk`, `*.github.io`).
 3. A connection to an IP address without a name is listed with the note that
    the proxy cannot allow an IP address. The user can ignore it.
+
+Localhost rules:
+
+1. A `LocalhostConnect` event becomes one rule for its port
+   (`Grant::Localhost`) in the section "Localhost ports". A proxy request
+   for `localhost` or for a loopback address counts the same. The rule
+   goes into `network.localhost`.
+2. The reason names the processes that connected. A control port of the
+   guard gets the name of its service and goes to the section "Blocked by
+   the guard", also when `pent run` denied it.
+3. The rule is strong, as a Unix socket is. The review does not select
+   such an item by default (`[n]`).
 
 Unix socket rules:
 
@@ -290,6 +332,9 @@ unix_sockets = [
 domains = [
   "api.anthropic.com",
   "*.npmjs.org",        # registry, www, cdn
+]
+localhost = [
+  5432,                 # used by psql
 ]
 ```
 

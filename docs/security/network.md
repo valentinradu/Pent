@@ -304,6 +304,12 @@ Proxy level (`crates/pent-proxy/tests/security_network.rs`):
 - A decimal IP string (`2130706433`) does not reach loopback. The proxy treats
   it as a name, which the allowlist refuses.
   (`http_connect_decimal_ip_form_is_not_resolved_to_loopback`)
+- A port in `localhost_ports` opens only a target that names the loopback
+  itself (`localhost`, a name below it, or a loopback address). A domain
+  that resolves to the loopback and the NAT64 form of a loopback address
+  still get the rule for private destinations.
+  (`test_only_a_loopback_name_or_address_gets_the_port_rule` in
+  `crates/pent-proxy/src/proxy.rs`)
 
 End to end (`crates/pent/tests/security_network_e2e.rs`):
 
@@ -314,6 +320,24 @@ End to end (`crates/pent/tests/security_network_e2e.rs`):
   `system_dbus_socket_is_masked` for NET-2)
 - The child cannot reach a service on the host loopback.
   (`child_cannot_reach_a_host_loopback_service`)
+- A port of `network.localhost` (or of `--localhost`) reaches the host with
+  a blocking and with a non-blocking socket, in proxy mode and in blocked
+  mode. A second `connect(2)` on a non-blocking socket keeps the first
+  connection. Another port of the host stays out of reach, and an
+  explicit `--network blocked` closes the listed port too.
+  (`a_listed_localhost_port_reaches_the_host_and_no_other_port`)
+- `pent run --trace` records a refused port in the denied log, and the
+  trace log names the flag.
+  (`a_refused_localhost_port_is_recorded_with_trace`)
+- A default watch run opens each port of the host, but the watch guard
+  keeps the port of the Docker API closed and marks it as blocked.
+  (`watch_blocks_a_control_port`)
+- A host port that does not take the connection does not stop the other
+  connections of the sandbox: the supervisor waits for it on a thread of
+  its own. (`a_slow_host_port_does_not_stop_other_connections`)
+- A default watch run reaches a port of the host and records it, and a
+  server of the program itself makes no event.
+  (`watch_reaches_and_records_a_localhost_port`)
 - The child cannot reach a host abstract Unix socket, and it does reach
   its own. The new network namespace isolates the abstract socket
   namespace. (`child_cannot_reach_a_host_abstract_unix_socket`)
@@ -399,3 +423,18 @@ inherent ones above, and these:
 - A performed send comes from a socket of the supervisor, which has no
   name, so an answer of the server reaches nobody. A notification
   protocol works; a datagram protocol that waits for an answer does not.
+- A port of `network.localhost` is a grant to whatever listens on that
+  port of the host. The supervisor connects to the port; it does not know
+  the service. The review never selects a port by default. The watch
+  guard blocks the known control ports (`pent_profile::CONTROL_PORTS`),
+  but another port can also run code on the host.
+- The supervisor compares the address of the connection with the
+  listening sockets of the child. A socket on `::` with `IPV6_V6ONLY`
+  looks like a socket that takes IPv4 too, so a connection to
+  `127.0.0.1` on that port stays in the namespace of the child.
+- The supervisor checks the listening sockets of the child and then
+  connects, in two steps. A program that connects to its own server before
+  the server listens reaches the port of the host instead, when the policy
+  opens that port.
+- Only TCP reaches the loopback of the host. A UDP socket stays in the
+  namespace of the child.

@@ -50,6 +50,11 @@ pub enum GuardClass {
     /// An exec of a privilege escalation tool (`sudo`, `su`, `pkexec`,
     /// `doas`).
     PrivilegeEscalation,
+    /// A connection to a control port on the loopback of the host (the
+    /// Docker API, the debug port of a browser). A program that reaches
+    /// such a port can run code on the host. See
+    /// [`crate::localhost::CONTROL_PORTS`].
+    ControlPort,
 }
 
 /// The result of an access.
@@ -112,6 +117,24 @@ pub enum WatchEvent {
         /// The result.
         outcome: Outcome,
     },
+    /// A direct TCP `connect()` to a port on the loopback of the host
+    /// (`127.0.0.0/8`, `::1`). The recorders send it: the seccomp
+    /// supervisor on Linux and the Seatbelt log on macOS.
+    ///
+    /// The proxy does not send this event. For a request for `localhost` or
+    /// a loopback address it sends [`WatchEvent::Connect`] with that host,
+    /// and the summary counts it as a port on the loopback too.
+    ///
+    /// On Linux, a connection to a server that the program itself runs in
+    /// the sandbox gives no event.
+    LocalhostConnect {
+        /// The destination port.
+        port: u16,
+        /// The process.
+        process: ProcessInfo,
+        /// The result.
+        outcome: Outcome,
+    },
     /// A TCP connection through the proxy.
     Connect {
         /// The destination host: a normalized domain name when the proxy
@@ -135,6 +158,7 @@ impl WatchEvent {
             Self::Fs { outcome, .. }
             | Self::UnixConnect { outcome, .. }
             | Self::Dns { outcome, .. }
+            | Self::LocalhostConnect { outcome, .. }
             | Self::Connect { outcome, .. } => *outcome,
         }
     }
@@ -282,6 +306,14 @@ mod tests {
                 protocol: NetProtocol::HttpConnect,
                 outcome: Outcome::Allowed,
             },
+            WatchEvent::LocalhostConnect {
+                port: 5432,
+                process: ProcessInfo {
+                    pid: 11,
+                    name: "psql".to_string(),
+                },
+                outcome: Outcome::Denied,
+            },
         ];
         for e in events {
             let line = e.to_json_line()?;
@@ -377,6 +409,11 @@ mod tests {
                 protocol: NetProtocol::Socks5,
                 outcome: Outcome::Allowed,
             },
+            WatchEvent::LocalhostConnect {
+                port: 5432,
+                process,
+                outcome: Outcome::Denied,
+            },
         ];
         let outcomes: Vec<Outcome> = events.iter().map(WatchEvent::outcome).collect();
         assert_eq!(
@@ -386,6 +423,7 @@ mod tests {
                 Outcome::Blocked(GuardClass::Credential),
                 Outcome::Denied,
                 Outcome::Allowed,
+                Outcome::Denied,
             ]
         );
     }
@@ -467,7 +505,8 @@ mod event_properties {
 
     /// Build an event of each kind.
     fn gen_event(rng: &mut Rng) -> WatchEvent {
-        let outcome = match rng.below(6) {
+        let outcome = match rng.below(7) {
+            5 => Outcome::Blocked(GuardClass::ControlPort),
             0 => Outcome::Blocked(GuardClass::Credential),
             1 => Outcome::Blocked(GuardClass::Persistence),
             2 => Outcome::Blocked(GuardClass::PentFiles),
@@ -481,7 +520,7 @@ mod event_properties {
             pid: rng.next_u64() as u32,
             name: name.clone(),
         };
-        match rng.below(4) {
+        match rng.below(5) {
             0 => {
                 use std::os::unix::ffi::OsStringExt as _;
                 let op = match rng.below(5) {
@@ -508,6 +547,15 @@ mod event_properties {
                 qtype: "A".to_string(),
                 outcome,
             },
+            3 => {
+                #[allow(clippy::cast_possible_truncation, reason = "a port fits in 16 bits")]
+                let port = rng.next_u64() as u16;
+                WatchEvent::LocalhostConnect {
+                    port,
+                    process,
+                    outcome,
+                }
+            }
             _ => {
                 #[allow(clippy::cast_possible_truncation, reason = "a port fits in 16 bits")]
                 let port = rng.next_u64() as u16;

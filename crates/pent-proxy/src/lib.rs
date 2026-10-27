@@ -109,6 +109,15 @@ pub enum TraceEvent {
     Violation(String),
     /// A connection or DNS query was permitted.
     Access(String),
+    /// A connection to a port on localhost was blocked, because the profile
+    /// does not open the port. The caller can name the fix
+    /// (`--localhost <port>`) from `port`, not from the text.
+    LocalhostClosed {
+        /// The message, in the form of [`TraceEvent::Violation`].
+        message: String,
+        /// The port that the profile does not open.
+        port: u16,
+    },
 }
 
 // ── Lock helpers ─────────────────────────────────────────────────────────────
@@ -567,6 +576,12 @@ impl SharedState {
     /// Report a policy violation (denied access) if a trace channel is configured.
     pub fn report_violation(&self, message: String) {
         self.send_event(TraceEvent::Violation(message));
+    }
+
+    /// Report the refusal of a port on localhost that the profile does not
+    /// open, if a trace channel is configured.
+    pub fn report_localhost_closed(&self, message: String, port: u16) {
+        self.send_event(TraceEvent::LocalhostClosed { message, port });
     }
 
     /// Report a granted-access event if a trace channel is configured.

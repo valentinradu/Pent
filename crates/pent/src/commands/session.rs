@@ -84,11 +84,13 @@ pub(crate) struct ProxyChannels {
 pub(crate) async fn start_proxy(
     settings: &ProxySettings,
     domains: Vec<String>,
+    localhost_ports: Vec<std::num::NonZeroU16>,
     policy: ProxyPolicy,
     channels: ProxyChannels,
 ) -> Result<ProxySession, CliError> {
     let mut config = ProxyConfig::try_from(settings).map_err(|e| CliError::Other(e.to_string()))?;
     config.domain_allowlist = domains;
+    config.localhost_ports = localhost_ports;
     config.policy = policy;
     config.violation_tx = channels.trace;
     config.event_tx = channels.events;

@@ -2,12 +2,15 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::Write as _;
+use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use pent_profile::{Outcome, ProfileName, WatchEvent};
 use pent_proxy::{ProxyPolicy, TraceEvent};
-use pent_sandbox::{build_env, check_availability, spawn_sandboxed, NetworkMode, SandboxConfig};
+use pent_sandbox::{
+    build_env, check_availability, spawn_sandboxed, LocalhostPorts, NetworkMode, SandboxConfig,
+};
 use pent_settings::{ConfigLoader, EventLog, ProfileStore};
 
 use crate::cli::{NetworkModeArg, RunArgs};
@@ -63,6 +66,16 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
     // domains, so that the two sources stay separate.
     let decision = resolve_network(args.network, &args.allow, &profile.network.domains);
     let domains = merge_domains(&profile.network.domains, &args.allow);
+    let localhost_ports = if blocks_localhost(decision) {
+        if let Some(source) = closed_ports_source(&profile.network.localhost, &args.localhost) {
+            ui::warn(format!(
+                "{source} have no effect: --network blocked closes the ports on localhost too"
+            ));
+        }
+        Vec::new()
+    } else {
+        merge_ports(&profile.network.localhost, &args.localhost)
+    };
     let env_map = build_run_env(&args.env);
     let trace_log_path = open_trace_log(args.trace, &store, &name);
 
@@ -98,7 +111,16 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
             trace: trace_tx,
             events: Some(access_tx),
         };
-        Some(start_proxy(&settings.proxy, domains, ProxyPolicy::Enforce, channels).await?)
+        Some(
+            start_proxy(
+                &settings.proxy,
+                domains,
+                localhost_ports.clone(),
+                ProxyPolicy::Enforce,
+                channels,
+            )
+            .await?,
+        )
     } else {
         None
     };
@@ -122,6 +144,7 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
     sandbox_cfg.record_events = args.trace;
     sandbox_cfg.unix_sockets =
         unix_socket_paths(&profile.filesystem.unix_sockets, &args.unix_socket, &cwd);
+    sandbox_cfg.localhost = LocalhostPorts::Listed(localhost_ports);
 
     if let Some(data_dir) = args.data_dir {
         sandbox_cfg = sandbox_cfg.with_data_dir(data_dir);
@@ -156,6 +179,9 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
     // takes time or stalls during namespace init.
     if let Some(line) = network_status(&sandbox_cfg.network, decision.source) {
         ui::status("network", line);
+    }
+    if let Some(line) = localhost_status(&sandbox_cfg.network, &sandbox_cfg.localhost) {
+        ui::status("localhost", line);
     }
 
     let mut signals = SignalRelay::install()?;
@@ -197,7 +223,7 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
         RunEvent::Access(event) => {
             // The recorder sends the filesystem denials only with --trace.
             // Write them to the trace log too.
-            if let Some(line) = fs_trace_line(&event, &name) {
+            if let Some(line) = access_trace_line(&event, &name) {
                 write_trace_line(trace_log_path.as_deref(), &line);
             }
             denied.record(&event);
@@ -267,6 +293,56 @@ pub(crate) fn unix_socket_paths(
         add(entry);
     }
     out
+}
+
+/// Return true when the user closed the network with `--network blocked`.
+/// The ports on localhost then close too. A network that is blocked only
+/// because the profile has no domains keeps the ports of the profile.
+fn blocks_localhost(decision: NetworkDecision) -> bool {
+    decision.source == NetworkSource::NetworkFlag && decision.choice == NetworkChoice::Blocked
+}
+
+/// Name the source of the ports that `--network blocked` closes, or `None`
+/// when no source has a port.
+fn closed_ports_source(profile: &[NonZeroU16], flags: &[NonZeroU16]) -> Option<&'static str> {
+    match (profile.is_empty(), flags.is_empty()) {
+        (true, true) => None,
+        (false, true) => Some("the localhost ports of the profile"),
+        (true, false) => Some("the --localhost flags"),
+        (false, false) => Some("the localhost ports of the profile and the --localhost flags"),
+    }
+}
+
+/// The ports of the profile and of `--localhost`, without duplicates.
+fn merge_ports(profile: &[NonZeroU16], flags: &[NonZeroU16]) -> Vec<NonZeroU16> {
+    let mut ports = profile.to_vec();
+    for port in flags {
+        if !ports.contains(port) {
+            ports.push(*port);
+        }
+    }
+    ports
+}
+
+/// Return the status line for the ports on the loopback of the host, if the
+/// run opens one. With `--network unrestricted` the command reaches each
+/// port anyway, so the line says nothing new.
+fn localhost_status(network: &NetworkMode, ports: &LocalhostPorts) -> Option<String> {
+    if *network == NetworkMode::Unrestricted {
+        return None;
+    }
+    match ports {
+        LocalhostPorts::Listed(list) if list.is_empty() => None,
+        LocalhostPorts::Listed(list) => Some(format!(
+            "{} {}",
+            if list.len() == 1 { "port" } else { "ports" },
+            list.iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+        LocalhostPorts::All => Some("each port".to_string()),
+    }
 }
 
 /// The profile domains and the `--allow` domains, without duplicates.
@@ -571,6 +647,10 @@ fn proxy_trace_line(event: TraceEvent, profile: &ProfileName) -> TraceLine {
             fix: Some(proxy_violation_fix(&msg, profile)),
             message: msg,
         },
+        TraceEvent::LocalhostClosed { message, port } => TraceLine::Denied {
+            fix: Some(localhost_fix(port, profile)),
+            message,
+        },
     }
 }
 
@@ -578,7 +658,24 @@ fn proxy_trace_line(event: TraceEvent, profile: &ProfileName) -> TraceLine {
 ///
 /// Returns `None` for other events and for accesses that the sandbox did not
 /// deny.
-fn fs_trace_line(event: &WatchEvent, profile: &ProfileName) -> Option<TraceLine> {
+fn access_trace_line(event: &WatchEvent, profile: &ProfileName) -> Option<TraceLine> {
+    if let WatchEvent::LocalhostConnect {
+        port,
+        process,
+        outcome: Outcome::Denied,
+    } = event
+    {
+        return Some(TraceLine::Denied {
+            message: format!(
+                "network: \"{}\" (pid {}) was denied a connection to port {port} on localhost",
+                process.name, process.pid
+            ),
+            fix: Some(format!(
+                "allow it for one run with --localhost {port}, or add it to the profile: \
+                 pent trust {profile} --review"
+            )),
+        });
+    }
     let WatchEvent::Fs {
         op,
         path,
@@ -606,6 +703,14 @@ fn fs_trace_line(event: &WatchEvent, profile: &ProfileName) -> Option<TraceLine>
              pent trust {profile} --review"
         )),
     })
+}
+
+/// The fix hint for a closed port on localhost.
+fn localhost_fix(port: u16, profile: &ProfileName) -> String {
+    format!(
+        "allow it for one run with --localhost {port}, or add it to the profile: \
+         pent trust {profile} --review"
+    )
 }
 
 /// Compute a fix hint for a proxy violation message.
@@ -851,7 +956,7 @@ mod tests {
             },
             outcome,
         };
-        let line = fs_trace_line(&event(Outcome::Denied), &profile_name());
+        let line = access_trace_line(&event(Outcome::Denied), &profile_name());
         assert_eq!(
             line.map(|l| format_trace_line(&l)),
             Some(format!(
@@ -862,8 +967,91 @@ mod tests {
             ))
         );
         assert_eq!(
-            fs_trace_line(&event(Outcome::Allowed), &profile_name()),
+            access_trace_line(&event(Outcome::Allowed), &profile_name()),
             None
         );
+    }
+
+    #[test]
+    fn a_denied_localhost_port_gives_a_trace_line_with_the_flag() {
+        let event = |outcome| WatchEvent::LocalhostConnect {
+            port: 5432,
+            process: pent_profile::ProcessInfo {
+                pid: 9,
+                name: "psql".to_string(),
+            },
+            outcome,
+        };
+        let line = access_trace_line(&event(Outcome::Denied), &profile_name());
+        assert_eq!(
+            line.map(|l| format_trace_line(&l)),
+            Some(format!(
+                "pent: [denied] network: \"psql\" (pid 9) was denied a connection to port 5432 \
+                 on localhost\n\
+                 pent: fix: allow it for one run with --localhost 5432, or add it to the \
+                 profile: pent trust {} --review\n\n",
+                profile_name()
+            ))
+        );
+        assert_eq!(
+            access_trace_line(&event(Outcome::Allowed), &profile_name()),
+            None
+        );
+    }
+
+    #[test]
+    fn the_localhost_status_names_the_ports() {
+        let port = |n: u16| NonZeroU16::MIN.saturating_add(n - 1);
+        let blocked = NetworkMode::Blocked;
+        assert_eq!(localhost_status(&blocked, &LocalhostPorts::default()), None);
+        assert_eq!(
+            localhost_status(&blocked, &LocalhostPorts::Listed(vec![port(5432)])),
+            Some("port 5432".to_string())
+        );
+        assert_eq!(
+            localhost_status(
+                &blocked,
+                &LocalhostPorts::Listed(vec![port(5432), port(6379)])
+            ),
+            Some("ports 5432, 6379".to_string())
+        );
+        assert_eq!(
+            localhost_status(&NetworkMode::Unrestricted, &LocalhostPorts::All),
+            None
+        );
+        assert_eq!(
+            merge_ports(&[port(1), port(2)], &[port(2), port(3)]),
+            vec![port(1), port(2), port(3)]
+        );
+        let flag = resolve_network(Some(NetworkModeArg::Blocked), &[], &[]);
+        assert!(blocks_localhost(flag));
+        let default = resolve_network(None, &[], &[]);
+        assert_eq!(default.choice, NetworkChoice::Blocked);
+        assert!(!blocks_localhost(default));
+        assert_eq!(closed_ports_source(&[], &[]), None);
+        assert_eq!(
+            closed_ports_source(&[port(1)], &[]),
+            Some("the localhost ports of the profile")
+        );
+        assert_eq!(
+            closed_ports_source(&[], &[port(1)]),
+            Some("the --localhost flags")
+        );
+    }
+
+    /// A closed port on localhost gets the flag that opens it, not the
+    /// setting that opens every private network.
+    #[test]
+    fn a_closed_localhost_port_gets_the_localhost_flag() {
+        let event = TraceEvent::LocalhostClosed {
+            message: "network: SOCKS5 connection to 127.0.0.1 port 5432 blocked".to_string(),
+            port: 5432,
+        };
+        let fix = match proxy_trace_line(event, &profile_name()) {
+            TraceLine::Denied { fix, .. } => fix.unwrap_or_default(),
+            TraceLine::Allowed(line) => format!("a closed port must be a denial: {line}"),
+        };
+        assert!(fix.contains("--localhost 5432"), "{fix}");
+        assert!(!fix.contains("private_destinations"), "{fix}");
     }
 }

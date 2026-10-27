@@ -78,7 +78,10 @@ mod linux_watch;
 #[cfg(target_os = "linux")]
 mod linux_unixconn;
 
-pub use config::{system_default_paths, SandboxConfig};
+#[cfg(target_os = "linux")]
+mod linux_loopback;
+
+pub use config::{system_default_paths, LocalhostPorts, SandboxConfig};
 pub use env::{build_env, resolve_path_directories, resolve_path_dirs_from};
 #[cfg(target_os = "linux")]
 pub use linux::check_user_namespaces;

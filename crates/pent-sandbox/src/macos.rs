@@ -38,7 +38,7 @@
 //! sandbox-exec is deprecated by Apple but still functional.
 //! No lightweight alternative exists for process sandboxing on macOS.
 
-use crate::{NetworkMode, SandboxConfig, SandboxError};
+use crate::{LocalhostPorts, NetworkMode, SandboxConfig, SandboxError};
 use std::path::{Path, PathBuf};
 
 /// Check if sandbox-exec is available on this system.
@@ -373,7 +373,7 @@ pub fn generate_sbpl_profile(config: &SandboxConfig) -> Result<String, SandboxEr
     // =========================================================================
     // NETWORK RULES
     // =========================================================================
-    let network_rules = generate_network_rules(&config.network);
+    let network_rules = generate_network_rules(&config.network, &config.localhost, Report::No);
     if !network_rules.is_empty() {
         profile.push_str(&network_rules);
         profile.push('\n');
@@ -679,15 +679,22 @@ impl Report {
     }
 }
 
-/// Generate the SBPL rules that let the process reach only the proxy.
+/// Generate the SBPL rules that let the process reach only the proxy and
+/// the open ports on localhost.
 ///
 /// The rules are:
 ///
 /// ```text
 /// (deny network-outbound)
-/// (allow network-outbound (remote ip "localhost:<port>"))
+/// (allow network-outbound (remote ip "localhost:5432"))     ; a port of the profile
+/// (allow network-outbound (remote ip "localhost:<port>"))   ; the proxy
 /// (allow network-outbound (literal "/private/var/run/mDNSResponder"))
 /// ```
+///
+/// The rule of the proxy port never has `(with report)`, and it comes after
+/// the rules of the open ports. A connection to the proxy thus makes no
+/// report also when watch mode opens each port (`localhost:*`): the proxy
+/// records each of its requests itself.
 ///
 /// The source of the syntax (from memory; nobody tested these rules on a
 /// Mac yet):
@@ -707,13 +714,43 @@ impl Report {
 /// The rules do not allow the kernel control sockets
 /// (`com.apple.netsrc`). Some programs that use `Network.framework` can need
 /// them. Test this on a Mac.
-fn proxy_network_rules(port: u16, report: Report) -> String {
+fn proxy_network_rules(port: u16, localhost: &LocalhostPorts, report: Report) -> String {
     let rep = report.suffix();
     format!(
         "(deny network-outbound)\n\
-         (allow network-outbound (remote ip \"localhost:{port}\"){rep})\n\
-         (allow network-outbound (literal \"{MDNS_RESPONDER_SOCKET}\"){rep})\n"
+         {}\
+         (allow network-outbound (remote ip \"localhost:{port}\"))\n\
+         (allow network-outbound (literal \"{MDNS_RESPONDER_SOCKET}\"){rep})\n",
+        localhost_port_rules(localhost, report)
     )
+}
+
+/// Generate the SBPL rules that open the ports on localhost: one rule for
+/// each port of the list, or one rule for each port (`localhost:*`).
+///
+/// With each port open, a deny rule for each control port of the watch
+/// guard ([`pent_profile::CONTROL_PORTS`]) comes after the allow, so it
+/// wins. The kernel logs the denial, and the reader marks it as blocked.
+///
+/// Seatbelt has no network namespace, so a server that the process itself
+/// runs on the loopback also needs its port in the list.
+fn localhost_port_rules(ports: &LocalhostPorts, report: Report) -> String {
+    let rep = report.suffix();
+    match ports {
+        LocalhostPorts::Listed(list) => list
+            .iter()
+            .map(|port| format!("(allow network-outbound (remote ip \"localhost:{port}\"){rep})\n"))
+            .collect(),
+        LocalhostPorts::All => {
+            let mut rules = format!("(allow network-outbound (remote ip \"localhost:*\"){rep})\n");
+            for (port, _) in pent_profile::CONTROL_PORTS {
+                rules.push_str(&format!(
+                    "(deny network-outbound (remote ip \"localhost:{port}\"))\n"
+                ));
+            }
+            rules
+        }
+    }
 }
 
 /// Generate SBPL network rules based on NetworkMode.
@@ -721,19 +758,23 @@ fn proxy_network_rules(port: u16, report: Report) -> String {
 /// # Network Rules
 /// - Unrestricted: No network rules (allow default permits it)
 /// - LocalhostOnly: Deny network, then allow all loopback outbound
-/// - ProxyOnly: Deny outbound connections, then allow the proxy port on
-///   loopback and the `mDNSResponder` socket (see [`proxy_network_rules`]).
-///   [`generate_sbpl_profile`] also allows the Unix sockets in the writable
-///   paths.
-/// - Blocked: `(deny network*)`
-fn generate_network_rules(mode: &NetworkMode) -> String {
+/// - ProxyOnly: Deny outbound connections, then allow the open ports on
+///   localhost, the proxy port on loopback and the `mDNSResponder` socket
+///   (see [`proxy_network_rules`]). [`generate_sbpl_profile`] also allows
+///   the Unix sockets in the writable paths.
+/// - Blocked: `(deny network*)`, then allow the open ports on localhost.
+fn generate_network_rules(
+    mode: &NetworkMode,
+    localhost: &LocalhostPorts,
+    report: Report,
+) -> String {
     match mode {
         NetworkMode::Unrestricted => {
             // Allow default already permits network.
             String::new()
         }
         NetworkMode::ProxyOnly { proxy_addr, .. } => {
-            proxy_network_rules(proxy_addr.port(), Report::No)
+            proxy_network_rules(proxy_addr.port(), localhost, report)
         }
         NetworkMode::LocalhostOnly => {
             // Deny all network, then allow only loopback.
@@ -747,8 +788,10 @@ fn generate_network_rules(mode: &NetworkMode) -> String {
                 .to_string()
         }
         NetworkMode::Blocked => {
-            // Explicit deny since we use allow default
-            "(deny network*)".to_string()
+            // Explicit deny since we use allow default. The rules of the
+            // open ports come after it, so they win.
+            let ports = localhost_port_rules(localhost, report);
+            format!("(deny network*)\n{ports}").trim_end().to_string()
         }
     }
 }
@@ -927,7 +970,11 @@ pub fn generate_watch_profile(
     }
     match &config.network {
         NetworkMode::ProxyOnly { proxy_addr, .. } => {
-            profile.push_str(&proxy_network_rules(proxy_addr.port(), Report::Yes));
+            profile.push_str(&proxy_network_rules(
+                proxy_addr.port(),
+                &config.localhost,
+                Report::Yes,
+            ));
             // Watch mode does not limit the Unix sockets. The recorder
             // records each connection.
             push_rule_with(
@@ -940,7 +987,7 @@ pub fn generate_watch_profile(
             )?;
         }
         other => {
-            let rules = generate_network_rules(other);
+            let rules = generate_network_rules(other, &config.localhost, Report::Yes);
             if !rules.is_empty() {
                 profile.push_str(&rules);
                 profile.push('\n');
@@ -1318,7 +1365,10 @@ pub(crate) fn spawn_watched(
     let events = reader.attach(
         child.id(),
         &root_process_names(cmd),
-        crate::macos_log::RecordMode::Watch(options.guard.clone()),
+        crate::macos_log::RecordMode::Watch {
+            guard: options.guard.clone(),
+            ports: config.localhost.clone(),
+        },
     );
     Ok(crate::WatchedChild {
         child: crate::SandboxChild {
@@ -1509,14 +1559,19 @@ mod tests {
 
     #[test]
     fn test_network_rules_unrestricted() {
-        let rules = generate_network_rules(&NetworkMode::Unrestricted);
+        let rules =
+            generate_network_rules(&NetworkMode::Unrestricted, &LocalhostPorts::All, Report::No);
         // Unrestricted = empty (allow default permits network)
         assert!(rules.is_empty());
     }
 
     #[test]
     fn test_network_rules_localhost_only() {
-        let rules = generate_network_rules(&NetworkMode::LocalhostOnly);
+        let rules = generate_network_rules(
+            &NetworkMode::LocalhostOnly,
+            &LocalhostPorts::default(),
+            Report::No,
+        );
         // Should deny all, then allow localhost
         assert!(rules.contains("(deny network*)"));
         assert!(rules.contains("localhost"));
@@ -1525,10 +1580,14 @@ mod tests {
     #[test]
     fn test_network_rules_proxy_only() {
         let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-        let rules = generate_network_rules(&NetworkMode::ProxyOnly {
-            proxy_addr: addr,
-            dns_port: 0,
-        });
+        let rules = generate_network_rules(
+            &NetworkMode::ProxyOnly {
+                proxy_addr: addr,
+                dns_port: 0,
+            },
+            &LocalhostPorts::default(),
+            Report::No,
+        );
         // Only the proxy port on loopback and the system resolver socket.
         assert_eq!(
             rules,
@@ -2023,8 +2082,8 @@ mod tests {
             .unwrap();
         let deny_at = profile.find("(deny network-outbound)\n").unwrap();
         assert!(deny_at > report_at, "the deny must come last: {profile}");
-        assert!(profile
-            .contains(r#"(allow network-outbound (remote ip "localhost:4321") (with report))"#));
+        // The proxy records its own requests, so its port has no report.
+        assert!(profile.contains("(allow network-outbound (remote ip \"localhost:4321\"))\n"));
         assert!(profile.contains(r#"(allow network-outbound (subpath "/") (with report))"#));
         assert!(!profile.contains(".pent"), "watch mode has no run policy");
     }
@@ -2286,9 +2345,65 @@ mod tests {
 
     #[test]
     fn test_network_rules_blocked() {
-        let rules = generate_network_rules(&NetworkMode::Blocked);
+        let rules = generate_network_rules(
+            &NetworkMode::Blocked,
+            &LocalhostPorts::default(),
+            Report::No,
+        );
         // Blocked = explicit deny
-        assert!(rules.contains("(deny network*)"));
+        assert_eq!(rules, "(deny network*)");
+    }
+
+    /// A port of the profile opens after the deny, in the blocked mode and
+    /// in the proxy mode, and the run profile reports nothing.
+    #[test]
+    fn the_run_profile_opens_the_listed_ports_after_the_deny() {
+        let port = std::num::NonZeroU16::MIN.saturating_add(5431);
+        let ports = LocalhostPorts::Listed(vec![port]);
+        let blocked = generate_network_rules(&NetworkMode::Blocked, &ports, Report::No);
+        assert_eq!(
+            blocked,
+            "(deny network*)\n(allow network-outbound (remote ip \"localhost:5432\"))"
+        );
+        let mut config = SandboxConfig::new("/w".into(), make_test_paths(), "/w".into())
+            .with_network(proxy_mode());
+        config.localhost = ports;
+        let profile = generate_sbpl_profile(&config).unwrap();
+        let deny_at = profile.find("(deny network-outbound)\n").unwrap();
+        let port_at = profile
+            .find("(allow network-outbound (remote ip \"localhost:5432\"))\n")
+            .unwrap();
+        assert!(port_at > deny_at, "{profile}");
+        assert!(!profile.contains("localhost:*"), "{profile}");
+        assert!(!profile.contains("(with report)"), "{profile}");
+    }
+
+    /// Watch mode opens each port on localhost with a report. The proxy
+    /// port comes after it with no report, so a request to the proxy makes
+    /// no event of the loopback.
+    #[test]
+    fn the_watch_profile_reports_each_port_but_not_the_proxy() {
+        let mut config = SandboxConfig::new("/w".into(), make_test_paths(), "/w".into())
+            .with_network(proxy_mode());
+        config.localhost = LocalhostPorts::All;
+        let profile = generate_watch_profile(&config, &[]).unwrap();
+        let deny_at = profile.find("(deny network-outbound)\n").unwrap();
+        let all_at = profile
+            .find("(allow network-outbound (remote ip \"localhost:*\") (with report))\n")
+            .unwrap();
+        let proxy_at = profile
+            .find("(allow network-outbound (remote ip \"localhost:4321\"))\n")
+            .unwrap();
+        assert!(deny_at < all_at && all_at < proxy_at, "{profile}");
+        // The watch guard closes each control port after the allow.
+        for (port, _) in pent_profile::CONTROL_PORTS {
+            let guard_at = profile
+                .find(&format!(
+                    "(deny network-outbound (remote ip \"localhost:{port}\"))\n"
+                ))
+                .unwrap();
+            assert!(guard_at > all_at, "{profile}");
+        }
     }
 
     /// The root process of a run has two names: the front end and the

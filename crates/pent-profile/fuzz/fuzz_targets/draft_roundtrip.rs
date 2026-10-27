@@ -28,6 +28,18 @@ fn rules(u: &mut Unstructured<'_>) -> arbitrary::Result<Vec<String>> {
     Ok(out)
 }
 
+/// Build a list of ports from the bytes of the fuzzer.
+fn ports(u: &mut Unstructured<'_>) -> arbitrary::Result<Vec<std::num::NonZeroU16>> {
+    let count = usize::from(u8::arbitrary(u)? % 4);
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        if let Some(port) = std::num::NonZeroU16::new(u16::arbitrary(u)?) {
+            out.push(port);
+        }
+    }
+    Ok(out)
+}
+
 fuzz_target!(|data: &[u8]| {
     let mut u = Unstructured::new(data);
     let Ok(doc) = (|| -> arbitrary::Result<ProfileDoc> {
@@ -40,6 +52,7 @@ fuzz_target!(|data: &[u8]| {
             },
             network: NetworkRules {
                 domains: rules(&mut u)?,
+                localhost: ports(&mut u)?,
             },
         })
     })() else {

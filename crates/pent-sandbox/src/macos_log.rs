@@ -246,13 +246,16 @@ pub(crate) enum OperationKind {
     Fs(FsOp),
     /// A `connect()` to a Unix socket.
     UnixConnect,
+    /// A TCP connection to this port on the loopback.
+    LocalhostConnect(u16),
 }
 
 /// Map a Seatbelt operation and its target to an event kind.
 ///
 /// Return `None` for the operations that a profile does not use (metadata
 /// reads, Mach lookups, IP connections, signals, ...). The proxy records the
-/// IP connections.
+/// IP connections, except a connection to the loopback, which does not go
+/// through the proxy.
 pub(crate) fn map_operation(operation: &str, target: &str) -> Option<OperationKind> {
     let kind = match operation {
         "file-read-data" | "file-read*" => OperationKind::Fs(FsOp::Read),
@@ -261,6 +264,7 @@ pub(crate) fn map_operation(operation: &str, target: &str) -> Option<OperationKi
         op if op.starts_with("file-write") => OperationKind::Fs(FsOp::Write),
         op if op.starts_with("process-exec") => OperationKind::Fs(FsOp::Exec),
         "network-outbound" if target.starts_with('/') => OperationKind::UnixConnect,
+        "network-outbound" => OperationKind::LocalhostConnect(loopback_port(target)?),
         _ => return None,
     };
     if matches!(kind, OperationKind::Fs(_)) && !target.starts_with('/') {
@@ -269,13 +273,42 @@ pub(crate) fn map_operation(operation: &str, target: &str) -> Option<OperationKi
     Some(kind)
 }
 
+/// Return the port of a network target on the loopback, or `None` for
+/// another target.
+///
+/// The author did not see the form of an IP target on a Mac. The function
+/// takes `<address>:<port>`, `[<address>]:<port>` and `localhost:<port>`,
+/// where the address is a loopback address. Port 0 gives `None`. Test this
+/// on a Mac.
+fn loopback_port(target: &str) -> Option<u16> {
+    let (host, port) = target.trim().rsplit_once(':')?;
+    let port: u16 = port.parse().ok().filter(|p| *p != 0)?;
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(pent_profile::is_loopback);
+    loopback.then_some(port)
+}
+
 /// The mode of the recorder.
 #[derive(Debug, Clone)]
 pub(crate) enum RecordMode {
     /// `pent run --trace`: each denial comes from the sandbox policy.
     Run,
     /// `pent watch`: a denial of a file operation comes from the guard.
-    Watch(Vec<GuardRule>),
+    Watch {
+        /// The rules of the guard.
+        guard: Vec<GuardRule>,
+        /// The ports on localhost that the run opens. The guard blocks a
+        /// control port only when the run opens each port
+        /// ([`crate::LocalhostPorts::guards`]); else the closed network
+        /// denies it, as on Linux.
+        ports: crate::LocalhostPorts,
+    },
 }
 
 /// Return the guard access that matches a filesystem operation.
@@ -304,7 +337,7 @@ pub(crate) fn to_event(record: &SeatbeltRecord, mode: &RecordMode) -> Option<Wat
         name: record.process.clone(),
     };
     let blocked_class = |op: FsOp| match mode {
-        RecordMode::Watch(rules) => {
+        RecordMode::Watch { guard: rules, .. } => {
             classify(rules, Path::new(&record.target), guard_access(op)).map(Outcome::Blocked)
         }
         RecordMode::Run => None,
@@ -325,6 +358,18 @@ pub(crate) fn to_event(record: &SeatbeltRecord, mode: &RecordMode) -> Option<Wat
             outcome: match record.action {
                 Action::Allow => Outcome::Allowed,
                 Action::Deny => Outcome::Denied,
+            },
+        },
+        OperationKind::LocalhostConnect(port) => WatchEvent::LocalhostConnect {
+            port,
+            process,
+            outcome: match (record.action, mode) {
+                (Action::Allow, _) => Outcome::Allowed,
+                // In watch mode only the guard denies a port on localhost.
+                (Action::Deny, RecordMode::Watch { ports, .. }) if ports.guards(port) => {
+                    Outcome::Blocked(pent_profile::GuardClass::ControlPort)
+                }
+                (Action::Deny, _) => Outcome::Denied,
             },
         },
     };
@@ -1506,9 +1551,109 @@ mod tests {
         assert_eq!(map_operation("file-read-data", ""), None);
     }
 
+    /// A connection to the loopback is an event of its own: it does not go
+    /// through the proxy. Another IP target stays the business of the
+    /// proxy.
+    #[test]
+    fn a_loopback_target_maps_to_its_port() {
+        let local = |port| Some(OperationKind::LocalhostConnect(port));
+        for (target, port) in [
+            ("127.0.0.1:5432", 5432),
+            ("127.1.2.3:80", 80),
+            ("localhost:11434", 11434),
+            ("[::1]:6379", 6379),
+            ("::1:6379", 6379),
+            ("::ffff:127.0.0.1:9", 9),
+        ] {
+            assert_eq!(
+                map_operation("network-outbound", target),
+                local(port),
+                "{target}"
+            );
+        }
+        for target in [
+            "1.1.1.1:443",
+            "127.0.0.1:0",
+            "127.0.0.1",
+            "localhost",
+            "10.0.0.1:22",
+        ] {
+            assert_eq!(map_operation("network-outbound", target), None, "{target}");
+        }
+        assert_eq!(map_operation("network-bind", "127.0.0.1:5432"), None);
+    }
+
+    #[test]
+    fn a_loopback_report_becomes_a_localhost_event() {
+        let deny = record("Sandbox: psql(9) deny(1) network-outbound 127.0.0.1:5432");
+        assert_eq!(
+            to_event(&deny, &RecordMode::Run),
+            Some(WatchEvent::LocalhostConnect {
+                port: 5432,
+                process: ProcessInfo {
+                    pid: 9,
+                    name: "psql".to_string(),
+                },
+                outcome: Outcome::Denied,
+            })
+        );
+        let allow = record("Sandbox: psql(9) allow(1) network-outbound 127.0.0.1:5432");
+        assert!(matches!(
+            to_event(
+                &allow,
+                &RecordMode::Watch {
+                    guard: Vec::new(),
+                    ports: crate::LocalhostPorts::All,
+                }
+            ),
+            Some(WatchEvent::LocalhostConnect {
+                outcome: Outcome::Allowed,
+                ..
+            })
+        ));
+        // The watch guard denies a control port.
+        let guard = record("Sandbox: curl(9) deny(1) network-outbound 127.0.0.1:2375");
+        assert!(matches!(
+            to_event(
+                &guard,
+                &RecordMode::Watch {
+                    guard: Vec::new(),
+                    ports: crate::LocalhostPorts::All,
+                }
+            ),
+            Some(WatchEvent::LocalhostConnect {
+                outcome: Outcome::Blocked(pent_profile::GuardClass::ControlPort),
+                ..
+            })
+        ));
+        assert!(matches!(
+            to_event(&guard, &RecordMode::Run),
+            Some(WatchEvent::LocalhostConnect {
+                outcome: Outcome::Denied,
+                ..
+            })
+        ));
+        // `pent watch --allow X` opens no port: the closed network denies
+        // the control port, not the guard.
+        let closed = RecordMode::Watch {
+            guard: Vec::new(),
+            ports: crate::LocalhostPorts::default(),
+        };
+        assert!(matches!(
+            to_event(&guard, &closed),
+            Some(WatchEvent::LocalhostConnect {
+                outcome: Outcome::Denied,
+                ..
+            })
+        ));
+    }
+
     #[test]
     fn outcome_of_watch_denial_is_guard_class() {
-        let mode = RecordMode::Watch(guard_rules(Path::new("/Users/u")));
+        let mode = RecordMode::Watch {
+            guard: guard_rules(Path::new("/Users/u")),
+            ports: crate::LocalhostPorts::All,
+        };
         let deny = record("Sandbox: ssh(9) deny(1) file-read-data /Users/u/.ssh/id_ed25519");
         let event = to_event(&deny, &mode);
         assert_eq!(
@@ -1534,7 +1679,10 @@ mod tests {
 
     #[test]
     fn outcome_of_allow_and_run_denial() {
-        let mode = RecordMode::Watch(guard_rules(Path::new("/Users/u")));
+        let mode = RecordMode::Watch {
+            guard: guard_rules(Path::new("/Users/u")),
+            ports: crate::LocalhostPorts::All,
+        };
         let allow = record("Sandbox: git(3) allow(1) file-read-data /Users/u/.gitconfig");
         assert_eq!(
             to_event(&allow, &mode),

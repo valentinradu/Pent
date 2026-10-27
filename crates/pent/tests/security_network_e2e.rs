@@ -452,6 +452,423 @@ except OSError as e:
     Ok(())
 }
 
+/// A TCP server on the loopback of the host that sends `banner` to each
+/// client. The receiver gets one message for each client.
+fn host_server(banner: &'static [u8]) -> std::io::Result<(u16, mpsc::Receiver<()>)> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    let (tx, rx) = mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        for mut s in listener.incoming().flatten() {
+            let _ = s.write_all(banner);
+            let _ = tx.send(());
+        }
+    });
+    Ok((port, rx))
+}
+
+/// The python script that tries the loopback of the host on `open` (with a
+/// blocking and a non-blocking socket) and on `closed`, and connects to a
+/// server of its own as the positive control.
+fn localhost_probe_script(open: u16, closed: u16) -> String {
+    format!(
+        r#"
+import select, socket, threading, time
+own = socket.socket(); own.bind(("127.0.0.1", 0)); own.listen(1)
+own_port = own.getsockname()[1]
+def serve():
+    c, _ = own.accept(); c.sendall(b"OWN"); c.close()
+threading.Thread(target=serve, daemon=True).start()
+c = socket.socket(); c.settimeout(3)
+try:
+    c.connect(("127.0.0.1", own_port)); print("OWN REACHED", c.recv(16))
+except OSError as e:
+    print("OWN BLOCKED", e)
+for label, port in (("OPEN", {open}), ("CLOSED", {closed})):
+    h = socket.socket(); h.settimeout(3)
+    try:
+        h.connect(("127.0.0.1", port)); print(label, "REACHED", h.recv(16))
+    except OSError as e:
+        print(label, "BLOCKED", e)
+n = socket.socket(); n.setblocking(False)
+code = n.connect_ex(("127.0.0.1", {open}))
+select.select([], [n], [], 3)
+err = n.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+n.settimeout(3)
+try:
+    print("NONBLOCK", code in (0, 115), err, n.recv(16))
+except OSError as e:
+    print("NONBLOCK BLOCKED", code, err, e)
+# A client that calls connect() again until the socket is connected must
+# keep its first connection (EALREADY, then EISCONN).
+r = socket.socket(); r.setblocking(False)
+codes = [r.connect_ex(("127.0.0.1", {open}))]
+deadline = time.monotonic() + 3
+while codes[-1] not in (0, 106) and time.monotonic() < deadline:
+    time.sleep(0.01); codes.append(r.connect_ex(("127.0.0.1", {open})))
+r.setblocking(True); r.settimeout(3)
+try:
+    print("RETRY", codes[-1] in (0, 106), r.recv(16))
+except OSError as e:
+    print("RETRY BLOCKED", codes[-5:], e)
+"#
+    )
+}
+
+/// A port of the profile (or of `--localhost`) on the loopback of the host
+/// is reachable from the namespace of the child, with a blocking and with a
+/// non-blocking socket. Another port of the host stays out of reach, and a
+/// server of the child itself still works. The rule holds with the proxy
+/// (a profile with domains) and without it (a profile with no domains).
+#[test]
+fn a_listed_localhost_port_reaches_the_host_and_no_other_port() -> TestResult {
+    let test = "a_listed_localhost_port_reaches_the_host_and_no_other_port";
+    if !ready(test) {
+        return Ok(());
+    }
+    let (open, open_rx) = host_server(b"HOSTOPEN")?;
+    let (closed, closed_rx) = host_server(b"VICTIM")?;
+    let script = localhost_probe_script(open, closed);
+
+    let env = TestEnv::new()?;
+    let cases: [(&str, String, Vec<String>); 3] = [
+        (
+            "no domains",
+            format!("[network]\nlocalhost = [{open}]\n"),
+            vec![],
+        ),
+        (
+            "with domains",
+            format!("{PROFILE}localhost = [{open}]\n"),
+            vec![],
+        ),
+        (
+            "the flag",
+            PROFILE.to_string(),
+            vec!["--localhost".to_string(), open.to_string()],
+        ),
+    ];
+    for (case, profile, flags) in cases {
+        env.install_profile("probe", &profile)?;
+        let mut args: Vec<&str> = vec!["run", "--profile", "probe"];
+        args.extend(flags.iter().map(String::as_str));
+        args.extend(["--", "python3", "-I", "-c", &script]);
+        let out = env.pent(&args)?;
+        let text = out_text(&out);
+        // Without domains the network is blocked, and the child has no
+        // loopback of its own. The port of the host still works.
+        assert!(
+            case == "no domains" || text.contains("OWN REACHED b'OWN'"),
+            "{case}: the child could not reach its own loopback:\n{text}"
+        );
+        assert!(
+            text.contains("OPEN REACHED b'HOSTOPEN'"),
+            "{case}: the listed port did not reach the host:\n{text}"
+        );
+        assert!(
+            text.contains("NONBLOCK True 0 b'HOSTOPEN'"),
+            "{case}: a non-blocking connection to the listed port failed:\n{text}"
+        );
+        assert!(
+            text.contains("RETRY True b'HOSTOPEN'"),
+            "{case}: a second connect() broke the connection:\n{text}"
+        );
+        assert!(
+            text.contains("CLOSED BLOCKED"),
+            "{case}: the child reached a port that the profile does not list:\n{text}"
+        );
+        assert!(
+            text.contains(&format!("port {open}")),
+            "{case}: the status line must name the port:\n{text}"
+        );
+        assert!(
+            open_rx.recv_timeout(Duration::from_secs(1)).is_ok(),
+            "{case}: the server of the listed port saw no client"
+        );
+        while open_rx.try_recv().is_ok() {}
+    }
+    assert!(
+        closed_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+        "the victim accepted a connection from the child"
+    );
+
+    // An explicit `--network blocked` closes the ports of the profile too.
+    env.install_profile("probe", &format!("[network]\nlocalhost = [{open}]\n"))?;
+    let out = env.pent(&[
+        "run",
+        "--network",
+        "blocked",
+        "--profile",
+        "probe",
+        "--",
+        "python3",
+        "-I",
+        "-c",
+        &script,
+    ])?;
+    let text = out_text(&out);
+    assert!(text.contains("OPEN BLOCKED"), "{text}");
+    assert!(
+        text.contains("the localhost ports of the profile have no effect"),
+        "{text}"
+    );
+    assert!(
+        open_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+        "--network blocked must close the listed port"
+    );
+    Ok(())
+}
+
+/// `pent run --trace` records a refused port of the loopback, so that
+/// `pent trust --review` can propose it, and the trace log names the flag.
+#[test]
+fn a_refused_localhost_port_is_recorded_with_trace() -> TestResult {
+    let test = "a_refused_localhost_port_is_recorded_with_trace";
+    if !ready(test) {
+        return Ok(());
+    }
+    let (closed, _closed_rx) = host_server(b"VICTIM")?;
+    let env = TestEnv::new()?;
+    env.install_profile("probe", PROFILE)?;
+    let script = format!(
+        r#"
+import socket
+h = socket.socket(); h.settimeout(3)
+try:
+    h.connect(("127.0.0.1", {closed})); print("CLOSED REACHED")
+except OSError as e:
+    print("CLOSED BLOCKED", e)
+"#
+    );
+    let out = env.pent(&[
+        "run",
+        "--trace",
+        "--profile",
+        "probe",
+        "--",
+        "python3",
+        "-I",
+        "-c",
+        &script,
+    ])?;
+    let text = out_text(&out);
+    assert!(text.contains("CLOSED BLOCKED"), "{text}");
+    let denied = std::fs::read_to_string(env.denied_log("probe")).unwrap_or_default();
+    assert!(
+        denied.contains("\"localhost_connect\"") && denied.contains(&format!("\"port\":{closed}")),
+        "the denied log must hold the port:\n{denied}\n{text}"
+    );
+    let trace = std::fs::read_to_string(env.trace_log("probe")).unwrap_or_default();
+    assert!(
+        trace.contains(&format!("--localhost {closed}")),
+        "the trace log must name the flag:\n{trace}"
+    );
+    Ok(())
+}
+
+/// The default watch run reaches each port on the loopback of the host and
+/// records it. The summary proposes the port, but a review without a
+/// terminal does not accept it. A server of the program itself gives no
+/// item.
+#[test]
+fn watch_reaches_and_records_a_localhost_port() -> TestResult {
+    let test = "watch_reaches_and_records_a_localhost_port";
+    if !ready(test) {
+        return Ok(());
+    }
+    let (open, _open_rx) = host_server(b"HOSTOPEN")?;
+    let env = TestEnv::new()?;
+    let script = localhost_probe_script(open, open);
+    let out = env.pent(&[
+        "watch",
+        "--yes",
+        "--profile",
+        "probe",
+        "--",
+        "python3",
+        "-I",
+        "-c",
+        &script,
+    ])?;
+    let text = out_text(&out);
+    assert!(text.contains("OWN REACHED b'OWN'"), "{text}");
+    assert!(
+        text.contains("OPEN REACHED b'HOSTOPEN'"),
+        "watch mode must open the loopback of the host:\n{text}"
+    );
+    let events = env.watch_events("probe");
+    assert!(
+        events.contains(&format!("\"type\":\"localhost_connect\",\"port\":{open}")),
+        "the watch log must hold the port:\n{events}"
+    );
+    assert_eq!(
+        events.matches("localhost_connect").count(),
+        events.matches(&format!("\"port\":{open}")).count(),
+        "only the port of the host makes an event, not the own server:\n{events}"
+    );
+    assert!(text.contains("Localhost ports"), "{text}");
+    let draft = std::fs::read_to_string(env.draft_path("probe")).unwrap_or_default();
+    assert!(
+        !draft.contains("localhost ="),
+        "a review without a terminal must not accept a port:\n{draft}"
+    );
+    Ok(())
+}
+
+/// The watch guard keeps a control port of the host closed (here the port
+/// of the Docker API), also when the watch run opens each other port. The
+/// event has the guard class, so the review shows the port as blocked.
+#[test]
+fn watch_blocks_a_control_port() -> TestResult {
+    let test = "watch_blocks_a_control_port";
+    if !ready(test) {
+        return Ok(());
+    }
+    // The test needs the port of the Docker API itself. A host that runs
+    // Docker on it cannot run the test.
+    let Ok(listener) = TcpListener::bind("127.0.0.1:2375") else {
+        return Ok(());
+    };
+    let (tx, rx) = mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        for mut s in listener.incoming().flatten() {
+            let _ = s.write_all(b"DOCKER");
+            let _ = tx.send(());
+        }
+    });
+    let env = TestEnv::new()?;
+    let script = r#"
+import socket
+h = socket.socket(); h.settimeout(3)
+try:
+    h.connect(("127.0.0.1", 2375)); print("DOCKER REACHED", h.recv(16))
+except OSError as e:
+    print("DOCKER BLOCKED", e)
+"#;
+    let out = env.pent(&[
+        "watch",
+        "--yes",
+        "--profile",
+        "probe",
+        "--",
+        "python3",
+        "-I",
+        "-c",
+        script,
+    ])?;
+    let text = out_text(&out);
+    assert!(text.contains("DOCKER BLOCKED"), "{text}");
+    assert!(
+        rx.recv_timeout(Duration::from_millis(200)).is_err(),
+        "the control port accepted a connection from the child"
+    );
+    let events = env.watch_events("probe");
+    assert!(
+        events.contains("\"port\":2375") && events.contains("control_port"),
+        "the watch log must hold the blocked port:\n{events}"
+    );
+    assert!(text.contains("Blocked by the guard"), "{text}");
+    Ok(())
+}
+
+/// A host service that does not take a connection must not stop the other
+/// connections of the sandbox. The supervisor waits for a slow blocking
+/// connection on a thread of its own.
+///
+/// The slow service is a listener whose queue is full: the kernel drops each
+/// new SYN, so a blocking `connect(2)` waits. In the same run another thread
+/// of the child connects to an open port, and that connection must not wait
+/// for the first one.
+#[test]
+fn a_slow_host_port_does_not_stop_other_connections() -> TestResult {
+    let test = "a_slow_host_port_does_not_stop_other_connections";
+    if !ready(test) {
+        return Ok(());
+    }
+    let (open, _open_rx) = host_server(b"HOSTOPEN")?;
+    // A queue of length 1 that nobody takes from, filled by two clients.
+    let slow = full_queue_listener()?;
+    let slow_port = slow.port;
+    let env = TestEnv::new()?;
+    env.install_profile(
+        "probe",
+        &format!("{PROFILE}localhost = [{open}, {slow_port}]\n"),
+    )?;
+    let script = format!(
+        r#"
+import socket, threading, time
+def slow():
+    s = socket.socket()
+    try:
+        s.connect(("127.0.0.1", {slow_port})); print("SLOW CONNECTED")
+    except OSError as e:
+        print("SLOW FAILED", e)
+t = threading.Thread(target=slow); t.start()
+time.sleep(0.3)
+start = time.monotonic()
+h = socket.socket(); h.settimeout(10)
+h.connect(("127.0.0.1", {open})); data = h.recv(16)
+print("OPEN AFTER %.2f" % (time.monotonic() - start), data)
+t.join()
+"#
+    );
+    let out = env.pent(&[
+        "run",
+        "--profile",
+        "probe",
+        "--",
+        "python3",
+        "-I",
+        "-c",
+        &script,
+    ])?;
+    let text = out_text(&out);
+    let after: f64 = text
+        .lines()
+        .find_map(|l| l.strip_prefix("OPEN AFTER "))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|n| n.parse().ok())
+        .ok_or_else(|| format!("the open port gave no answer:\n{text}"))?;
+    assert!(
+        after < 2.0,
+        "the open port waited {after} s for the slow one:\n{text}"
+    );
+    assert!(text.contains("b'HOSTOPEN'"), "{text}");
+    drop(slow);
+    Ok(())
+}
+
+/// A listener on the loopback with a queue of length 1 that nobody takes
+/// from, and the clients that fill the queue. The kernel then drops each new
+/// SYN to the port, so a blocking `connect(2)` waits. Keep the value alive
+/// for the whole test.
+struct FullQueue {
+    port: u16,
+    _listener: TcpListener,
+    _clients: Vec<std::net::TcpStream>,
+}
+
+fn full_queue_listener() -> std::io::Result<FullQueue> {
+    use std::os::fd::AsRawFd as _;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    // SAFETY: listen(2) on an open socket with an integer backlog.
+    if unsafe { libc::listen(listener.as_raw_fd(), 0) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let clients = (0..3)
+        .filter_map(|_| {
+            std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(300)).ok()
+        })
+        .collect();
+    Ok(FullQueue {
+        port,
+        _listener: listener,
+        _clients: clients,
+    })
+}
+
 /// NET-4. With no socket in the profile the child still makes a socket of
 /// the Unix family, for its own use. The control of the address refuses
 /// each path that the profile does not name, with `connect` and with a
