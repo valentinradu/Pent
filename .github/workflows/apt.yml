@@ -1,0 +1,108 @@
+name: Publish APT
+
+# Publish the .deb files of one release in the APT repository on gh-pages.
+#
+# The release workflow calls this workflow after it makes the GitHub
+# release. Start it by hand to publish a release again, for example after
+# a failure of this step: the .deb files come from the assets of the
+# release, not from the artifacts of a run.
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: The tag of the release (for example v0.2.0)
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The tag of the release (for example v0.2.0)
+        required: true
+        type: string
+
+jobs:
+  apt:
+    name: Publish APT repo
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+
+      # The Ubuntu 26.04 runners do not have apt-ftparchive by default.
+      - name: Install the APT tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y apt-utils dpkg-dev
+
+      - name: Download the .deb files of the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern '*.deb' --dir debs
+
+      - name: Set up APT repo directory
+        run: mkdir -p apt
+
+      - name: Copy .deb files into apt/
+        run: cp debs/*.deb apt/
+
+      - name: Import GPG key
+        uses: crazy-max/ghaction-import-gpg@v6
+        with:
+          gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
+          passphrase: ${{ secrets.GPG_PASSPHRASE }}
+
+      - name: Export public key
+        run: gpg --armor --export > apt/KEY.gpg
+
+      - name: Generate Packages index
+        run: |
+          cd apt
+          dpkg-scanpackages --multiversion . > Packages
+          gzip -k -f Packages
+
+      - name: Generate and sign Release file
+        run: |
+          cd apt
+          cat > Release <<EOF
+          Origin: Pent
+          Label: Pent
+          Suite: stable
+          Codename: stable
+          Architectures: amd64 arm64
+          Components: main
+          Description: Pent APT repository
+          EOF
+          apt-ftparchive release . >> Release
+
+      - name: Sign Release
+        run: |
+          cd apt
+          gpg --batch --yes --clearsign -o InRelease Release
+          gpg --batch --yes -abs -o Release.gpg Release
+
+      - name: Update apt/index.html
+        run: |
+          cat > apt/index.html <<'EOF'
+          <!DOCTYPE html>
+          <html>
+          <body>
+          <h1>Pent APT repository</h1>
+          <p>See <a href="https://github.com/valentinradu/Pent">README</a> for install instructions.</p>
+          </body>
+          </html>
+          EOF
+
+      - name: Commit and push gh-pages
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add apt/
+          git commit -m "apt: publish pent $TAG" || echo "Nothing to commit"
+          git push

@@ -228,82 +228,14 @@ jobs:
           force_push: true
 
   # ── Publish APT repository ────────────────────────────────────────────────
+  # The steps are in apt.yml, so that a release can be published there again
+  # by hand. The .deb files come from the assets of the GitHub release.
   apt:
     name: Publish APT repo
     needs: release
-    runs-on: ubuntu-latest
     permissions:
       contents: write
-
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: gh-pages
-
-      - name: Download .deb artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: debs
-          pattern: deb-*
-          merge-multiple: true
-
-      - name: Set up APT repo directory
-        run: mkdir -p apt
-
-      - name: Copy .deb files into apt/
-        run: cp debs/*.deb apt/
-
-      - name: Import GPG key
-        uses: crazy-max/ghaction-import-gpg@v6
-        with:
-          gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
-          passphrase: ${{ secrets.GPG_PASSPHRASE }}
-
-      - name: Export public key
-        run: gpg --armor --export > apt/KEY.gpg
-
-      - name: Generate Packages index
-        run: |
-          cd apt
-          dpkg-scanpackages --multiversion . > Packages
-          gzip -k -f Packages
-
-      - name: Generate and sign Release file
-        run: |
-          cd apt
-          cat > Release <<EOF
-          Origin: Pent
-          Label: Pent
-          Suite: stable
-          Codename: stable
-          Architectures: amd64 arm64
-          Components: main
-          Description: Pent APT repository
-          EOF
-          apt-ftparchive release . >> Release
-
-      - name: Sign Release
-        run: |
-          cd apt
-          gpg --batch --yes --clearsign -o InRelease Release
-          gpg --batch --yes -abs -o Release.gpg Release
-
-      - name: Update apt/index.html
-        run: |
-          cat > apt/index.html <<'EOF'
-          <!DOCTYPE html>
-          <html>
-          <body>
-          <h1>Pent APT repository</h1>
-          <p>See <a href="https://github.com/valentinradu/Pent">README</a> for install instructions.</p>
-          </body>
-          </html>
-          EOF
-
-      - name: Commit and push gh-pages
-        run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add apt/
-          git commit -m "apt: publish pent ${{ github.ref_name }}" || echo "Nothing to commit"
-          git push
+    uses: ./.github/workflows/apt.yml
+    with:
+      tag: ${{ github.ref_name }}
+    secrets: inherit
