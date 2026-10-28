@@ -77,6 +77,12 @@ pub(crate) struct RunArgs {
     #[arg(long = "unix-socket", value_name = "PATH")]
     pub unix_socket: Vec<PathBuf>,
 
+    /// Let the command connect to this TCP port on the loopback of the host
+    /// (127.0.0.1, ::1) for this run. A server that the command itself runs
+    /// needs no rule (repeatable)
+    #[arg(long = "localhost", value_name = "PORT")]
+    pub localhost: Vec<std::num::NonZeroU16>,
+
     /// Allow or set an environment variable (KEY or KEY=VALUE; repeatable)
     #[arg(long = "env", value_name = "KEY[=VALUE]")]
     pub env: Vec<String>,

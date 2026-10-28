@@ -347,6 +347,17 @@ impl ChildSocket {
     pub(crate) fn kind(&self) -> libc::c_int {
         self.kind
     }
+
+    /// The address family of the socket (`SO_DOMAIN`).
+    pub(crate) fn domain(&self) -> libc::c_int {
+        self.domain
+    }
+
+    /// The copy of the descriptor of the child.
+    pub(crate) fn fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        use std::os::fd::AsFd as _;
+        self.fd.as_fd()
+    }
 }
 
 /// Take a copy of the socket `fd` of the process `pid` and read its
@@ -461,7 +472,7 @@ fn sockaddr_un(path: &Path) -> Result<(libc::sockaddr_un, libc::socklen_t), i32>
 }
 
 /// The error number of the last failed system call.
-fn errno() -> i32 {
+pub(crate) fn errno() -> i32 {
     std::io::Error::last_os_error()
         .raw_os_error()
         .unwrap_or(libc::EIO)
@@ -488,7 +499,7 @@ fn make_socket(kind: libc::c_int) -> Result<OwnedFd, i32> {
 }
 
 /// Set or clear `O_NONBLOCK` on `sock`.
-fn set_nonblock(sock: &OwnedFd, want: bool) -> Result<(), i32> {
+pub(crate) fn set_nonblock(sock: &OwnedFd, want: bool) -> Result<(), i32> {
     // SAFETY: fcntl(2) reads the flags of an open descriptor.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let flags = unsafe { libc::fcntl(sock.as_raw_fd(), libc::F_GETFL) };

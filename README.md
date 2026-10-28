@@ -233,7 +233,7 @@ The same facts are comments in the first lines of the draft.
 
 ### The network of a watch run
 
-A watch run must learn which domains the program needs, so the network is open by default: the proxy observes each request and allows each domain. A hostile program can then send out everything that it reads.
+A watch run must learn which domains the program needs, so the network is open by default: the proxy observes each request and allows each domain. The ports on the loopback of the host are open too, and each connection to one becomes an item in the `Localhost ports` section. A hostile program can then send out everything that it reads.
 
 To close the network, use the same two flags as in `pent run`. The proxy then enforces the allowlist, and each refused request becomes an item of the summary:
 
@@ -277,6 +277,9 @@ pent run --read /etc/ssl/certs --write ./out --execute ~/tools/bin -- claude
 
 # One more Unix socket
 pent run --unix-socket ~/.gnupg/S.gpg-agent -- claude
+
+# One more TCP port on the loopback of the host
+pent run --localhost 5432 -- claude
 
 # No network access
 pent run --network blocked -- claude
@@ -372,6 +375,9 @@ domains = [
   "api.anthropic.com",
   "*.npmjs.org",        # registry, www, cdn
 ]
+localhost = [
+  5432,                 # used by psql
+]
 ```
 
 Pent expands a leading `~` to your home directory. A relative path resolves against the workspace. The workspace (the current directory) is always read-write, and the system paths (`/usr`, `/etc`, `/tmp`, ...) are always available.
@@ -379,6 +385,10 @@ Pent expands a leading `~` to your home directory. A relative path resolves agai
 `unix_sockets` names the Unix sockets that the program can connect to. Pent makes each permitted connection itself, so a socket that the list does not name is not reachable, also when a path rule gives access to its directory. This rule is strong: a program that reaches the socket of an agent can use the key of that agent. Thus the review never selects such an item for you. The reason names the agent when pent knows the socket (`ssh-agent`, `gpg-agent`, `D-Bus`, `Docker`), else it names the process that connected.
 
 A program can also connect to an abstract address (`@name`). A rule cannot name an abstract address, so the summary lists it under "Not in the rules".
+
+`localhost` names the TCP ports on the loopback of the host (`127.0.0.1`, `::1`) that the program can connect to, for example a database or a local model server. The rule works in each network mode except `--network blocked` as a flag. A port on the loopback is a strong grant: a service there often has no authentication, and some ports run code (the Docker API on 2375, the debug port of a browser on 9222). Thus the review never selects such an item for you. The watch guard blocks the known control ports, and the review shows them under "Blocked by the guard". A profile can still name such a port.
+
+On Linux the program has its own loopback. A server that the program starts itself works with no rule, and pent connects each listed port to the host. In the `blocked` network mode the program has no loopback of its own, so only the listed ports of the host work. On macOS the loopback of the program is the loopback of the host, so a server that the program starts itself also needs its port in the list.
 
 To record more accesses into the same draft, run `pent watch --append -- claude`. Each run adds to the draft.
 

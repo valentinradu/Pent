@@ -24,12 +24,13 @@ use crate::{GuardClass, ProfileDoc, ProfileName};
 const LABEL_CAP: usize = 40;
 
 /// The sections in the order of the summary.
-pub(crate) const SECTIONS: [Section; 6] = [
+pub(crate) const SECTIONS: [Section; 7] = [
     Section::ReadWrite,
     Section::Read,
     Section::Execute,
     Section::UnixSockets,
     Section::Network,
+    Section::Localhost,
     Section::Blocked,
 ];
 
@@ -52,6 +53,7 @@ pub const fn section_title(section: Section) -> &'static str {
         Section::Execute => "Execute",
         Section::UnixSockets => "Unix sockets",
         Section::Network => "Network",
+        Section::Localhost => "Localhost ports",
         Section::Blocked => "Blocked by the guard",
     }
 }
@@ -64,6 +66,7 @@ pub const fn class_label(class: GuardClass) -> &'static str {
         GuardClass::Persistence => "persistence",
         GuardClass::PentFiles => "pent files",
         GuardClass::PrivilegeEscalation => "privilege escalation",
+        GuardClass::ControlPort => "control port",
     }
 }
 
@@ -159,18 +162,20 @@ fn escape_with(text: &str, unsafe_char: impl Fn(char) -> bool) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-/// Return the rule text of a grant (the path or the domain).
-fn grant_text(grant: &Grant) -> &str {
+/// Return the rule text of a grant (the path, the domain or the port).
+fn grant_text(grant: &Grant) -> Cow<'_, str> {
     match grant {
-        Grant::Fs { path, .. } | Grant::UnixSocket(path) => path,
-        Grant::Domain(domain) => domain,
+        Grant::Fs { path, .. } | Grant::UnixSocket(path) => Cow::Borrowed(path),
+        Grant::Domain(domain) => Cow::Borrowed(domain),
+        Grant::Localhost(port) => Cow::Owned(port.to_string()),
     }
 }
 
 /// Return the first column of an item: the path or the domain. A blocked
 /// item starts with the access (`read ~/.ssh/id_ed25519`).
 pub(crate) fn item_label(item: &Item) -> String {
-    let text = safe(grant_text(&item.grant));
+    let grant = grant_text(&item.grant);
+    let text = safe(&grant);
     if item.blocked.is_none() {
         return text.into_owned();
     }
@@ -180,7 +185,7 @@ pub(crate) fn item_label(item: &Item) -> String {
             FsAccess::ReadWrite => "write",
             FsAccess::Execute => "exec",
         },
-        Grant::Domain(_) | Grant::UnixSocket(_) => "connect",
+        Grant::Domain(_) | Grant::UnixSocket(_) | Grant::Localhost(_) => "connect",
     };
     format!("{verb} {text}")
 }
@@ -449,7 +454,7 @@ impl Reasons {
             let Some(kind) = list else {
                 continue;
             };
-            let Some((value, rest)) = split_string_literal(trimmed) else {
+            let Some((grant, rest)) = kind.parse_entry(trimmed) else {
                 continue;
             };
             let comment = rest
@@ -460,7 +465,7 @@ impl Reasons {
                 .strip_prefix('#')
                 .map(str::trim);
             if let Some(comment) = comment.filter(|c| !c.is_empty()) {
-                map.insert(kind.grant(value), comment.to_string());
+                map.insert(grant, comment.to_string());
             }
         }
         Self(map)
@@ -486,7 +491,7 @@ impl Reasons {
     }
 }
 
-/// The five lists of a profile.
+/// The six lists of a profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ListKind {
     ReadWrite,
@@ -494,15 +499,17 @@ enum ListKind {
     Execute,
     UnixSockets,
     Domains,
+    Localhost,
 }
 
 impl ListKind {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::ReadWrite,
         Self::Read,
         Self::Execute,
         Self::UnixSockets,
         Self::Domains,
+        Self::Localhost,
     ];
 
     const fn key(self) -> &'static str {
@@ -512,6 +519,15 @@ impl ListKind {
             Self::Execute => "execute",
             Self::UnixSockets => "unix_sockets",
             Self::Domains => "domains",
+            Self::Localhost => "localhost",
+        }
+    }
+
+    /// Return the table of the list in the profile file.
+    const fn table(self) -> &'static str {
+        match self {
+            Self::ReadWrite | Self::Read | Self::Execute | Self::UnixSockets => "filesystem",
+            Self::Domains | Self::Localhost => "network",
         }
     }
 
@@ -522,31 +538,74 @@ impl ListKind {
             Self::Execute => Section::Execute,
             Self::UnixSockets => Section::UnixSockets,
             Self::Domains => Section::Network,
+            Self::Localhost => Section::Localhost,
         }
     }
 
-    fn list(self, doc: &ProfileDoc) -> &[String] {
+    /// Return the rules of the list, each with its grant.
+    fn rules(self, doc: &ProfileDoc) -> Vec<Grant> {
+        let fs = |list: &[String], access| {
+            list.iter()
+                .map(|path| Grant::Fs {
+                    access,
+                    path: path.clone(),
+                })
+                .collect()
+        };
         match self {
-            Self::ReadWrite => &doc.filesystem.read_write,
-            Self::Read => &doc.filesystem.read,
-            Self::Execute => &doc.filesystem.execute,
-            Self::UnixSockets => &doc.filesystem.unix_sockets,
-            Self::Domains => &doc.network.domains,
+            Self::ReadWrite => fs(&doc.filesystem.read_write, FsAccess::ReadWrite),
+            Self::Read => fs(&doc.filesystem.read, FsAccess::Read),
+            Self::Execute => fs(&doc.filesystem.execute, FsAccess::Execute),
+            Self::UnixSockets => doc
+                .filesystem
+                .unix_sockets
+                .iter()
+                .cloned()
+                .map(Grant::UnixSocket)
+                .collect(),
+            Self::Domains => doc
+                .network
+                .domains
+                .iter()
+                .cloned()
+                .map(Grant::Domain)
+                .collect(),
+            Self::Localhost => doc
+                .network
+                .localhost
+                .iter()
+                .copied()
+                .map(Grant::Localhost)
+                .collect(),
         }
     }
 
-    fn grant(self, value: String) -> Grant {
+    /// Return the grant of the value at the start of a line of a draft
+    /// list, and the rest of the line. A port is a TOML integer, each other
+    /// rule is a TOML string.
+    fn parse_entry(self, line: &str) -> Option<(Grant, &str)> {
         let access = match self {
             Self::ReadWrite => FsAccess::ReadWrite,
             Self::Read => FsAccess::Read,
             Self::Execute => FsAccess::Execute,
-            Self::UnixSockets => return Grant::UnixSocket(value),
-            Self::Domains => return Grant::Domain(value),
+            Self::UnixSockets => {
+                let (value, rest) = split_string_literal(line)?;
+                return Some((Grant::UnixSocket(value), rest));
+            }
+            Self::Domains => {
+                let (value, rest) = split_string_literal(line)?;
+                return Some((Grant::Domain(value), rest));
+            }
+            Self::Localhost => {
+                let end = line
+                    .find(|c: char| !c.is_ascii_digit())
+                    .unwrap_or(line.len());
+                let port = line.get(..end)?.parse().ok()?;
+                return Some((Grant::Localhost(port), line.get(end..)?));
+            }
         };
-        Grant::Fs {
-            access,
-            path: value,
-        }
+        let (path, rest) = split_string_literal(line)?;
+        Some((Grant::Fs { access, path }, rest))
     }
 
     /// Return the list that starts on this line (`read = [`).
@@ -712,14 +771,18 @@ pub fn render_draft_with(
     let mut lists: Vec<(ListKind, Vec<DraftEntry>)> = Vec::new();
     for kind in ListKind::ALL {
         let entries: Vec<DraftEntry> = kind
-            .list(doc)
+            .rules(doc)
             .iter()
-            .map(|rule| {
+            .map(|grant| {
                 let comment = reasons
-                    .get(&kind.grant(rule.clone()))
+                    .get(grant)
                     .map(comment_text)
                     .filter(|c| !c.is_empty());
-                (format!("{},", toml_string(rule)), comment)
+                let value = match grant {
+                    Grant::Localhost(port) => port.to_string(),
+                    other => toml_string(&grant_text(other)),
+                };
+                (format!("{value},"), comment)
             })
             .collect();
         if !entries.is_empty() {
@@ -734,11 +797,7 @@ pub fn render_draft_with(
 
     let mut table = "";
     for (kind, entries) in &lists {
-        let this_table = if *kind == ListKind::Domains {
-            "network"
-        } else {
-            "filesystem"
-        };
+        let this_table = kind.table();
         if this_table != table {
             out.push_str(&format!("\n[{this_table}]\n"));
             table = this_table;
@@ -766,24 +825,24 @@ pub fn render_profile(doc: &ProfileDoc, reasons: &Reasons) -> String {
     if doc.is_empty() {
         return "The profile has no rules.\n".to_string();
     }
-    let labels: Vec<Cow<'_, str>> = ListKind::ALL
-        .iter()
-        .flat_map(|kind| kind.list(doc).iter().map(|r| safe(r)))
+    let lists: Vec<(ListKind, Vec<Grant>)> = ListKind::ALL
+        .into_iter()
+        .map(|kind| (kind, kind.rules(doc)))
         .collect();
-    let width = column_width(labels.iter().map(AsRef::as_ref));
+    let labels: Vec<String> = lists
+        .iter()
+        .flat_map(|(_, rules)| rules.iter().map(|g| safe(&grant_text(g)).into_owned()))
+        .collect();
+    let width = column_width(labels.iter().map(String::as_str));
     let mut out = String::new();
-    for kind in ListKind::ALL {
-        let list = kind.list(doc);
-        if list.is_empty() {
+    for (kind, rules) in &lists {
+        if rules.is_empty() {
             continue;
         }
         out.push_str(&format!("{}\n", section_title(kind.section())));
-        for rule in list {
-            let reason = reasons
-                .get(&kind.grant(rule.clone()))
-                .map(safe)
-                .unwrap_or_default();
-            push_row(&mut out, "  ", &safe(rule), width, &reason);
+        for grant in rules {
+            let reason = reasons.get(grant).map(safe).unwrap_or_default();
+            push_row(&mut out, "  ", &safe(&grant_text(grant)), width, &reason);
         }
     }
     out
@@ -1312,6 +1371,40 @@ domains = [
         );
     }
 
+    /// A port is a TOML integer in the `[network]` table. The draft keeps
+    /// the reason of the port as a comment, and the reader finds it again.
+    #[test]
+    fn a_port_rule_round_trips_with_its_reason() -> TestResult {
+        let port = std::num::NonZeroU16::MIN.saturating_add(5431);
+        let mut doc = ProfileDoc::default();
+        doc.network.domains.push("a.example".to_string());
+        doc.network.localhost.push(port);
+        let summary = Summary {
+            items: vec![Item {
+                grant: Grant::Localhost(port),
+                reason: "used by psql".to_string(),
+                blocked: None,
+                notes: Vec::new(),
+            }],
+            stats: crate::Stats::default(),
+        };
+        let text = render_draft(&name("db")?, 1, &doc, &summary);
+        assert!(
+            text.contains("[network]\ndomains = [\n  \"a.example\",\n]\nlocalhost = [\n  5432,"),
+            "{text}"
+        );
+        assert!(
+            ProfileDoc::parse(&text).is_ok_and(|parsed| parsed == doc),
+            "{text}"
+        );
+        let reasons = Reasons::from_draft(&text);
+        assert_eq!(reasons.get(&Grant::Localhost(port)), Some("used by psql"));
+        let shown = render_profile(&doc, &reasons);
+        assert!(shown.contains("Localhost ports\n  5432"), "{shown}");
+        assert!(shown.contains("used by psql"), "{shown}");
+        Ok(())
+    }
+
     /// [`Reasons::is_empty`] is true only when no rule has a reason.
     #[test]
     fn reasons_are_empty_only_without_a_reason() {
@@ -1404,8 +1497,19 @@ mod render_properties {
             },
             network: crate::NetworkRules {
                 domains: gen_rules(rng),
+                localhost: gen_ports(rng),
             },
         }
+    }
+
+    /// Build a list of ports. A port can repeat, as in a file that a person
+    /// edited.
+    fn gen_ports(rng: &mut Rng) -> Vec<std::num::NonZeroU16> {
+        let count = rng.below(4);
+        #[allow(clippy::cast_possible_truncation, reason = "a port fits in 16 bits")]
+        (0..count)
+            .filter_map(|_| std::num::NonZeroU16::new(rng.next_u64() as u16))
+            .collect()
     }
 
     /// A draft parses back to the document that it holds, and it holds no

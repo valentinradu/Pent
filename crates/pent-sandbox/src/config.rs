@@ -2,7 +2,59 @@
 
 use crate::{Mount, NetworkMode, SandboxPaths, SandboxSettings};
 use std::collections::HashMap;
+use std::num::NonZeroU16;
 use std::path::PathBuf;
+
+/// The TCP ports on the loopback of the host that the child can reach.
+///
+/// With its own network namespace (Linux) or the network rules of Seatbelt
+/// (macOS), the child cannot reach a service on the loopback of the host
+/// (`127.0.0.1`, `::1`). This value opens such ports. A server that the
+/// child itself runs on the loopback needs no rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalhostPorts {
+    /// Only the ports in the list. An empty list opens no port.
+    Listed(Vec<NonZeroU16>),
+    /// Each port, except the control ports that the watch guard blocks
+    /// ([`pent_profile::CONTROL_PORTS`]). Watch mode with an open network
+    /// uses this value.
+    All,
+}
+
+impl Default for LocalhostPorts {
+    fn default() -> Self {
+        Self::Listed(Vec::new())
+    }
+}
+
+impl LocalhostPorts {
+    /// Return true if the child can reach `port` on the loopback of the
+    /// host. Port 0 is never reachable.
+    #[must_use]
+    pub fn permits(&self, port: u16) -> bool {
+        let Some(port) = NonZeroU16::new(port) else {
+            return false;
+        };
+        match self {
+            Self::Listed(ports) => ports.contains(&port),
+            Self::All => pent_profile::control_port(port.get()).is_none(),
+        }
+    }
+
+    /// Return true if the watch guard blocks `port`: the value opens each
+    /// port, and `port` is a control port. A listed control port is not
+    /// guarded: the profile names it.
+    #[must_use]
+    pub fn guards(&self, port: u16) -> bool {
+        matches!(self, Self::All) && pent_profile::control_port(port).is_some()
+    }
+
+    /// Return true if the value opens no port.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        matches!(self, Self::Listed(ports) if ports.is_empty())
+    }
+}
 
 /// Platform-appropriate system-wide sandbox path defaults.
 ///
@@ -104,6 +156,13 @@ pub struct SandboxConfig {
     /// connected socket to the child. A path that is not in this list gets
     /// `EACCES`. An empty list permits no connection to a Unix socket.
     pub unix_sockets: Vec<PathBuf>,
+
+    /// The TCP ports on the loopback of the host that the child can reach.
+    ///
+    /// On Linux the supervisor makes each such connection on the network of
+    /// the host and gives the connected socket to the child. On macOS the
+    /// Seatbelt profile allows the ports. The default opens no port.
+    pub localhost: LocalhostPorts,
 }
 
 impl SandboxConfig {
@@ -126,6 +185,7 @@ impl SandboxConfig {
             no_enforcement: false,
             record_events: false,
             unix_sockets: Vec::new(),
+            localhost: LocalhostPorts::default(),
         }
     }
 
@@ -251,5 +311,27 @@ mod tests {
         assert_eq!(config.mounts.len(), 1);
         assert_eq!(config.mounts[0].path, PathBuf::from("/opt/tools"));
         assert!(config.mounts[0].readonly);
+    }
+
+    #[test]
+    fn localhost_ports_permit_only_their_ports() {
+        let none = LocalhostPorts::default();
+        assert!(none.is_empty());
+        assert!(!none.permits(5432));
+        let listed = LocalhostPorts::Listed(vec![NonZeroU16::MIN.saturating_add(5431)]);
+        assert!(!listed.is_empty());
+        assert!(listed.permits(5432));
+        assert!(!listed.permits(5433));
+        assert!(LocalhostPorts::All.permits(1));
+        assert!(!LocalhostPorts::All.permits(0));
+        // The watch guard keeps the control ports closed, but a profile can
+        // name one.
+        assert!(!LocalhostPorts::All.permits(2375));
+        assert!(LocalhostPorts::All.guards(2375));
+        assert!(!LocalhostPorts::All.guards(5432));
+        let docker = LocalhostPorts::Listed(vec![NonZeroU16::MIN.saturating_add(2374)]);
+        assert!(docker.permits(2375));
+        assert!(!docker.guards(2375));
+        assert!(!LocalhostPorts::All.is_empty());
     }
 }

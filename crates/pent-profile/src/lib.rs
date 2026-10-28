@@ -18,6 +18,7 @@
 pub mod doc;
 pub mod event;
 pub mod guard;
+pub mod localhost;
 pub mod name;
 pub mod psl;
 pub mod render;
@@ -29,6 +30,7 @@ pub use event::{FsOp, GuardClass, NetProtocol, Outcome, ProcessInfo, WatchEvent}
 pub use guard::{
     classify, guard_rules, guard_rules_with, name_matches, GuardAccess, GuardRule, GuardTarget,
 };
+pub use localhost::{control_port, is_localhost_name, is_loopback, CONTROL_PORTS};
 pub use name::{ProfileName, ProfileNameError};
 pub use render::{
     render_draft, render_draft_with, render_header, render_profile, render_terminal, safe_lines,

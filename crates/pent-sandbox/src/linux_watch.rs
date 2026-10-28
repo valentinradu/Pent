@@ -60,6 +60,12 @@
 //! these calls and makes no event. The cost is one notification for each
 //! such call of the child.
 //!
+//! # The loopback of the host
+//!
+//! The same trap of `connect(2)` serves a TCP socket with a loopback
+//! address: the supervisor connects to a port of the host that the policy
+//! opens, and gives the socket to the child. See [`crate::linux_loopback`].
+//!
 //! The filter also lets a `sendto(2)` with a null address pointer through
 //! without a notification, because the address is an argument. A
 //! `sendmsg(2)` carries its address in memory, so each one costs a
@@ -338,6 +344,10 @@ pub(crate) enum RecorderScope {
     /// The path system calls and the calls of the Unix socket control.
     /// Each call makes an event.
     Full,
+    /// [`RecorderScope::Full`], and also the calls that test a path without
+    /// an open ([`PROBE_CALLS`]). `pent run --trace` takes this scope when
+    /// an overlay can hide a path.
+    FullAndProbes,
     /// Only the calls of the Unix socket control, and no event. `pent run`
     /// without `--trace` takes this scope.
     ConnectOnly,
@@ -501,6 +511,10 @@ enum Call {
     Connect,
     /// A send that can carry a destination address.
     Send(SendCall),
+    /// A call that tests a path and opens nothing (`stat`, `access`). The
+    /// second field is the index of the flags argument, when the call has
+    /// one (`AT_EMPTY_PATH`).
+    Probe(PathArg, Option<usize>),
 }
 
 /// The send system calls of the Unix socket control.
@@ -576,6 +590,42 @@ const CALLS: &[(libc::c_long, Call)] = &[
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 const CALLS: &[(libc::c_long, Call)] = &[];
 
+/// A table of system calls and their kinds.
+type CallTable = &'static [(libc::c_long, Call)];
+
+/// The calls that test a path and open nothing.
+///
+/// A program can test a path before it opens it, and stop when the test
+/// fails: uutils `cat` (the `cat` of Ubuntu 26.04) calls `statx` and never
+/// `open` for a file that does not exist. Landlock does not control such a
+/// test, so it fails only for a path that the overlay hides. The recorder
+/// of `pent run --trace` traps these calls only when an overlay can hide a
+/// path, and it records a denial only for a hidden path (DIFF-1).
+#[cfg(target_arch = "x86_64")]
+const PROBE_CALLS: &[(libc::c_long, Call)] = &[
+    (libc::SYS_stat, Call::Probe(p(0), None)),
+    (libc::SYS_lstat, Call::Probe(p(0), None)),
+    (libc::SYS_newfstatat, Call::Probe(at(0, 1), Some(3))),
+    (libc::SYS_statx, Call::Probe(at(0, 1), Some(2))),
+    (libc::SYS_access, Call::Probe(p(0), None)),
+    (libc::SYS_faccessat, Call::Probe(at(0, 1), None)),
+    (libc::SYS_faccessat2, Call::Probe(at(0, 1), Some(3))),
+];
+
+/// The calls that test a path and open nothing. The generic system call
+/// table of aarch64 has only the `*at` forms.
+#[cfg(target_arch = "aarch64")]
+const PROBE_CALLS: &[(libc::c_long, Call)] = &[
+    (libc::SYS_newfstatat, Call::Probe(at(0, 1), Some(3))),
+    (libc::SYS_statx, Call::Probe(at(0, 1), Some(2))),
+    (libc::SYS_faccessat, Call::Probe(at(0, 1), None)),
+    (libc::SYS_faccessat2, Call::Probe(at(0, 1), Some(3))),
+];
+
+/// No recorder exists for this CPU architecture.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+const PROBE_CALLS: &[(libc::c_long, Call)] = &[];
+
 /// The system calls of the Unix socket control. The filter traps them in
 /// both scopes: the control runs also without `--trace`.
 ///
@@ -619,6 +669,7 @@ fn decode(nr: i32) -> Option<Call> {
     CALLS
         .iter()
         .chain(CONTROL_CALLS)
+        .chain(PROBE_CALLS)
         .find(|(n, _)| *n == nr)
         .map(|(_, c)| *c)
 }
@@ -637,12 +688,14 @@ fn native_filter(scope: RecorderScope) -> Result<Vec<libc::sock_filter>, Sandbox
     let to_u32 = |n: libc::c_long| {
         u32::try_from(n).map_err(|_| SandboxError::InvalidConfig(format!("system call {n}")))
     };
-    let path_calls: &[(libc::c_long, Call)] = match scope {
-        RecorderScope::Full => CALLS,
-        RecorderScope::ConnectOnly => &[],
+    let (path_calls, probe_calls): (CallTable, CallTable) = match scope {
+        RecorderScope::Full => (CALLS, &[]),
+        RecorderScope::FullAndProbes => (CALLS, PROBE_CALLS),
+        RecorderScope::ConnectOnly => (&[], &[]),
     };
     let notify = path_calls
         .iter()
+        .chain(probe_calls)
         .chain(CONTROL_CALLS)
         .map(|(n, _)| to_u32(*n))
         .collect::<Result<Vec<_>, _>>()?;
@@ -1072,6 +1125,8 @@ pub(crate) struct RecorderPlan {
     pub(crate) judge: Option<Judge>,
     /// The control of `connect(2)` to a Unix socket.
     pub(crate) unix: crate::linux_unixconn::UnixControl,
+    /// The control of a TCP connection to the loopback of the host.
+    pub(crate) loopback: crate::linux_loopback::LoopbackControl,
 }
 
 /// Start the supervisor thread of the recorder.
@@ -1080,10 +1135,10 @@ pub(crate) struct RecorderPlan {
 /// Returns `SandboxUnavailable` on a CPU architecture without a recorder, or
 /// `SpawnFailed` if the socket pair or the thread cannot be created.
 pub(crate) fn start_recorder(plan: RecorderPlan) -> Result<RecorderSetup, SandboxError> {
-    let scope = if plan.judge.is_some() {
-        RecorderScope::Full
-    } else {
-        RecorderScope::ConnectOnly
+    let scope = match &plan.judge {
+        Some(Judge::Policy(policy)) if policy.can_hide() => RecorderScope::FullAndProbes,
+        Some(_) => RecorderScope::Full,
+        None => RecorderScope::ConnectOnly,
     };
     let filter = native_filter(scope)?;
     let (parent_sock, child_sock) = crate::linux_fdpass::seqpacket_pair()?;
@@ -1276,9 +1331,10 @@ enum AddrKind {
 
 /// The socket that a trapped call names.
 enum SocketOfCall {
-    /// A socket of another family. It reaches no Unix socket, so the
-    /// control lets the call through.
-    Other,
+    /// A socket of another family, with a copy of the descriptor when the
+    /// supervisor could take one. It reaches no Unix socket, so the control
+    /// of the Unix sockets lets the call through.
+    Other(Option<crate::linux_unixconn::ChildSocket>),
     /// A socket of the `AF_UNIX` family, with a copy of the descriptor.
     Unix(crate::linux_unixconn::ChildSocket),
     /// A socket of the `AF_UNIX` family that the supervisor could not
@@ -1289,14 +1345,14 @@ enum SocketOfCall {
 impl SocketOfCall {
     /// True when the socket belongs to the `AF_UNIX` family.
     fn is_unix(&self) -> bool {
-        !matches!(self, Self::Other)
+        !matches!(self, Self::Other(_))
     }
 
     /// True when the kernel uses the address of a send on this socket.
     /// Only a datagram socket of the `AF_UNIX` family does.
     fn uses_the_send_address(&self) -> bool {
         match self {
-            Self::Other => false,
+            Self::Other(_) => false,
             Self::Unix(sock) => sock.send_uses_the_address(),
             // Without the type of the socket the supervisor takes the
             // careful answer.
@@ -1308,7 +1364,7 @@ impl SocketOfCall {
     fn kind(&self) -> Option<libc::c_int> {
         match self {
             Self::Unix(sock) => Some(sock.kind()),
-            Self::Other | Self::UnixOpaque => None,
+            Self::Other(_) | Self::UnixOpaque => None,
         }
     }
 }
@@ -1344,7 +1400,8 @@ enum Answer {
     Fail(i32),
     /// The supervisor did the work; the call returns this value.
     Return(i64),
-    /// Put `fd` at the number `at` in the child and return the value 0.
+    /// Put `fd` at the number `at` in the child and return the value 0, or
+    /// fail with `error` when it is not 0.
     Give {
         /// The connected socket of the supervisor.
         fd: OwnedFd,
@@ -1352,8 +1409,108 @@ enum Answer {
         at: RawFd,
         /// The descriptor of the child was close-on-exec.
         cloexec: bool,
+        /// The error number of the call after the hand-over: 0, or
+        /// `EINPROGRESS` for a TCP connection that is not complete yet.
+        error: i32,
     },
+    /// A worker thread answers the notification later (a blocking
+    /// connection to the host that is not complete yet).
+    Deferred,
 }
+
+/// Put the descriptor `fd` of the supervisor at the number `at` in the
+/// child of the notification `id`.
+///
+/// # Errors
+/// Returns the error number of the ioctl. `ENOENT` means that the task
+/// died; the answer then fails too, and the child needs none.
+fn add_fd(listener: &OwnedFd, id: u64, fd: &OwnedFd, at: RawFd, cloexec: bool) -> Result<(), i32> {
+    let req = NotifAddfd {
+        id,
+        flags: ADDFD_FLAG_SETFD,
+        srcfd: u32::try_from(fd.as_raw_fd()).map_err(|_| libc::EBADF)?,
+        newfd: u32::try_from(at).map_err(|_| libc::EBADF)?,
+        // The flag value is positive and small.
+        #[allow(clippy::cast_sign_loss)]
+        newfd_flags: if cloexec { libc::O_CLOEXEC as u32 } else { 0 },
+    };
+    // SAFETY: the ioctl reads one `struct seccomp_notif_addfd`, and `req`
+    // lives until the call returns.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let ret = unsafe { libc::ioctl(listener.as_raw_fd(), NOTIF_ADDFD, &raw const req) };
+    if ret < 0 {
+        return Err(std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO));
+    }
+    Ok(())
+}
+
+/// The response that fails the call with `err`.
+const fn fail_resp(id: u64, err: i32) -> libc::seccomp_notif_resp {
+    libc::seccomp_notif_resp {
+        id,
+        val: 0,
+        error: -err,
+        flags: 0,
+    }
+}
+
+/// Put `fd` at the number `at` in the child, and return the response: the
+/// call returns 0, or fails with `error` when it is not 0 (`EINPROGRESS`).
+///
+/// The child keeps its descriptor number, so `connect(2)` returns and the
+/// program goes on with a connected socket.
+fn give_resp(
+    listener: &OwnedFd,
+    id: u64,
+    fd: &OwnedFd,
+    at: RawFd,
+    cloexec: bool,
+    error: i32,
+) -> libc::seccomp_notif_resp {
+    let error = match add_fd(listener, id, fd, at, cloexec) {
+        Ok(()) => error,
+        Err(e) => e,
+    };
+    fail_resp(id, error)
+}
+
+/// Send the response `resp` through the buffer `buf` (the kernel size of
+/// `struct seccomp_notif_resp` or more).
+///
+/// # Errors
+/// Returns the OS error of the ioctl. `ENOENT` (the task died) is not an
+/// error: the child needs no answer.
+fn send_resp(
+    listener: &OwnedFd,
+    buf: &mut [u64],
+    resp: libc::seccomp_notif_resp,
+) -> std::io::Result<()> {
+    buf.fill(0);
+    if buf.len().saturating_mul(8) < std::mem::size_of::<libc::seccomp_notif_resp>() {
+        return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    // SAFETY: the buffer is aligned for u64 and at least as large as
+    // `struct seccomp_notif_resp` (checked above).
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    unsafe { std::ptr::write(buf.as_mut_ptr().cast::<libc::seccomp_notif_resp>(), resp) };
+    // SAFETY: the buffer holds a valid response; the kernel reads it.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let ret = unsafe { libc::ioctl(listener.as_raw_fd(), NOTIF_SEND, buf.as_mut_ptr()) };
+    if ret != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::ENOENT) {
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
+/// The most worker threads that wait for a connection to the host at one
+/// time. A program with more blocking connections in flight makes the
+/// supervisor wait for the next one itself.
+const MAX_CONNECT_WORKERS: usize = 64;
 
 struct Supervisor {
     listener: OwnedFd,
@@ -1362,6 +1519,8 @@ struct Supervisor {
     judge: Option<Judge>,
     /// The control of `connect(2)` to a Unix socket.
     unix: crate::linux_unixconn::UnixControl,
+    /// The control of a TCP connection to the loopback of the host.
+    loopback: crate::linux_loopback::LoopbackControl,
     /// The answer to the current notification.
     answer: Answer,
     procs: ProcCache,
@@ -1378,6 +1537,10 @@ struct Supervisor {
     out: Vec<WatchEvent>,
     /// The number of unexpected errors (the log shows only the first few).
     errors: u32,
+    /// The event channel, for the worker threads. `run` sets it.
+    events: Option<mpsc::Sender<WatchEvent>>,
+    /// The number of worker threads that wait for a connection now.
+    workers: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Supervisor {
@@ -1417,6 +1580,7 @@ impl Supervisor {
             listener,
             judge: plan.judge,
             unix: plan.unix,
+            loopback: plan.loopback,
             answer: Answer::Continue,
             procs: ProcCache::default(),
             page,
@@ -1426,6 +1590,8 @@ impl Supervisor {
             send_buf: Vec::new(),
             out: Vec::new(),
             errors: 0,
+            events: None,
+            workers: std::sync::Arc::default(),
         }
     }
 
@@ -1438,6 +1604,7 @@ impl Supervisor {
 
     /// Serve notifications until no task uses the filter.
     fn run(mut self, tx: &mpsc::Sender<WatchEvent>) {
+        self.events = Some(tx.clone());
         // SAFETY: the ioctl takes an integer argument. An older kernel
         // returns EINVAL; the recorder then works with normal wake-ups.
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
@@ -1523,38 +1690,11 @@ impl Supervisor {
         unsafe { libc::ioctl(self.listener.as_raw_fd(), NOTIF_ID_VALID, &raw const id) == 0 }
     }
 
-    /// Put the descriptor `fd` of the supervisor at the number `at` in the
-    /// child of the notification `id`.
-    ///
-    /// # Errors
-    /// Returns the error number of the ioctl. `ENOENT` means that the task
-    /// died; the answer then fails too, and the child needs none.
-    fn add_fd(&self, id: u64, fd: &OwnedFd, at: RawFd, cloexec: bool) -> Result<(), i32> {
-        let req = NotifAddfd {
-            id,
-            flags: ADDFD_FLAG_SETFD,
-            srcfd: u32::try_from(fd.as_raw_fd()).map_err(|_| libc::EBADF)?,
-            newfd: u32::try_from(at).map_err(|_| libc::EBADF)?,
-            // The flag value is positive and small.
-            #[allow(clippy::cast_sign_loss)]
-            newfd_flags: if cloexec { libc::O_CLOEXEC as u32 } else { 0 },
-        };
-        // SAFETY: the ioctl reads one `struct seccomp_notif_addfd`, and
-        // `req` lives until the call returns.
-        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-        let ret = unsafe { libc::ioctl(self.listener.as_raw_fd(), NOTIF_ADDFD, &raw const req) };
-        if ret < 0 {
-            return Err(std::io::Error::last_os_error()
-                .raw_os_error()
-                .unwrap_or(libc::EIO));
-        }
-        Ok(())
-    }
-
     fn respond(&mut self, id: u64) {
-        self.resp.fill(0);
         let answer = std::mem::replace(&mut self.answer, Answer::Continue);
         let resp = match answer {
+            // A worker thread answers this notification.
+            Answer::Deferred => return,
             Answer::Continue => libc::seccomp_notif_resp {
                 id,
                 val: 0,
@@ -1563,57 +1703,22 @@ impl Supervisor {
                 #[allow(clippy::cast_possible_truncation)]
                 flags: libc::SECCOMP_USER_NOTIF_FLAG_CONTINUE as u32,
             },
-            Answer::Fail(err) => libc::seccomp_notif_resp {
-                id,
-                val: 0,
-                error: -err,
-                flags: 0,
-            },
+            Answer::Fail(err) => fail_resp(id, err),
             Answer::Return(val) => libc::seccomp_notif_resp {
                 id,
                 val,
                 error: 0,
                 flags: 0,
             },
-            Answer::Give { fd, at, cloexec } => {
-                // The child keeps its descriptor number, so `connect(2)`
-                // returns 0 and the program goes on with a connected
-                // socket.
-                let error = match self.add_fd(id, &fd, at, cloexec) {
-                    Ok(()) => 0,
-                    Err(e) => -e,
-                };
-                libc::seccomp_notif_resp {
-                    id,
-                    val: 0,
-                    error,
-                    flags: 0,
-                }
-            }
+            Answer::Give {
+                fd,
+                at,
+                cloexec,
+                error,
+            } => give_resp(&self.listener, id, &fd, at, cloexec, error),
         };
-        // SAFETY: `resp` buffer is aligned for u64 and at least as large as
-        // `struct seccomp_notif_resp`.
-        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-        unsafe {
-            std::ptr::write(
-                self.resp.as_mut_ptr().cast::<libc::seccomp_notif_resp>(),
-                resp,
-            )
-        };
-        // SAFETY: the buffer holds a valid response; the kernel reads it.
-        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-        let ret = unsafe {
-            libc::ioctl(
-                self.listener.as_raw_fd(),
-                NOTIF_SEND,
-                self.resp.as_mut_ptr(),
-            )
-        };
-        if ret != 0 {
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() != Some(libc::ENOENT) {
-                self.log_error("NOTIF_SEND", &err);
-            }
+        if let Err(err) = send_resp(&self.listener, &mut self.resp, resp) {
+            self.log_error("NOTIF_SEND", &err);
         }
     }
 
@@ -1860,6 +1965,37 @@ impl Supervisor {
                 let process = self.procs.get(tid);
                 self.push_fs(&process, FsOp::Write, path, st, true);
             }
+            Call::Probe(arg, flags_arg) => {
+                // Only a path that the overlay hides gives the program a
+                // wrong answer: Landlock does not control a test of a path.
+                if !matches!(self.judge, Some(Judge::Policy(_))) {
+                    return;
+                }
+                let flags = flags_arg.and_then(|i| args.get(i)).copied().unwrap_or(0);
+                // The kernel uses the low 32 bits of the flags argument.
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                if flags as u32 & libc::AT_EMPTY_PATH as u32 != 0 {
+                    // A test of an open descriptor looks up no path.
+                    return;
+                }
+                let Some(path) = self.path_of(tid, &args, arg, false, false) else {
+                    return;
+                };
+                // A path that the host does not have is not hidden: the
+                // test fails in the same way outside the sandbox.
+                let hidden =
+                    matches!(&self.judge, Some(Judge::Policy(policy)) if policy.hidden(&path));
+                if !hidden || !PathState::probe(&path).exists {
+                    return;
+                }
+                let process = self.procs.get(tid);
+                self.out.push(WatchEvent::Fs {
+                    op: FsOp::Read,
+                    path,
+                    process,
+                    outcome: Outcome::Denied,
+                });
+            }
             Call::Connect => self.record_connect(notif),
             Call::Send(kind) => self.record_send(notif, kind),
         }
@@ -1917,12 +2053,12 @@ impl Supervisor {
         let pid = self.procs.get(tid).pid;
         match crate::linux_unixconn::child_socket(pid, fd) {
             Some(sock) if sock.is_unix() => SocketOfCall::Unix(sock),
-            Some(_) => SocketOfCall::Other,
+            Some(sock) => SocketOfCall::Other(Some(sock)),
             // Without a copy of the descriptor the supervisor asks the
             // table of the Unix sockets of the task. It then knows the
             // family, but it cannot make a call on the socket itself.
             None if crate::linux_unixconn::is_unix_socket(tid, fd) => SocketOfCall::UnixOpaque,
-            None => SocketOfCall::Other,
+            None => SocketOfCall::Other(None),
         }
     }
 
@@ -1958,6 +2094,9 @@ impl Supervisor {
         #[allow(clippy::cast_possible_truncation)]
         let sockfd = sockfd as RawFd;
         let socket = self.socket_of_call(tid, sockfd);
+        if let SocketOfCall::Other(Some(sock)) = &socket {
+            return self.control_loopback(notif, sock, sockfd, addr, len);
+        }
         if !socket.is_unix() {
             // A socket of another family reaches no Unix socket, whatever
             // another thread writes in the address.
@@ -2007,6 +2146,7 @@ impl Supervisor {
                             fd,
                             at: sockfd,
                             cloexec: flags.cloexec,
+                            error: 0,
                         },
                         Err(err) => Answer::Fail(err),
                     }
@@ -2019,6 +2159,212 @@ impl Supervisor {
             };
         }
         self.record_unix_event(tid, &target, decision.outcome());
+    }
+
+    /// Control a `connect()` on a socket of another family: a TCP
+    /// connection to the loopback goes to the host when the policy opens
+    /// the port. See [`crate::linux_loopback`].
+    ///
+    /// The supervisor reads the address one time. It connects to the host
+    /// with that copy, so another thread cannot change the target. Every
+    /// other call keeps `CONTINUE` and runs in the namespace of the child.
+    fn control_loopback(
+        &mut self,
+        notif: &libc::seccomp_notif,
+        sock: &crate::linux_unixconn::ChildSocket,
+        sockfd: RawFd,
+        addr: u64,
+        len: u64,
+    ) {
+        use crate::linux_loopback::{
+            self as loopback, LoopbackControl, LoopbackDecision, PortPolicy,
+        };
+
+        let tid = notif.pid;
+        let record = self.judge.is_some();
+        match &self.loopback {
+            // The loopback of the child is the loopback of the host.
+            LoopbackControl::Shared => return,
+            // No port opens and no event is wanted: the call stays in the
+            // namespace of the child at no cost.
+            LoopbackControl::Private { ports, .. } if ports.is_empty() && !record => return,
+            LoopbackControl::Private { .. } => {}
+        }
+        let domain = sock.domain();
+        if sock.kind() != libc::SOCK_STREAM || !matches!(domain, libc::AF_INET | libc::AF_INET6) {
+            return;
+        }
+        let Some(facts) = loopback::SocketFacts::of(sock.fd(), domain) else {
+            return;
+        };
+        let mut raw = [0u8; loopback::SOCKADDR_INET_LEN];
+        let want = usize::try_from(len)
+            .unwrap_or(0)
+            .min(loopback::SOCKADDR_INET_LEN);
+        let Some(buf) = raw.get_mut(..want) else {
+            return;
+        };
+        let n = self.read_remote(tid, addr, buf);
+        let Some(dest) = raw
+            .get(..n)
+            .and_then(|bytes| loopback::parse_inet(bytes, domain))
+        else {
+            return;
+        };
+        let port = dest.port();
+        // A socket that is connecting or connected, another protocol, or an
+        // address that the kernel refuses for this socket: the kernel
+        // answers. The call stays in the namespace of the child.
+        if port == 0 || !loopback::is_loopback(dest.ip()) || !facts.takes(dest) {
+            return;
+        }
+        let LoopbackControl::Private { ports, pent } = &self.loopback else {
+            return;
+        };
+        // A listener of pent in the namespace of the child (the proxy, the
+        // DNS server): the connection stays there, with no event and no
+        // look at the tables.
+        if pent.contains(&dest) {
+            return;
+        }
+        let policy = PortPolicy::of(ports, port);
+        // A closed port stays in the namespace of the child whatever it
+        // listens on. Without an event, the supervisor needs no look at the
+        // sockets of the child: the proxy port and the DNS port pay
+        // nothing.
+        if policy != PortPolicy::Open && !record {
+            return;
+        }
+        let decision = loopback::decide(policy, || loopback::child_listens(tid, dest));
+        let event =
+            decision
+                .outcome()
+                .filter(|_| record)
+                .map(|outcome| WatchEvent::LocalhostConnect {
+                    port,
+                    process: self.procs.get(tid),
+                    outcome,
+                });
+        if decision == LoopbackDecision::Host {
+            // A dead task must get no descriptor, and its identifier can
+            // belong to another process now.
+            if !self.id_valid(notif.id) {
+                return;
+            }
+            let flags = crate::linux_unixconn::fd_flags(tid, sockfd);
+            let conn = match loopback::start_on_host(dest) {
+                Ok(conn) => conn,
+                Err(err) => {
+                    // Nothing serves the port on the host either, so the
+                    // run needs no rule for it.
+                    self.answer = Answer::Fail(err);
+                    return;
+                }
+            };
+            if conn.in_progress
+                && !flags.nonblock
+                && self.defer_connect(notif.id, sockfd, flags, &conn, event.clone())
+            {
+                // The worker thread now owns the answer and the event. The
+                // supervisor goes on with the next notification.
+                drop(conn);
+                return;
+            }
+            match loopback::finish_on_host(conn, flags, crate::linux_unixconn::CONNECT_LIMIT) {
+                Ok(conn) => {
+                    self.answer = Answer::Give {
+                        fd: conn.fd,
+                        at: sockfd,
+                        cloexec: flags.cloexec,
+                        error: if conn.in_progress {
+                            libc::EINPROGRESS
+                        } else {
+                            0
+                        },
+                    };
+                }
+                Err(err) => {
+                    self.answer = Answer::Fail(err);
+                    return;
+                }
+            }
+        }
+        self.out.extend(event);
+    }
+
+    /// Let a worker thread wait for the blocking connection `conn` and then
+    /// answer the notification `id`, so that one slow service of the host
+    /// does not stop the other processes of the sandbox.
+    ///
+    /// The worker takes a copy of the socket and of the listener. It sends
+    /// `event` when the connection completes. Return false, and do nothing,
+    /// when [`MAX_CONNECT_WORKERS`] threads already wait or a copy fails:
+    /// the supervisor then waits itself.
+    fn defer_connect(
+        &mut self,
+        id: u64,
+        at: RawFd,
+        flags: crate::linux_unixconn::FdFlags,
+        conn: &crate::linux_loopback::HostConnection,
+        event: Option<WatchEvent>,
+    ) -> bool {
+        use std::sync::atomic::Ordering;
+
+        let Some(events) = self.events.clone() else {
+            return false;
+        };
+        if self.workers.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECT_WORKERS {
+            self.workers.fetch_sub(1, Ordering::SeqCst);
+            return false;
+        }
+        let (Ok(listener), Ok(fd)) = (self.listener.try_clone(), conn.fd.try_clone()) else {
+            self.workers.fetch_sub(1, Ordering::SeqCst);
+            return false;
+        };
+        let workers = std::sync::Arc::clone(&self.workers);
+        let mut buf = vec![0u64; self.resp.len()];
+        let job = move || {
+            let conn = crate::linux_loopback::HostConnection {
+                fd,
+                in_progress: true,
+            };
+            let (resp, done) = match crate::linux_loopback::finish_on_host(
+                conn,
+                flags,
+                crate::linux_unixconn::CONNECT_LIMIT,
+            ) {
+                Ok(conn) => (
+                    give_resp(&listener, id, &conn.fd, at, flags.cloexec, 0),
+                    true,
+                ),
+                Err(err) => (fail_resp(id, err), false),
+            };
+            if let Err(err) = send_resp(&listener, &mut buf, resp) {
+                tracing::warn!("seccomp recorder: NOTIF_SEND of a worker: {err}");
+            }
+            if done {
+                if let Some(event) = event {
+                    // The caller can drop the receiver; the answer above
+                    // matters, not the event.
+                    let _ = events.send(event);
+                }
+            }
+            workers.fetch_sub(1, Ordering::SeqCst);
+        };
+        match std::thread::Builder::new()
+            .name("pent-connect".to_string())
+            .spawn(job)
+        {
+            Ok(_) => {
+                self.answer = Answer::Deferred;
+                true
+            }
+            Err(_) => {
+                // The closure and its copies are gone with the error.
+                self.workers.fetch_sub(1, Ordering::SeqCst);
+                false
+            }
+        }
     }
 
     /// Connect the socket of the child itself to the address that the
@@ -2610,6 +2956,32 @@ mod tests {
             Some(Call::Open(at(0, 1), OpenFlags::Arg(2)))
         );
         assert_eq!(decode(i32::try_from(libc::SYS_getpid)?), None);
+        Ok(())
+    }
+
+    /// The calls that test a path go to the supervisor only in the scope
+    /// that asks for them: a `stat` is frequent, and only an overlay can
+    /// make it fail.
+    #[test]
+    fn the_probe_calls_are_trapped_only_when_asked() -> TestResult {
+        let Some((arch, _)) = NATIVE else {
+            return Err("no native spec".into());
+        };
+        let with = native_filter(RecorderScope::FullAndProbes)?;
+        let without = native_filter(RecorderScope::Full)?;
+        for (nr, call) in PROBE_CALLS {
+            let nr = u32::try_from(*nr)?;
+            assert_eq!(run_bpf(&with, nr, arch), Some(RET_NOTIFY), "{call:?}");
+            assert_eq!(
+                run_bpf(&without, nr, arch),
+                Some(SECCOMP_RET_ALLOW),
+                "{call:?}"
+            );
+            assert!(matches!(decode(i32::try_from(nr)?), Some(Call::Probe(..))));
+        }
+        for (nr, _) in CALLS.iter().chain(CONTROL_CALLS) {
+            assert_eq!(run_bpf(&with, u32::try_from(*nr)?, arch), Some(RET_NOTIFY));
+        }
         Ok(())
     }
 

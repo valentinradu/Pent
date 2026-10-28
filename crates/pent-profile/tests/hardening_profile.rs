@@ -213,7 +213,7 @@ fn p1_crafted_events_reach_each_output_field() {
     let has_payload = |text: &str| PAYLOADS.iter().any(|p| text.contains(p));
     assert!(summary.items.iter().any(|i| match &i.grant {
         Grant::Fs { path, .. } => has_payload(path),
-        Grant::Domain(_) | Grant::UnixSocket(_) => false,
+        Grant::Domain(_) | Grant::UnixSocket(_) | Grant::Localhost(_) => false,
     }));
     assert!(summary
         .items
@@ -336,7 +336,12 @@ fn p1_domains_and_ip_hosts_drop_payloads() {
             );
         }
     }
-    assert_eq!(summary.stats.ip_hosts, vec!["1.2.3.4:443", "[::1]:443"]);
+    // `::1` is the loopback, so it gives a port rule and no IP host.
+    assert_eq!(summary.stats.ip_hosts, vec!["1.2.3.4:443"]);
+    assert!(summary
+        .items
+        .iter()
+        .any(|i| matches!(i.grant, Grant::Localhost(p) if p.get() == 443)));
 }
 
 // ── Property 2: draft integrity ──────────────────────────────────────────────
@@ -555,7 +560,7 @@ fn bad_rules(summary: &Summary) -> Vec<String> {
                     .any(|c| c == Component::ParentDir);
                 (forbidden.contains(path) || dotdot).then(|| format!("{access:?} {path}"))
             }
-            Grant::Domain(_) | Grant::UnixSocket(_) => None,
+            Grant::Domain(_) | Grant::UnixSocket(_) | Grant::Localhost(_) => None,
         })
         .collect()
 }
@@ -1387,7 +1392,7 @@ fn p6_blocked_items_keep_their_access() {
         .filter(|i| i.blocked.is_some())
         .filter_map(|i| match &i.grant {
             Grant::Fs { access, .. } => Some(*access),
-            Grant::Domain(_) | Grant::UnixSocket(_) => None,
+            Grant::Domain(_) | Grant::UnixSocket(_) | Grant::Localhost(_) => None,
         })
         .collect();
     assert!(accesses.contains(&FsAccess::Read));

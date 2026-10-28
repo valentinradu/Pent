@@ -6,7 +6,8 @@ use std::time::Duration;
 use pent_profile::{guard_rules_with, ProfileName, WatchEvent};
 use pent_proxy::ProxyPolicy;
 use pent_sandbox::{
-    build_env, spawn_watched, SandboxConfig, SandboxError, SandboxPaths, WatchOptions,
+    build_env, spawn_watched, LocalhostPorts, SandboxConfig, SandboxError, SandboxPaths,
+    WatchOptions,
 };
 use pent_settings::{ConfigLoader, ProfileStore, WatchRunMode};
 
@@ -38,8 +39,8 @@ const BANNER_HEAD: &str =
 
 /// The line that the banner adds when the proxy allows each domain.
 const BANNER_OPEN_NETWORK: &str =
-    "  The network is open in this run. Use --allow DOMAIN or --network blocked \
-     to close it.\n";
+    "  The network is open in this run. The ports on localhost are open too. Use \
+     --allow DOMAIN or --network blocked to close them.\n";
 
 /// The last lines of the banner.
 const BANNER_TAIL: &str =
@@ -65,6 +66,8 @@ struct WatchNetwork {
     policy: ProxyPolicy,
     /// The domains of the allowlist.
     domains: Vec<String>,
+    /// The ports on the loopback of the host that the program can reach.
+    localhost: LocalhostPorts,
 }
 
 /// Decide the network of a watch run.
@@ -83,12 +86,16 @@ fn watch_network(flag: Option<NetworkModeArg>, allow: &[String]) -> WatchNetwork
             },
             policy: ProxyPolicy::Observe,
             domains: Vec::new(),
+            localhost: LocalhostPorts::All,
         };
     }
+    // The ports on localhost close with the network. The recorder still
+    // marks each attempt as denied, so the review can propose the port.
     WatchNetwork {
         decision: resolve_network(flag, allow, &[]),
         policy: ProxyPolicy::Enforce,
         domains: allow.to_vec(),
+        localhost: LocalhostPorts::default(),
     }
 }
 
@@ -155,6 +162,7 @@ pub(crate) async fn watch(args: WatchArgs, cwd: PathBuf) -> Result<(), CliError>
             start_proxy(
                 &settings.proxy,
                 net.domains,
+                Vec::new(),
                 net.policy,
                 ProxyChannels {
                     trace: None,
@@ -174,7 +182,7 @@ pub(crate) async fn watch(args: WatchArgs, cwd: PathBuf) -> Result<(), CliError>
         ui::status("network", line);
     }
 
-    let sandbox_cfg = SandboxConfig::from_sandbox_settings(
+    let mut sandbox_cfg = SandboxConfig::from_sandbox_settings(
         settings.sandbox,
         SandboxPaths::default(),
         cwd.clone(),
@@ -182,6 +190,7 @@ pub(crate) async fn watch(args: WatchArgs, cwd: PathBuf) -> Result<(), CliError>
     )
     .with_network(network)
     .with_env(build_env(&[]));
+    sandbox_cfg.localhost = net.localhost;
     // The guard protects the files of pent at their real place, also when
     // $XDG_CONFIG_HOME or $XDG_STATE_HOME points outside of the defaults.
     let options = WatchOptions {
@@ -348,6 +357,10 @@ mod tests {
         let open = banner("claude", ProxyPolicy::Observe);
         assert!(open.contains("The network is open in this run."), "{open}");
         assert!(open.contains("--network blocked"), "{open}");
+        assert!(
+            open.contains("The ports on localhost are open too."),
+            "{open}"
+        );
         let closed = banner("claude", ProxyPolicy::Enforce);
         assert!(!closed.contains("The network is open"), "{closed}");
         assert_eq!(closed.lines().count(), 5);
@@ -360,6 +373,7 @@ mod tests {
         assert_eq!(net.decision.choice, NetworkChoice::Proxy);
         assert_eq!(net.decision.source, NetworkSource::Default);
         assert!(net.domains.is_empty());
+        assert_eq!(net.localhost, LocalhostPorts::All);
     }
 
     #[test]
@@ -369,6 +383,7 @@ mod tests {
         assert_eq!(net.decision.choice, NetworkChoice::Proxy);
         assert_eq!(net.decision.source, NetworkSource::AllowFlag);
         assert_eq!(net.domains, vec!["a.example"]);
+        assert!(net.localhost.is_empty());
     }
 
     /// `--network` has precedence over `--allow`, as in `pent run`.

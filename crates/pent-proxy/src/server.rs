@@ -86,6 +86,12 @@ pub struct ProxyConfig {
     /// Default: [`PrivateDestinations::Deny`]
     pub private_destinations: PrivateDestinations,
 
+    /// The TCP ports on the loopback of the host that a client can reach
+    /// through the proxy, as `localhost` or as a loopback address. In
+    /// observe mode, each port is reachable.
+    /// Default: no port
+    pub localhost_ports: Vec<std::num::NonZeroU16>,
+
     /// Optional channel for reporting trace events (violations and granted access).
     /// When set, both blocked and allowed connections send a typed [`TraceEvent`].
     pub violation_tx: Option<tokio::sync::mpsc::UnboundedSender<TraceEvent>>,
@@ -106,7 +112,9 @@ pub enum ProxyPolicy {
     #[default]
     Enforce,
     /// Allow each domain and emit an event for each request (watch mode).
-    /// The rule for destinations that are not public still applies. The TLS
+    /// The rule for destinations that are not public still applies, except
+    /// for `localhost` and a loopback address: watch mode lets the program
+    /// reach each port on the loopback of the host. The TLS
     /// SNI and the HTTP `Host` header do not block a connection; the proxy
     /// uses them only to name it.
     Observe,
@@ -130,6 +138,7 @@ impl Default for ProxyConfig {
             tcp_idle_timeout: std::time::Duration::from_secs(300),
             handshake_timeout: std::time::Duration::from_secs(10),
             private_destinations: PrivateDestinations::Deny,
+            localhost_ports: Vec::new(),
         }
     }
 }
@@ -175,6 +184,7 @@ impl ProxyConfig {
             idle_timeout: self.tcp_idle_timeout,
             handshake_timeout: self.handshake_timeout,
             private_destinations: self.private_destinations,
+            localhost_ports: self.localhost_ports.clone(),
             ..Default::default()
         }
     }
@@ -530,9 +540,14 @@ impl ProxyServer {
         let dns_config = self
             .config
             .dns_config(dns_addr.unwrap_or(self.config.dns_bind_addr));
-        let tcp_config = self
+        let mut tcp_config = self
             .config
             .tcp_config(proxy_addr.unwrap_or(self.config.proxy_bind_addr));
+        // The DNS server of a bound proxy listens on the loopback of the
+        // host too. The proxy must not reach it.
+        tcp_config
+            .own_ports
+            .extend(dns_addr.map(|addr| addr.port()));
         let dns_server = Arc::new(DnsServer::new(dns_config, Arc::clone(&self.state))?);
         let tcp_proxy = Arc::new(TcpProxy::new(tcp_config, Arc::clone(&self.state))?);
         Ok(ProxyHandle {

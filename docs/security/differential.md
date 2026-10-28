@@ -120,6 +120,21 @@ and works inside the run, so it is not a denial. The recorder also drops
 a read of a path that does not exist on the host, so a hidden name that
 the child made itself makes no event.
 
+**The second form** (2026-10-28). The fix covered `open` only. The CI
+runners of Ubuntu 26.04 have uutils, the Rust coreutils, and its `cat`
+calls `statx` on the file and stops at `ENOENT`, with no `open`. The
+recorder saw nothing, and the test failed again. Any program that tests a
+path before it opens it has this form. With `--trace`, when the run has an
+overlay, the recorder now also traps the calls that test a path
+(`stat`, `lstat`, `newfstatat`, `statx`, `access`, `faccessat`,
+`faccessat2`; `PROBE_CALLS` in `linux_watch.rs`). It records a denied read
+only for a path that the overlay hides and that the host has: Landlock
+does not control such a test, so no other path gives the program a wrong
+answer. A normal `pent run` and watch mode do not trap these calls. The
+test `diff_1_a_test_of_a_hidden_path_is_a_recorded_denial` uses the test
+of the shell (`[ -e ]`), so it does not depend on the `cat` of the
+machine.
+
 ### DIFF-2 — a profile entry that names a symbolic link gives access to nothing
 
 **Severity:** Medium. **Wrong description:** the kernel. **Fixed** in

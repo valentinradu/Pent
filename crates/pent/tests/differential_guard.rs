@@ -65,6 +65,7 @@ printf 'rc=%s\n' "$?"
             GuardClass::Persistence => "persistence",
             GuardClass::PentFiles => "pent-files",
             GuardClass::PrivilegeEscalation => "privilege-escalation",
+            GuardClass::ControlPort => "control-port",
         }
     }
 

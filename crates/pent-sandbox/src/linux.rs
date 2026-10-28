@@ -350,6 +350,12 @@ impl AccessPolicy {
         }
     }
 
+    /// Return true when an overlay can hide a path: the policy has at least
+    /// one overlay mount point.
+    pub(crate) fn can_hide(&self) -> bool {
+        !self.overlay_roots.is_empty()
+    }
+
     /// Return true when the upper layer of an overlay hides `path`.
     ///
     /// `populate_upper_stubs` in `linux_overlayfs.rs` makes a stub for
@@ -362,7 +368,7 @@ impl AccessPolicy {
     /// back. The policy calls such a read a denial too. The report stays
     /// true, because the file of the host stays hidden: the child reads
     /// its own content, never the content that the overlay hides.
-    fn hidden(&self, path: &Path) -> bool {
+    pub(crate) fn hidden(&self, path: &Path) -> bool {
         if !self
             .overlay_roots
             .iter()
@@ -3166,7 +3172,34 @@ pub(crate) fn spawn_linux(
     } else {
         crate::linux_unixconn::UnixControl::Observe(unix_policy)
     };
-    let recorder = if record || enforce {
+    // A TCP connection to the loopback of the host. With its own network
+    // namespace the child reaches only the ports that the policy opens,
+    // through the supervisor; with `--network unrestricted` it shares the
+    // loopback of the host.
+    let loopback = if net_flag == 0 {
+        crate::linux_loopback::LoopbackControl::Shared
+    } else {
+        // In proxy mode the child makes the listeners of the proxy and of
+        // the DNS server in its namespace (see `linux_proxynet.rs`).
+        let pent = if matches!(config.network, NetworkMode::ProxyOnly { .. }) {
+            let proxy = crate::linux_proxynet::CHILD_PROXY_PORT;
+            vec![
+                crate::linux_proxynet::child_proxy_addr(),
+                std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, proxy)),
+                std::net::SocketAddr::from((
+                    std::net::Ipv4Addr::LOCALHOST,
+                    crate::linux_proxynet::CHILD_DNS_PORT,
+                )),
+            ]
+        } else {
+            Vec::new()
+        };
+        crate::linux_loopback::LoopbackControl::Private {
+            ports: config.localhost.clone(),
+            pent,
+        }
+    };
+    let recorder = if record || enforce || loopback.is_active() {
         let judge = if record {
             Some(match guard {
                 Some(plan) => crate::linux_watch::Judge::Guard {
@@ -3191,7 +3224,11 @@ pub(crate) fn spawn_linux(
             None
         };
         Some(crate::linux_watch::start_recorder(
-            crate::linux_watch::RecorderPlan { judge, unix },
+            crate::linux_watch::RecorderPlan {
+                judge,
+                unix,
+                loopback,
+            },
         )?)
     } else {
         None

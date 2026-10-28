@@ -29,7 +29,15 @@ mod macos {
     use super::common::e2e::{
         have_tools, internet, rules, sandbox_ready, set, stderr, stdout, TestEnv, TestResult,
     };
-    use super::common::macos::have_files;
+    use super::common::macos::{have_files, wait_for_log_line};
+
+    /// The Seatbelt lines of the kernel for an outbound connection, to show
+    /// in the message of a failed assertion. The form of the target of an
+    /// IP connection is not known yet; these lines show it.
+    fn outbound_lines() -> String {
+        wait_for_log_line("2m", "network-outbound", std::time::Duration::from_secs(3))
+            .unwrap_or_else(|e| format!("log show failed: {e}"))
+    }
 
     /// The shell of each test.
     const SH: &str = "/bin/sh";
@@ -217,6 +225,83 @@ mod macos {
             !denied.contains("127.0.0.1"),
             "the loopback request went to the proxy; NO_PROXY must keep it \
              direct:\n{denied}"
+        );
+        Ok(())
+    }
+
+    /// A small HTTP server on the loopback of the host. It answers each
+    /// request with `HELLO`.
+    fn http_server() -> std::io::Result<u16> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut buf = [0u8; 512];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\nHELLO");
+            }
+        });
+        Ok(port)
+    }
+
+    /// A port of the profile on localhost opens, and another port stays
+    /// closed. `pent run --trace` records the closed port, and a default
+    /// watch run reaches the port and records it.
+    ///
+    /// The test also checks two forms that nobody saw on a Mac yet: the rule
+    /// `(remote ip "localhost:<port>")` for one port, and the target of a
+    /// `network-outbound` report for an IP connection, which the log reader
+    /// parses (`loopback_port` in `macos_log.rs`).
+    #[test]
+    fn a_listed_localhost_port_works_and_watch_records_it() -> TestResult {
+        if !ready("listed_localhost_port") {
+            return Ok(());
+        }
+        let open = http_server()?;
+        let closed = http_server()?;
+        let env = TestEnv::new()?;
+        env.install_profile("net", &format!("{NET_PROFILE}localhost = [{open}]\n"))?;
+
+        let out = run(&env, &curl(&format!("http://127.0.0.1:{open}/")))?;
+        assert_eq!(
+            stdout(&out),
+            "200",
+            "the listed port must open\nstderr: {}",
+            stderr(&out)
+        );
+        let mut args = vec!["run".to_string(), "--trace".to_string()];
+        args.extend(["--profile", "net", "--"].map(String::from));
+        args.extend(curl(&format!("http://127.0.0.1:{closed}/")));
+        let out = env.pent(&args.iter().map(String::as_str).collect::<Vec<_>>())?;
+        assert!(
+            !out.status.success(),
+            "the child reached a port that the profile does not list\nstdout: {}",
+            stdout(&out)
+        );
+        let denied = fs::read_to_string(env.denied_log("net")).unwrap_or_default();
+        assert!(
+            denied.contains(&format!("\"port\":{closed}")),
+            "the denied log must hold the closed port:\n{denied}\n{}\n\
+             the Seatbelt lines:\n{}",
+            stderr(&out),
+            outbound_lines()
+        );
+
+        let mut args: Vec<String> = ["watch", "--yes", "--profile", "w", "--"]
+            .map(String::from)
+            .to_vec();
+        args.extend(curl(&format!("http://127.0.0.1:{closed}/")));
+        let out = env.pent(&args.iter().map(String::as_str).collect::<Vec<_>>())?;
+        assert!(
+            stdout(&out).contains("200"),
+            "watch mode must open each port on localhost\nstderr: {}",
+            stderr(&out)
+        );
+        let events = env.watch_events("w");
+        assert!(
+            events.contains(&format!("\"type\":\"localhost_connect\",\"port\":{closed}")),
+            "the watch log must hold the port:\n{events}\nthe Seatbelt lines:\n{}",
+            outbound_lines()
         );
         Ok(())
     }

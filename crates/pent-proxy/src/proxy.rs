@@ -32,6 +32,16 @@
 //! each IP address. The rule for destinations that are not public still
 //! applies. The TLS SNI and the HTTP `Host` header only name the connection.
 //!
+//! # The loopback of the host
+//!
+//! A request for `localhost` (or a name below it) or for a loopback address
+//! asks for a port on the loopback of the host. The proxy connects to such a
+//! port in observe mode, and in enforce mode when the port is in
+//! [`TcpProxyConfig::localhost_ports`]. The allowlist, the DNS cache and the
+//! TLS SNI do not apply to it: the port is the rule. A domain that resolves
+//! to a loopback address does not count, so a rebound name still gets the
+//! rule for destinations that are not public.
+//!
 //! In both policies, the proxy sends one [`WatchEvent::Connect`] for each
 //! connection attempt, if the configuration has an event channel. A domain
 //! that does not resolve gets the outcome `Allowed`, because the policy
@@ -55,7 +65,8 @@ use crate::inspect::{self, Inspect};
 use crate::netaddr::{self, PrivateDestinations};
 use crate::{normalize_hostname, ProxyError, ProxyPolicy, Result, SharedState};
 use pent_profile::{NetProtocol, Outcome, WatchEvent};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::num::NonZeroU16;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -92,6 +103,17 @@ pub struct TcpProxyConfig {
     /// Policy for destinations that are not public addresses.
     /// Default: [`PrivateDestinations::Deny`]
     pub private_destinations: PrivateDestinations,
+
+    /// The TCP ports on the loopback of the host that a client can reach in
+    /// enforce mode. See the module documentation.
+    /// Default: no port
+    pub localhost_ports: Vec<NonZeroU16>,
+
+    /// The ports of the other listeners of pent on the loopback of the host
+    /// (the DNS server). The proxy never connects to them, as it never
+    /// connects to `bind_addr`.
+    /// Default: no port
+    pub own_ports: Vec<u16>,
 }
 
 impl Default for TcpProxyConfig {
@@ -105,8 +127,26 @@ impl Default for TcpProxyConfig {
             max_connections: 1000,
             handshake_timeout: Duration::from_secs(10),
             private_destinations: PrivateDestinations::Deny,
+            localhost_ports: Vec::new(),
+            own_ports: Vec::new(),
         }
     }
+}
+
+/// The answer of the policy for a target on the loopback of the host.
+enum LocalTarget {
+    /// The target is not on the loopback, or the settings decide it (an
+    /// allowlisted `localhost` with `private_destinations = "allow"`). The
+    /// other checks decide.
+    Other,
+    /// The policy opens the port. The proxy connects to these addresses.
+    Open(Vec<SocketAddr>),
+    /// The policy closes the port. The proxy reported the refusal.
+    Refused(ProxyError),
+    /// The target is a listener of pent itself. The proxy reported the
+    /// refusal, and it sends no watch event: no rule can open the port, so
+    /// the summary must not propose it.
+    Own(ProxyError),
 }
 
 /// The hint that each refusal of a destination that is not public
@@ -217,6 +257,11 @@ impl<'a> ConnectRecord<'a> {
             .cloned()
             .or_else(|| self.ip.map(|ip| ip.to_string()))
             .unwrap_or_default()
+    }
+
+    /// Send no event for this attempt.
+    fn discard(&mut self) {
+        self.sent = true;
     }
 
     /// Send the event with `outcome`, if the proxy did not send it before.
@@ -510,7 +555,18 @@ impl TcpProxy {
         } = negotiated;
 
         let mut record = ConnectRecord::new(&self.state, protocol, &target);
-        let candidates = match self.check_target(protocol, &target, &mut record).await {
+        let local = self.local_grant(protocol, &target);
+        let is_local = matches!(local, LocalTarget::Open(_));
+        let checked = match local {
+            LocalTarget::Open(addrs) => Ok(addrs),
+            LocalTarget::Refused(e) => Err(e),
+            LocalTarget::Own(e) => {
+                record.discard();
+                Err(e)
+            }
+            LocalTarget::Other => self.check_target(protocol, &target, &mut record).await,
+        };
+        let candidates = match checked {
             Ok(c) => c,
             Err(e) => {
                 // A name that does not resolve is not a policy decision: the
@@ -540,7 +596,8 @@ impl TcpProxy {
 
         send_success(&mut client, protocol, &destination).await?;
 
-        if let Some(kind) = Inspect::for_port(target.port()) {
+        // A port on the loopback has no name to check: the port is the rule.
+        if let Some(kind) = Inspect::for_port(target.port()).filter(|_| !is_local) {
             initial =
                 inspect::read_initial(&mut client, initial, kind, self.config.handshake_timeout)
                     .await
@@ -568,6 +625,87 @@ impl TcpProxy {
         }
 
         self.relay(client, destination).await
+    }
+
+    /// Decide a target on the loopback of the host.
+    ///
+    /// The target must name the loopback itself: `localhost`, a name below
+    /// it, or a loopback address. The proxy does not resolve the name, so
+    /// the resolver cannot give another address for it.
+    ///
+    /// The proxy never connects to its own listener: a client could chain
+    /// requests through the proxy and use up its connections. In observe
+    /// mode the policy opens each port except the control ports of the
+    /// watch guard ([`pent_profile::CONTROL_PORTS`]); in enforce mode it
+    /// opens the ports of [`TcpProxyConfig::localhost_ports`].
+    fn local_grant(&self, protocol: Protocol, target: &Target) -> LocalTarget {
+        let port = target.port();
+        let addrs = match target {
+            Target::Ip(addr) if pent_profile::is_loopback(addr.ip()) => vec![*addr],
+            Target::Domain { host, .. } if pent_profile::is_localhost_name(host) => vec![
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+                SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port),
+            ],
+            Target::Ip(_) | Target::Domain { .. } => return LocalTarget::Other,
+        };
+        let error = || {
+            let addr = addrs
+                .first()
+                .copied()
+                .unwrap_or_else(|| SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port));
+            ProxyError::NonPublicDestination {
+                addr,
+                reason: "loopback".to_string(),
+            }
+        };
+        let refuse = |why: String| {
+            self.state.report_violation(format!(
+                "network: {protocol} connection to {target} blocked: {why}"
+            ));
+            LocalTarget::Refused(error())
+        };
+        let own = self.config.bind_addr.port();
+        if (own != 0 && port == own) || self.config.own_ports.contains(&port) {
+            self.state.report_violation(format!(
+                "network: {protocol} connection to {target} blocked: the port is a \
+                 listener of pent"
+            ));
+            return LocalTarget::Own(error());
+        }
+        match self.state.policy() {
+            ProxyPolicy::Observe => {
+                if let Some(name) = pent_profile::control_port(port) {
+                    return refuse(format!(
+                        "port {port} on localhost is a control port ({name}), which the \
+                         watch guard blocks"
+                    ));
+                }
+            }
+            ProxyPolicy::Enforce => {
+                let listed = NonZeroU16::new(port)
+                    .is_some_and(|port| self.config.localhost_ports.contains(&port));
+                if !listed {
+                    if self.config.private_destinations == PrivateDestinations::Allow {
+                        // The settings can still permit an allowlisted
+                        // `localhost`, as before the port rules.
+                        return LocalTarget::Other;
+                    }
+                    self.state.report_localhost_closed(
+                        format!(
+                            "network: {protocol} connection to {target} blocked: the address \
+                             is loopback, and port {port} on localhost is not open"
+                        ),
+                        port,
+                    );
+                    return LocalTarget::Refused(error());
+                }
+            }
+        }
+        self.state.report_access(format!(
+            "network: {protocol} connection to {target} allowed: a port on the loopback \
+             of the host"
+        ));
+        LocalTarget::Open(addrs)
     }
 
     /// Check a target against the policy, and return the addresses that the
@@ -2869,6 +3007,9 @@ mod tests {
             out.push(match event {
                 crate::TraceEvent::Access(m) => format!("access {m}"),
                 crate::TraceEvent::Violation(m) => format!("violation {m}"),
+                crate::TraceEvent::LocalhostClosed { message, port } => {
+                    format!("closed {port} {message}")
+                }
             });
         }
         out
@@ -2890,7 +3031,7 @@ mod tests {
         assert!(
             messages
                 .iter()
-                .any(|m| m.starts_with("violation network: SOCKS5")
+                .any(|m| m.starts_with("closed 22 network: SOCKS5")
                     && m.contains("127.0.0.1 port 22")
                     && m.contains("loopback")),
             "{messages:?}"
@@ -3661,8 +3802,31 @@ mod tests {
         handle.abort();
     }
 
+    /// Observe mode keeps the rule for private destinations. The proxy
+    /// refuses the address before it connects, so no server must listen.
     #[tokio::test]
     async fn test_observe_still_denies_private_destination() {
+        let (state, mut rx) = watched_state(&[], ProxyPolicy::Observe);
+        let Some((proxy, handle)) = start_proxy(state, TcpProxyConfig::default()).await else {
+            return;
+        };
+        let dest: SocketAddr = "10.0.0.1:9".parse().unwrap();
+        assert_eq!(
+            socks5_reply_code(proxy, &socks5_ipv4_request(dest)).await,
+            socks5::CONNECTION_NOT_ALLOWED
+        );
+        assert_eq!(
+            next_event(&mut rx).await,
+            connect_event("10.0.0.1", 9, NetProtocol::Socks5, Outcome::Denied)
+        );
+        handle.abort();
+    }
+
+    /// Observe mode lets the program reach each port on the loopback of the
+    /// host, by address and by the name `localhost`, with the default
+    /// settings.
+    #[tokio::test]
+    async fn test_observe_allows_the_loopback_of_the_host() {
         let Some((dest, _server)) = local_destination().await else {
             return;
         };
@@ -3672,7 +3836,7 @@ mod tests {
         };
         assert_eq!(
             socks5_reply_code(proxy, &socks5_ipv4_request(dest)).await,
-            socks5::CONNECTION_NOT_ALLOWED
+            socks5::SUCCEEDED
         );
         assert_eq!(
             next_event(&mut rx).await,
@@ -3680,10 +3844,230 @@ mod tests {
                 "127.0.0.1",
                 dest.port(),
                 NetProtocol::Socks5,
+                Outcome::Allowed
+            )
+        );
+        let request = socks5_domain_request("LocalHost", dest.port());
+        assert_eq!(socks5_reply_code(proxy, &request).await, socks5::SUCCEEDED);
+        assert_eq!(
+            next_event(&mut rx).await,
+            connect_event(
+                "localhost",
+                dest.port(),
+                NetProtocol::Socks5,
+                Outcome::Allowed
+            )
+        );
+        handle.abort();
+    }
+
+    /// Enforce mode lets the program reach a port on the loopback only when
+    /// the port is in the list. The domain allowlist does not need the name
+    /// `localhost`.
+    #[tokio::test]
+    async fn test_enforce_allows_only_the_listed_loopback_ports() {
+        let Some((dest, _server)) = local_destination().await else {
+            return;
+        };
+        let Some(port) = NonZeroU16::new(dest.port()) else {
+            return;
+        };
+        let (state, mut rx) = watched_state(&[], ProxyPolicy::Enforce);
+        let config = TcpProxyConfig {
+            localhost_ports: vec![port],
+            ..Default::default()
+        };
+        let Some((proxy, handle)) = start_proxy(state, config).await else {
+            return;
+        };
+        assert_eq!(
+            socks5_reply_code(proxy, &socks5_ipv4_request(dest)).await,
+            socks5::SUCCEEDED
+        );
+        assert_eq!(
+            next_event(&mut rx).await,
+            connect_event(
+                "127.0.0.1",
+                dest.port(),
+                NetProtocol::Socks5,
+                Outcome::Allowed
+            )
+        );
+        let status = http_connect_status(proxy, &format!("localhost:{}", dest.port())).await;
+        assert!(status.contains("200"), "{status}");
+        assert_eq!(
+            next_event(&mut rx).await,
+            connect_event(
+                "localhost",
+                dest.port(),
+                NetProtocol::HttpConnect,
+                Outcome::Allowed
+            )
+        );
+
+        // Another port on the loopback stays closed.
+        let other = SocketAddr::new(dest.ip(), dest.port().wrapping_add(1).max(1));
+        assert_eq!(
+            socks5_reply_code(proxy, &socks5_ipv4_request(other)).await,
+            socks5::CONNECTION_NOT_ALLOWED
+        );
+        assert_eq!(
+            next_event(&mut rx).await,
+            connect_event(
+                "127.0.0.1",
+                other.port(),
+                NetProtocol::Socks5,
                 Outcome::Denied
             )
         );
         handle.abort();
+    }
+
+    /// A port in the list opens only a target that names the loopback
+    /// itself. A domain that resolves to the loopback (DNS rebinding) and
+    /// the NAT64 form of a loopback address go through the other checks.
+    #[test]
+    fn test_only_a_loopback_name_or_address_gets_the_port_rule() {
+        let port = NonZeroU16::MIN.saturating_add(5431);
+        let (state, _rx) = watched_state(&["rebound.example"], ProxyPolicy::Enforce);
+        let config = TcpProxyConfig {
+            localhost_ports: vec![port],
+            ..Default::default()
+        };
+        let proxy = TcpProxy::new(config, state).unwrap();
+        let domain = |host: &str, port: u16| Target::Domain {
+            host: host.to_string(),
+            port,
+        };
+        let ip = |text: &str| Target::Ip(text.parse().unwrap());
+        let open = |proxy: &TcpProxy, target: &Target| {
+            matches!(
+                proxy.local_grant(Protocol::Socks5, target),
+                LocalTarget::Open(_)
+            )
+        };
+        let other = |proxy: &TcpProxy, target: &Target| {
+            matches!(
+                proxy.local_grant(Protocol::Socks5, target),
+                LocalTarget::Other
+            )
+        };
+        let refused = |proxy: &TcpProxy, target: &Target| {
+            matches!(
+                proxy.local_grant(Protocol::Socks5, target),
+                LocalTarget::Refused(_)
+            )
+        };
+        for target in [
+            domain("localhost", 5432),
+            domain("LOCALHOST.", 5432),
+            domain("api.localhost", 5432),
+            ip("127.0.0.1:5432"),
+            ip("127.1.2.3:5432"),
+            ip("[::1]:5432"),
+            ip("[::ffff:127.0.0.1]:5432"),
+        ] {
+            assert!(open(&proxy, &target), "{target}");
+        }
+        // Not the loopback: the other checks decide.
+        for target in [
+            domain("rebound.example", 5432),
+            domain("localhost.example", 5432),
+            ip("10.0.0.1:5432"),
+            ip("[64:ff9b::7f00:1]:5432"),
+        ] {
+            assert!(other(&proxy, &target), "{target}");
+        }
+        // The loopback, but a port that the list does not have.
+        for target in [domain("localhost", 5433), ip("127.0.0.1:5433")] {
+            assert!(refused(&proxy, &target), "{target}");
+        }
+
+        // With `private_destinations = "allow"`, the settings still decide
+        // a port that the list does not have, as before the port rules.
+        let (state, _rx) = watched_state(&["localhost"], ProxyPolicy::Enforce);
+        let allow = TcpProxy::new(private_allowed(), state).unwrap();
+        assert!(other(&allow, &domain("localhost", 5433)));
+    }
+
+    /// The proxy never connects to its own listener, also when the policy
+    /// opens each port. In observe mode it refuses the control ports of the
+    /// watch guard and opens the other ports.
+    #[test]
+    fn test_observe_opens_each_port_but_its_own_and_the_control_ports() {
+        let (state, _rx) = watched_state(&[], ProxyPolicy::Observe);
+        let config = TcpProxyConfig {
+            bind_addr: "127.0.0.1:4321".parse().unwrap(),
+            own_ports: vec![5353],
+            ..Default::default()
+        };
+        let proxy = TcpProxy::new(config, state).unwrap();
+        let at = |port: u16| Target::Ip(SocketAddr::from(([127, 0, 0, 1], port)));
+        // The listener of the proxy and the DNS server of pent.
+        for port in [4321, 5353] {
+            assert!(
+                matches!(
+                    proxy.local_grant(Protocol::Socks5, &at(port)),
+                    LocalTarget::Own(_)
+                ),
+                "{port}"
+            );
+        }
+        for port in [2375, 2376, 9222, 9229] {
+            assert!(
+                matches!(
+                    proxy.local_grant(Protocol::Socks5, &at(port)),
+                    LocalTarget::Refused(_)
+                ),
+                "{port}"
+            );
+        }
+        assert!(matches!(
+            proxy.local_grant(Protocol::Socks5, &at(5432)),
+            LocalTarget::Open(_)
+        ));
+    }
+
+    /// A request for a listener of pent gives no watch event: no rule can
+    /// open such a port, so the summary must not propose it.
+    #[tokio::test]
+    async fn test_a_request_for_a_listener_of_pent_gives_no_event() {
+        let (state, mut rx) = watched_state(&[], ProxyPolicy::Observe);
+        let config = TcpProxyConfig {
+            own_ports: vec![9],
+            ..Default::default()
+        };
+        let Some((proxy, handle)) = start_proxy(state, config).await else {
+            return;
+        };
+        let own: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        assert_eq!(
+            socks5_reply_code(proxy, &socks5_ipv4_request(own)).await,
+            socks5::CONNECTION_NOT_ALLOWED
+        );
+        let event = tokio::time::timeout(Duration::from_millis(300), rx.recv()).await;
+        assert!(event.is_err(), "the proxy sent an event: {event:?}");
+        handle.abort();
+    }
+
+    /// The refusal of a closed port carries the port in a typed event, so
+    /// that `pent run` can give the right fix.
+    #[test]
+    fn test_a_closed_port_carries_the_port() {
+        let (state, mut rx) = traced_state(&[]);
+        let proxy = TcpProxy::new(TcpProxyConfig::default(), state).unwrap();
+        let target = Target::Ip(SocketAddr::from(([127, 0, 0, 1], 5432)));
+        assert!(matches!(
+            proxy.local_grant(Protocol::Socks5, &target),
+            LocalTarget::Refused(_)
+        ));
+        let messages = drain(&mut rx);
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.starts_with("closed 5432 ") && m.contains("not open")),
+            "{messages:?}"
+        );
     }
 
     #[tokio::test]
@@ -3726,7 +4110,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_ip_path_event_uses_cache_domain_or_ip() {
+    async fn test_ip_path_event_names_a_loopback_address() {
         let Some((dest, _server)) = local_destination().await else {
             return;
         };
@@ -3750,7 +4134,10 @@ mod tests {
             )
         );
 
-        // A cache entry: the event names the domain.
+        // A cache entry for a loopback address: the event still names the
+        // address. The port rule of the loopback applies to it, not the
+        // domain. `test_enforce_ip_path_denied_event_uses_cache_domain`
+        // checks the name from the cache.
         cache(&state, "api.example", dest.ip());
         assert_eq!(
             socks5_reply_code(proxy, &socks5_ipv4_request(dest)).await,
@@ -3759,7 +4146,7 @@ mod tests {
         assert_eq!(
             next_event(&mut rx).await,
             connect_event(
-                "api.example",
+                "127.0.0.1",
                 dest.port(),
                 NetProtocol::Socks5,
                 Outcome::Allowed
@@ -3770,9 +4157,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_enforce_ip_path_denied_event_uses_cache_domain() {
-        let Some((dest, _server)) = local_destination().await else {
-            return;
-        };
+        // A private address: the proxy refuses it before it connects, so no
+        // server must listen. A loopback address would get the port rule of
+        // the loopback, and its event names the address.
+        let dest: SocketAddr = "10.0.0.1:9".parse().unwrap();
         let (state, mut rx) = watched_state(&[], ProxyPolicy::Enforce);
         cache(&state, "test.local", dest.ip());
         let Some((proxy, handle)) = start_proxy(state, TcpProxyConfig::default()).await else {

@@ -7,9 +7,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::net::IpAddr;
+use std::num::NonZeroU16;
 use std::path::{Component, Path, PathBuf};
 
 use crate::guard::{classify, guard_rules, GuardAccess, GuardRule, GuardTarget};
+use crate::localhost::{control_port, is_localhost_name, is_loopback};
 use crate::psl;
 use crate::{FsOp, GuardClass, Outcome, ProfileDoc, WatchEvent};
 
@@ -87,6 +89,12 @@ pub enum Grant {
     /// agent can use the key of that agent. The review does not select such
     /// an item by default.
     UnixSocket(String),
+    /// A TCP port on the loopback of the host that the program can connect
+    /// to.
+    ///
+    /// This rule is a strong grant: a service on the loopback often has no
+    /// authentication. The review does not select such an item by default.
+    Localhost(NonZeroU16),
 }
 
 /// A note that the summary shows next to an item.
@@ -129,6 +137,8 @@ pub enum Section {
     UnixSockets,
     /// Domains.
     Network,
+    /// Ports on the loopback of the host.
+    Localhost,
     /// Accesses that the watch guard blocked.
     Blocked,
 }
@@ -137,11 +147,12 @@ impl Section {
     /// Return true if the review selects the items of this section by
     /// default.
     ///
-    /// A blocked access and a Unix socket are strong grants, so the user
-    /// must select them. The default of these two sections is `[n]`.
+    /// A blocked access, a Unix socket and a port on the loopback are strong
+    /// grants, so the user must select them. The default of these three
+    /// sections is `[n]`.
     #[must_use]
     pub const fn selects_by_default(self) -> bool {
-        !matches!(self, Self::Blocked | Self::UnixSockets)
+        !matches!(self, Self::Blocked | Self::UnixSockets | Self::Localhost)
     }
 }
 
@@ -160,6 +171,7 @@ impl Item {
             },
             Grant::Domain(_) => Section::Network,
             Grant::UnixSocket(_) => Section::UnixSockets,
+            Grant::Localhost(_) => Section::Localhost,
         }
     }
 }
@@ -236,6 +248,12 @@ impl Summary {
                 }
                 Grant::Domain(d) => (&mut doc.network.domains, d),
                 Grant::UnixSocket(s) => (&mut doc.filesystem.unix_sockets, s),
+                Grant::Localhost(port) => {
+                    if !doc.network.localhost.contains(port) {
+                        doc.network.localhost.push(*port);
+                    }
+                    continue;
+                }
             };
             if !list.0.contains(list.1) {
                 list.0.push(list.1.clone());
@@ -279,8 +297,11 @@ impl Summary {
 ///   [`Grant::UnixSocket`]. An abstract address (`@name`) and a relative
 ///   path give no item: a rule cannot name them. The summary lists them in
 ///   [`Stats::unreachable_sockets`].
-/// - Connections to an IP address give no item. The summary lists them in
-///   [`Stats::ip_hosts`].
+/// - A connection to a port on the loopback of the host gives one item with
+///   [`Grant::Localhost`] for each port. A proxy connection to `localhost` or
+///   to a loopback address counts as such a connection.
+/// - Connections to another IP address give no item. The summary lists them
+///   in [`Stats::ip_hosts`].
 #[must_use]
 pub fn summarize<'a, I>(events: I, ctx: &SummaryContext) -> Summary
 where
@@ -293,6 +314,7 @@ where
     let mut net = NetLog::default();
     let mut unix = UnixLog::default();
     let mut ips = Names::default();
+    let mut local = LocalLog::default();
 
     for event in events {
         match event {
@@ -344,11 +366,18 @@ where
                 stats.net_events = stats.net_events.saturating_add(1);
                 net.add(name, None);
             }
+            WatchEvent::LocalhostConnect { port, process, .. } => {
+                stats.net_events = stats.net_events.saturating_add(1);
+                add_name(&mut stats.processes, &process.name);
+                local.add(*port, &process.name);
+            }
             WatchEvent::Connect { host, port, .. } => {
                 stats.net_events = stats.net_events.saturating_add(1);
                 match parse_ip(host) {
+                    Some(ip) if is_loopback(ip) => local.add(*port, ""),
                     Some(IpAddr::V4(ip)) => ips.add(&format!("{ip}:{port}")),
                     Some(IpAddr::V6(ip)) => ips.add(&format!("[{ip}]:{port}")),
+                    None if is_localhost_name(host) => local.add(*port, ""),
                     None => net.add(host, Some(*port)),
                 }
             }
@@ -369,16 +398,17 @@ where
         .iter()
         .filter_map(|item| match &item.grant {
             Grant::Fs { path, .. } => Some(path.as_str()),
-            Grant::Domain(_) | Grant::UnixSocket(_) => None,
+            Grant::Domain(_) | Grant::UnixSocket(_) | Grant::Localhost(_) => None,
         })
         .collect();
     items.retain(|item| match &item.grant {
         Grant::Fs { path, .. } => !guarded.iter().any(|g| covers_path(path, g)),
-        Grant::Domain(_) | Grant::UnixSocket(_) => true,
+        Grant::Domain(_) | Grant::UnixSocket(_) | Grant::Localhost(_) => true,
     });
     items.extend(blocked_items);
     items.extend(net.items());
     items.extend(unix.items());
+    items.extend(local.items());
     if let Some(existing) = &ctx.existing {
         items.retain(|item| !doc_covers(existing, &item.grant, &env));
     }
@@ -1184,6 +1214,48 @@ fn port_reason(ports: &BTreeSet<u16>) -> String {
     list_names(&parts)
 }
 
+// ── Localhost ────────────────────────────────────────────────────────────────
+
+/// The connections to the loopback of the host that the summary keeps.
+#[derive(Default)]
+struct LocalLog {
+    /// The processes of each port.
+    ports: BTreeMap<NonZeroU16, Names>,
+}
+
+impl LocalLog {
+    /// Add one connection. A connection to port 0 cannot succeed, so it
+    /// gives no rule.
+    fn add(&mut self, port: u16, process: &str) {
+        if let Some(port) = NonZeroU16::new(port) {
+            self.ports.entry(port).or_default().add(process);
+        }
+    }
+
+    /// One item for each port. A control port goes to the blocked section,
+    /// also when the guard did not block it (a denial of `pent run`), as a
+    /// guarded path does.
+    fn items(&self) -> Vec<Item> {
+        self.ports
+            .iter()
+            .map(|(port, processes)| {
+                let known = control_port(port.get());
+                let reason = match known {
+                    Some(name) => name.to_string(),
+                    None if processes.0.is_empty() => "TCP port".to_string(),
+                    None => format!("used by {}", list_names(&processes.0)),
+                };
+                Item {
+                    grant: Grant::Localhost(*port),
+                    reason,
+                    blocked: known.map(|_| GuardClass::ControlPort),
+                    notes: Vec::new(),
+                }
+            })
+            .collect()
+    }
+}
+
 // ── Unix sockets ─────────────────────────────────────────────────────────────
 
 /// Return the name of a common Unix socket, or `None` for a socket that
@@ -1302,18 +1374,22 @@ fn doc_covers(doc: &ProfileDoc, grant: &Grant, env: &Env) -> bool {
             .unix_sockets
             .iter()
             .any(|rule| env.rule_form(rule) == Path::new(path)),
+        Grant::Localhost(port) => doc.network.localhost.contains(port),
     }
 }
 
-/// The sort key of an item: the section, then the path or the domain. A
-/// wildcard sorts next to its domain.
-fn sort_key(item: &Item) -> (Section, &str, bool) {
+/// The sort key of an item: the section, then the port, the path or the
+/// domain. A wildcard sorts next to its domain.
+fn sort_key(item: &Item) -> (Section, u16, &str, bool) {
     match &item.grant {
-        Grant::Fs { path, .. } | Grant::UnixSocket(path) => (item.section(), path.as_str(), false),
+        Grant::Fs { path, .. } | Grant::UnixSocket(path) => {
+            (item.section(), 0, path.as_str(), false)
+        }
         Grant::Domain(domain) => match domain.strip_prefix("*.") {
-            Some(base) => (item.section(), base, true),
-            None => (item.section(), domain.as_str(), false),
+            Some(base) => (item.section(), 0, base, true),
+            None => (item.section(), 0, domain.as_str(), false),
         },
+        Grant::Localhost(port) => (item.section(), port.get(), "", false),
     }
 }
 
@@ -1335,6 +1411,7 @@ mod tests {
                     Section::Execute => "x",
                     Section::UnixSockets => "unix",
                     Section::Network => "net",
+                    Section::Localhost => "local",
                     Section::Blocked => "blocked",
                 };
                 let rule = match &item.grant {
@@ -1343,6 +1420,7 @@ mod tests {
                     }
                     Grant::Fs { path, .. } | Grant::UnixSocket(path) => path.clone(),
                     Grant::Domain(d) => d.clone(),
+                    Grant::Localhost(port) => port.to_string(),
                 };
                 let mut line = format!("{section} {rule} | {}", item.reason);
                 if let Some(class) = item.blocked {
@@ -1841,11 +1919,92 @@ mod tests {
             vec![
                 "net example.com | DNS lookup only",
                 "net ssh.example.org | HTTPS, HTTP, port 22",
+                "local 8080 | TCP port",
             ]
         );
+        assert_eq!(summary.stats.ip_hosts, vec!["[2001:db8::1]:443"]);
+    }
+
+    fn local(port: u16, process: &str, outcome: Outcome) -> WatchEvent {
+        WatchEvent::LocalhostConnect {
+            port,
+            process: crate::ProcessInfo {
+                pid: 1,
+                name: process.to_string(),
+            },
+            outcome,
+        }
+    }
+
+    /// Each port on the loopback gives one rule, with the processes that
+    /// used it. A proxy request for `localhost` or for a loopback address
+    /// counts as a connection to the loopback.
+    #[test]
+    fn loopback_connections_give_one_rule_for_each_port() {
+        let events = [
+            local(5432, "psql", Outcome::Allowed),
+            local(5432, "node", Outcome::Allowed),
+            local(11434, "ollama", Outcome::Denied),
+            local(0, "x", Outcome::Allowed),
+            connect("localhost", 3000),
+            connect("api.localhost", 3000),
+            connect("127.0.0.2", 8000),
+            connect("[::ffff:127.0.0.1]", 8001),
+        ];
+        let summary = summarize(&events, &ctx());
         assert_eq!(
-            summary.stats.ip_hosts,
-            vec!["[::1]:8080", "[2001:db8::1]:443"]
+            lines(&summary),
+            vec![
+                "local 3000 | TCP port",
+                "local 5432 | used by psql, node",
+                "local 8000 | TCP port",
+                "local 8001 | TCP port",
+                "local 11434 | used by ollama",
+            ]
+        );
+        assert!(summary.stats.ip_hosts.is_empty());
+        assert_eq!(summary.stats.processes, vec!["psql", "node", "ollama", "x"]);
+    }
+
+    /// A control port runs code on the host. The summary names the service
+    /// and puts the port in the blocked section, which the review does not
+    /// select by default.
+    #[test]
+    fn a_control_port_goes_to_the_blocked_section() {
+        let events = [
+            local(2375, "docker", Outcome::Allowed),
+            local(9222, "node", Outcome::Allowed),
+        ];
+        assert_eq!(
+            run(&events),
+            vec![
+                "blocked 2375 | Docker API (ControlPort)",
+                "blocked 9222 | browser debug port (ControlPort)",
+            ]
+        );
+    }
+
+    /// A port rule is a strong grant: the review does not select it by
+    /// default. The profile keeps the port, and an existing rule hides it.
+    #[test]
+    fn a_port_rule_goes_into_the_profile_and_an_existing_rule_hides_it() {
+        assert!(!Section::Localhost.selects_by_default());
+        let events = [
+            local(5432, "psql", Outcome::Allowed),
+            local(6379, "redis", Outcome::Allowed),
+        ];
+        let summary = summarize(&events, &ctx());
+        let doc = summary.to_doc(&[0, 1, 1]);
+        let ports: Vec<u16> = doc.network.localhost.iter().map(|p| p.get()).collect();
+        assert_eq!(ports, vec![5432, 6379]);
+
+        let mut c = ctx();
+        let mut existing = ProfileDoc::default();
+        existing.network.localhost = doc.network.localhost.get(..1).unwrap_or_default().to_vec();
+        c.existing = Some(existing);
+        assert_eq!(
+            lines(&summarize(&events, &c)),
+            vec!["local 6379 | used by redis"]
         );
     }
 
