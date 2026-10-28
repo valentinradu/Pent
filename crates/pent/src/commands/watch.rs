@@ -110,6 +110,12 @@ pub(crate) async fn watch(args: WatchArgs, cwd: PathBuf) -> Result<(), CliError>
     let name = selected.name;
     let net = watch_network(args.network, &args.allow);
 
+    // One watch run of a profile at a time: two runs would delete and read
+    // each other's logs. A second run stops here, before the banner
+    // question. The lock holds until the draft is written.
+    let store = ProfileStore::open_default()?;
+    let _lock = store.lock_watch(&name)?;
+
     // ── Banner ───────────────────────────────────────────────────────────────
     if args.yes {
         eprint!("{}", banner(name.as_str(), net.policy));
@@ -138,7 +144,6 @@ pub(crate) async fn watch(args: WatchArgs, cwd: PathBuf) -> Result<(), CliError>
         ui::warn(warning);
     }
 
-    let store = ProfileStore::open_default()?;
     let settings = ConfigLoader::load(&cwd, pent_settings::PentDirs::from_env().as_ref())?;
     let home = home_dir()?;
     let mode = if args.append {

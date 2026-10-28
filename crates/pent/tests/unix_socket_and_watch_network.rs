@@ -47,6 +47,18 @@ impl Env {
     }
 
     fn pent(&self, args: &[&str]) -> std::io::Result<Output> {
+        self.command(args).output()
+    }
+
+    /// Start pent with `args` and do not wait for it.
+    fn spawn(&self, args: &[&str]) -> std::io::Result<std::process::Child> {
+        self.command(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+    }
+
+    fn command(&self, args: &[&str]) -> Command {
         let mut cmd = Command::new(PENT);
         cmd.args(args)
             .current_dir(&self.workspace)
@@ -69,7 +81,7 @@ impl Env {
                 Ok(())
             });
         }
-        cmd.output()
+        cmd
     }
 
     fn draft_path(&self, name: &str) -> PathBuf {
@@ -278,6 +290,61 @@ fn watch_with_allow_records_a_refused_domain() -> TestResult {
             "a review without a terminal must not accept a socket\n{text}\n{err}"
         );
     }
+    Ok(())
+}
+
+/// Two watch runs of one profile at the same time would delete and read
+/// each other's logs and write the same draft. A second run stops at once
+/// with a clear message, and the first run ends as usual.
+#[test]
+fn a_second_watch_of_the_same_profile_stops_at_once() -> TestResult {
+    let env = Env::new()?;
+    let first = env.spawn(&["watch", "--yes", "--profile", "busy", "--", "sleep", "4"])?;
+    // Wait until the first run holds the lock: the lock file names it.
+    let lock = env.state.join("pent/watch/busy.lock");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while fs::read_to_string(&lock)
+        .unwrap_or_default()
+        .trim()
+        .is_empty()
+    {
+        if std::time::Instant::now() > deadline {
+            return Err("the first run never took the lock".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    let started = std::time::Instant::now();
+    let second = env.pent(&["watch", "--yes", "--profile", "busy", "--", "true"])?;
+    let err = stderr(&second);
+    assert!(!second.status.success(), "the second run must fail:\n{err}");
+    assert!(
+        err.contains("another pent watch of \"busy\" runs now")
+            && err.contains(&format!("(pid {})", first.id())),
+        "the message must name the first run:\n{err}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(3),
+        "the second run must not wait for the first one"
+    );
+    assert!(
+        !err.contains("Watch mode does not sandbox"),
+        "the second run must stop before the banner:\n{err}"
+    );
+
+    let first = first.wait_with_output()?;
+    if recorder_missing(&first) {
+        return Ok(());
+    }
+    assert!(
+        first.status.success(),
+        "the first run must end as usual:\n{}",
+        stderr(&first)
+    );
+    assert!(
+        env.draft_path("busy").exists(),
+        "the first run wrote no draft"
+    );
     Ok(())
 }
 

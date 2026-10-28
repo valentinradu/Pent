@@ -26,7 +26,7 @@ The commands and the results are the same on Linux and on macOS.
 
 | Command | Description |
 |---|---|
-| `pent watch [--profile NAME] [--append] [--yes] [--allow D] [--network M] -- CMD...` | Record a run. `--append` merges the new run into the current draft. `--yes` skips the banner question (for scripts). `--allow` and `--network` have the meaning and the precedence of `pent run`; without them the network is open. |
+| `pent watch [--profile NAME] [--append] [--yes] [--allow D] [--network M] -- CMD...` | Record a run. `--append` merges the new run into the current draft. One run of a profile at a time: a second run stops at once (`ProfileStore::lock_watch`, a lock on `~/.local/state/pent/watch/<name>.lock`). `--yes` skips the banner question (for scripts). `--allow` and `--network` have the meaning and the precedence of `pent run`; without them the network is open. |
 | `pent trust NAME [--yes]` | Show the draft of NAME, ask, then move it to the store and record its hash. |
 | `pent trust NAME --review` | Review the accesses that `pent run` denied since the last trust, then update the draft. |
 | `pent untrust NAME` | Remove the trust of the profile. |
