@@ -29,7 +29,7 @@ mod trust;
 pub use loader::ConfigLoader;
 pub use store::{
     open_log_nofollow, EventLog, LoadedProfile, LogOpen, PentDirs, ProfileEntry, ProfileStatus,
-    ProfileStore, StoreError, WatchRunMode,
+    ProfileStore, StoreError, WatchLock, WatchRunMode,
 };
 pub use trust::{TrustError, TrustStatus, TrustStore};
 

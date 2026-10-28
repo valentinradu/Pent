@@ -26,7 +26,7 @@ The commands and the results are the same on Linux and on macOS.
 
 | Command | Description |
 |---|---|
-| `pent watch [--profile NAME] [--append] [--yes] [--allow D] [--network M] -- CMD...` | Record a run. `--append` merges the new run into the current draft. `--yes` skips the banner question (for scripts). `--allow` and `--network` have the meaning and the precedence of `pent run`; without them the network is open. |
+| `pent watch [--profile NAME] [--append] [--yes] [--allow D] [--network M] -- CMD...` | Record a run. `--append` merges the new run into the current draft. One run of a profile at a time: a second run stops at once (`ProfileStore::lock_watch`, a lock on `~/.local/state/pent/watch/<name>.lock`). `--yes` skips the banner question (for scripts). `--allow` and `--network` have the meaning and the precedence of `pent run`; without them the network is open. |
 | `pent trust NAME [--yes]` | Show the draft of NAME, ask, then move it to the store and record its hash. |
 | `pent trust NAME --review` | Review the accesses that `pent run` denied since the last trust, then update the draft. |
 | `pent untrust NAME` | Remove the trust of the profile. |
@@ -94,12 +94,13 @@ pent watch: claude
   Watch mode does not sandbox the program. It records what the program does.
   The program can read and change your files and use the network.
   The network is open in this run. The ports on localhost are open too. Use --allow DOMAIN or --network blocked to close them.
+  Pent does not record what a program behind a port on localhost does for the command.
   Pent blocks only the most dangerous accesses (credentials, persistence).
   If you do not trust this binary, run it in a VM or a container.
 Continue? [y/N]
 ```
 
-The third line appears only when the proxy observes. With `--allow` or
+The third and the fourth line appear only when the proxy observes. With `--allow` or
 `--network`, the proxy enforces the allowlist and the ports on localhost
 close, so the line goes away.
 
@@ -249,6 +250,15 @@ Localhost rules:
    the guard", also when `pent run` denied it.
 3. The rule is strong, as a Unix socket is. The review does not select
    such an item by default (`[n]`).
+4. A port that the command reached gets the note "a program outside the
+   recording serves it", and the summary and the draft get the warning
+   line "the command reached N ports on localhost; pent does not record
+   what the programs behind them do". A program can give its work to a
+   service on the host: the interface of `opencode` connects to the
+   `opencode serve --service` that runs outside pent, so the files and the
+   tools of the session never reach the recording. With such a port in a
+   profile, `pent run` lets the sandboxed command drive a program with all
+   the rights of the user.
 
 Unix socket rules:
 

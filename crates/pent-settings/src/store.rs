@@ -77,6 +77,30 @@ pub enum StoreError {
     /// trust.
     #[error("no draft and no profile for \"{0}\"")]
     NothingToTrust(ProfileName),
+
+    /// Another `pent watch` of the same profile runs now. Two runs would
+    /// delete and read each other's logs and write the same draft.
+    #[error(
+        "another pent watch of \"{name}\" runs now{}; wait until it ends, \
+         or record under another name with --profile",
+        pid.map(|p| format!(" (pid {p})")).unwrap_or_default()
+    )]
+    WatchBusy {
+        /// The profile.
+        name: ProfileName,
+        /// The process that holds the lock, when the lock file names it.
+        pid: Option<u32>,
+    },
+}
+
+/// The lock on the watch runs of one profile. See
+/// [`ProfileStore::lock_watch`].
+///
+/// The lock ends when the value drops, and the kernel ends it when the
+/// process ends, also after a crash.
+#[derive(Debug)]
+pub struct WatchLock {
+    _file: std::fs::File,
 }
 
 /// The pent directories.
@@ -297,6 +321,74 @@ impl ProfileStore {
     #[must_use]
     pub fn watch_dir(&self, name: &ProfileName) -> PathBuf {
         self.dirs.state.join("watch").join(name.as_str())
+    }
+
+    /// The lock file of the watch runs of `name`, next to the directory of
+    /// the logs. `pent profile rm` deletes that directory, so the lock file
+    /// is outside it.
+    #[must_use]
+    pub fn watch_lock_path(&self, name: &ProfileName) -> PathBuf {
+        self.dirs
+            .state
+            .join("watch")
+            .join(format!("{}.lock", name.as_str()))
+    }
+
+    /// Take the lock on the watch runs of `name`. Hold it for the whole run,
+    /// until the draft is written.
+    ///
+    /// A run without `--append` deletes the logs of the earlier runs, and
+    /// each run reads all logs and writes the draft at its end. Two runs of
+    /// one profile at the same time would thus delete and read each other's
+    /// logs. The lock does not wait: a second run stops at once.
+    ///
+    /// The lock file holds the PID of the run that holds the lock, for the
+    /// message of a second run. The open uses `O_NOFOLLOW`.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::WatchBusy`] when another run holds the lock,
+    /// and `StoreError::Io` when the lock file cannot be opened or written.
+    pub fn lock_watch(&self, name: &ProfileName) -> Result<WatchLock, StoreError> {
+        use std::io::{Read as _, Seek as _};
+        let path = self.watch_lock_path(name);
+        if let Some(dir) = path.parent() {
+            create_private_dir(dir)?;
+        }
+        let io = |source| StoreError::Io {
+            path: path.clone(),
+            source,
+        };
+        let mut options = std::fs::OpenOptions::new();
+        // No truncation before the lock: the file names the holder.
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut file = options.open(&path).map_err(io)?;
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
+                let mut text = String::new();
+                // The PID is only for the message; an unreadable file gives
+                // the message without it.
+                let pid = file
+                    .read_to_string(&mut text)
+                    .ok()
+                    .and_then(|_| text.trim().parse().ok());
+                return Err(StoreError::WatchBusy {
+                    name: name.clone(),
+                    pid,
+                });
+            }
+            Err(std::fs::TryLockError::Error(source)) => return Err(io(source)),
+        }
+        file.set_len(0).map_err(io)?;
+        file.rewind().map_err(io)?;
+        file.write_all(std::process::id().to_string().as_bytes())
+            .map_err(io)?;
+        Ok(WatchLock { _file: file })
     }
 
     /// The log of the accesses that `pent run` denied for `name`.
@@ -859,6 +951,67 @@ mod tests {
             },
             outcome,
         }
+    }
+
+    /// One watch run of a profile at a time. A second lock fails at once
+    /// and names the holder; the lock of another profile works; the lock
+    /// is free again when the first one drops.
+    #[test]
+    fn a_second_watch_of_a_profile_is_refused() {
+        let f = fixture();
+        let first = f.store.lock_watch(&name("claude"));
+        assert!(first.is_ok(), "{first:?}");
+        let second = f.store.lock_watch(&name("claude"));
+        assert!(
+            matches!(
+                &second,
+                Err(StoreError::WatchBusy { name: n, pid })
+                    if *n == name("claude") && *pid == Some(std::process::id())
+            ),
+            "the second lock must fail and name this process: {second:?}"
+        );
+        let message = StoreError::WatchBusy {
+            name: name("claude"),
+            pid: Some(42),
+        }
+        .to_string();
+        assert!(
+            message.contains("(pid 42)") && message.contains("--profile"),
+            "{message}"
+        );
+        assert!(f.store.lock_watch(&name("other")).is_ok());
+        drop(first);
+        assert!(f.store.lock_watch(&name("claude")).is_ok());
+        // `pent profile rm` deletes the log directory; the lock file is not
+        // in it.
+        assert!(!f
+            .store
+            .watch_lock_path(&name("claude"))
+            .starts_with(f.store.watch_dir(&name("claude"))));
+    }
+
+    /// The lock file is private, and a symbolic link at its path makes the
+    /// lock fail: pent never writes through such a link.
+    #[cfg(unix)]
+    #[test]
+    fn the_watch_lock_file_is_private_and_does_not_follow_links() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let f = fixture();
+        let lock = f.store.lock_watch(&name("claude"));
+        assert!(lock.is_ok(), "{lock:?}");
+        let path = f.store.watch_lock_path(&name("claude"));
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        let target = f._root.path().join("target");
+        std::fs::write(&target, "keep").unwrap();
+        let link = f.store.watch_lock_path(&name("linked"));
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(matches!(
+            f.store.lock_watch(&name("linked")),
+            Err(StoreError::Io { .. })
+        ));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep");
     }
 
     #[test]

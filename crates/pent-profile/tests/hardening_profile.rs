@@ -464,6 +464,7 @@ fn p2_render_draft_with_arbitrary_rules_round_trips() -> TestResult {
         outside_home: 2,
         other_repository: 1,
         refused_unix_sockets: 3,
+        localhost_ports: 1,
     };
     let profile = name("tool")?;
     for source in [DraftSource::WatchRuns(3), DraftSource::DeniedReview] {

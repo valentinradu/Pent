@@ -233,7 +233,7 @@ The same facts are comments in the first lines of the draft.
 
 ### The network of a watch run
 
-A watch run must learn which domains the program needs, so the network is open by default: the proxy observes each request and allows each domain. The ports on the loopback of the host are open too, and each connection to one becomes an item in the `Localhost ports` section. A hostile program can then send out everything that it reads.
+A watch run must learn which domains the program needs, so the network is open by default: the proxy observes each request and allows each domain. The ports on the loopback of the host are open too, and each connection to one becomes an item in the `Localhost ports` section. A program behind such a port runs outside the recording, so pent does not see what it does for the command: the interface of `opencode`, for example, gives its work to the `opencode` service on your host. The banner, the summary and the item say so. A hostile program can then send out everything that it reads.
 
 To close the network, use the same two flags as in `pent run`. The proxy then enforces the allowlist, and each refused request becomes an item of the summary:
 
@@ -390,7 +390,7 @@ A program can also connect to an abstract address (`@name`). A rule cannot name 
 
 On Linux the program has its own loopback. A server that the program starts itself works with no rule, and pent connects each listed port to the host. In the `blocked` network mode the program has no loopback of its own, so only the listed ports of the host work. On macOS the loopback of the program is the loopback of the host, so a server that the program starts itself also needs its port in the list.
 
-To record more accesses into the same draft, run `pent watch --append -- claude`. Each run adds to the draft.
+To record more accesses into the same draft, run `pent watch --append -- claude`. Each run adds to the draft. Without `--append`, a new run starts a new draft. Pent records one watch run of a profile at a time: a second run of the same profile stops at once with an error, before it asks anything.
 
 ### Trust
 

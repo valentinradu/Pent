@@ -106,6 +106,10 @@ pub enum ItemNote {
     OutsideHome,
     /// The path is in another directory that looks like a source repository.
     OtherRepository,
+    /// The command reached a program on the host through this port on
+    /// localhost. That program runs outside the recording: pent does not
+    /// record what it does for the command.
+    ServedOutside,
 }
 
 /// One proposed rule.
@@ -366,18 +370,28 @@ where
                 stats.net_events = stats.net_events.saturating_add(1);
                 net.add(name, None);
             }
-            WatchEvent::LocalhostConnect { port, process, .. } => {
+            WatchEvent::LocalhostConnect {
+                port,
+                process,
+                outcome,
+            } => {
                 stats.net_events = stats.net_events.saturating_add(1);
                 add_name(&mut stats.processes, &process.name);
-                local.add(*port, &process.name);
+                local.add(*port, &process.name, *outcome == Outcome::Allowed);
             }
-            WatchEvent::Connect { host, port, .. } => {
+            WatchEvent::Connect {
+                host,
+                port,
+                outcome,
+                ..
+            } => {
                 stats.net_events = stats.net_events.saturating_add(1);
+                let reached = *outcome == Outcome::Allowed;
                 match parse_ip(host) {
-                    Some(ip) if is_loopback(ip) => local.add(*port, ""),
+                    Some(ip) if is_loopback(ip) => local.add(*port, "", reached),
                     Some(IpAddr::V4(ip)) => ips.add(&format!("{ip}:{port}")),
                     Some(IpAddr::V6(ip)) => ips.add(&format!("[{ip}]:{port}")),
-                    None if is_localhost_name(host) => local.add(*port, ""),
+                    None if is_localhost_name(host) => local.add(*port, "", reached),
                     None => net.add(host, Some(*port)),
                 }
             }
@@ -1219,16 +1233,28 @@ fn port_reason(ports: &BTreeSet<u16>) -> String {
 /// The connections to the loopback of the host that the summary keeps.
 #[derive(Default)]
 struct LocalLog {
-    /// The processes of each port.
-    ports: BTreeMap<NonZeroU16, Names>,
+    /// The connections of each port.
+    ports: BTreeMap<NonZeroU16, PortEntry>,
+}
+
+/// The connections to one port on the loopback of the host.
+#[derive(Default)]
+struct PortEntry {
+    /// The processes that connected.
+    processes: Names,
+    /// At least one connection reached the port: a program on the host
+    /// served the command.
+    reached: bool,
 }
 
 impl LocalLog {
     /// Add one connection. A connection to port 0 cannot succeed, so it
-    /// gives no rule.
-    fn add(&mut self, port: u16, process: &str) {
+    /// gives no rule. `reached` is true when the connection went through.
+    fn add(&mut self, port: u16, process: &str, reached: bool) {
         if let Some(port) = NonZeroU16::new(port) {
-            self.ports.entry(port).or_default().add(process);
+            let entry = self.ports.entry(port).or_default();
+            entry.processes.add(process);
+            entry.reached |= reached;
         }
     }
 
@@ -1238,7 +1264,8 @@ impl LocalLog {
     fn items(&self) -> Vec<Item> {
         self.ports
             .iter()
-            .map(|(port, processes)| {
+            .map(|(port, entry)| {
+                let processes = &entry.processes;
                 let known = control_port(port.get());
                 let reason = match known {
                     Some(name) => name.to_string(),
@@ -1249,7 +1276,11 @@ impl LocalLog {
                     grant: Grant::Localhost(*port),
                     reason,
                     blocked: known.map(|_| GuardClass::ControlPort),
-                    notes: Vec::new(),
+                    notes: if entry.reached {
+                        vec![ItemNote::ServedOutside]
+                    } else {
+                        Vec::new()
+                    },
                 }
             })
             .collect()
@@ -1919,7 +1950,7 @@ mod tests {
             vec![
                 "net example.com | DNS lookup only",
                 "net ssh.example.org | HTTPS, HTTP, port 22",
-                "local 8080 | TCP port",
+                "local 8080 | TCP port [ServedOutside]",
             ]
         );
         assert_eq!(summary.stats.ip_hosts, vec!["[2001:db8::1]:443"]);
@@ -1955,10 +1986,10 @@ mod tests {
         assert_eq!(
             lines(&summary),
             vec![
-                "local 3000 | TCP port",
-                "local 5432 | used by psql, node",
-                "local 8000 | TCP port",
-                "local 8001 | TCP port",
+                "local 3000 | TCP port [ServedOutside]",
+                "local 5432 | used by psql, node [ServedOutside]",
+                "local 8000 | TCP port [ServedOutside]",
+                "local 8001 | TCP port [ServedOutside]",
                 "local 11434 | used by ollama",
             ]
         );
@@ -1978,8 +2009,8 @@ mod tests {
         assert_eq!(
             run(&events),
             vec![
-                "blocked 2375 | Docker API (ControlPort)",
-                "blocked 9222 | browser debug port (ControlPort)",
+                "blocked 2375 | Docker API (ControlPort) [ServedOutside]",
+                "blocked 9222 | browser debug port (ControlPort) [ServedOutside]",
             ]
         );
     }
@@ -2004,7 +2035,7 @@ mod tests {
         c.existing = Some(existing);
         assert_eq!(
             lines(&summarize(&events, &c)),
-            vec!["local 6379 | used by redis"]
+            vec!["local 6379 | used by redis [ServedOutside]"]
         );
     }
 

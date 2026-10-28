@@ -37,10 +37,16 @@ const BANNER_HEAD: &str =
     "  Watch mode does not sandbox the program. It records what the program does.\n  \
      The program can read and change your files and use the network.\n";
 
-/// The line that the banner adds when the proxy allows each domain.
+/// The lines that the banner adds when the proxy allows each domain.
+///
+/// A program on the host can serve the command through a port on localhost
+/// and do its work there, outside the recording (the service of
+/// `opencode`, for example). The second line says so.
 const BANNER_OPEN_NETWORK: &str =
     "  The network is open in this run. The ports on localhost are open too. Use \
-     --allow DOMAIN or --network blocked to close them.\n";
+     --allow DOMAIN or --network blocked to close them.\n  \
+     Pent does not record what a program behind a port on localhost does for \
+     the command.\n";
 
 /// The last lines of the banner.
 const BANNER_TAIL: &str =
@@ -110,6 +116,12 @@ pub(crate) async fn watch(args: WatchArgs, cwd: PathBuf) -> Result<(), CliError>
     let name = selected.name;
     let net = watch_network(args.network, &args.allow);
 
+    // One watch run of a profile at a time: two runs would delete and read
+    // each other's logs. A second run stops here, before the banner
+    // question. The lock holds until the draft is written.
+    let store = ProfileStore::open_default()?;
+    let _lock = store.lock_watch(&name)?;
+
     // ── Banner ───────────────────────────────────────────────────────────────
     if args.yes {
         eprint!("{}", banner(name.as_str(), net.policy));
@@ -138,7 +150,6 @@ pub(crate) async fn watch(args: WatchArgs, cwd: PathBuf) -> Result<(), CliError>
         ui::warn(warning);
     }
 
-    let store = ProfileStore::open_default()?;
     let settings = ConfigLoader::load(&cwd, pent_settings::PentDirs::from_env().as_ref())?;
     let home = home_dir()?;
     let mode = if args.append {
@@ -347,7 +358,7 @@ mod tests {
         let b = banner("claude", ProxyPolicy::Observe);
         assert!(b.starts_with("pent watch: claude\n  Watch mode does not sandbox the program."));
         assert!(b.ends_with("run it in a VM or a container.\n"));
-        assert_eq!(b.lines().count(), 6);
+        assert_eq!(b.lines().count(), 7);
     }
 
     /// The default run has an open network, and the banner says so. With a
@@ -359,6 +370,10 @@ mod tests {
         assert!(open.contains("--network blocked"), "{open}");
         assert!(
             open.contains("The ports on localhost are open too."),
+            "{open}"
+        );
+        assert!(
+            open.contains("Pent does not record what a program behind a port on localhost"),
             "{open}"
         );
         let closed = banner("claude", ProxyPolicy::Enforce);

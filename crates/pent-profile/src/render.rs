@@ -77,6 +77,7 @@ pub const fn note_label(note: &ItemNote) -> &'static str {
         ItemNote::CreatedThenExecuted => "created in the session, then run",
         ItemNote::OutsideHome => "outside the home directory",
         ItemNote::OtherRepository => "in another repository",
+        ItemNote::ServedOutside => "a program outside the recording serves it",
     }
 }
 
@@ -299,6 +300,9 @@ pub struct Warnings {
     pub other_repository: usize,
     /// The number of connections to a Unix socket that pent refused.
     pub refused_unix_sockets: usize,
+    /// The number of ports on localhost through which the command reached a
+    /// program on the host. Pent does not record what such a program does.
+    pub localhost_ports: usize,
 }
 
 impl Warnings {
@@ -316,13 +320,17 @@ impl Warnings {
             outside_home: count(&ItemNote::OutsideHome),
             other_repository: count(&ItemNote::OtherRepository),
             refused_unix_sockets: summary.stats.refused_unix_sockets,
+            localhost_ports: count(&ItemNote::ServedOutside),
         }
     }
 
     /// Return true if each count is zero.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.outside_home == 0 && self.other_repository == 0 && self.refused_unix_sockets == 0
+        self.outside_home == 0
+            && self.other_repository == 0
+            && self.refused_unix_sockets == 0
+            && self.localhost_ports == 0
     }
 
     /// One short line for each count that is not zero.
@@ -348,6 +356,16 @@ impl Warnings {
                     self.refused_unix_sockets,
                     "connection to a Unix socket",
                     "connections to a Unix socket"
+                )
+            ));
+        }
+        if self.localhost_ports > 0 {
+            lines.push(format!(
+                "the command reached {}; pent does not record what the programs behind them do",
+                plural(
+                    self.localhost_ports,
+                    "port on localhost",
+                    "ports on localhost"
                 )
             ));
         }
@@ -1264,6 +1282,10 @@ Network
                 refused_unix_sockets: 1,
                 ..Warnings::default()
             },
+            Warnings {
+                localhost_ports: 1,
+                ..Warnings::default()
+            },
         ];
         for warnings in counts {
             assert!(
@@ -1282,6 +1304,7 @@ Network
             outside_home: 2,
             other_repository: 1,
             refused_unix_sockets: 3,
+            localhost_ports: 2,
         };
         assert_eq!(
             warnings.lines(),
@@ -1289,6 +1312,9 @@ Network
                 "2 rules read outside the home directory".to_string(),
                 "1 rule reads in another repository".to_string(),
                 "pent refused 3 connections to a Unix socket".to_string(),
+                "the command reached 2 ports on localhost; pent does not record what the \
+                 programs behind them do"
+                    .to_string(),
             ]
         );
         let one = Warnings {
