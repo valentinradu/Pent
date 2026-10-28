@@ -276,12 +276,19 @@ pub(crate) fn map_operation(operation: &str, target: &str) -> Option<OperationKi
 /// Return the port of a network target on the loopback, or `None` for
 /// another target.
 ///
-/// The author did not see the form of an IP target on a Mac. The function
-/// takes `<address>:<port>`, `[<address>]:<port>` and `localhost:<port>`,
-/// where the address is a loopback address. Port 0 gives `None`. Test this
-/// on a Mac.
+/// The kernel writes an IP target as `remote:*:<port>` (seen on macOS 15 in
+/// CI on 2026-10-28), without the address. The profiles of pent report an
+/// IP connection only on the loopback (see `LOOPBACK_ONLY_REPORTS` in
+/// `macos.rs`), so the host `*` counts as the loopback. The function also
+/// takes a named host: `localhost` or a loopback address, with or without
+/// brackets. Port 0 gives `None`.
 fn loopback_port(target: &str) -> Option<u16> {
-    let (host, port) = target.trim().rsplit_once(':')?;
+    let target = target.trim();
+    let target = target.strip_prefix("remote:").unwrap_or(target);
+    let (host, port) = target.rsplit_once(':')?;
+    if host == "*" {
+        return port.parse().ok().filter(|p| *p != 0);
+    }
     let port: u16 = port.parse().ok().filter(|p| *p != 0)?;
     let host = host
         .strip_prefix('[')
@@ -1558,6 +1565,8 @@ mod tests {
     fn a_loopback_target_maps_to_its_port() {
         let local = |port| Some(OperationKind::LocalhostConnect(port));
         for (target, port) in [
+            // The form that the kernel writes (macOS 15).
+            ("remote:*:5432", 5432),
             ("127.0.0.1:5432", 5432),
             ("127.1.2.3:80", 80),
             ("localhost:11434", 11434),
@@ -1577,6 +1586,9 @@ mod tests {
             "127.0.0.1",
             "localhost",
             "10.0.0.1:22",
+            "remote:*:0",
+            "remote:*",
+            "",
         ] {
             assert_eq!(map_operation("network-outbound", target), None, "{target}");
         }
@@ -1585,7 +1597,7 @@ mod tests {
 
     #[test]
     fn a_loopback_report_becomes_a_localhost_event() {
-        let deny = record("Sandbox: psql(9) deny(1) network-outbound 127.0.0.1:5432");
+        let deny = record("Sandbox: psql(9) deny(1) network-outbound remote:*:5432");
         assert_eq!(
             to_event(&deny, &RecordMode::Run),
             Some(WatchEvent::LocalhostConnect {

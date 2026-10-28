@@ -718,12 +718,26 @@ fn proxy_network_rules(port: u16, localhost: &LocalhostPorts, report: Report) ->
     let rep = report.suffix();
     format!(
         "(deny network-outbound)\n\
+         {LOOPBACK_ONLY_REPORTS}\
          {}\
          (allow network-outbound (remote ip \"localhost:{port}\"))\n\
          (allow network-outbound (literal \"{MDNS_RESPONDER_SOCKET}\"){rep})\n",
         localhost_port_rules(localhost, report)
     )
 }
+
+/// The rules that make each reported IP denial a denial on the loopback.
+///
+/// The kernel writes an IP target as `remote:*:<port>`, without the
+/// address (seen on macOS 15 in CI on 2026-10-28). The log reader thus
+/// cannot tell `127.0.0.1:5432` from `1.2.3.4:5432`. The first rule turns
+/// the report off for each IP denial, and the second one, which comes after
+/// it and wins for the loopback, turns it on again. Each IP denial in the
+/// log is then a denial on the loopback. The reader never used the other
+/// IP denials: the proxy records the connections to the internet.
+const LOOPBACK_ONLY_REPORTS: &str =
+    "(deny network-outbound (remote ip \"*:*\") (with no-report))\n\
+     (deny network-outbound (remote ip \"localhost:*\"))\n";
 
 /// Generate the SBPL rules that open the ports on localhost: one rule for
 /// each port of the list, or one rule for each port (`localhost:*`).
@@ -791,7 +805,9 @@ fn generate_network_rules(
             // Explicit deny since we use allow default. The rules of the
             // open ports come after it, so they win.
             let ports = localhost_port_rules(localhost, report);
-            format!("(deny network*)\n{ports}").trim_end().to_string()
+            format!("(deny network*)\n{LOOPBACK_ONLY_REPORTS}{ports}")
+                .trim_end()
+                .to_string()
         }
     }
 }
@@ -1589,9 +1605,12 @@ mod tests {
             Report::No,
         );
         // Only the proxy port on loopback and the system resolver socket.
+        // Only a denial on the loopback makes a report.
         assert_eq!(
             rules,
             "(deny network-outbound)\n\
+             (deny network-outbound (remote ip \"*:*\") (with no-report))\n\
+             (deny network-outbound (remote ip \"localhost:*\"))\n\
              (allow network-outbound (remote ip \"localhost:8080\"))\n\
              (allow network-outbound (literal \"/private/var/run/mDNSResponder\"))\n"
         );
@@ -2350,8 +2369,13 @@ mod tests {
             &LocalhostPorts::default(),
             Report::No,
         );
-        // Blocked = explicit deny
-        assert_eq!(rules, "(deny network*)");
+        // Blocked = explicit deny; only a denial on the loopback reports.
+        assert_eq!(
+            rules,
+            "(deny network*)\n\
+             (deny network-outbound (remote ip \"*:*\") (with no-report))\n\
+             (deny network-outbound (remote ip \"localhost:*\"))"
+        );
     }
 
     /// A port of the profile opens after the deny, in the blocked mode and
@@ -2363,7 +2387,10 @@ mod tests {
         let blocked = generate_network_rules(&NetworkMode::Blocked, &ports, Report::No);
         assert_eq!(
             blocked,
-            "(deny network*)\n(allow network-outbound (remote ip \"localhost:5432\"))"
+            "(deny network*)\n\
+             (deny network-outbound (remote ip \"*:*\") (with no-report))\n\
+             (deny network-outbound (remote ip \"localhost:*\"))\n\
+             (allow network-outbound (remote ip \"localhost:5432\"))"
         );
         let mut config = SandboxConfig::new("/w".into(), make_test_paths(), "/w".into())
             .with_network(proxy_mode());
@@ -2374,7 +2401,12 @@ mod tests {
             .find("(allow network-outbound (remote ip \"localhost:5432\"))\n")
             .unwrap();
         assert!(port_at > deny_at, "{profile}");
-        assert!(!profile.contains("localhost:*"), "{profile}");
+        // The only rule for each port is the deny that reports a denial on
+        // the loopback; no allow opens each port.
+        assert!(
+            !profile.contains("(allow network-outbound (remote ip \"localhost:*\")"),
+            "{profile}"
+        );
         assert!(!profile.contains("(with report)"), "{profile}");
     }
 
