@@ -5,20 +5,20 @@ Codename: stable
 Architectures: amd64 arm64
 Components: main
 Description: Pent APT repository
-Date: Mon, 26 Oct 2026 09:25:16 +0000
+Date: Wed, 28 Oct 2026 01:10:15 +0000
 MD5Sum:
- 3fd11dbde62144bbde6d8ab3a70d621f             6996 Packages
- c889f6f69172bfa1785abe169a80322a             1623 Packages.gz
- f8d2c1bb0373f7636eb5de1155a97ea8              171 Release
+ 7c7d491115df0e1929512fd5c2fac712             8162 Packages
+ 291ccdcee8d362e12793b6836eb76e51             1836 Packages.gz
+ d9d852d2476d3fba82bb3b23732db8e9              171 Release
 SHA1:
- 334eae29128384320b48c3b19ad77170e94a743c             6996 Packages
- e4426a18a37bfd1e9968d264f32092a8281a03f7             1623 Packages.gz
- 51e008f59de8005244c33e3b025984cf8fac1306              171 Release
+ b471631db84753bcc350797a119070de07e1ffd6             8162 Packages
+ 32b8f7a5066eac3638b5375f2905e3d0e9badefc             1836 Packages.gz
+ b3614c0a20f11997559b866eb5138f29896186ca              171 Release
 SHA256:
- 4f18ccaa7c8d61b28d29d4184d6bc6d6c4b089e1e693ef2495aad8dfab3de583             6996 Packages
- 74803ad63321cefaeba246d730d86d163be678bccc5ddaea0d4087325b985339             1623 Packages.gz
- 165790e1288a31adb3fb517d2bf719136cadb9eac79ef79166c61d633ff4073c              171 Release
+ 9f8dcc63c46b5976349f4807c39a4898c4781f70e87be26c0c1e87f87546eab5             8162 Packages
+ 054aa7e6238b60dae546f7fa134cc5d596219d5b393b882aeba8d74f75a852e9             1836 Packages.gz
+ 1f98bb5d055204d580a939a59af447a37068c58b54951724b01f17469bd51d8d              171 Release
 SHA512:
- 0a6ba5842611023488be2fa441ae85a5bf5e4c1be971acb4c8739d26787fbfb28699f503a3f32b8559e438d19d011f391e04791876ec0c5db91e50bfd192cf16             6996 Packages
- 39f4ee94c9ac94de5df54d53dbc6f71a5f350cf2e6190762ed74e6452baefc8f4508a5a380749088b497b0fb23dcc0d361c2290163ef2cb57fa30716b410ed92             1623 Packages.gz
- 1bea11895c78cd939244c8fde876da2adf684e446df1b8e438c19731a03674ed0ccd07f7c22b6f3432ae8eb9bea57ce80c4cbe549d62eb8de2a268de693e09ef              171 Release
+ c51f81f58708f78c6d71c72d7e2cae2d39e6e722747b29ee82ba88773406088e5fbc5796d82ae37db5fed9ebaf1b96e6fd74d77fa26c929d1601e4d883f0a832             8162 Packages
+ 6f8c1ba29f13d9c00bce0343d9cbc6b5583c98df64c539fce07dabfeaa1224f26518b1aeccafa956f75cdb4aa81943ea4c20f793de26bcd9d983158e3de3a4f6             1836 Packages.gz
+ 073b8b80ca32f0d34c7f4a51559fad3d6cc86e460f073c923665f64703dc0495bda4f7677e1f139fca27bdb268978fc9d3dc445401d4b70211a835f3d536889b              171 Release
