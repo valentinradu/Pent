@@ -4,6 +4,34 @@ The format follows [Keep a Changelog](https://keepachangelog.com/1.1.0/),
 and the versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Pent is below 1.0, so a minor version can break what you have.
 
+## 0.2.1 — 2026-10-28
+
+This release makes two runs of `pent watch` safe, and it says what a watch
+run cannot see behind a port on localhost.
+
+### Fixed
+
+- **One watch run of a profile at a time.** Two runs of `pent watch` for
+  one profile at the same time broke each other: the second run deleted
+  the log of the first one, the first run then made its summary from the
+  events of the second run, and both wrote the same draft. A second run of
+  the same profile now stops at once, before it asks anything, and the
+  message names the process of the first run. Runs of other profiles do
+  not wait. The lock is the file `~/.local/state/pent/watch/<name>.lock`.
+
+### Changed
+
+- **A warning for the ports on localhost in watch mode.** A default watch
+  run opens each port on localhost, and a program can give its work to a
+  service on your machine through such a port. The interface of
+  `opencode`, for example, connects to the `opencode` service that runs
+  outside pent, so a watch run records only the interface. The ports stay
+  open, but the banner, the summary, the draft and the item of each
+  reached port now say that pent does not record what the program behind
+  the port does. A port of such a service in a profile lets `pent run`
+  drive that program with all your rights, so read the item before you
+  accept it.
+
 ## 0.2.0 — 2026-10-28
 
 This release lets a program reach a service on the loopback of your
