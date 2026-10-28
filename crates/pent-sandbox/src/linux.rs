@@ -350,6 +350,12 @@ impl AccessPolicy {
         }
     }
 
+    /// Return true when an overlay can hide a path: the policy has at least
+    /// one overlay mount point.
+    pub(crate) fn can_hide(&self) -> bool {
+        !self.overlay_roots.is_empty()
+    }
+
     /// Return true when the upper layer of an overlay hides `path`.
     ///
     /// `populate_upper_stubs` in `linux_overlayfs.rs` makes a stub for
@@ -362,7 +368,7 @@ impl AccessPolicy {
     /// back. The policy calls such a read a denial too. The report stays
     /// true, because the file of the host stays hidden: the child reads
     /// its own content, never the content that the overlay hides.
-    fn hidden(&self, path: &Path) -> bool {
+    pub(crate) fn hidden(&self, path: &Path) -> bool {
         if !self
             .overlay_roots
             .iter()

@@ -361,6 +361,49 @@ printf 'rc=%s\n' "$?"
         Ok(())
     }
 
+    /// DIFF-1, second form. A program can test a path before it opens it
+    /// and stop there: uutils `cat`, the `cat` of Ubuntu 26.04, calls
+    /// `statx` and never `open` for a file that is not there. The test of
+    /// the shell (`[ -e ]`) does the same with no `open`, so this test does
+    /// not depend on the `cat` of the machine.
+    #[test]
+    fn diff_1_a_test_of_a_hidden_path_is_a_recorded_denial() -> TestResult {
+        let test = "fs_diff_1_hidden_test";
+        if !ready(test) {
+            return Ok(());
+        }
+        let env = TestEnv::new()?;
+        env.install_profile("p", "[filesystem]\nread = [\"~/open.txt\"]\n")?;
+        std::fs::write(env.home.join("open.txt"), format!("{MARKER}\n"))?;
+        std::fs::write(env.home.join("secret.txt"), "SECRET\n")?;
+        let hidden = env.home.join("secret.txt").to_string_lossy().into_owned();
+        let out = env.pent(&[
+            "run",
+            "--profile",
+            "p",
+            "--trace",
+            "--",
+            "sh",
+            "-c",
+            r#"printf 'PENT_CHILD_RAN\n'; [ -e "$1" ] && echo PRESENT || echo MISSING"#,
+            "p",
+            &hidden,
+        ])?;
+        let combined = format!("{}{}", stdout(&out), stderr(&out));
+        assert!(combined.contains(RAN), "the child did not run:\n{combined}");
+        assert!(
+            combined.contains("MISSING"),
+            "the overlay did not hide the path, so this test proves nothing:\n{combined}"
+        );
+        let log = std::fs::read_to_string(env.denied_log("p")).unwrap_or_default();
+        assert!(
+            log.contains("secret.txt"),
+            "the program tested a hidden path and got ENOENT, but pent recorded \
+             no denial:\n{combined}\nlog: {log}"
+        );
+        Ok(())
+    }
+
     /// DIFF-1. The kernel must tell pent about every access that it
     /// blocks.
     ///

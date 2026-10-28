@@ -344,6 +344,10 @@ pub(crate) enum RecorderScope {
     /// The path system calls and the calls of the Unix socket control.
     /// Each call makes an event.
     Full,
+    /// [`RecorderScope::Full`], and also the calls that test a path without
+    /// an open ([`PROBE_CALLS`]). `pent run --trace` takes this scope when
+    /// an overlay can hide a path.
+    FullAndProbes,
     /// Only the calls of the Unix socket control, and no event. `pent run`
     /// without `--trace` takes this scope.
     ConnectOnly,
@@ -507,6 +511,10 @@ enum Call {
     Connect,
     /// A send that can carry a destination address.
     Send(SendCall),
+    /// A call that tests a path and opens nothing (`stat`, `access`). The
+    /// second field is the index of the flags argument, when the call has
+    /// one (`AT_EMPTY_PATH`).
+    Probe(PathArg, Option<usize>),
 }
 
 /// The send system calls of the Unix socket control.
@@ -582,6 +590,42 @@ const CALLS: &[(libc::c_long, Call)] = &[
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 const CALLS: &[(libc::c_long, Call)] = &[];
 
+/// A table of system calls and their kinds.
+type CallTable = &'static [(libc::c_long, Call)];
+
+/// The calls that test a path and open nothing.
+///
+/// A program can test a path before it opens it, and stop when the test
+/// fails: uutils `cat` (the `cat` of Ubuntu 26.04) calls `statx` and never
+/// `open` for a file that does not exist. Landlock does not control such a
+/// test, so it fails only for a path that the overlay hides. The recorder
+/// of `pent run --trace` traps these calls only when an overlay can hide a
+/// path, and it records a denial only for a hidden path (DIFF-1).
+#[cfg(target_arch = "x86_64")]
+const PROBE_CALLS: &[(libc::c_long, Call)] = &[
+    (libc::SYS_stat, Call::Probe(p(0), None)),
+    (libc::SYS_lstat, Call::Probe(p(0), None)),
+    (libc::SYS_newfstatat, Call::Probe(at(0, 1), Some(3))),
+    (libc::SYS_statx, Call::Probe(at(0, 1), Some(2))),
+    (libc::SYS_access, Call::Probe(p(0), None)),
+    (libc::SYS_faccessat, Call::Probe(at(0, 1), None)),
+    (libc::SYS_faccessat2, Call::Probe(at(0, 1), Some(3))),
+];
+
+/// The calls that test a path and open nothing. The generic system call
+/// table of aarch64 has only the `*at` forms.
+#[cfg(target_arch = "aarch64")]
+const PROBE_CALLS: &[(libc::c_long, Call)] = &[
+    (libc::SYS_newfstatat, Call::Probe(at(0, 1), Some(3))),
+    (libc::SYS_statx, Call::Probe(at(0, 1), Some(2))),
+    (libc::SYS_faccessat, Call::Probe(at(0, 1), None)),
+    (libc::SYS_faccessat2, Call::Probe(at(0, 1), Some(3))),
+];
+
+/// No recorder exists for this CPU architecture.
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+const PROBE_CALLS: &[(libc::c_long, Call)] = &[];
+
 /// The system calls of the Unix socket control. The filter traps them in
 /// both scopes: the control runs also without `--trace`.
 ///
@@ -625,6 +669,7 @@ fn decode(nr: i32) -> Option<Call> {
     CALLS
         .iter()
         .chain(CONTROL_CALLS)
+        .chain(PROBE_CALLS)
         .find(|(n, _)| *n == nr)
         .map(|(_, c)| *c)
 }
@@ -643,12 +688,14 @@ fn native_filter(scope: RecorderScope) -> Result<Vec<libc::sock_filter>, Sandbox
     let to_u32 = |n: libc::c_long| {
         u32::try_from(n).map_err(|_| SandboxError::InvalidConfig(format!("system call {n}")))
     };
-    let path_calls: &[(libc::c_long, Call)] = match scope {
-        RecorderScope::Full => CALLS,
-        RecorderScope::ConnectOnly => &[],
+    let (path_calls, probe_calls): (CallTable, CallTable) = match scope {
+        RecorderScope::Full => (CALLS, &[]),
+        RecorderScope::FullAndProbes => (CALLS, PROBE_CALLS),
+        RecorderScope::ConnectOnly => (&[], &[]),
     };
     let notify = path_calls
         .iter()
+        .chain(probe_calls)
         .chain(CONTROL_CALLS)
         .map(|(n, _)| to_u32(*n))
         .collect::<Result<Vec<_>, _>>()?;
@@ -1088,10 +1135,10 @@ pub(crate) struct RecorderPlan {
 /// Returns `SandboxUnavailable` on a CPU architecture without a recorder, or
 /// `SpawnFailed` if the socket pair or the thread cannot be created.
 pub(crate) fn start_recorder(plan: RecorderPlan) -> Result<RecorderSetup, SandboxError> {
-    let scope = if plan.judge.is_some() {
-        RecorderScope::Full
-    } else {
-        RecorderScope::ConnectOnly
+    let scope = match &plan.judge {
+        Some(Judge::Policy(policy)) if policy.can_hide() => RecorderScope::FullAndProbes,
+        Some(_) => RecorderScope::Full,
+        None => RecorderScope::ConnectOnly,
     };
     let filter = native_filter(scope)?;
     let (parent_sock, child_sock) = crate::linux_fdpass::seqpacket_pair()?;
@@ -1917,6 +1964,37 @@ impl Supervisor {
                 }
                 let process = self.procs.get(tid);
                 self.push_fs(&process, FsOp::Write, path, st, true);
+            }
+            Call::Probe(arg, flags_arg) => {
+                // Only a path that the overlay hides gives the program a
+                // wrong answer: Landlock does not control a test of a path.
+                if !matches!(self.judge, Some(Judge::Policy(_))) {
+                    return;
+                }
+                let flags = flags_arg.and_then(|i| args.get(i)).copied().unwrap_or(0);
+                // The kernel uses the low 32 bits of the flags argument.
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                if flags as u32 & libc::AT_EMPTY_PATH as u32 != 0 {
+                    // A test of an open descriptor looks up no path.
+                    return;
+                }
+                let Some(path) = self.path_of(tid, &args, arg, false, false) else {
+                    return;
+                };
+                // A path that the host does not have is not hidden: the
+                // test fails in the same way outside the sandbox.
+                let hidden =
+                    matches!(&self.judge, Some(Judge::Policy(policy)) if policy.hidden(&path));
+                if !hidden || !PathState::probe(&path).exists {
+                    return;
+                }
+                let process = self.procs.get(tid);
+                self.out.push(WatchEvent::Fs {
+                    op: FsOp::Read,
+                    path,
+                    process,
+                    outcome: Outcome::Denied,
+                });
             }
             Call::Connect => self.record_connect(notif),
             Call::Send(kind) => self.record_send(notif, kind),
@@ -2878,6 +2956,32 @@ mod tests {
             Some(Call::Open(at(0, 1), OpenFlags::Arg(2)))
         );
         assert_eq!(decode(i32::try_from(libc::SYS_getpid)?), None);
+        Ok(())
+    }
+
+    /// The calls that test a path go to the supervisor only in the scope
+    /// that asks for them: a `stat` is frequent, and only an overlay can
+    /// make it fail.
+    #[test]
+    fn the_probe_calls_are_trapped_only_when_asked() -> TestResult {
+        let Some((arch, _)) = NATIVE else {
+            return Err("no native spec".into());
+        };
+        let with = native_filter(RecorderScope::FullAndProbes)?;
+        let without = native_filter(RecorderScope::Full)?;
+        for (nr, call) in PROBE_CALLS {
+            let nr = u32::try_from(*nr)?;
+            assert_eq!(run_bpf(&with, nr, arch), Some(RET_NOTIFY), "{call:?}");
+            assert_eq!(
+                run_bpf(&without, nr, arch),
+                Some(SECCOMP_RET_ALLOW),
+                "{call:?}"
+            );
+            assert!(matches!(decode(i32::try_from(nr)?), Some(Call::Probe(..))));
+        }
+        for (nr, _) in CALLS.iter().chain(CONTROL_CALLS) {
+            assert_eq!(run_bpf(&with, u32::try_from(*nr)?, arch), Some(RET_NOTIFY));
+        }
         Ok(())
     }
 
