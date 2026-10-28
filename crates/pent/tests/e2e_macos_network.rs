@@ -29,7 +29,15 @@ mod macos {
     use super::common::e2e::{
         have_tools, internet, rules, sandbox_ready, set, stderr, stdout, TestEnv, TestResult,
     };
-    use super::common::macos::have_files;
+    use super::common::macos::{have_files, wait_for_log_line};
+
+    /// The Seatbelt lines of the kernel for an outbound connection, to show
+    /// in the message of a failed assertion. The form of the target of an
+    /// IP connection is not known yet; these lines show it.
+    fn outbound_lines() -> String {
+        wait_for_log_line("2m", "network-outbound", std::time::Duration::from_secs(3))
+            .unwrap_or_else(|e| format!("log show failed: {e}"))
+    }
 
     /// The shell of each test.
     const SH: &str = "/bin/sh";
@@ -273,8 +281,10 @@ mod macos {
         let denied = fs::read_to_string(env.denied_log("net")).unwrap_or_default();
         assert!(
             denied.contains(&format!("\"port\":{closed}")),
-            "the denied log must hold the closed port:\n{denied}\n{}",
-            stderr(&out)
+            "the denied log must hold the closed port:\n{denied}\n{}\n\
+             the Seatbelt lines:\n{}",
+            stderr(&out),
+            outbound_lines()
         );
 
         let mut args: Vec<String> = ["watch", "--yes", "--profile", "w", "--"]
@@ -290,7 +300,8 @@ mod macos {
         let events = env.watch_events("w");
         assert!(
             events.contains(&format!("\"type\":\"localhost_connect\",\"port\":{closed}")),
-            "the watch log must hold the port:\n{events}"
+            "the watch log must hold the port:\n{events}\nthe Seatbelt lines:\n{}",
+            outbound_lines()
         );
         Ok(())
     }
