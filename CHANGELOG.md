@@ -4,6 +4,51 @@ The format follows [Keep a Changelog](https://keepachangelog.com/1.1.0/),
 and the versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Pent is below 1.0, so a minor version can break what you have.
 
+## 0.2.0 — 2026-10-28
+
+This release lets a program reach a service on the loopback of your
+machine, such as a database or a local model server. Before, the sandbox
+always closed the loopback, and watch mode did not record the attempt.
+
+### Added
+
+- **Rules for the ports on localhost.** A profile opens a TCP port of the
+  loopback of the host with `[network] localhost = [5432]`, and
+  `pent run --localhost <port>` opens one for a single run. On Linux, a
+  server that the command starts itself works with no rule. On macOS, the
+  command shares the loopback of the host, so such a server needs its port
+  in the list too.
+- **Watch mode records the ports on localhost.** A default watch run opens
+  each port and records each connection. The review shows the ports in the
+  section "Localhost ports" and does not select them for you.
+- **A guard for the control ports.** A program that reaches the Docker API
+  (2375, 2376), the debug port of a browser (9222) or the Node.js inspector
+  (9229) can run code on your machine. The watch guard blocks these ports,
+  and the review shows them under "Blocked by the guard". A profile can
+  still name such a port.
+
+### Changed
+
+- **`--network blocked` closes the ports on localhost too**, also the ports
+  of the profile, and pent says so. A network that is blocked only because
+  the profile has no domains keeps the ports of the profile.
+- **The proxy names the fix for a closed port.** A request for `localhost`
+  or for a loopback address on a closed port gives the hint
+  `--localhost <port>`, not the setting that opens each private network.
+  For an embedder of `pent-proxy`, the refusal is the new variant
+  `TraceEvent::LocalhostClosed { message, port }`; a `match` on
+  `TraceEvent` needs the new arm.
+- **The proxy never connects to its own listeners** (the proxy port and the
+  DNS port), so a request cannot go through pent twice.
+
+### Fixed
+
+- `pent run --trace` did not record a read of a path that the overlay hides
+  when the program tested the path before it opened it. uutils `cat`, the
+  `cat` of Ubuntu 26.04, does this. The recorder now also traps the calls
+  that test a path (`stat`, `access` and the like) in that case, so
+  `pent trust <name> --review` shows the access.
+
 ## 0.1.0 — 2026-10-25
 
 This release replaces the profiles that a user wrote by hand with profiles
