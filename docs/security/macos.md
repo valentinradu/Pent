@@ -115,8 +115,16 @@ summary of pent can never drift apart again (MAC-2 and MAC-3).
 ### C. The network
 
 macOS has no network namespace. The Seatbelt profile denies each outbound
-connection and allows only the proxy port on loopback, the system resolver
-socket and the Unix sockets in the writable paths.
+connection and allows only the proxy port on loopback, the ports of
+`network.localhost`, the system resolver socket and the Unix sockets in the
+writable paths.
+
+The kernel writes the target of a denied IP connection as
+`remote:*:<port>`, without the address (CI, macOS 15, 2026-10-28). The
+reader cannot tell the loopback from the internet in such a line. Thus the
+profiles turn the report off for each IP denial and on again for the
+loopback (`LOOPBACK_ONLY_REPORTS` in `macos.rs`), so each reported IP
+denial is a denial on the loopback.
 
 | Property | Test |
 |---|---|
@@ -124,6 +132,7 @@ socket and the Unix sockets in the writable paths.
 | A direct connection that does not use the proxy fails (`curl --noproxy '*'`). | `a_direct_connection_without_the_proxy_fails` |
 | The proxy variables are in the environment of the child, `NO_PROXY` names the loopback addresses, and a loopback service of the host stays out of reach. | `the_proxy_variables_are_in_the_environment_of_the_child` |
 | A denied domain goes into the denied log, and `pent trust NAME --review --yes` adds it to the profile. | `a_denied_domain_reaches_the_log_and_the_review` |
+| A port of `network.localhost` opens and another port stays closed; `pent run --trace` records the closed port, and a default watch run reaches a port and records it. | `a_listed_localhost_port_works_and_watch_records_it` |
 
 ### D. The watch recorder
 
