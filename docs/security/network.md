@@ -438,3 +438,10 @@ inherent ones above, and these:
   opens that port.
 - Only TCP reaches the loopback of the host. A UDP socket stays in the
   namespace of the child.
+- A default watch run opens each port on localhost, so a program can give
+  its work to a service on the host, and pent records only the requests.
+  The interface of `opencode` does this with `opencode serve --service`:
+  a watch run of `opencode` recorded 142 events, all of the interface.
+  The banner, the summary, the draft and the item of each reached port
+  say that pent does not record that program. The same port in a profile
+  lets `pent run` drive that program with all the rights of the user.

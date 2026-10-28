@@ -222,6 +222,7 @@ mod tests {
             outside_home: 2,
             other_repository: 1,
             refused_unix_sockets: 3,
+            localhost_ports: 0,
         };
         assert_eq!(
             facts.lines(),

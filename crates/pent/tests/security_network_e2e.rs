@@ -707,6 +707,16 @@ fn watch_reaches_and_records_a_localhost_port() -> TestResult {
         "only the port of the host makes an event, not the own server:\n{events}"
     );
     assert!(text.contains("Localhost ports"), "{text}");
+    // The program behind the port runs outside the recording; the summary
+    // says so on the item and in a warning line.
+    assert!(
+        text.contains("a program outside the recording serves it"),
+        "{text}"
+    );
+    assert!(
+        text.contains("the command reached 1 port on localhost; pent does not record"),
+        "{text}"
+    );
     let draft = std::fs::read_to_string(env.draft_path("probe")).unwrap_or_default();
     assert!(
         !draft.contains("localhost ="),
