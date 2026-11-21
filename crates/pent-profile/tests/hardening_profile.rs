@@ -535,10 +535,6 @@ fn forbidden_rules() -> BTreeSet<String> {
         "~/.local/state",
         "~/.cache",
         "~/.ssh",
-        "~/Library",
-        "~/Library/Application Support",
-        "~/Library/Caches",
-        "~/Library/Preferences",
         // The parent of the workspace.
         "~/work",
     ]
@@ -574,8 +570,6 @@ const BROAD_DIRS: &[&str] = &[
     "/home/u/.local/share",
     "/home/u/.local/state",
     "/home/u/.cache",
-    "/home/u/Library",
-    "/home/u/Library/Caches",
 ];
 
 const ALL_OPS: [FsOp; 5] = [
@@ -958,19 +952,6 @@ fn p4_guard_covers_the_named_locations() {
             R,
             Some(Cred),
         ),
-        ("Library/Keychains/login.keychain-db", R, Some(Cred)),
-        ("Library/Cookies/Cookies.binarycookies", R, Some(Cred)),
-        ("Library/Safari/History.db", R, Some(Cred)),
-        (
-            "Library/Application Support/Google/Chrome/Default/Login Data",
-            R,
-            Some(Cred),
-        ),
-        (
-            "Library/Application Support/Firefox/Profiles/x/logins.json",
-            R,
-            Some(Cred),
-        ),
         // Persistence (write).
         (".bashrc", W, Some(Pers)),
         (".bash_profile", W, Some(Pers)),
@@ -991,7 +972,6 @@ fn p4_guard_covers_the_named_locations() {
         (".config/systemd/user/x.service", W, Some(Pers)),
         (".config/environment.d/x.conf", W, Some(Pers)),
         (".local/bin/git", W, Some(Pers)),
-        ("Library/LaunchAgents/x.plist", W, Some(Pers)),
         // Persistence is write only: a read of an rc file is normal.
         (".bashrc", R, None),
         // Pent's own files (write), at the default locations.

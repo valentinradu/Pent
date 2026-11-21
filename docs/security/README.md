@@ -10,7 +10,6 @@ result.
 | [containment.md](containment.md) | The private directories, the PID namespace, the `connect(2)` supervisor and the guard |
 | [network.md](network.md) | The proxy, the DNS server and the network namespace |
 | [watch-and-profiles.md](watch-and-profiles.md) | The recorder, the guard, the summary, the review and the profile store |
-| [macos.md](macos.md) | The macOS Seatbelt backend: the first test suite, and the findings that it states |
 | [fuzzing.md](fuzzing.md) | The parsers that read bytes which an attacker chooses: the fuzz run and its findings |
 
 ## The threat model
@@ -51,11 +50,9 @@ tree that states the secure behaviour and fails, so `--include-ignored`
 names every one of them. No finding is open today.
 
 Each one has a fix, and the test that found it stays as a regression test.
-The reports hold the detail, and `docs/security/macos.md` holds the limits
-that stay inside a fix: the window of a few milliseconds of MAC-10, and the
-operation families of SBPL that the macOS profile still allows (MAC-4).
+The reports hold the detail.
 
-The tests run on Linux and on macOS in the pipeline, with
+The tests run on Linux in the pipeline, with
 `PENT_REQUIRE_ALL_TESTS=1`, so a skip is a failure, and every job is green.
 The container job runs twice: one run keeps the masks of the runtime, where
 the kernel refuses a private `/proc` and pent says so, and one run gives the
@@ -74,6 +71,3 @@ container no mask, where the protection holds.
   back.
 - **Encrypted traffic.** The proxy reads the server name of a TLS connection,
   but not the bytes inside it.
-- **macOS.** The Seatbelt profile starts from `(allow default)`, so it limits
-  only file reads, file writes and the network. See the platform notes in the
-  README and [macos.md](macos.md).

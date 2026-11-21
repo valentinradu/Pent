@@ -12,11 +12,8 @@
 //! persistence writes, and the positive controls that the guard must not
 //! block.
 //!
-//! The same table runs on Linux and on macOS. A row carries one
-//! disagreement identifier for each platform, because the two kernel
-//! backends enforce the guard in different ways. The macOS half runs in
-//! the pipeline, on `macos-latest`. Every row agrees there since
-//! 2026-10-25 (DIFF-9).
+//! A row carries a disagreement identifier when the kernel and the summary
+//! do not agree.
 //!
 //! A test skips (it prints `SKIP` and passes) when the sandbox or a tool
 //! is absent. Set `PENT_REQUIRE_ALL_TESTS=1` to make each skip a failure.
@@ -30,7 +27,7 @@ mod common;
 #[path = "common/differential.rs"]
 mod differential;
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 mod guard_table {
     use std::path::Path;
 
@@ -231,45 +228,13 @@ printf 'rc=%s\n' "$?"
     /// DIFF-6. The guard must hide a private key that the program makes
     /// during the run. The summary says "blocked", so the program must
     /// not read the key.
-    ///
-    /// Seatbelt decides at the time of the access, so the row never had a
-    /// disagreement on macOS and the test runs on Linux only.
     #[test]
-    #[cfg(target_os = "linux")]
     fn diff_6_a_key_made_during_the_run() -> TestResult {
         let test = "guard_diff_6_new_key";
         if !ready(test) {
             return Ok(());
         }
         run_rows(test, &guard_rows(&["key-made-during-the-run"]))
-    }
-
-    /// DIFF-9. The guard must hide a key whose name matches a pattern
-    /// with a leading `*`, which is a file name suffix. The macOS backend
-    /// translates that form (`name_pattern_regex`), and a character with
-    /// a meaning in a regular expression matches only itself.
-    ///
-    /// The run of 2026-10-25 on a Mac proved each of the seven rows, so
-    /// the test has no `ignore` mark any more.
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn diff_9_a_suffix_pattern_on_macos() -> TestResult {
-        let test = "guard_diff_9_suffix_pattern";
-        if !ready(test) {
-            return Ok(());
-        }
-        run_rows(
-            test,
-            &guard_rows(&[
-                "key-suffix-rsa",
-                "key-suffix-pem",
-                "key-suffix-key",
-                "key-name-with-a-dot",
-                "key-name-with-a-plus",
-                "key-name-with-brackets",
-                "key-name-with-a-star",
-            ]),
-        )
     }
 
     /// Each disagreement of the table has an ignored test in this file.

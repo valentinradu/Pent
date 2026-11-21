@@ -378,9 +378,9 @@ that the recorder reports. The walk does not follow a symbolic link: it
 reads the type of each entry with `symlink_metadata`, so a link in the
 directory is not a way out.
 
-The doc comment of `GuardTarget::FilesInDir` in `crates/pent-profile` still
-says that the kernel backends mask only the direct children. That is true
-for the macOS backend now, not for Linux.
+The doc comment of `GuardTarget::FilesInDir` in `crates/pent-profile`
+names the limits of the walk: the depth, and the files that exist when the
+child starts.
 
 **H-14 — open, small.** `guard_rules_with(home, pent_dirs)` moves only the
 `PentFiles` rules to the XDG directories of the session. Another rule that

@@ -20,8 +20,6 @@ pent trust claude             # 5. Show the draft, ask, move it to the profile s
 pent run -- claude            # 6. Pent finds the "claude" profile.
 ```
 
-The commands and the results are the same on Linux and on macOS.
-
 ## Command line
 
 | Command | Description |
@@ -107,17 +105,17 @@ close, so the line goes away.
 ### The guard
 
 The guard blocks a small set of dangerous accesses. The kernel enforces it, so
-the program cannot race it. The list is `pent_profile::guard_rules`, the same on
-all platforms. `pent watch` calls `guard_rules_with`, which adds the real pent
+the program cannot race it. The list is `pent_profile::guard_rules`.
+`pent watch` calls `guard_rules_with`, which adds the real pent
 directories, because `$XDG_CONFIG_HOME` and `$XDG_STATE_HOME` can move them:
 
-| Class | Access | Linux | macOS |
-|---|---|---|---|
-| Credential | read | bind-mount `/dev/null` over the file, or an empty tmpfs over the directory | `(deny file-read-data ...)` |
-| Persistence | write | a read-only bind mount | `(deny file-write* ...)` |
-| Pent's files | write | a read-only bind mount | `(deny file-write* ...)` |
-| Privilege escalation | exec | `NO_NEW_PRIVS` makes setuid fail | `NO_NEW_PRIVS` is not available; Seatbelt `(deny process-exec ...)` on the binary name |
-| Control port | connect to a port on localhost | the supervisor does not connect to the port of the host | `(deny network-outbound (remote ip "localhost:<port>"))` |
+| Class | Access | Enforcement |
+|---|---|---|
+| Credential | read | bind-mount `/dev/null` over the file, or an empty tmpfs over the directory |
+| Persistence | write | a read-only bind mount |
+| Pent's files | write | a read-only bind mount |
+| Privilege escalation | exec | `NO_NEW_PRIVS` makes setuid fail |
+| Control port | connect to a port on localhost | the supervisor does not connect to the port of the host |
 
 The control ports are `pent_profile::CONTROL_PORTS`: 2375 and 2376 (the
 Docker API), 9222 (the debug port of a browser) and 9229 (the Node.js
@@ -133,7 +131,7 @@ owns the terminal, so pent does not ask then.
 
 All recorders emit `pent_profile::WatchEvent`.
 
-**Linux (filesystem).** A seccomp filter with `SECCOMP_RET_USER_NOTIF` on the
+**Filesystem.** A seccomp filter with `SECCOMP_RET_USER_NOTIF` on the
 path syscalls: `open`, `openat`, `openat2`, `creat`, `execve`, `execveat`,
 `mkdir`, `mkdirat`, `unlink`, `unlinkat`, `rmdir`, `rename`, `renameat`,
 `renameat2`, `link`, `linkat`, `symlink`, `symlinkat`, `truncate`, and
@@ -170,16 +168,7 @@ as a `pent run` child does, so the program sees only the processes of the
 sandbox. PID 1 of the namespace waits up to five seconds for the orphans
 of the program, so their events still reach the recorder.
 
-**macOS (filesystem).** A Seatbelt profile that allows each operation
-`(with report)`, plus the guard denies. Pent reads the reports from
-`log stream` and keeps only the PIDs of the process tree. macOS limits the rate
-of the reports, so the result is a lower bound. The tree comes from a poll of
-`ps` every 100 ms, so a child that forks and exits inside one poll leaves no
-name and the recorder drops its reports (MAC-10 in
-`docs/security/macos.md`); a program that the root runs in place keeps the
-PID of the root and has no such gap. `--append` merges more runs.
-
-**Network (both platforms).** By default the proxy runs in observe mode: it
+**Network.** By default the proxy runs in observe mode: it
 allows each request and emits `WatchEvent::Dns` and `WatchEvent::Connect` with
 the domain name (from the request, the TLS SNI or the DNS cache). This is the
 default because a watch run must learn what the program needs. It is also a
@@ -188,22 +177,16 @@ so, and `--allow DOMAIN` or `--network MODE` closes the network. With one of
 the two flags, the proxy enforces the allowlist and emits each refused request
 with `Outcome::Denied`. Such a request becomes an item of the summary, as a
 denial of `pent run` does. The kernel lets the
-process reach only the proxy: on Linux the network namespace of the child,
-where the proxy listens on sockets that the child made (no privilege is
-necessary); on macOS `(deny network-outbound)` plus
-`(allow network-outbound (remote ip "localhost:<port>"))`. Pent sets
+process reach only the proxy: the network namespace of the child, where
+the proxy listens on sockets that the child made (no privilege is
+necessary). Pent sets
 `HTTPS_PROXY`, `HTTP_PROXY` and `ALL_PROXY` in both modes.
 
-**Localhost (both platforms).** The default run also opens each TCP port on
+**Localhost.** The default run also opens each TCP port on
 the loopback of the host. In observe mode the proxy connects a request for
 `localhost` or for a loopback address. A direct connection (`NO_PROXY`
-names the loopback) goes through the supervisor on Linux (see the recorder
-above). On macOS the watch profile adds
-`(allow network-outbound (remote ip "localhost:*") (with report))` before
-the rule of the proxy port, which has no report, and `macos_log.rs` maps
-each report of a loopback target to a `LocalhostConnect` event. Nobody saw
-the form of such a report on a Mac yet; the test
-`a_listed_localhost_port_works_and_watch_records_it` checks it.
+names the loopback) goes through the supervisor (see the recorder
+above).
 
 ## The summary
 
@@ -354,8 +337,8 @@ localhost = [
 `~/.local/state/pent/denied/<name>.jsonl`:
 
 - Network denials come from the proxy, always.
-- Filesystem denials come from the macOS log stream, and on Linux from the
-  seccomp recorder in observe mode next to Landlock. Both need `--trace`.
+- Filesystem denials come from the seccomp recorder in observe mode next
+  to Landlock. They need `--trace`.
 
 At exit, pent prints `3 accesses denied; review them: pent trust claude --review`.
 The review uses the same summary and the same interactive flow.

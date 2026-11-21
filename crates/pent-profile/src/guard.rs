@@ -1,14 +1,11 @@
 //! The dangerous accesses that watch mode blocks.
 //!
 //! Watch mode does not sandbox the program, but it blocks a small set of
-//! dangerous accesses. The kernel enforces the guard, so a program cannot race
-//! it: on Linux with masks in the private mount namespace of the child, on
-//! macOS with Seatbelt deny rules. The recorder still sees each attempt and
-//! emits it with [`Outcome::Blocked`](crate::Outcome::Blocked). The user
-//! decides about these items at the end of watch mode.
-//!
-//! Both platforms use the same list, so a recorded profile does not depend on
-//! the platform.
+//! dangerous accesses. The kernel enforces the guard with masks in the
+//! private mount namespace of the child, so a program cannot race it. The
+//! recorder still sees each attempt and emits it with
+//! [`Outcome::Blocked`](crate::Outcome::Blocked). The user decides about these
+//! items at the end of watch mode.
 
 use std::path::{Path, PathBuf};
 
@@ -18,10 +15,9 @@ use crate::GuardClass;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GuardAccess {
     /// Block reads of the content. Linux: bind-mount `/dev/null` over a file
-    /// or an empty tmpfs over a directory. macOS: `(deny file-read-data)`.
+    /// or an empty tmpfs over a directory.
     Read,
     /// Block writes, creation and deletion. Linux: a read-only bind mount.
-    /// macOS: `(deny file-write*)`.
     Write,
     /// Block execution of a binary with this file name, wherever it is. The
     /// `NO_NEW_PRIVS` flag already makes setuid binaries fail; the recorder
@@ -44,10 +40,10 @@ pub enum GuardTarget {
     /// file name suffix instead: `*_rsa` matches `github_rsa`. See
     /// [`name_matches`].
     ///
-    /// The rule matches a file at any depth below `dir`. The two kernel
-    /// backends mask only the direct children of `dir` that exist when the
-    /// child starts, and the macOS backend knows only the prefix form, so
-    /// the kernel enforces less than this rule says. The summary and the
+    /// The rule matches a file at any depth below `dir`. The kernel backend
+    /// masks only the files below `dir` that exist when the child starts,
+    /// down to a fixed depth, so the kernel enforces less than this rule
+    /// says. The summary and the
     /// review use the full rule, so a matched read always goes to the
     /// blocked section. See `docs/security/watch-and-profiles.md`.
     FilesInDir {
@@ -144,7 +140,7 @@ const SSH_KEY_PATTERNS: &[&str] = &[
 
 /// The directories of the Python user site. A `.pth` file and
 /// `usercustomize.py` run at the start of each Python process.
-const PYTHON_USER_SITE_DIRS: &[&str] = &[".local/lib", "Library/Python"];
+const PYTHON_USER_SITE_DIRS: &[&str] = &[".local/lib"];
 
 /// The file name patterns that run code at the start of a Python process.
 const PYTHON_STARTUP_PATTERNS: &[&str] = &["*.pth", "usercustomize.py", "sitecustomize.py"];
@@ -156,8 +152,7 @@ const PYTHON_STARTUP_PATTERNS: &[&str] = &["*.pth", "usercustomize.py", "sitecus
 /// real directories must use [`guard_rules_with`]: with `$XDG_CONFIG_HOME`
 /// or `$XDG_STATE_HOME`, the files of pent are in another place.
 ///
-/// The list has the Linux and the macOS paths. A path that does not exist
-/// on a platform has no effect there.
+/// A path that does not exist on the host has no effect.
 #[must_use]
 pub fn guard_rules(home: &Path) -> Vec<GuardRule> {
     guard_rules_with(home, &[])
@@ -274,11 +269,6 @@ pub fn guard_rules_with(home: &Path, pent_dirs: &[PathBuf]) -> Vec<GuardRule> {
         ".config/google-chrome",
         ".config/chromium",
         ".config/BraveSoftware",
-        "Library/Keychains",
-        "Library/Cookies",
-        "Library/Safari",
-        "Library/Application Support/Google/Chrome",
-        "Library/Application Support/Firefox",
     ] {
         for path in paths(subtree) {
             add(Credential, Read, GuardTarget::Subtree(path));
@@ -338,7 +328,6 @@ pub fn guard_rules_with(home: &Path, pent_dirs: &[PathBuf]) -> Vec<GuardRule> {
         ".config/systemd/user",
         ".config/environment.d",
         ".config/cron",
-        "Library/LaunchAgents",
         // Directories of the `PATH`. A binary here (for example `git`) runs
         // later outside of the sandbox.
         "bin",

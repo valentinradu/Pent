@@ -315,8 +315,6 @@ fn resolve_entry(entry: &str, base: &Path) -> Option<String> {
 }
 
 /// An additional mount point exposed inside the sandbox.
-///
-/// Only the Linux backend uses mounts. The macOS backend ignores them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Mount {

@@ -7,8 +7,8 @@ use std::path::PathBuf;
 
 /// The TCP ports on the loopback of the host that the child can reach.
 ///
-/// With its own network namespace (Linux) or the network rules of Seatbelt
-/// (macOS), the child cannot reach a service on the loopback of the host
+/// The child has its own network namespace, so it cannot reach a service on
+/// the loopback of the host
 /// (`127.0.0.1`, `::1`). This value opens such ports. A server that the
 /// child itself runs on the loopback needs no rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,46 +69,20 @@ pub fn system_default_paths() -> SandboxPaths {
             "/usr/lib".to_string(),
             "/usr/share".to_string(),
             "/etc".to_string(),
-            // macOS system libraries and frameworks
-            "/Library".to_string(),
-            "/System/Library".to_string(),
-            "/System/Volumes/Preboot/Cryptexes".to_string(),
-            // macOS system databases (Security framework, Keychain, timezone, dyld cache)
-            "/private/var/db".to_string(),
         ],
         execute: vec![
             "/bin".to_string(),
             "/sbin".to_string(),
             "/usr/bin".to_string(),
             "/usr/sbin".to_string(),
-            // Homebrew: ARM Macs → /opt/homebrew, Intel → /usr/local (covered by /usr/*)
-            "/opt/homebrew".to_string(),
         ],
-        read_write: default_read_write_paths(),
+        // The Landlock backend always grants the minimal device set
+        // (`/dev/null`, `/dev/zero`, `/dev/tty`, `/dev/pts`, ... read-write
+        // and `/dev/urandom`, ... read-only). Thus `/dev` is not in this list:
+        // a read-write grant on all of `/dev` includes `/dev/shm` and
+        // `/dev/mqueue`.
+        read_write: vec!["/tmp".to_string()],
     }
-}
-
-/// Default read-write paths.
-///
-/// On Linux, the Landlock backend always grants the minimal device set
-/// (`/dev/null`, `/dev/zero`, `/dev/tty`, `/dev/pts`, ... read-write and
-/// `/dev/urandom`, ... read-only). Thus `/dev` is not in this list: a
-/// read-write grant on all of `/dev` includes `/dev/shm` and `/dev/mqueue`.
-#[cfg(target_os = "linux")]
-fn default_read_write_paths() -> Vec<String> {
-    vec!["/tmp".to_string()]
-}
-
-/// Default read-write paths.
-#[cfg(not(target_os = "linux"))]
-fn default_read_write_paths() -> Vec<String> {
-    vec![
-        "/tmp".to_string(),
-        // Device files — processes need /dev/null, /dev/urandom, etc.
-        "/dev".to_string(),
-        // macOS per-user volatile cache dirs (Keychain/MDS/Security framework)
-        "/private/var/folders".to_string(),
-    ]
 }
 
 /// Configuration for sandboxed process execution.
@@ -120,7 +94,7 @@ pub struct SandboxConfig {
     pub workspace: PathBuf,
 
     /// Sandbox filesystem paths (traversal, read, execute, `read_write`).
-    /// Applied by both the macOS SBPL profile generator and Linux Landlock ruleset.
+    /// Applied by the Linux Landlock ruleset.
     pub paths: SandboxPaths,
 
     /// Application data directory (e.g. `~/.myapp`) — read-write inside sandbox.
@@ -159,9 +133,9 @@ pub struct SandboxConfig {
 
     /// The TCP ports on the loopback of the host that the child can reach.
     ///
-    /// On Linux the supervisor makes each such connection on the network of
-    /// the host and gives the connected socket to the child. On macOS the
-    /// Seatbelt profile allows the ports. The default opens no port.
+    /// The supervisor makes each such connection on the network of the host
+    /// and gives the connected socket to the child. The default opens no
+    /// port.
     pub localhost: LocalhostPorts,
 }
 
@@ -170,7 +144,7 @@ impl SandboxConfig {
     ///
     /// # Arguments
     /// * `workspace` - Workspace directory (read-write)
-    /// * `paths` - Sandbox filesystem paths (macOS SBPL)
+    /// * `paths` - Sandbox filesystem paths
     /// * `cwd` - Working directory
     #[must_use]
     pub fn new(workspace: PathBuf, paths: SandboxPaths, cwd: PathBuf) -> Self {

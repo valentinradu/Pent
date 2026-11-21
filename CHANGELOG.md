@@ -42,10 +42,8 @@ always closed the loopback, and watch mode did not record the attempt.
 
 - **Rules for the ports on localhost.** A profile opens a TCP port of the
   loopback of the host with `[network] localhost = [5432]`, and
-  `pent run --localhost <port>` opens one for a single run. On Linux, a
-  server that the command starts itself works with no rule. On macOS, the
-  command shares the loopback of the host, so such a server needs its port
-  in the list too.
+  `pent run --localhost <port>` opens one for a single run. A server that
+  the command starts itself works with no rule.
 - **Watch mode records the ports on localhost.** A default watch run opens
   each port and records each connection. The review shows the ports in the
   section "Localhost ports" and does not select them for you.
@@ -130,10 +128,6 @@ how you configure pent, so read "Breaking changes" before you upgrade.
   other programs. Where a container runtime hides a part of `/proc`, the
   kernel refuses the mount; pent then runs without the namespace and says
   so.
-- **macOS enforces the network.** The Seatbelt profile lets the command
-  reach the proxy and nothing else, and it denies `process-exec` and
-  `mach-lookup`, so an `execute` rule means something and a program cannot
-  ask `launchd` to run something outside the sandbox.
 - **Landlock is a hard requirement** (ABI 3, Linux 6.2 or later). An earlier
   version ran with no filesystem limit when the kernel had no Landlock, and
   said nothing.
@@ -173,12 +167,6 @@ are in [`docs/security`](docs/security/). Among them:
 
 ### Known limits
 
-- **macOS.** A watch run can still lose the accesses of a program that
-  forks and exits within a few milliseconds. The recorder wakes on the fork
-  itself, so the window is a few milliseconds and no longer a poll
-  interval, and a measured run keeps the access in each of 47 tries. The
-  window cannot close while a program that has already exited is invisible
-  to the kernel interface that pent may use.
 - Landlock does not control a connection to a Unix socket that has a path.
   Pent performs each permitted connection itself and hides the sockets that
   no rule names, which covers the ones it knows.

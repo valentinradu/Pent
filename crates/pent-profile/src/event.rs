@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 pub struct ProcessInfo {
     /// The process ID.
     pub pid: u32,
-    /// The short process name (`comm` on Linux, the name in the Seatbelt
-    /// message on macOS). Empty when the recorder does not know it.
+    /// The short process name (`comm`). Empty when the recorder does not
+    /// know it.
     pub name: String,
 }
 
@@ -118,8 +118,7 @@ pub enum WatchEvent {
         outcome: Outcome,
     },
     /// A direct TCP `connect()` to a port on the loopback of the host
-    /// (`127.0.0.0/8`, `::1`). The recorders send it: the seccomp
-    /// supervisor on Linux and the Seatbelt log on macOS.
+    /// (`127.0.0.0/8`, `::1`). The seccomp supervisor sends it.
     ///
     /// The proxy does not send this event. For a request for `localhost` or
     /// a loopback address it sends [`WatchEvent::Connect`] with that host,

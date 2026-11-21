@@ -98,9 +98,9 @@ pub(crate) struct RunArgs {
     #[arg(long)]
     pub trace: bool,
 
-    /// Disable filesystem sandbox (no Landlock, no overlayfs). Linux only.
+    /// Disable filesystem sandbox (no Landlock, no overlayfs).
     /// Network isolation is preserved unless --network unrestricted is also set.
-    #[arg(long, hide = cfg!(target_os = "macos"))]
+    #[arg(long)]
     pub no_sandbox: bool,
 
     /// Command and arguments to run inside the sandbox

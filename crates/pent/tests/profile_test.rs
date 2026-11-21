@@ -431,7 +431,7 @@ fn test_watch_yes_records_a_draft() -> TestResult {
     let draft = fs::read_to_string(&path)?;
     // `true` touches nothing, so the draft has no rule. It must still name
     // the program and the run, and it must parse. The rules of a recorded
-    // run are in tests/parity_watch.rs.
+    // run are in tests/watch_draft_rules.rs.
     assert!(
         draft.contains("# Profile for \"true\"."),
         "the draft does not name the program:\n{draft}"

@@ -495,13 +495,11 @@ pub struct WatchCase {
 pub const SHELL_NOISE: &[&str] = &[
     "~/.bash",
     "~/.cache",
-    "~/.CFUserTextEncoding",
     "~/.config/fish",
     "~/.local/share",
     "~/.profile",
     "~/.terminfo",
     "~/.zsh",
-    "~/Library",
 ];
 
 /// The default row.
@@ -632,10 +630,8 @@ pub struct GuardCase {
     pub link_dir: Option<(&'static str, &'static str)>,
     /// True when the file must not exist before the run.
     pub make_in_run: bool,
-    /// The identifier of the disagreement on Linux, when pent has one.
-    pub open_linux: Option<&'static str>,
-    /// The identifier of the disagreement on macOS, when pent has one.
-    pub open_macos: Option<&'static str>,
+    /// The identifier of the disagreement, when pent has one.
+    pub open: Option<&'static str>,
 }
 
 impl GuardCase {
@@ -645,16 +641,6 @@ impl GuardCase {
         match self.kind {
             GuardKind::Read => "read",
             GuardKind::Write => "write",
-        }
-    }
-
-    /// The identifier of the disagreement on this platform.
-    #[must_use]
-    pub fn open_here(&self) -> Option<&'static str> {
-        if cfg!(target_os = "macos") {
-            self.open_macos
-        } else {
-            self.open_linux
         }
     }
 }
@@ -667,11 +653,10 @@ const GUARD: GuardCase = GuardCase {
     class: "credential",
     link_dir: None,
     make_in_run: false,
-    open_linux: None,
-    open_macos: None,
+    open: None,
 };
 
-/// The guard against the summary. The table runs on Linux and on macOS.
+/// The guard against the summary.
 ///
 /// A row with the empty class is a positive control: the guard must not
 /// block it, so a run that blocks everything fails the table.
@@ -682,10 +667,7 @@ pub const GUARD_CASES: &[GuardCase] = &[
         path: ".ssh/id_ed25519",
         ..GUARD
     },
-    // A pattern with a leading `*` is a file name suffix. The macOS
-    // backend translates this form too (`name_pattern_regex`), so these
-    // rows agree on both platforms. DIFF-9 held the gap until the run of
-    // 2026-10-25 on a Mac proved the translation.
+    // A pattern with a leading `*` is a file name suffix.
     GuardCase {
         id: "key-suffix-rsa",
         path: ".ssh/github_rsa",
@@ -733,20 +715,17 @@ pub const GUARD_CASES: &[GuardCase] = &[
         path: ".ssh/old/more/id_rsa",
         ..GUARD
     },
-    // Through a symbolic link. The Linux supervisor refuses the read,
-    // because no mask covers the name that the program uses; the macOS
-    // profile holds a deny rule for the real directory of the link,
-    // because Seatbelt matches the path that the kernel resolves.
+    // Through a symbolic link. The supervisor refuses the read, because
+    // no mask covers the name that the program uses.
     GuardCase {
         id: "key-through-a-symbolic-link",
         path: ".ssh/linked/id_rsa",
         link_dir: Some((".ssh/linked", "keystore")),
         ..GUARD
     },
-    // A key that the program makes during the run. The Linux backend
+    // A key that the program makes during the run. The kernel backend
     // masks only the children that exist when the child starts, so the
-    // supervisor refuses the read; Seatbelt decides at the time of the
-    // access.
+    // supervisor refuses the read.
     GuardCase {
         id: "key-made-during-the-run",
         path: ".ssh/id_new",
@@ -994,24 +973,16 @@ pub fn fs_rows(ids: &[&str]) -> Vec<&'static FsCase> {
     rows
 }
 
-/// The rows of [`GUARD_CASES`] that have no open disagreement on this
-/// platform.
+/// The rows of [`GUARD_CASES`] that have no open disagreement.
 #[must_use]
 pub fn guard_closed() -> Vec<&'static GuardCase> {
-    GUARD_CASES
-        .iter()
-        .filter(|c| c.open_here().is_none())
-        .collect()
+    GUARD_CASES.iter().filter(|c| c.open.is_none()).collect()
 }
 
-/// The rows of [`GUARD_CASES`] that state the disagreement `id` on this
-/// platform.
+/// The rows of [`GUARD_CASES`] that state the disagreement `id`.
 #[must_use]
 pub fn guard_open(id: &str) -> Vec<&'static GuardCase> {
-    GUARD_CASES
-        .iter()
-        .filter(|c| c.open_here() == Some(id))
-        .collect()
+    GUARD_CASES.iter().filter(|c| c.open == Some(id)).collect()
 }
 
 /// The rows of [`GUARD_CASES`] with these names.
@@ -1033,14 +1004,11 @@ pub fn guard_rows(ids: &[&str]) -> Vec<&'static GuardCase> {
     rows
 }
 
-/// Every disagreement that [`GUARD_CASES`] states on this platform, sorted
+/// Every disagreement that [`GUARD_CASES`] states, sorted
 /// and without a repeat.
 #[must_use]
 pub fn guard_open_ids() -> Vec<&'static str> {
-    let mut ids: Vec<&'static str> = GUARD_CASES
-        .iter()
-        .filter_map(GuardCase::open_here)
-        .collect();
+    let mut ids: Vec<&'static str> = GUARD_CASES.iter().filter_map(|c| c.open).collect();
     ids.sort_unstable();
     ids.dedup();
     ids

@@ -3,11 +3,11 @@
 //! This crate holds the parts of watch mode that do not depend on the
 //! platform:
 //!
-//! - [`event`]: the event type that each recorder emits (Linux seccomp
-//!   recorder, macOS Seatbelt recorder, the proxy).
+//! - [`event`]: the event type that each recorder emits (the seccomp
+//!   recorder, the proxy).
 //! - [`name`]: the name of a profile.
 //! - [`doc`]: the profile file (`~/.config/pent/profiles/<name>.toml`).
-//! - [`guard`]: the dangerous paths that watch mode blocks on all platforms.
+//! - [`guard`]: the dangerous paths that watch mode blocks.
 //! - [`summary`]: the step that groups raw events into a short list of rules.
 //! - [`review`](mod@review): the interactive review at the end of watch mode.
 //! - [`render`]: the text of the summary, the draft file and a profile.

@@ -38,26 +38,14 @@ const BROAD_HOME_DIRS: &[&str] = &[
     ".local/share",
     ".local/state",
     ".cache",
-    "Library",
-    "Library/Application Support",
-    "Library/Caches",
-    "Library/Preferences",
 ];
 
 /// Cache directories below the home directory.
-const CACHE_DIRS: &[&str] = &[".cache", "Library/Caches"];
+const CACHE_DIRS: &[&str] = &[".cache"];
 
 /// Directories with short-lived files. The summary omits all paths below
 /// them.
-const EPHEMERAL_DIRS: &[&str] = &[
-    "/tmp",
-    "/var/tmp",
-    "/dev",
-    "/private/tmp",
-    "/private/var/tmp",
-    "/var/folders",
-    "/private/var/folders",
-];
+const EPHEMERAL_DIRS: &[&str] = &["/tmp", "/var/tmp", "/dev"];
 
 /// The access that a filesystem rule gives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]

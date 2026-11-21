@@ -11,7 +11,7 @@ REMOTE ?= origin
 BRANCH ?= main
 
 .PHONY: help build build-release install test clippy fmt fmt-check check \
-	e2e-macos e2e-linux e2e-linux-native release-check release-tag release-publish-all
+	e2e-linux e2e-linux-native release-check release-tag release-publish-all
 
 help:
 	@echo "Pent developer tasks"
@@ -27,7 +27,6 @@ help:
 	@echo "  make check               fmt-check + clippy + test"
 	@echo ""
 	@echo "E2E:"
-	@echo "  make e2e-macos           Run the macOS e2e tests"
 	@echo "  make e2e-linux           Run the Linux e2e tests in Docker"
 	@echo "  make e2e-linux-native    Run the Linux e2e tests on this host"
 	@echo ""
@@ -40,7 +39,7 @@ help:
 	@echo ""
 	@echo "Notes:"
 	@echo "  - release-tag pushes tag vX.Y.Z to $(REMOTE), triggering release workflow."
-	@echo "  - release workflow fans out binaries, AUR/APT publish, and Homebrew tap dispatch."
+	@echo "  - release workflow fans out binaries and the AUR/APT publish."
 
 build:
 	cargo build --workspace
@@ -54,9 +53,6 @@ install:
 	@if [ -d man ]; then \
 		if [ -n "$${MANPREFIX:-}" ]; then \
 			MAN_DIR="$$MANPREFIX/man1"; \
-		elif [ "$$(uname)" = "Darwin" ]; then \
-			MAN_DIR="$$(brew --prefix 2>/dev/null)/share/man/man1"; \
-			MAN_DIR=$${MAN_DIR:-/usr/local/share/man/man1}; \
 		elif [ "$$(id -u)" = "0" ]; then \
 			MAN_DIR="/usr/local/share/man/man1"; \
 		else \
@@ -85,12 +81,6 @@ fmt-check:
 
 check: fmt-check clippy test
 
-# The macOS suites: the Seatbelt sandbox, the network and the parity with
-# Linux. PENT_REQUIRE_ALL_TESTS makes each skip a failure, as in the CI.
-e2e-macos:
-	PENT_REQUIRE_ALL_TESTS=1 cargo test -p pent --no-fail-fast \
-		--test e2e_macos --test e2e_macos_network --test parity_watch -- --nocapture
-
 # The image runs the e2e, integration and profile tests in parallel (see
 # the CMD of e2e/Dockerfile). Pent needs unshare(2): the default seccomp and
 # AppArmor profiles of Docker block it. The overlay upper layers of pent are
@@ -103,7 +93,7 @@ e2e-linux:
 # The same tests on this host, without Docker.
 e2e-linux-native:
 	PENT_REQUIRE_ALL_TESTS=1 cargo test -p pent --no-fail-fast --test e2e_linux \
-		--test integration_test --test profile_test --test parity_watch -- --nocapture
+		--test integration_test --test profile_test --test watch_draft_rules -- --nocapture
 
 release-check:
 	@if [[ -z "$${VERSION:-}" ]]; then \

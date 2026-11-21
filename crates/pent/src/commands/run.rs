@@ -37,13 +37,6 @@ enum RunEvent {
 // platform-specific steps under `cfg`. To split it would hide this order.
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
-    #[cfg(target_os = "macos")]
-    if args.no_sandbox {
-        return Err(CliError::Other(
-            "--no-sandbox is not supported on macOS".to_string(),
-        ));
-    }
-
     // ── Profile ──────────────────────────────────────────────────────────────
     let selected = select_profile(args.profile.as_deref(), &args.command)?;
     if let Some(warning) = generic_warning(&selected) {
@@ -85,8 +78,7 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
 
     // ── Events ───────────────────────────────────────────────────────────────
     // All event sources send into one channel: the proxy (trace lines and
-    // structured events), the recorder of the sandbox (`--trace`), and on
-    // macOS the Seatbelt log.
+    // structured events) and the recorder of the sandbox (`--trace`).
     let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<RunEvent>();
     let stop = ForwardStop::default();
 
@@ -210,9 +202,9 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
         forward_std(rx, event_tx.clone(), RunEvent::Access);
     }
 
-    // Both platforms get the denials through `SandboxChild::events`. On
-    // macOS the reader of the unified log holds the channel open for a
-    // moment after the child exits, and `FINAL_DRAIN` covers that.
+    // The denials come through `SandboxChild::events`. The recorder closes
+    // the channel when the last process exits, so the late events need no
+    // grace here. `FINAL_DRAIN` covers the rest.
     let drain_grace = Duration::ZERO;
     // Only the forwarders keep senders. When they stop, the channel closes.
     drop(event_tx);
@@ -515,7 +507,7 @@ pub(crate) struct NetworkDecision {
     pub source: NetworkSource,
 }
 
-/// Resolve the network mode. This rule is the same on all platforms.
+/// Resolve the network mode.
 ///
 /// The precedence, from high to low:
 /// 1. An explicit `--network` flag.
@@ -742,8 +734,6 @@ fn proxy_violation_fix(violation: &str, profile: &ProfileName) -> String {
         "make sure that the process uses DNS names, and add the domain to the profile: {review}"
     )
 }
-
-// ── macOS trace ──────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]

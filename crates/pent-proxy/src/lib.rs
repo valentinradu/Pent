@@ -55,8 +55,7 @@
 //! # Security Model
 //!
 //! - Binds to `127.0.0.1` only (not reachable from network)
-//! - Sandboxed processes forced to use this proxy via network namespace (Linux)
-//!   or sandbox-exec localhost-only rule (macOS)
+//! - Sandboxed processes forced to use this proxy via network namespace
 //! - On Linux, the proxy has no host listener: it serves on listeners that
 //!   the child made in its own network namespace
 //!   ([`ProxyHandle::attach_listeners`])

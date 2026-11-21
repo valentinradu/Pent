@@ -23,7 +23,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest]
 
     steps:
       - uses: actions/checkout@v4
@@ -51,17 +51,6 @@ jobs:
           cat /etc/os-release | head -2
           echo "user.max_user_namespaces=$(sysctl -n user.max_user_namespaces 2>/dev/null || echo unknown)"
 
-      - name: Show the platform (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          sw_vers
-          uname -m
-          echo "developer directory: $(xcode-select --print-path 2>/dev/null || echo none)"
-          pkgutil --pkg-info=com.apple.pkg.CLTools_Executables 2>/dev/null \
-            || echo "the command line tools package is not registered"
-          clang --version | head -1 || true
-          ls -l /usr/bin/sandbox-exec /usr/bin/log /usr/bin/logger || true
-
       # Ubuntu 24.04 limits unprivileged user namespaces with AppArmor. Pent
       # needs them. Without this step every sandbox test skips, and the job
       # proves nothing.
@@ -78,10 +67,8 @@ jobs:
       - name: Build
         run: cargo build --workspace --tests
 
-      # The whole workspace, in debug. The macOS suites (e2e_macos,
-      # e2e_macos_network, parity_watch) are part of the workspace, so this
-      # one command runs them too. --nocapture keeps the profile and the log
-      # lines that a failed assertion prints.
+      # The whole workspace, in debug. --nocapture keeps the profile and the
+      # log lines that a failed assertion prints.
       - name: Run tests
         run: cargo test --workspace --no-fail-fast -- --nocapture
 
@@ -91,7 +78,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest]
     steps:
       - uses: actions/checkout@v4
 

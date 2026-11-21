@@ -1,9 +1,8 @@
 //! OS-level process sandboxing.
 //!
-//! Provides filesystem and network containment using native OS mechanisms:
-//! - macOS: sandbox-exec with SBPL profiles
-//! - Linux: Landlock LSM for filesystem, network namespaces for network.
-//!   No privileges are necessary: pent uses unprivileged user namespaces.
+//! Provides filesystem and network containment on Linux: Landlock LSM for
+//! the filesystem, network namespaces for the network. No privileges are
+//! necessary: pent uses unprivileged user namespaces.
 //!
 //! # Example
 //!
@@ -31,31 +30,6 @@
 
 mod config;
 mod env;
-
-// The SBPL generator is pure Rust, so its unit tests also run on Linux.
-// On Linux, only the tests use the module; the allow stops dead-code
-// warnings for the macOS spawn functions.
-#[cfg(any(target_os = "macos", test))]
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-mod macos;
-
-// The parse and filter functions of the macOS log reader are pure Rust, so
-// their unit tests also run on Linux.
-#[cfg(any(target_os = "macos", test))]
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-mod macos_log;
-
-// The snapshot of the process tree, which the log reader needs. The two
-// calls of `libproc` exist only on macOS.
-#[cfg(target_os = "macos")]
-mod macos_proctable;
-
-// The `kqueue` watch of a `fork`, which wakes the follower of the process
-// tree the moment a member forks (MAC-10). The module also holds the
-// measurement of `NOTE_TRACK` as a test, so a later macOS that follows a
-// `fork` itself is visible.
-#[cfg(target_os = "macos")]
-mod macos_kqueue;
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -134,8 +108,7 @@ pub fn implicit_allowed_paths(path_env: &str) -> Vec<std::path::PathBuf> {
 ///
 /// Watch mode does not apply the sandbox policy. It records each access of
 /// the process tree and blocks only the accesses that `guard` names. The
-/// kernel enforces the guard (mount masks on Linux, Seatbelt deny rules on
-/// macOS).
+/// kernel enforces the guard with mount masks.
 #[derive(Debug, Clone)]
 pub struct WatchOptions {
     /// The dangerous accesses to block (see [`pent_profile::guard_rules`]).
@@ -162,12 +135,6 @@ pub struct WatchedChild {
 /// Watch mode uses [`NetworkMode::ProxyOnly`] with the proxy in observe mode,
 /// so that network events have domain names.
 ///
-/// On macOS, the child runs under a Seatbelt profile that allows each
-/// operation with `(with report)` and denies the guard accesses. A reader of
-/// `log stream` (started before the spawn) turns the reports of the process
-/// tree into events. macOS limits the rate of the reports, so the events are
-/// a lower bound.
-///
 /// On Linux, a seccomp filter with user notification reports the path
 /// syscalls of the process tree to a supervisor thread, and masks in the
 /// private mount namespace of the child enforce the guard.
@@ -179,23 +146,18 @@ pub struct WatchedChild {
 ///
 /// # Errors
 /// Returns [`SandboxError::UnsupportedPlatform`] on a platform without a
-/// recorder, [`SandboxError::SandboxUnavailable`] on macOS if
-/// `log stream` cannot start, or a spawn error.
+/// recorder, or a spawn error.
 pub fn spawn_watched(
     config: &SandboxConfig,
     options: &WatchOptions,
     cmd: &str,
     args: &[String],
 ) -> Result<WatchedChild, SandboxError> {
-    #[cfg(target_os = "macos")]
-    {
-        macos::spawn_watched(config, options, cmd, args)
-    }
     #[cfg(target_os = "linux")]
     {
         linux_watch::spawn_watched(config, options, cmd, args)
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(not(target_os = "linux"))]
     {
         let _ = (config, options, cmd, args);
         Err(SandboxError::UnsupportedPlatform)
@@ -218,9 +180,6 @@ pub struct SandboxChild {
     /// The recorded events when [`SandboxConfig::record_events`] is set
     /// (`pent run --trace`). The recorder observes next to the enforcement.
     /// Events that the policy denies have [`pent_profile::Outcome::Denied`].
-    ///
-    /// On macOS, the channel has the Seatbelt denials of the process tree.
-    /// It is `None` if `log stream` cannot start.
     ///
     /// On Linux, the seccomp recorder reports each access, and the outcome is
     /// `Denied` when the Landlock policy does not allow the access. The
@@ -277,9 +236,8 @@ pub fn spawn_sandboxed(
     // `binary_grant_dirs` for the rules). This lets runtimes like Node.js read
     // the files of their own package.
     //
-    // Must happen before any platform-specific call:
-    // - Linux: overlayfs accessible set is built from config at mount time.
-    // - macOS: SBPL profile is generated from config before spawn.
+    // Do this before the Linux spawn: the overlay code makes the accessible
+    // set from the config when it mounts the overlay.
     let mut effective_config = config.clone();
     // Directories that need ReadFile for execve to work. On Linux these get
     // read + execute access (ReadFile | ReadDir | Execute), not the
@@ -305,10 +263,6 @@ pub fn spawn_sandboxed(
     }
     let config = &effective_config;
 
-    #[cfg(target_os = "macos")]
-    {
-        macos::spawn_run(config, cmd, args)
-    }
     #[cfg(target_os = "linux")]
     {
         let child_path = config.env.get("PATH").map_or("", |s| s.as_str());
@@ -345,7 +299,7 @@ pub fn spawn_sandboxed(
             events: spawned.events,
         })
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(not(target_os = "linux"))]
     {
         Err(SandboxError::UnsupportedPlatform)
     }
@@ -488,15 +442,11 @@ pub fn teardown_overlay(handle: OverlayHandle) -> OverlayTeardownReport {
 /// # Errors
 /// Returns a [`SandboxError`] if sandboxing is not available or not properly configured.
 pub fn check_availability() -> Result<(), SandboxError> {
-    #[cfg(target_os = "macos")]
-    {
-        macos::check_available()
-    }
     #[cfg(target_os = "linux")]
     {
         linux::check_available()
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(not(target_os = "linux"))]
     {
         Err(SandboxError::UnsupportedPlatform)
     }
@@ -538,7 +488,7 @@ mod tests {
         // things that do not: the function answers for the platform that
         // pent supports, and a refusal names the reason.
         let result = check_availability();
-        if cfg!(not(any(target_os = "linux", target_os = "macos"))) {
+        if cfg!(not(target_os = "linux")) {
             assert!(
                 matches!(result, Err(SandboxError::UnsupportedPlatform)),
                 "an unsupported platform must say so: {result:?}"
@@ -553,7 +503,7 @@ mod tests {
             );
             assert!(
                 !matches!(e, SandboxError::UnsupportedPlatform),
-                "Linux and macOS are supported platforms: {message}"
+                "Linux is a supported platform: {message}"
             );
         }
     }
@@ -576,36 +526,6 @@ mod tests {
             config,
             _temp: temp,
         }
-    }
-
-    #[test]
-    #[serial]
-    #[cfg(target_os = "macos")]
-    fn test_spawn_sandboxed_native_macos() -> TestResult {
-        if check_availability().is_err() {
-            return Ok(());
-        }
-        let dirs = make_test_config();
-        let result = spawn_sandboxed(&dirs.config, "/usr/bin/true", &[]);
-
-        match result {
-            Ok(mut sc) => {
-                let status = sc
-                    .child
-                    .wait()
-                    .map_err(|e| format!("Failed to wait: {e}"))?;
-                if !status.success() {
-                    if status.code() == Some(71) {
-                        return Ok(());
-                    }
-                    return Err(format!("Exit status: {:?}", status).into());
-                }
-            }
-            Err(SandboxError::SpawnFailed(err))
-                if err.kind() == std::io::ErrorKind::PermissionDenied => {}
-            Err(e) => return Err(format!("spawn_sandboxed failed: {e:?}").into()),
-        }
-        Ok(())
     }
 
     #[test]

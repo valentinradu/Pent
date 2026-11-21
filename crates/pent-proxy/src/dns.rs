@@ -199,7 +199,7 @@ impl Default for DnsServerConfig {
 impl DnsServerConfig {
     /// Get upstream servers, falling back to system resolvers.
     ///
-    /// Reads `/etc/resolv.conf` on Linux/macOS if no explicit upstream is set.
+    /// Reads `/etc/resolv.conf` if no explicit upstream is set.
     /// Falls back to well-known public DNS if system config is unavailable.
     #[must_use]
     pub fn get_upstream(&self) -> Vec<SocketAddr> {

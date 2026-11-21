@@ -11,8 +11,7 @@
 //! | `<state>/denied/<name>.jsonl` | The accesses that `pent run` denied. |
 //!
 //! `<config>` is `$XDG_CONFIG_HOME/pent` (default `~/.config/pent`) and
-//! `<state>` is `$XDG_STATE_HOME/pent` (default `~/.local/state/pent`). Pent
-//! uses these paths on all platforms.
+//! `<state>` is `$XDG_STATE_HOME/pent` (default `~/.local/state/pent`).
 //!
 //! Pent writes profiles, drafts and the trust store atomically, with the mode
 //! `0600`. The directories get the mode `0700` when pent creates them.

@@ -310,13 +310,12 @@ the arm.
 
 ## The first run: the gaps
 
-The three gaps of the first run are closed. Two points stay open. Neither
-point is a mutant that survives.
+The three gaps of the first run are closed. One point stays open. It is
+not a mutant that survives.
 
 | Point | What is missing |
 |---|---|
 | The ports of the inspection are not yet a setting of the session | `InspectPorts` is a value with the usual ports as the default, and only a test gives other ports. `ProxyConfig` does not carry the ports yet, because `server.rs` and `proxy.rs` belong to another change. The step that stays: put the field in `ProxyConfig`, give the value to `TcpProxy`, and take the value of the process away. |
-| The test with no home directory runs on Linux only | `PentDirs::from_env` answers `None` only when the environment gives no location **and** the user database has no entry for the user. The tests `no_home_and_no_xdg_variable_give_none` and `pent_reports_a_clear_error_and_does_not_panic` make that state with a user namespace, thus they run on Linux only. macOS has no equivalent, and there the two functions keep the answer of the user database. |
 
 ### How a test reaches a machine with no home directory
 
@@ -472,7 +471,7 @@ The second measurement reports all five as caught.
 
 | Mutant | Why |
 |---|---|
-| `loader.rs:84:23`: the guard `e.raw_os_error() == Some(1)` with `false` | The arm above it already returns `Ok(None)` for every error whose kind is `PermissionDenied`. On Linux `std` maps EPERM (raw error 1) to `PermissionDenied`, and an error that a program builds itself has no raw error number. Thus no error reaches this arm, and the two forms give the same answer for every input. The arm exists for macOS, where the comment says that the mapping is not always the same. Keep it, and keep this note with it. |
+| `loader.rs:84:23`: the guard `e.raw_os_error() == Some(1)` with `false` | The arm above it already returns `Ok(None)` for every error whose kind is `PermissionDenied`. On Linux `std` maps EPERM (raw error 1) to `PermissionDenied`, and an error that a program builds itself has no raw error number. Thus no error reaches this arm, and the two forms give the same answer for every input. The arm is a second guard. Keep it, and keep this note with it. |
 
 #### Needs a seam: the test exists, but the code must open a door
 
@@ -485,7 +484,7 @@ The second measurement reports all five as caught.
 
 | File | Mutants | Why |
 |---|---:|---|
-| `crates/pent-sandbox/src/*.rs` (`lib.rs`, `config.rs`, `env.rs`, `linux*.rs`, `macos*.rs`) | not counted | The tests of these files start real sandboxes: they unshare namespaces, they mount an overlay and they run a seccomp supervisor. One mutant can leave a mount or a process behind, and the run is slow. This is the largest hole: `linux_overlayfs.rs`, `linux_watch.rs` and `macos.rs` hold most of the containment. |
+| `crates/pent-sandbox/src/*.rs` (`lib.rs`, `config.rs`, `env.rs`, `linux*.rs`) | not counted | The tests of these files start real sandboxes: they unshare namespaces, they mount an overlay and they run a seccomp supervisor. One mutant can leave a mount or a process behind, and the run is slow. This is the largest hole: `linux_overlayfs.rs` and `linux_watch.rs` hold most of the containment. |
 | `crates/pent/src/**` | not counted | The CLI. Its tests are end-to-end: each one starts a child process under the sandbox. |
 | `crates/pent-profile/src/fixture.rs` | not counted | Test data only. A mutant of it changes no behaviour of the product. |
 | `crates/pent-profile/src/lib.rs` | not counted | The module list and the re-exports. |

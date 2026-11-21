@@ -69,15 +69,12 @@ pub(crate) struct ProxyChannels {
 
 /// Start the proxy with `domains` and `policy`.
 ///
-/// On Linux, the proxy has no host listener. The child unshares its network
+/// The proxy has no host listener. The child unshares its network
 /// namespace and makes the listeners there (127.0.0.1:3128 for SOCKS5 and
 /// HTTP CONNECT, 127.0.0.1:53 for DNS). Then it sends them to pent. Call
 /// [`ProxySession::attach`] after the spawn. The child can reach only its
 /// own loopback, so all its traffic goes through the proxy. No privilege is
 /// necessary.
-///
-/// On macOS, the proxy listens on loopback. The Seatbelt profile lets the
-/// child reach only the proxy port.
 ///
 /// # Errors
 /// Returns an error if the settings are not valid or the proxy cannot start.

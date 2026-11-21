@@ -7,7 +7,7 @@ include!("src/cli.rs");
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Write man pages to a stable `man/` directory at the repo root so that
-    // packaging scripts (PKGBUILD, cargo-deb, Homebrew formula) can find them
+    // packaging scripts (PKGBUILD, cargo-deb) can find them
     // at a known path regardless of Cargo's OUT_DIR.
     let manifest_dir = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);
     let man_dir = manifest_dir.join("../../man");

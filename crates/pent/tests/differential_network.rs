@@ -9,10 +9,6 @@
 //! as a number, and a name that the profile allows but that resolves to a
 //! loopback or to a private address.
 //!
-//! The rows run on Linux only. On macOS the system resolver answers each
-//! query, so the DNS layer has no verdict there; `docs/security/macos.md`
-//! holds that difference.
-//!
 //! Every row that asserts a refusal has a row that asserts a connection in
 //! the same table, and each probe prints `PENT_CHILD_RAN` first.
 //!

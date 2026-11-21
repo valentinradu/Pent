@@ -204,16 +204,13 @@ takes a file name prefix, or a file name suffix with a leading `*`, and it
 matches a file at any depth below the directory.
 
 `classify` uses the full rule, so the summary always puts such an access in
-the blocked section and the review does not select it. The two kernel
-backends enforce less:
+the blocked section and the review does not select it. The kernel backend
+enforces less:
 
 - Linux (`plan_guard`) masks only the direct children of the directory that
   exist when the child starts. A key in `~/.ssh/keys/` is not masked.
-- macOS builds one regular expression from the prefix. A pattern with a
-  leading `*` matches no file there, thus these rules have no effect on
-  macOS yet.
 
-A follow-up in `pent-sandbox` must give both backends the pattern form and
+A follow-up in `pent-sandbox` must give the backend the pattern form and
 the depth. Until then, pent records and shows the access, but the kernel
 does not stop it.
 

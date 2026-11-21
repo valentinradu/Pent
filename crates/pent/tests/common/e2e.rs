@@ -402,8 +402,8 @@ pub fn have_tools(test: &str, tools: &[&str]) -> bool {
 
 /// The messages that a shell prints when the sandbox denies a write.
 ///
-/// Landlock gives `EACCES` ("Permission denied"); Seatbelt gives `EPERM`
-/// ("Operation not permitted").
+/// Landlock gives `EACCES` ("Permission denied"). A read-only mount or a
+/// refusal of the supervisor can give `EPERM` ("Operation not permitted").
 const DENIAL_MESSAGES: &[&str] = &["Permission denied", "Operation not permitted"];
 
 /// Return true if pent can make its sandbox on this host. Else print the

@@ -95,7 +95,7 @@ Each target ran for 150 seconds.
 | `pent-proxy` | `domain_filter` | A pattern and a list of names. A wildcard must match only a name below its suffix. | 3,007,962 |
 | | | **Total** | **32,343,404** |
 
-The parsers of `pent-proxy` and of `pent-sandbox` are private, so a fuzz
+The parsers of `pent-proxy` are private, so a fuzz
 target cannot reach them without a change to the production code. The task
 forbids such a change, so the property tests of those parsers sit next to
 the code.
@@ -113,7 +113,6 @@ the source of each module), so a normal `cargo test` stays short.
 | `pent-proxy/src/inspect.rs` | `inspect_properties` | The inspector finds the server name of a well-formed ClientHello; it never reports a name that is not in the record; a full record is always complete, so the read always stops; the `Host` reader never reports an IP address. |
 | `pent-proxy/src/filter.rs` | `filter_properties` | A normalized name follows the rules and the normalization is idempotent; a wildcard matches only a name below its suffix. |
 | `pent-proxy/src/netaddr.rs` | `netaddr_properties` | The IPv4 ranges are the documented ones, checked against a second table with plain arithmetic; every boundary of every range holds; the IPv4-mapped and the NAT64 forms keep the class of their IPv4 address. |
-| `pent-sandbox/src/macos_log.rs` | `log_properties` | `parse_line` keeps its rules for every line; a filesystem event always has an absolute path; the process tree always stops, also for a process table with a cycle. |
 | `pent-profile/src/render.rs` | `render_properties` | A draft parses back to the same document and holds no control character; the profile text is safe for the terminal; `safe_lines` escapes every control character except the newline; a TOML string parses back to its rule. |
 | `pent-profile/src/event.rs` | `event_properties` | One event is one line, and the line reads back as the same event; a line that a program changed gives an error or the same event. |
 
@@ -124,12 +123,11 @@ only noise reaches only the first check of a parser.
 
 ## The findings
 
-Three findings. `docs/security/fuzzing.md` holds the attack, the effect and
+Two findings. `docs/security/fuzzing.md` holds the attack, the effect and
 the fix of each one.
 
 | ID | Severity | One line | State |
 |----|----------|----------|-------|
-| FUZZ-1 | Medium | A crafted executable name forges a Seatbelt report on macOS. | Open |
 | FUZZ-2 | Low | The DNS server clears the truncation bit of an upstream answer. | Open |
 | FUZZ-3 | Informational | The documentation of the domain filter names a pattern form that the code rejects. | Open |
 
@@ -167,7 +165,6 @@ count only the lines above the first `#[cfg(test)]` of each file.
 | `pent-profile/src/render.rs` | 0 |
 | `pent-proxy/src/filter.rs` | 0 |
 | `pent-proxy/src/netaddr.rs` | 0 |
-| `pent-sandbox/src/macos_log.rs` | 0 |
 | `pent-proxy/src/inspect.rs` | 1 |
 | `pent-proxy/src/server.rs` | 10 |
 | `pent-proxy/src/proxy.rs` | 26 |
@@ -246,10 +243,6 @@ that runs when an attacker is at work.
   These print the report of the host and the settings. The low number comes
   from the branches for a host that has no Landlock and no user namespace.
   They are not parsers and not security decisions.
-- **A whole message that a Mac writes.** The parser of `macos_log.rs` has
-  full line coverage, but nobody ran it against a real `log stream` on a
-  Mac. FUZZ-1 depends on the true length of the process name in a kernel
-  report. Check it on a Mac before you accept or reject the finding.
 - **The fuzz corpora.** The run keeps no corpus in the repository. Each
   target starts from an empty corpus and reaches the numbers above in 150
   seconds. A longer run with a stored corpus would go deeper into
@@ -270,8 +263,6 @@ that runs when an attacker is at work.
 - `pent-proxy/src/filter.rs`, `mod filter_properties`: two properties and
   the two tests of FUZZ-3.
 - `pent-proxy/src/netaddr.rs`, `mod netaddr_properties`: four properties.
-- `pent-sandbox/src/macos_log.rs`, `mod log_properties`: three properties
-  and the two tests of FUZZ-1.
 - `pent-profile/src/render.rs`, `mod render_properties`: four properties.
 - `pent-profile/src/event.rs`, `mod event_properties`: two properties.
 
@@ -284,8 +275,6 @@ seeded generator `Rng` and the function `rounds`.
   `the_server_clears_the_truncation_bit_today`.
 - `filter.rs`: `a_pattern_with_two_wildcards_is_rejected` (FUZZ-3) and
   `the_catch_all_patterns_allow_everything_below_them`.
-- `macos_log.rs`: `a_crafted_executable_name_forges_no_report`
-  (`#[ignore]`, FUZZ-1) and `the_crafted_name_gives_the_forged_target_today`.
 
 ### The tests of the coverage gaps
 

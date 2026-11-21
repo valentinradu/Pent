@@ -1,10 +1,7 @@
 # Differential tests: the profile, the summary and the kernel
 
-Status: review of commit `69cdc99` (2026-10-25). DIFF-1 to DIFF-9 have a
-fix; each section names its commit. DIFF-9 was a macOS rule that no
-machine here could run. The pipeline ran its seven rows on
-`macos-latest` on 2026-10-25 and each one agreed, so the finding is
-closed.
+Status: review of commit `69cdc99` (2026-10-25). DIFF-1 to DIFF-8 have a
+fix; each section names its commit.
 
 Pent describes one policy three times:
 
@@ -36,16 +33,7 @@ code.
 The tables are in `crates/pent/tests/common/differential.rs`. A row is one
 line of data. To add a case, add one line.
 
-`GUARD_CASES` runs on Linux and on macOS. Each row carries one
-disagreement identifier for each platform, because the two kernel backends
-enforce the guard in different ways. The macOS half runs only in the
-pipeline.
-
-The other three tables run on Linux only. Each verdict in them comes from
-a measurement on Linux. macOS has no overlayfs and no network namespace,
-and the system resolver answers each DNS query there, so the same rows
-need their own measurement on a Mac first. Nobody has run the macOS
-backend on a Mac yet.
+Each verdict in the tables comes from a measurement on Linux.
 
 Each test makes its own `HOME` and its own XDG directories below
 `CARGO_TARGET_TMPDIR`. Each probe prints `PENT_CHILD_RAN` first, so a child
@@ -69,7 +57,7 @@ three seconds alone.
 ## The disagreements
 
 A row with a disagreement stays in the table with the mark
-`open_linux` or `open_macos`. The normal test skips the row, and one test
+`open`. The normal test skips the row, and one test
 with `#[ignore = "OPEN DIFF-<n>: ..."]` runs it. The assertion stays as the
 proof of the finding.
 
@@ -83,7 +71,6 @@ proof of the finding.
 | DIFF-6 | High | The kernel | **Fixed.** The guard missed a private key that the program makes during the run, and the summary said "blocked". |
 | DIFF-7 | High | The summary | **Fixed.** The draft granted a path that the same summary showed as a blocked credential. |
 | DIFF-8 | Medium | The summary | **Fixed.** The proxy refused a destination that is not public, and recorded nothing. |
-| DIFF-9 | Medium | The kernel | **Closed.** The prediction was wrong: the macOS backend already translates a guard pattern with a leading `*`. |
 
 ### DIFF-1 — a read that the overlay hides is not a recorded denial
 
@@ -248,29 +235,18 @@ The program read the key. The kernel blocked nothing: the Linux guard masks
 the direct children of `~/.ssh`, and the real path of the key is below
 `~/keystore`.
 
-This is the same class of defect as the macOS case that started this
-review. The user reads "blocked" and believes in a protection that is not
+The user reads "blocked" and believes in a protection that is not
 there.
 
 **The fix.** A mount covers one inode, so a mask can never cover each
-name that reaches a key. The two backends close the hole in the way that
-fits them.
+name that reaches a key.
 
-On Linux, `plan_guard` puts each `FilesInDir` rule in the list
+`plan_guard` puts each `FilesInDir` rule in the list
 `unenforced` of the plan. The supervisor of the recorder sees the
 `openat` before the kernel answers, it classifies the path as the summary
 does, and it refuses the read with `EACCES` (`Judge::denies` in
 `linux_watch.rs`). The masks stay the first layer and have no race; the
 supervisor is the second layer and stops the names that no mask covers.
-
-On macOS, `guard_dir_variants` in `macos.rs` walks each guarded directory
-one time before the child starts and adds a deny rule for the real
-directory of every symbolic link that leaves the tree. Seatbelt matches
-the path that the kernel resolves, so the rule on `~/keystore` covers
-`~/.ssh/linked/id_rsa`. The macOS half is a prediction until the pipeline
-runs the row on a Mac; the unit test
-`the_watch_profile_covers_a_key_behind_a_symbolic_link` holds the shape
-of the profile.
 
 ### DIFF-6 — the guard misses a private key that the program makes
 
@@ -373,30 +349,6 @@ connection after its answer (`forward_head`), because the proxy checks
 the destination one time: a connection must carry one request only. A
 plain `http://` URL to a domain of the allowlist now works; before the
 fix it answered 400.
-
-### DIFF-9 — on macOS a guard pattern with a leading `*` has no effect
-
-**Severity:** Medium. **Wrong description:** the kernel. **Closed on
-2026-10-25** by `test(macos): close DIFF-9; measure the three open
-findings on a Mac`.
-
-**Test:** `differential_guard.rs`, `diff_9_a_suffix_pattern_on_macos`.
-Rows `key-suffix-rsa`, `key-suffix-pem`, `key-suffix-key`,
-`key-name-with-a-dot`, `key-name-with-a-plus`, `key-name-with-brackets`,
-`key-name-with-a-star`.
-
-`GuardTarget::FilesInDir` takes a file name prefix, or a file name suffix
-with a leading `*`. The row said that the macOS backend builds one
-regular expression from the prefix form, so a pattern with a leading `*`
-matches no file there.
-
-That was a prediction. The fix of MAC-2 (`name_pattern_regex` in
-`crates/pent-sandbox/src/macos.rs`) gave the backend the suffix form
-before anybody ran the row. The run of 2026-10-25 on `macos-latest`
-(run 40235794827) ran the seven rows and each one agreed: the kernel
-hides each key, and `classify` says the same. The test lost its `ignore`
-mark, and the seven rows lost their `open_macos` field, so
-`classify_and_the_kernel_agree` runs them too.
 
 ## Where the three descriptions agree
 

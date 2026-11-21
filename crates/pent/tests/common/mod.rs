@@ -6,9 +6,6 @@
 #[cfg(unix)]
 pub mod e2e;
 
-#[cfg(target_os = "macos")]
-pub mod macos;
-
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -111,22 +108,10 @@ impl Xdg {
 /// `@gemini` and their dependencies). Pent does not ship profiles now; the
 /// user records them with `pent watch`.
 pub fn agent_profile(agent: &str) -> String {
-    let macos = cfg!(target_os = "macos");
     let mut read = vec!["~/.bashrc", "~/.bash_profile", "~/.profile", "~/.npmrc"];
     let mut read_write = vec!["~/.npm"];
-    let mut execute = vec!["~/.local/bin"];
+    let execute = vec!["~/.local/bin"];
     let mut domains = vec!["registry.npmjs.org", "*.npmjs.org"];
-    if macos {
-        read.extend([
-            "~/.zshenv",
-            "~/.zprofile",
-            "~/.zshrc",
-            "~/.CFUserTextEncoding",
-            "~/Library/Preferences",
-            "~/Library/Application Support/com.apple.TCC",
-        ]);
-        execute.push("/usr/libexec/path_helper");
-    }
     match agent {
         "claude" => {
             read.extend([
@@ -143,9 +128,6 @@ pub fn agent_profile(agent: &str) -> String {
                 "~/.local/share/claude",
                 "~/.cache/claude",
             ]);
-            if macos {
-                read_write.push("~/Library/Application Support/claude");
-            }
             domains.extend([
                 "api.anthropic.com",
                 "statsig.anthropic.com",
@@ -164,9 +146,6 @@ pub fn agent_profile(agent: &str) -> String {
         }
         "gemini" => {
             read_write.push("~/.gemini");
-            if macos {
-                read_write.push("~/Library/Application Support/gemini-cli");
-            }
             domains.extend([
                 "generativelanguage.googleapis.com",
                 "aiplatform.googleapis.com",

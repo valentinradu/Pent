@@ -270,8 +270,8 @@ mod key_tests {
     ///
     /// `untrust` runs after a delete in `ProfileStore::remove`, so a key
     /// that needs the file would miss the entry and the approval would
-    /// stay. On a host where a parent of the path is a symbolic link (on
-    /// macOS `/var` is one) the two forms differ, and the defect showed.
+    /// stay. On a host where a parent of the path is a symbolic link, the
+    /// two forms differ, and the defect showed.
     #[test]
     fn the_key_is_the_same_before_and_after_a_delete() {
         let tmp = tempfile::tempdir().unwrap();

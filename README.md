@@ -1,7 +1,7 @@
 # Pent
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-![Platform: Linux | macOS](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS-blue.svg)
+![Platform: Linux](https://img.shields.io/badge/Platform-Linux-blue.svg)
 
 Wrap any process in a lightweight containment layer that restricts filesystem and network access using native OS mechanisms. No containers, no VMs.
 
@@ -25,7 +25,7 @@ Pent is for developers who need to run powerful but untrusted processes without 
 | | **Pent** | **Docker** | **Firejail** | **bubblewrap** |
 | :--- | :--- | :--- | :--- | :--- |
 | **Target** | Any process | Services & apps | Desktop apps | Any process |
-| **Platforms** | macOS & Linux | All (via VM) | Linux only | Linux only |
+| **Platforms** | Linux only | All (via VM) | Linux only | Linux only |
 | **Network control** | Domain allowlist | IP/port rules | IP/firewall | None |
 | **Filesystem control** | Path allowlist + overlayfs | Volume mounts | Path rules | Bind mounts |
 | **Setup** | Recorded profiles | Dockerfile | Per-app profiles | Manual flags |
@@ -47,14 +47,6 @@ Pent launches a child process inside a sandbox with two complementary controls.
 
 ## How it works
 
-### macOS: Seatbelt (sandbox-exec + SBPL)
-
-On macOS, Pent generates a [Sandbox Profile Language (SBPL)](https://reverse.put.as/wp-content/uploads/2011/09/Apple-Sandbox-Guide-v1.0.pdf) policy and launches the child process via `sandbox-exec`.
-
-The profile starts from `(allow default)`. It denies file reads (file content), file writes, program execution, a launchd job and a Mach service lookup, and then allows the configured paths, the workspace, the system program directories and the Mach services that an ordinary program needs. The other operation families stay allowed: see [macOS: the profile starts from `(allow default)`](#macos-the-profile-starts-from-allow-default).
-
-macOS has no network namespaces. In proxy mode, the profile denies outbound connections and allows only the proxy port on loopback, the system name resolver socket and the Unix sockets in the writable paths. See [Platform limitations](#platform-limitations) below.
-
 ### Linux: Landlock + overlayfs + namespaces
 
 On Linux, Pent combines four kernel mechanisms. **Landlock LSM** restricts filesystem access at the kernel level. **Overlayfs shadowing** protects parent directories by mounting a temporary layer in a private namespace; writes to non-allowlisted paths disappear when the process exits. **Mount namespaces** give the child its own empty `/tmp`, `/var/tmp` and `/run`, so the temporary files and the control sockets of the host stay out of reach. **Network namespaces** (`unshare(CLONE_NEWNET)`) isolate the network stack. In proxy mode, the child can reach only its own loopback. Pent's proxy listens there on sockets that the child makes and gives to Pent. A **PID namespace** with its own `proc` hides the processes of the host and ends the background processes of the sandbox; inside a container the kernel refuses this one mount, and Pent then says so (see [Processes](#processes)). Pent needs no root and no capability.
@@ -67,7 +59,7 @@ The proxy rejects destinations that are not public (loopback, private, CGNAT, li
 
 ### Network mode
 
-Pent uses the same rule on all platforms to select the network mode. The first item that applies sets the mode:
+Pent uses this rule to select the network mode. The first item that applies sets the mode:
 
 1. An explicit `--network` flag.
 2. One or more `--allow` flags. These select proxy mode.
@@ -81,35 +73,6 @@ Pent uses the same rule on all platforms to select the network mode. The first i
 Pent sends SIGTERM, SIGHUP, SIGUSR1 and SIGUSR2 to the child. Pent ignores SIGINT and SIGQUIT while the child runs: the terminal sends these signals to the child directly. After the child exits, Pent removes its temporary resources and exits with the status of the child. If a signal stopped the child, Pent stops itself with the same signal.
 
 ## Platform limitations
-
-### macOS: proxy mode with Seatbelt
-
-On macOS, the Seatbelt profile enforces proxy mode. The process can connect only to the proxy port on loopback. Pent sets `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY`, so a proxy-aware program sends its traffic through the proxy. A program that ignores these variables cannot connect to a remote host. There are two differences from Linux. DNS queries go to the system resolver, not to the Pent DNS server, so the process can resolve names that the allowlist does not have (it cannot connect to them). The process also cannot connect to the other loopback ports of the host.
-
-### macOS: the profile starts from `(allow default)`
-
-The macOS profile is not a deny-by-default sandbox. It limits file content reads, file writes, program execution, a launchd job, a Mach service lookup and (in the `blocked` and `localhost` modes) network access. These operation families stay allowed:
-
-- a metadata read (`stat`) on every path, also outside the profile;
-- a signal to another process of yours, a sysctl read, an IOKit open, and the other operation families of SBPL.
-
-**The three ways to run a program are closed.** Pent denies `process-exec`, and it allows it again for the `execute` paths, for the executable files of the read paths and for the system program directories. The workspace is in none of these, so a program in the workspace runs only with `--execute`, as on Linux. Pent also denies `job-creation`, so the process cannot ask `launchd` for a job, and `mach-lookup`, so it cannot ask a service of another program to act for it. The allowlist of the Mach services holds the ones that an ordinary program needs; a run on a Mac named each one. See MAC-4 in [docs/security/macos.md](docs/security/macos.md).
-
-None of the operation families that stay allowed runs a program outside the sandbox. A deny-by-default profile is still the stronger form, and it needs a run on a Mac for each family that an ordinary program uses.
-
-The macOS backend also ignores `[[sandbox.mounts]]`. Use a profile rule (or `--read`, `--write`) to give access to a path on macOS.
-
-### macOS: watch mode is a lower bound for a child that lives microseconds
-
-The macOS test suite ran on a Mac for the first time on 2026-10-25. The profile forms and the reader of the unified log hold, with these results.
-
-Watch mode reads the Seatbelt reports of the kernel from the unified log. To tell a real report from a line that the watched program writes itself, Pent checks the name of each report against the program that the process runs, and it reads the process tree from the kernel. A child process that forks and exits before Pent reads the tree never reaches that tree, so Pent loses its accesses. The root process of the run has no such gap, and a program that the root runs **in place** has none either: it keeps the process ID of the root, and Pent learns its name from the exec report of the kernel.
-
-Pent closes most of that window. It asks the kernel for an event on each `fork` of each member of the tree (`kqueue` with `EVFILT_PROC` and `NOTE_FORK`), so it reads the tree the moment a member forks and not at the next tick of a timer. A run on `macos-latest` measured the result: with a timer the recorder kept the accesses of a forked `cat` in 0 of 40 runs, and with the event in 47 of 47 runs.
-
-The window is smaller and not closed, so **watch mode on macOS stays a lower bound**: the draft can miss an access of a child that exits inside the window, and `pent watch --append` merges more runs. Linux has no such gap, because the Linux recorder reads each access from the kernel through seccomp. A guarantee on macOS needs the `EndpointSecurity` framework, which names the child of each `fork` with no race and which needs an Apple entitlement that a tool you build yourself cannot have. The finding is MAC-10 in [docs/security/macos.md](docs/security/macos.md), with the tests and the numbers.
-
-Before Pent starts your program, it makes one Seatbelt report of its own and waits for it. The first `log stream` of a machine delivers no report for its first moments, and without this wait the first watch run of a machine recorded nothing (MAC-12). The wait costs about 300 ms on the first run of a machine and about 50 ms after it. If it passes its limit of ten seconds, Pent warns you that the run can record no access at all.
 
 ### Linux: requirements and Unix sockets
 
@@ -161,12 +124,6 @@ before you upgrade.
 ## Installation
 
 Pent needs no root and no capability. The packages do not run `setcap`.
-
-### Homebrew (macOS / Linux)
-```bash
-brew tap valentinradu/pent
-brew install pent
-```
 
 ### AUR (Arch Linux)
 ```bash
@@ -289,7 +246,7 @@ pent run --network blocked -- claude
 
 ### Files
 
-Pent uses the XDG directories on all platforms. When `$XDG_CONFIG_HOME` or `$XDG_STATE_HOME` is set, pent uses it.
+Pent uses the XDG directories. When `$XDG_CONFIG_HOME` or `$XDG_STATE_HOME` is set, pent uses it.
 
 | Path | Content |
 |---|---|
@@ -388,7 +345,7 @@ A program can also connect to an abstract address (`@name`). A rule cannot name 
 
 `localhost` names the TCP ports on the loopback of the host (`127.0.0.1`, `::1`) that the program can connect to, for example a database or a local model server. The rule works in each network mode except `--network blocked` as a flag. A port on the loopback is a strong grant: a service there often has no authentication, and some ports run code (the Docker API on 2375, the debug port of a browser on 9222). Thus the review never selects such an item for you. The watch guard blocks the known control ports, and the review shows them under "Blocked by the guard". A profile can still name such a port.
 
-On Linux the program has its own loopback. A server that the program starts itself works with no rule, and pent connects each listed port to the host. In the `blocked` network mode the program has no loopback of its own, so only the listed ports of the host work. On macOS the loopback of the program is the loopback of the host, so a server that the program starts itself also needs its port in the list.
+The program has its own loopback. A server that the program starts itself works with no rule, and pent connects each listed port to the host. In the `blocked` network mode the program has no loopback of its own, so only the listed ports of the host work.
 
 To record more accesses into the same draft, run `pent watch --append -- claude`. Each run adds to the draft. Without `--append`, a new run starts a new draft. Pent records one watch run of a profile at a time: a second run of the same profile stops at once with an error, before it asks anything.
 
@@ -443,7 +400,7 @@ pent: fix: allow it for one run with --allow evil.example, or add it to the prof
 pent: [allowed] network: connection to "example.com" allowed
 ```
 
-The proxy events are in the log only in proxy mode (domains in the profile, `--allow`, or `--network proxy`). In other modes, pent shows a note. On macOS, pent also reads the Seatbelt denials of the process tree from the unified log (`log stream`).
+The proxy events are in the log only in proxy mode (domains in the profile, `--allow`, or `--network proxy`). In other modes, pent shows a note.
 
 ### `strace`: see all filesystem accesses
 
