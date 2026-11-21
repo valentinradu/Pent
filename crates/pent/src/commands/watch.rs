@@ -145,7 +145,6 @@ pub(crate) async fn watch(args: WatchArgs, cwd: PathBuf) -> Result<(), CliError>
     }
     // Watch mode takes the PID namespace too, where the kernel gives one.
     // See `ProcIsolation` in pent-sandbox.
-    #[cfg(target_os = "linux")]
     for warning in pent_sandbox::proc_isolation().warning_lines() {
         ui::warn(warning);
     }
@@ -233,7 +232,6 @@ pub(crate) async fn watch(args: WatchArgs, cwd: PathBuf) -> Result<(), CliError>
         }
     };
 
-    #[cfg(target_os = "linux")]
     let cleanup = SessionCleanup::new(
         watched.child.child.id(),
         crate::commands::session::LinuxResources {
@@ -244,12 +242,9 @@ pub(crate) async fn watch(args: WatchArgs, cwd: PathBuf) -> Result<(), CliError>
     // The child made the proxy listeners in its network namespace. If the
     // proxy cannot use them, the error drops `cleanup`, which stops the
     // child.
-    #[cfg(target_os = "linux")]
     if let Some(proxy) = &proxy {
         proxy.attach(watched.child.proxy_listeners)?;
     }
-    #[cfg(not(target_os = "linux"))]
-    let cleanup = SessionCleanup::new(watched.child.child.id(), ());
 
     // ── Record ───────────────────────────────────────────────────────────────
     let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<WatchEvent>();

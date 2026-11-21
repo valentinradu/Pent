@@ -5,13 +5,10 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-#[cfg(target_os = "linux")]
 use pent_proxy::ExternalListeners;
 use pent_proxy::{ProxyConfig, ProxyHandle, ProxyPolicy, ProxyServer, TraceEvent};
-#[cfg(target_os = "linux")]
 use pent_sandbox::teardown_overlay;
 use pent_sandbox::NetworkMode;
-#[cfg(target_os = "linux")]
 use pent_sandbox::ProxyListeners;
 use pent_settings::ProxySettings;
 use tokio::signal::unix::{signal, Signal, SignalKind};
@@ -38,7 +35,6 @@ impl ProxySession {
     /// # Errors
     /// Returns an error if the spawn returned no listeners, or if the proxy
     /// cannot use them.
-    #[cfg(target_os = "linux")]
     pub fn attach(&self, listeners: Option<ProxyListeners>) -> Result<(), CliError> {
         let listeners = listeners.ok_or_else(|| {
             CliError::Other("the sandbox did not make the proxy listeners".to_string())
@@ -93,20 +89,11 @@ pub(crate) async fn start_proxy(
     config.event_tx = channels.events;
     let server = ProxyServer::new(config)?;
 
-    #[cfg(target_os = "linux")]
     let (handle, proxy_addr, dns_port) = (
         server.start_unbound()?,
         pent_sandbox::child_proxy_addr(),
         pent_sandbox::CHILD_DNS_PORT,
     );
-    #[cfg(not(target_os = "linux"))]
-    let (handle, proxy_addr, dns_port) = {
-        let handle = server.start().await?;
-        let (Some(proxy_addr), Some(dns_addr)) = (handle.proxy_addr(), handle.dns_addr()) else {
-            return Err(CliError::Other("the proxy has no listener".to_string()));
-        };
-        (handle, proxy_addr, dns_addr.port())
-    };
     tracing::debug!(
         proxy = %proxy_addr,
         dns_port,
@@ -415,19 +402,13 @@ pub(crate) trait Teardown {
     fn teardown(self);
 }
 
-impl Teardown for () {
-    fn teardown(self) {}
-}
-
 /// The Linux resources of one session.
-#[cfg(target_os = "linux")]
 pub(crate) struct LinuxResources {
     pub overlay: Option<pent_sandbox::OverlayHandle>,
     /// Show the writes that the overlay discards (trace mode).
     pub trace: bool,
 }
 
-#[cfg(target_os = "linux")]
 impl Teardown for LinuxResources {
     fn teardown(self) {
         if let Some(handle) = self.overlay {
@@ -439,7 +420,6 @@ impl Teardown for LinuxResources {
 
 /// Tell the user about edits that pent could not save, and (in trace mode)
 /// about writes that the overlay discards.
-#[cfg(target_os = "linux")]
 fn show_overlay_report(report: &pent_sandbox::OverlayTeardownReport, trace: bool) {
     for failure in &report.failures {
         ui::error(format!(

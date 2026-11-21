@@ -469,9 +469,9 @@ The second measurement reports all five as caught.
 
 #### Equivalent: no input can tell the two forms apart
 
-| Mutant | Why |
-|---|---|
-| `loader.rs:84:23`: the guard `e.raw_os_error() == Some(1)` with `false` | The arm above it already returns `Ok(None)` for every error whose kind is `PermissionDenied`. On Linux `std` maps EPERM (raw error 1) to `PermissionDenied`, and an error that a program builds itself has no raw error number. Thus no error reaches this arm, and the two forms give the same answer for every input. The arm is a second guard. Keep it, and keep this note with it. |
+The one equivalent survivor was the EPERM arm in `loader.rs`. The arm above
+it already caught EPERM on Linux, so a later commit removed the arm. The
+numbers above are still the numbers of the measurement.
 
 #### Needs a seam: the test exists, but the code must open a door
 

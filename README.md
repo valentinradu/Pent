@@ -271,7 +271,7 @@ tcp_connect_timeout_secs = 30
 tcp_idle_timeout_secs = 300
 private_destinations = "deny"       # "allow" for an internal registry on 10.x
 
-# Linux only. A mount is read-only unless you set readonly = false.
+# A mount is read-only unless you set readonly = false.
 [[sandbox.mounts]]
 path = "/opt/tools"
 ```

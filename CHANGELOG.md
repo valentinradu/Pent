@@ -4,6 +4,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/1.1.0/),
 and the versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Pent is below 1.0, so a minor version can break what you have.
 
+## Unreleased
+
+### Removed
+
+- **Pent runs on Linux only.** The release has no binary for another
+  platform, and the Homebrew tap gets no update. A build for another
+  platform stops with the error "pent runs on Linux only".
+
 ## 0.2.1 — 2026-10-28
 
 This release makes two runs of `pent watch` safe, and it says what a watch

@@ -145,8 +145,10 @@ pub struct WatchedChild {
 /// before you wait for the channel to close.
 ///
 /// # Errors
-/// Returns [`SandboxError::UnsupportedPlatform`] on a platform without a
-/// recorder, or a spawn error.
+/// Returns [`SandboxError::SandboxUnavailable`] on a CPU architecture
+/// without a recorder or when the recorder does not start,
+/// [`SandboxError::UnsupportedPlatform`] on a platform other than Linux, or a
+/// spawn error.
 pub fn spawn_watched(
     config: &SandboxConfig,
     options: &WatchOptions,

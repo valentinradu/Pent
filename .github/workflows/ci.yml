@@ -17,13 +17,11 @@ env:
 
 jobs:
   test:
-    name: Test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    # The name keeps the old matrix form, so a required check of the
+    # branch protection still matches.
+    name: Test (ubuntu-latest)
+    runs-on: ubuntu-latest
     timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest]
 
     steps:
       - uses: actions/checkout@v4
@@ -44,8 +42,7 @@ jobs:
 
       # The version of the runner decides which sandbox features work. Print
       # it, so that a future failure is easy to place.
-      - name: Show the platform (Linux)
-        if: runner.os == 'Linux'
+      - name: Show the platform
         run: |
           uname -a
           cat /etc/os-release | head -2
@@ -55,7 +52,6 @@ jobs:
       # needs them. Without this step every sandbox test skips, and the job
       # proves nothing.
       - name: Allow unprivileged user namespaces
-        if: runner.os == 'Linux'
         run: |
           knob=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
           if [ -e "$knob" ]; then
@@ -73,12 +69,8 @@ jobs:
         run: cargo test --workspace --no-fail-fast -- --nocapture
 
   clippy:
-    name: Clippy (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest]
+    name: Clippy (ubuntu-latest)
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 

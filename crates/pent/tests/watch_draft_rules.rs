@@ -13,6 +13,9 @@
 
 mod common;
 
+#[path = "common/differential.rs"]
+mod differential;
+
 #[cfg(target_os = "linux")]
 mod draft_rules {
     use std::collections::BTreeSet;
@@ -33,25 +36,14 @@ mod draft_rules {
     /// The read-write rules that the draft must have.
     const EXPECTED_READ_WRITE: &[&str] = &["~/.config/app/settings.toml"];
 
-    /// The prefixes of the rules that depend on the shell of the host.
-    ///
-    /// A shell reads its own start files. A rule below one of these
-    /// prefixes is not a change in the pipeline, so the comparison ignores
-    /// it. Keep this list short: each entry hides a difference.
-    const HOST_SPECIFIC: &[&str] = &[
-        "~/.cache",
-        "~/.bash",
-        "~/.zsh",
-        "~/.profile",
-        "~/.local/share",
-        "~/.config/fish",
-        "~/.terminfo",
-    ];
-
     /// Return true if `rule` names a path that depends on the shell of the
-    /// host.
+    /// host. A shell reads its own start files, so such a rule is not a
+    /// change in the pipeline. The list is `SHELL_NOISE`, which the
+    /// differential tests use too.
     fn is_host_specific(rule: &str) -> bool {
-        HOST_SPECIFIC.iter().any(|p| rule.starts_with(p))
+        super::differential::SHELL_NOISE
+            .iter()
+            .any(|p| rule.starts_with(p))
     }
 
     /// A known command gives exactly the expected rules in the draft.

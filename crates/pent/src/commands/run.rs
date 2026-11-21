@@ -33,8 +33,8 @@ enum RunEvent {
     Access(WatchEvent),
 }
 
-// The function is long because it lists the steps of one run in order, with
-// platform-specific steps under `cfg`. To split it would hide this order.
+// The function is long because it lists the steps of one run in order. To
+// split it would hide this order.
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
     // ── Profile ──────────────────────────────────────────────────────────────
@@ -50,9 +50,8 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
     let mut paths = profile_paths(&profile);
     add_cli_paths(&mut paths, &args);
     paths.resolve_relative(&cwd);
-    // On Linux, read_write paths must be exact filenames — glob ('*') patterns
+    // The read_write paths must be exact filenames — glob ('*') patterns
     // are not supported because overlayfs requires specific paths to mount over.
-    #[cfg(target_os = "linux")]
     paths.validate_no_rw_globs()?;
 
     // Decide the network mode before `--allow` merges into the profile
@@ -155,7 +154,6 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
     // container runtime hides a part of `/proc`, and the kernel then refuses
     // the mount. Pent goes on, and the user learns what the command can
     // see. See `ProcIsolation` in pent-sandbox.
-    #[cfg(target_os = "linux")]
     if !args.no_sandbox {
         for line in pent_sandbox::proc_isolation().warning_lines() {
             ui::warn(line);
@@ -180,7 +178,6 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
 
     let sandbox_child = spawn_sandboxed(&sandbox_cfg, cmd, cmd_args)?;
 
-    #[cfg(target_os = "linux")]
     let cleanup = SessionCleanup::new(
         sandbox_child.child.id(),
         crate::commands::session::LinuxResources {
@@ -191,12 +188,9 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
     // The child made the proxy listeners in its network namespace. If the
     // proxy cannot use them, the error drops `cleanup`, which stops the
     // child.
-    #[cfg(target_os = "linux")]
     if let Some(proxy) = &proxy {
         proxy.attach(sandbox_child.proxy_listeners)?;
     }
-    #[cfg(not(target_os = "linux"))]
-    let cleanup = SessionCleanup::new(sandbox_child.child.id(), ());
     let child = sandbox_child.child;
     if let Some(rx) = sandbox_child.events {
         forward_std(rx, event_tx.clone(), RunEvent::Access);
@@ -204,8 +198,8 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
 
     // The denials come through `SandboxChild::events`. The recorder closes
     // the channel when the last process exits, so the late events need no
-    // grace here. `FINAL_DRAIN` covers the rest.
-    let drain_grace = Duration::ZERO;
+    // grace. `FINAL_DRAIN` covers the rest.
+    //
     // Only the forwarders keep senders. When they stop, the channel closes.
     drop(event_tx);
 
@@ -228,8 +222,7 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
     // mount namespace is already destroyed and no writes are in flight.
     cleanup.finish();
 
-    // Read the late events, then stop the forwarders and read the rest.
-    let rest = drain(rest, drain_grace, &mut sink).await;
+    // Stop the forwarders, then read the rest of the events.
     stop.stop();
     if let Some(proxy) = proxy {
         proxy.shutdown().await;

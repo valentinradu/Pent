@@ -82,9 +82,6 @@ fn read_optional(path: &Path) -> Result<Option<Vec<u8>>, SettingsError> {
         {
             Ok(None)
         }
-        // A second guard for EPERM (raw os error 1). On Linux, `std` maps
-        // EPERM to `PermissionDenied`, so the arm above already catches it.
-        Err(ref e) if e.raw_os_error() == Some(1) => Ok(None),
         Err(e) => Err(SettingsError::Io(e)),
     }
 }

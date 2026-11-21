@@ -57,19 +57,19 @@ All three are fixed.
 
 ### The marks today
 
-The workspace has **4** `#[ignore]` attributes. Each one holds the proof of
-an open finding, except the benchmark.
+The workspace has **1** `#[ignore]` attribute: the benchmark.
 
 | File | Test | Reason | Fails today? |
 |------|------|--------|--------------|
-| `crates/pent/tests/security_linux_sandbox.rs` | `test_unix_socket_connect_outside_profile` | `OPEN VULN LS-1 (partial)` | Yes |
-| `crates/pent/tests/security_network_e2e.rs` | `a_profile_path_below_a_private_dir_keeps_its_siblings_hidden` | `OPEN NET-3` | Yes |
-| `crates/pent-profile/tests/hardening_profile.rs` | `p4_persistence_rules_follow_the_xdg_config_directory` | `OPEN H-14` | Yes |
 | `crates/pent-sandbox/src/linux_watch.rs` | `bench_recorder_overhead` | `a benchmark, not a check` | n/a |
 
-NET-3 and H-14 are new. The audit asked for a test for each open item of a
-report, and these two had none. See `docs/security/network.md` and
-`docs/security/watch-and-profiles.md`.
+The three tests that had an `OPEN` mark have no mark now, and they pass:
+
+| Test | Finding |
+|------|---------|
+| `test_unix_socket_connect_outside_profile` | LS-1, fixed by `dab7058` |
+| `a_profile_path_below_a_private_dir_keeps_its_siblings_hidden` | NET-3, fixed by `dedaf2e` |
+| `p4_persistence_rules_follow_the_xdg_config_directory` | H-14 |
 
 ### What the audit found
 

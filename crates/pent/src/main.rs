@@ -1,3 +1,6 @@
+#[cfg(not(target_os = "linux"))]
+compile_error!("pent runs on Linux only");
+
 mod cli;
 mod commands;
 mod error;
@@ -14,7 +17,6 @@ async fn main() {
     let run_mode = matches!(cli.command, Command::Run(_) | Command::Watch(_));
     setup_tracing(cli.verbose, run_mode);
 
-    #[cfg(target_os = "linux")]
     pent_sandbox::cleanup_stale_overlays();
 
     let result = dispatch(cli).await;

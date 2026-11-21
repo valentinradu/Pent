@@ -25,9 +25,8 @@ pub(crate) async fn check(cwd: PathBuf) -> Result<(), CliError> {
         }
     }
 
-    // On Linux, the sandbox, the network containment and watch mode need
-    // unprivileged user namespaces.
-    #[cfg(target_os = "linux")]
+    // The sandbox, the network containment and watch mode need unprivileged
+    // user namespaces.
     match pent_sandbox::check_user_namespaces() {
         Ok(()) => ui::ok("user namespaces"),
         Err(e) => {
@@ -39,7 +38,6 @@ pub(crate) async fn check(cwd: PathBuf) -> Result<(), CliError> {
     // The PID namespace and the private `/proc` go together, and a container
     // does not give them. Their absence is not a failure of the check: the
     // file rules and the network rules hold without them.
-    #[cfg(target_os = "linux")]
     match pent_sandbox::proc_isolation() {
         pent_sandbox::ProcIsolation::Private => {
             ui::ok("pid namespace and private /proc");
