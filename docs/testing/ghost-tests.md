@@ -69,7 +69,7 @@ The three tests that had an `OPEN` mark have no mark now, and they pass:
 |------|---------|
 | `test_unix_socket_connect_outside_profile` | LS-1, fixed by `dab7058` |
 | `a_profile_path_below_a_private_dir_keeps_its_siblings_hidden` | NET-3, fixed by `dedaf2e` |
-| `p4_persistence_rules_follow_the_xdg_config_directory` | H-14 |
+| `p4_persistence_rules_follow_the_xdg_config_directory` | H-14, fixed by `918b6db` |
 
 ### What the audit found
 
@@ -132,8 +132,8 @@ reports mark each one `Fixed`, and a fixed finding keeps its test without an
 ignore.
 
 `docs/security/watch-and-profiles.md` listed H-13 (Medium) and H-14 (Low) as
-open with no test. H-14 has one now. H-13 needs a change in `pent-sandbox`
-and belongs with that work.
+open with no test. Both are fixed now: H-13 by `842ad66` and H-14 by
+`918b6db`.
 
 ## Every finding
 
@@ -244,7 +244,7 @@ the behaviour changes.
   document a limit of the design and assert the current behaviour. One row
   of the finding table covers the single weak assertion at line 395.
 - **`crates/pent-profile`** (67 unit tests, 45 in
-  `tests/hardening_profile.rs`, one of them `#[ignore]` for H-14). The summary, the guard list, the renderers,
+  `tests/hardening_profile.rs`). The summary, the guard list, the renderers,
   the public suffix subset and the control-character escapes. Pure logic, no
   guards, exact assertions.
 - **`crates/pent-settings`** (44 unit tests, 17 in

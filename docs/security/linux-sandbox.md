@@ -382,11 +382,9 @@ The doc comment of `GuardTarget::FilesInDir` in `crates/pent-profile`
 names the limits of the walk: the depth, and the files that exist when the
 child starts.
 
-**H-14 — open, small.** `guard_rules_with(home, pent_dirs)` moves only the
-`PentFiles` rules to the XDG directories of the session. Another rule that
-names a path under `~/.config` still uses the default location, so a
-session with a different `XDG_CONFIG_HOME` guards the wrong path. The fix
-belongs in `crates/pent-profile/src/guard.rs`.
+**H-14 — fixed.** `guard_rules_with` moved only the `PentFiles` rules to
+the XDG directories of the session. Now each rule below `.config` and
+`.local/state` follows the roots of the user (`918b6db`).
 
 ## Verified defenses
 
@@ -415,8 +413,6 @@ Each test below passes. It guards a defense that works.
 
 Every finding of this report is fixed. The open points are smaller:
 
-- H-14 (above): `guard_rules_with` moves only the `PentFiles` rules to the
-  XDG directories of the session.
 - The three limits of the control of the Unix sockets (see LS-1, "What
   stays open"): `sendmmsg(2)` with a path, a message with ancillary data
   to a named path on a datagram socket, and the answer to a performed

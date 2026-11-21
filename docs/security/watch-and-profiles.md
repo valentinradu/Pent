@@ -65,7 +65,7 @@ The files:
 | 1. Output safety | Holds. Pent escapes C0, DEL, C1 and the Unicode format characters (H-1). |
 | 2. Draft integrity | Holds. `render_draft_with` cleans each comment (H-6). |
 | 3. Grouping limits | Holds. Every rule keeps the limit (H-2, H-3, H-4). The public suffix subset has the common services (H-5). |
-| 4. Guard coverage | Holds for the named locations and for G-1 to G-10. The kernel enforces less than the SSH key rules and the Python user site rules say; see "Open items". |
+| 4. Guard coverage | Holds for the named locations and for G-1 to G-10. The kernel enforces the SSH key rules and the Python user site rules at any depth (H-13). |
 | 5. Store and trust safety | Holds. See the table "Fixed items" for H-7 to H-12. |
 | 6. Review input handling | Holds. Pent discards the queued terminal input before each question (O-1). |
 
@@ -204,15 +204,12 @@ takes a file name prefix, or a file name suffix with a leading `*`, and it
 matches a file at any depth below the directory.
 
 `classify` uses the full rule, so the summary always puts such an access in
-the blocked section and the review does not select it. The kernel backend
-enforces less:
-
-- Linux (`plan_guard`) masks only the direct children of the directory that
-  exist when the child starts. A key in `~/.ssh/keys/` is not masked.
-
-A follow-up in `pent-sandbox` must give the backend the pattern form and
-the depth. Until then, pent records and shows the access, but the kernel
-does not stop it.
+the blocked section and the review does not select it. The kernel enforces
+the same rule: `plan_guard` walks the directory down to `GUARD_WALK_DEPTH`
+levels and masks each file that matches, so a key in `~/.ssh/keys/` is
+masked too. The walk sees only the files that exist when the child starts.
+See H-13 in `docs/security/linux-sandbox.md`. The test is
+`the_summary_and_the_kernel_agree_on_the_blocked_accesses`.
 
 ## Property 5: store and trust safety
 
@@ -268,27 +265,8 @@ run in the normal suite.
 | H-12 | Medium | `serde_json` cannot encode a non-UTF-8 `PathBuf`, so one crafted `open()` stopped the log for the rest of the run. **Fix:** the path has a byte-array form in JSON, and `pent watch` skips a bad event, counts it, and warns one time. | `p5_event_log_accepts_non_utf8_paths` |
 | G-1 to G-10 | High to Low | The guard list missed common credential and persistence locations. **Fix:** see "Property 4". | `p4_gap_*` (10 tests) |
 | O-1 | Low | A process of the command could put text in the terminal input and answer the review. **Fix:** `Tty::confirm` and `Tty::split` call `tcflush(TCIFLUSH)` first. | No test: the test needs a controlling terminal. |
-
-## Open items
-
-| ID | Severity | Description | Test |
-|---|---|---|---|
-| H-13 | Medium | The kernel enforces less than the new guard rules with a file name pattern say. See "What the kernel enforces" in Property 4. The fix belongs in `pent-sandbox`. | None yet |
-| H-14 | Low | `guard_rules_with` moves only the `PentFiles` rules to the real directories. The other rules below `~/.config` (fish, nushell, autostart, systemd, direnv, nvim, cron) still use `~/.config`. `$XDG_CONFIG_HOME` does not move them. | `p4_persistence_rules_follow_the_xdg_config_directory` |
-
-The test of H-14 is in `crates/pent-profile/tests/hardening_profile.rs` with
-the mark `#[ignore = "OPEN H-14: ..."]`. It states the behaviour that the
-guard must have, and it fails on its own assertion today:
-
-```
-"/home/u/dotfiles/config/fish/config.fish is not protected",
-"/home/u/dotfiles/config/autostart/x.desktop is not protected",
-…
-```
-
-**The fix.** Give `guard_rules_with` the base directories, not only the pent
-directories, and make each rule below `~/.config` use the real base. Then
-remove the `#[ignore]`.
+| H-13 | Medium | The kernel masked only the direct children of a `FilesInDir` directory, so a key in a subdirectory was not masked. **Fix:** `plan_guard` walks the tree (`842ad66`). | `the_summary_and_the_kernel_agree_on_the_blocked_accesses` |
+| H-14 | Low | `guard_rules_with` moved only the `PentFiles` rules to the real directories, so `$XDG_CONFIG_HOME` did not move the other rules below `~/.config`. **Fix:** each rule below `.config` and `.local/state` follows the roots of the user (`918b6db`). | `p4_persistence_rules_follow_the_xdg_config_directory` |
 
 ## Other observations (no test)
 
