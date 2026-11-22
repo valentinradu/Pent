@@ -1,5 +1,8 @@
 # Plan: the new pent
 
+**Cursor: step 1.2.** Steps with `[x]` are done. Work on the branch `next`,
+one commit for each step, and move this cursor when a step is done.
+
 This plan builds the design in `docs/design/pent.md`. Each step names its
 goal, the main files, and the condition for "done". A step is done only
 when `cargo clippy --workspace --all-targets -- -D warnings` and
@@ -112,9 +115,9 @@ not their structure.
 
 ## Phase 5: files, with FUSE and grafts
 
-This is the largest phase. The prototypes are in the scratchpad of
-2026-11-22 (`protoC/proto.py`, `protoC/proto2.py`), and section 14 of the
-design has their results.
+This is the largest phase. The prototypes are in `docs/design/prototypes/`
+(`fuse_graft.py`, `fuse_writes_exec.py`; run them with `python3 -I`), and
+section 14 of the design has their results.
 
 - [ ] **5.1 The FUSE server.** In Rust, in `pent-sandbox`, mounted by the
   helper in the user namespace of the session. It answers `INIT` with
