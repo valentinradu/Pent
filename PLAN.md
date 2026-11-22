@@ -3,6 +3,27 @@
 **Cursor: step 2.4.** Steps with `[x]` are done. Work on the branch `next`,
 one commit for each step, and move this cursor when a step is done.
 
+**Handoff (2026-11-22).** Steps 1.1 to 2.3 are done, reviewed and pushed.
+pentd has its lock, socket, holds, queue and notification hook
+(`crates/pent/src/daemon/`, `docs/security/pentd.md`). `pent run` holds
+pentd but asks no question yet (phase 3).
+
+- **The way of work.** One commit for each step. Then the user runs
+  `/code-review origin/main..HEAD`, and each finding gets a fix in one more
+  commit. Push only when the user approves that push. Each new test gets a
+  mutation check by hand (`docs/testing/mutation.md`). When the protocol
+  changes, run the fuzz target `protocol_line` again and write the number
+  in the documents.
+- **Open points for step 2.4.**
+  - `pent denials` needs the events of each session. pentd reads
+    `Message::Event` today and keeps nothing: decide where pentd keeps them
+    and for how long.
+  - `pent allow ID` must name a width and a scope (for example `--width N`
+    and `--remember`); the default is the exact target and the scope `run`.
+  - `pent rules forget` must go through pentd, the only writer of the
+    rules, so the protocol needs messages for the rules. `pent rules list`
+    and `show` can read the files.
+
 This plan builds the design in `docs/design/pent.md`. Each step names its
 goal, the main files, and the condition for "done". A step is done only
 when all of these are true:
