@@ -106,11 +106,21 @@ fn only_the_named_path_under_tmp_comes_back() -> TestResult {
     std::fs::write(named.join("ok"), "PENT_NAMED_DATA")?;
     std::fs::write(sibling.join("secret"), "PENT_SIBLING_SECRET")?;
     env.install_profile("sh", &format!("[filesystem]\nread = {}\n", one(&named)))?;
+    // The test environment puts `XDG_RUNTIME_DIR` in `/tmp`, and the
+    // sandbox gives the child an empty directory at that path. The child
+    // lists it too, so the test proves that it is empty.
+    let runtime_name = env
+        .runtime
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
     let script = format!(
         "echo {RAN}; cat '{n}/ok'; echo; cat '{s}/secret' 2>&1; echo; \
-         echo TMPLS $(ls -a /tmp | tr '\\n' ' ')",
+         echo TMPLS $(ls -a /tmp | tr '\\n' ' '); \
+         echo RTLS $(ls -A '{r}' | tr '\\n' ' ')",
         n = named.display(),
-        s = sibling.display()
+        s = sibling.display(),
+        r = env.runtime.display()
     );
     let out = env.pent(&["run", "--profile", "sh", "--", "sh", "-c", &script])?;
     let all = assert_ran(&out);
@@ -129,8 +139,17 @@ fn only_the_named_path_under_tmp_comes_back() -> TestResult {
     let entries: Vec<&str> = line
         .trim_start_matches("TMPLS ")
         .split_whitespace()
-        .filter(|e| *e != "." && *e != "..")
+        .filter(|e| *e != "." && *e != ".." && *e != runtime_name)
         .collect();
+    let runtime_line = all
+        .lines()
+        .find(|l| l.starts_with("RTLS"))
+        .ok_or("the child could not list its runtime directory")?;
+    assert_eq!(
+        runtime_line.trim(),
+        "RTLS",
+        "the runtime directory of the child is not empty:\n{all}"
+    );
     let want = named.file_name().and_then(|n| n.to_str()).unwrap_or("");
     assert_eq!(
         entries,

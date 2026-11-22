@@ -17,6 +17,30 @@ pub const PENT: &str = env!("CARGO_BIN_EXE_pent");
 /// The profile name that the tests use for a run without an agent.
 pub const TEST_PROFILE: &str = "pent-test";
 
+/// A private runtime directory for one test, for `XDG_RUNTIME_DIR`.
+///
+/// `pent run` starts pentd in the runtime directory. A test that does not
+/// set its own directory would hold, or start, the pentd of the user. The
+/// directory is short and in `/tmp`, because the path of a Unix socket has
+/// at most 107 bytes, and pent uses `XDG_RUNTIME_DIR` only below a
+/// directory that the sandbox hides.
+///
+/// # Errors
+/// Returns an error if the directory cannot be made.
+pub fn runtime_dir() -> std::io::Result<TempDir> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::Builder::new().prefix("pt").tempdir_in("/tmp")?;
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))?;
+    Ok(dir)
+}
+
+/// Give `cmd` the runtime directory `dir`, and a short linger, so the
+/// pentd that `pent run` starts stops soon after the test.
+pub fn use_runtime<'a>(cmd: &'a mut Command, dir: &TempDir) -> &'a mut Command {
+    cmd.env("XDG_RUNTIME_DIR", dir.path())
+        .env("PENTD_LINGER_MS", "200")
+}
+
 /// Temporary XDG directories for one test.
 ///
 /// Pent finds its config (profiles, trust store, `pent.toml`) and its state
@@ -24,6 +48,7 @@ pub const TEST_PROFILE: &str = "pent-test";
 /// that sets them never reads or changes the real files of the user.
 pub struct Xdg {
     _dir: TempDir,
+    runtime: TempDir,
     /// The value of `XDG_CONFIG_HOME`.
     pub config: PathBuf,
     /// The value of `XDG_STATE_HOME`.
@@ -41,12 +66,14 @@ impl Xdg {
             config: dir.path().join("config"),
             state: dir.path().join("state"),
             _dir: dir,
+            runtime: runtime_dir()?,
         })
     }
 
-    /// Set the XDG variables on `cmd`.
+    /// Set the XDG variables on `cmd`, also the runtime directory.
     pub fn apply<'a>(&self, cmd: &'a mut Command) -> &'a mut Command {
-        cmd.env("XDG_CONFIG_HOME", &self.config)
+        use_runtime(cmd, &self.runtime)
+            .env("XDG_CONFIG_HOME", &self.config)
             .env("XDG_STATE_HOME", &self.state)
             .env_remove("PENT_LOG")
     }

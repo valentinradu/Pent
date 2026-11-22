@@ -320,9 +320,7 @@ fn runtime_dir() -> PathBuf {
             return dir.join("pent");
         }
     }
-    // SAFETY: getuid has no preconditions.
-    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-    let uid = unsafe { libc::getuid() };
+    let uid = pent_settings::current_uid();
     std::env::temp_dir().join(format!("pent-{uid}"))
 }
 
@@ -339,9 +337,7 @@ fn ensure_runtime_dir() -> Result<PathBuf, SandboxError> {
         .map_err(|e| fail(format!("cannot create {}: {e}", dir.display())))?;
     let meta = std::fs::symlink_metadata(&dir)
         .map_err(|e| fail(format!("cannot read {}: {e}", dir.display())))?;
-    // SAFETY: getuid has no preconditions.
-    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-    let uid = unsafe { libc::getuid() };
+    let uid = pent_settings::current_uid();
     if !meta.is_dir() || meta.uid() != uid || meta.mode() & 0o022 != 0 {
         return Err(fail(format!(
             "{} is not a private directory of this user",

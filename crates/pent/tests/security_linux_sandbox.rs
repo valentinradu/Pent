@@ -20,6 +20,8 @@
 #![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used, clippy::expect_used)] // test code; failures are the point
 
+mod common;
+
 use std::io::Write as _;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
@@ -41,6 +43,8 @@ struct Harness {
     workspace: PathBuf,
     /// A host directory that no profile names, for victim resources.
     outside: PathBuf,
+    /// The value of `XDG_RUNTIME_DIR` (see `common::runtime_dir`).
+    runtime: tempfile::TempDir,
 }
 
 static SEQ: AtomicU32 = AtomicU32::new(0);
@@ -60,6 +64,7 @@ impl Harness {
             workspace: base.join("workspace"),
             outside: base.join("outside"),
             base,
+            runtime: common::runtime_dir()?,
         };
         for d in [&h.config, &h.state, &h.home, &h.workspace, &h.outside] {
             std::fs::create_dir_all(d)?;
@@ -81,6 +86,7 @@ impl Harness {
     /// program; the rest are arguments.
     fn command(&self, argv: &[&str]) -> Command {
         let mut cmd = Command::new(argv[0]);
+        common::use_runtime(&mut cmd, &self.runtime);
         cmd.args(&argv[1..])
             .env("XDG_CONFIG_HOME", &self.config)
             .env("XDG_STATE_HOME", &self.state)

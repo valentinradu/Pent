@@ -14,6 +14,8 @@
 //! A test with `#[ignore = "OPEN H-<n>: ..."]` shows a property that does not
 //! hold now. See `docs/security/watch-and-profiles.md`.
 
+mod common;
+
 use std::fs;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
@@ -39,6 +41,7 @@ const PAYLOADS: &[&str] = &[
 /// An isolated home and XDG directories for one test.
 struct Env {
     _root: tempfile::TempDir,
+    runtime: tempfile::TempDir,
     home: PathBuf,
     workspace: PathBuf,
     config: PathBuf,
@@ -59,11 +62,13 @@ impl Env {
             home,
             workspace,
             _root: root,
+            runtime: common::runtime_dir()?,
         })
     }
 
     fn pent(&self, args: &[&str]) -> std::io::Result<Output> {
         let mut cmd = Command::new(PENT);
+        common::use_runtime(&mut cmd, &self.runtime);
         cmd.args(args)
             .current_dir(&self.workspace)
             .env("HOME", &self.home)

@@ -38,10 +38,17 @@ makes one mutation by hand. The test must fail on the mutant. No
 | 1.2 | `RuleStore::lock` takes no lock. | `store::tests::rules::parallel_updates_lose_no_rule` |
 | 2.1 | pentd does not count a hold. | `a_spawned_pentd_stops_after_the_last_hold`, `a_crash_of_a_holder_ends_its_hold`, `two_spawned_starts_give_one_server_and_the_second_stops_in_silence`, `pent_run_starts_pentd_and_holds_it_for_the_run` |
 | 2.1 | pentd removes the socket at its path when it stops, also when the socket is not its own. | `pentd_does_not_remove_a_socket_that_another_process_put_at_its_path` |
+| 2.1 | pentd removes a socket where another process listens. | `pentd_does_not_take_a_socket_where_another_process_listens` |
+| 2.1 | The pentd of systemd does not wait for the lock. | `an_activated_pentd_waits_for_the_lock_of_a_pentd_that_stops` |
+| 2.1 | The client waits the full 3 s for a pentd that stopped. | `pent_run_does_not_wait_for_a_pentd_that_cannot_start` |
+| 2.1 | pentd does not pause after a failed `accept(2)`. | `pentd_does_not_spin_at_the_limit_of_file_descriptors` |
 
 The first form of `pent_run_starts_pentd_and_holds_it_for_the_run` passed on
 the mutant: the client started a new pentd each time that it lost one. The
-test now compares the PID in the lock file during the run.
+test now compares the PID in the lock file during the run. The first form of
+`pentd_does_not_take_a_socket_where_another_process_listens` did not stop on
+its mutant: the mutant pentd served, and the test waited for its end. The
+test now has a time limit and fails with a message.
 
 ## How to repeat the run
 

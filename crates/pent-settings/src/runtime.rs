@@ -1,15 +1,24 @@
 //! The runtime directory of pent: the socket and the lock of pentd.
 //!
-//! The directory is `$XDG_RUNTIME_DIR/pent` when the variable names an
-//! absolute directory, else `/tmp/pent-<uid>`. The fallback has a fixed
-//! name, not `$TMPDIR`: each pent process of the user must find the same
-//! pentd. The sandbox hides `/run` and `/tmp`, so the program never reaches
-//! the directory.
+//! The directory is `$XDG_RUNTIME_DIR/pent` when the variable names a
+//! directory below one of the [`HIDDEN_ROOTS`], else `/tmp/pent-<uid>`. The
+//! sandbox covers each hidden root with a private tmpfs, so the program
+//! never reaches the socket of pentd. A `XDG_RUNTIME_DIR` in another place
+//! (for example `~/.run`) would be visible in the sandbox, and the check of
+//! `SO_PEERCRED` does not stop the program: it has the same user ID.
+//!
+//! The fallback has a fixed name, not `$TMPDIR`: each pent process of the
+//! user must find the same pentd.
 
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use thiserror::Error;
+
+/// The directories that the sandbox covers with a private tmpfs. They are
+/// the paths of `PRIVATE_DIRS` in `pent-sandbox`, and a test there checks
+/// that the two lists agree.
+pub const HIDDEN_ROOTS: &[&str] = &["/tmp", "/var/tmp", "/run", "/var/run"];
 
 /// The file name of the socket of pentd.
 const PENTD_SOCKET: &str = "pentd.sock";
@@ -47,20 +56,28 @@ pub struct RuntimeDir {
 }
 
 impl RuntimeDir {
-    /// Find the directory from the environment.
+    /// Find the directory from the environment. Pent resolves the links of
+    /// `XDG_RUNTIME_DIR` first, so a link below a hidden root that leads to
+    /// another place does not count as hidden.
     #[must_use]
     pub fn from_env() -> Self {
         let xdg = std::env::var_os("XDG_RUNTIME_DIR")
-            .filter(|dir| Path::new(dir).is_absolute() && Path::new(dir).is_dir());
+            .filter(|dir| Path::new(dir).is_absolute())
+            .and_then(|dir| std::fs::canonicalize(dir).ok())
+            .filter(|dir| dir.is_dir())
+            .map(PathBuf::into_os_string);
         Self::from_var(xdg, current_uid())
     }
 
     /// Find the directory from the given values. A test calls this function
     /// instead of [`RuntimeDir::from_env`].
+    ///
+    /// Pent uses `xdg_runtime_dir` only when it is absolute, has no `..`
+    /// component, and is below one of the [`HIDDEN_ROOTS`].
     #[must_use]
     pub fn from_var(xdg_runtime_dir: Option<OsString>, uid: u32) -> Self {
         let path = match xdg_runtime_dir.map(PathBuf::from) {
-            Some(dir) if dir.is_absolute() => dir.join("pent"),
+            Some(dir) if is_hidden(&dir) => dir.join("pent"),
             _ => PathBuf::from(format!("/tmp/pent-{uid}")),
         };
         Self { path }
@@ -112,8 +129,17 @@ impl RuntimeDir {
     }
 }
 
+/// Return true if `dir` is absolute, has no `..` component, and is a
+/// hidden root or below one.
+fn is_hidden(dir: &Path) -> bool {
+    dir.is_absolute()
+        && !dir.components().any(|c| c == Component::ParentDir)
+        && HIDDEN_ROOTS.iter().any(|root| dir.starts_with(root))
+}
+
 /// The user ID of this process.
-fn current_uid() -> u32 {
+#[must_use]
+pub fn current_uid() -> u32 {
     // SAFETY: getuid has no preconditions and cannot fail.
     unsafe { libc::getuid() }
 }
@@ -143,8 +169,25 @@ mod tests {
     }
 
     #[test]
+    fn a_runtime_dir_that_the_sandbox_does_not_hide_is_not_used() {
+        for visible in ["/home/u/.run", "/run/../home/u", "/runx/user", "/", "/var"] {
+            let d = RuntimeDir::from_var(Some(visible.into()), 1000);
+            assert_eq!(d.path(), Path::new("/tmp/pent-1000"), "{visible}");
+        }
+        for hidden in [
+            "/run/user/1000",
+            "/tmp/rt",
+            "/var/tmp/rt",
+            "/var/run/user/1",
+        ] {
+            let d = RuntimeDir::from_var(Some(hidden.into()), 1000);
+            assert_eq!(d.path(), Path::new(hidden).join("pent"), "{hidden}");
+        }
+    }
+
+    #[test]
     fn ensure_makes_a_private_directory_and_refuses_an_open_one() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir_in("/tmp").unwrap();
         let d = RuntimeDir::from_var(Some(tmp.path().into()), current_uid());
         let path = d.ensure().unwrap().to_path_buf();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
@@ -160,7 +203,7 @@ mod tests {
 
         // A link at the path is refused, also to a private directory.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let other = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir_in("/tmp").unwrap();
         let real = other.path().join("real");
         std::fs::create_dir(&real).unwrap();
         std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).unwrap();

@@ -33,9 +33,6 @@ enum RunEvent {
     Access(WatchEvent),
 }
 
-// The function is long because it lists the steps of one run in order. To
-// split it would hide this order.
-#[allow(clippy::too_many_lines)]
 /// Hold pentd for this run, and start it when no pentd runs.
 ///
 /// pentd answers no question yet (step 2.2 of PLAN.md), so a failure does
@@ -59,6 +56,9 @@ async fn hold_pentd(command: &[String]) -> Option<crate::daemon::client::HoldHan
     }
 }
 
+// The function is long because it lists the steps of one run in order. To
+// split it would hide this order.
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
     // ── Profile ──────────────────────────────────────────────────────────────
     let selected = select_profile(args.profile.as_deref(), &args.command)?;

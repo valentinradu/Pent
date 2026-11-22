@@ -28,7 +28,7 @@ mod store;
 mod trust;
 
 pub use loader::ConfigLoader;
-pub use runtime::{RuntimeDir, RuntimeDirError};
+pub use runtime::{current_uid, RuntimeDir, RuntimeDirError, HIDDEN_ROOTS};
 pub use store::{
     open_log_nofollow, EventLog, LoadedProfile, LogOpen, PentDirs, ProfileEntry, ProfileStatus,
     ProfileStore, RuleStore, StoreError, WatchLock, WatchRunMode,

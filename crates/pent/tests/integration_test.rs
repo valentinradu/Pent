@@ -34,7 +34,9 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 #[allow(clippy::panic)] // infrastructure helper: spawn failure is a hard test setup error
 fn run_pent(cwd: &Path, args: &[&str]) -> Output {
     let home = cwd.join(".test-home");
-    Command::new(PENT)
+    let runtime =
+        common::runtime_dir().unwrap_or_else(|e| panic!("cannot make a runtime directory: {e}"));
+    common::use_runtime(&mut Command::new(PENT), &runtime)
         .args(args)
         .current_dir(cwd)
         .env_remove("PENT_LOG") // keep test output clean
@@ -305,7 +307,8 @@ mod no_hang {
     /// can never block on a full pipe.
     #[allow(clippy::panic, clippy::unwrap_used, clippy::expect_used)] // infrastructure helper: spawn/pipe failures are hard test setup errors
     fn pent_timeout(dir: &Path, home: &Path, args: &[&str], timeout_secs: u64) -> (bool, String) {
-        let mut child = Command::new(PENT)
+        let runtime = common::runtime_dir().unwrap();
+        let mut child = common::use_runtime(&mut Command::new(PENT), &runtime)
             .args(args)
             .current_dir(dir)
             .env("HOME", home)
@@ -551,7 +554,7 @@ mod no_hang {
         dir: &Path,
         agent_home: &Path,
         args: &[&str],
-    ) -> (libc::c_int, std::process::Child) {
+    ) -> (libc::c_int, std::process::Child, TempDir) {
         use std::os::unix::io::FromRawFd;
         use std::process::Stdio;
 
@@ -572,7 +575,8 @@ mod no_hang {
         let slave_err = unsafe { libc::dup(slave) };
         assert!(slave_out >= 0 && slave_err >= 0, "dup(slave) failed");
 
-        let child = Command::new(PENT)
+        let runtime = common::runtime_dir().expect("cannot make a runtime directory");
+        let child = common::use_runtime(&mut Command::new(PENT), &runtime)
             .args(args)
             .current_dir(dir)
             // Use the agent_home so the {agent} profile is visible.
@@ -587,7 +591,7 @@ mod no_hang {
             .spawn()
             .expect("failed to spawn pent with PTY");
 
-        (master, child)
+        (master, child, runtime)
     }
 
     /// Install the trusted `{agent}` profile into a fresh temp HOME.
@@ -717,7 +721,7 @@ mod no_hang {
         // Install the agent profile; keep TempDir alive so the config persists.
         let agent_home = setup_agent_config(agent);
 
-        let (master, mut child) = spawn_with_pty(
+        let (master, mut child, _runtime) = spawn_with_pty(
             dir.path(),
             agent_home.path(),
             &[

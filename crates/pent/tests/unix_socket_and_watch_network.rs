@@ -11,6 +11,8 @@
 //! unprivileged user namespaces cannot run it. Each test that records a run
 //! checks the message of such a host and stops.
 
+mod common;
+
 use std::fs;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
@@ -23,6 +25,7 @@ const PENT: &str = env!("CARGO_BIN_EXE_pent");
 /// An isolated home, workspace and XDG directories for one test.
 struct Env {
     _root: tempfile::TempDir,
+    runtime: tempfile::TempDir,
     home: PathBuf,
     workspace: PathBuf,
     config: PathBuf,
@@ -43,6 +46,7 @@ impl Env {
             home,
             workspace,
             _root: root,
+            runtime: common::runtime_dir()?,
         })
     }
 
@@ -60,6 +64,7 @@ impl Env {
 
     fn command(&self, args: &[&str]) -> Command {
         let mut cmd = Command::new(PENT);
+        common::use_runtime(&mut cmd, &self.runtime);
         cmd.args(args)
             .current_dir(&self.workspace)
             .env("HOME", &self.home)

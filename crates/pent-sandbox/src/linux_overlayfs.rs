@@ -731,8 +731,7 @@ enum RootCreate {
 }
 
 fn current_uid() -> libc::uid_t {
-    // SAFETY: `getuid` has no preconditions and cannot fail.
-    unsafe { libc::getuid() }
+    pent_settings::current_uid()
 }
 
 /// Returns the possible staging roots, in the order of preference.

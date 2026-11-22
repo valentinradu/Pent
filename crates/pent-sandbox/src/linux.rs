@@ -5383,6 +5383,18 @@ mod tests {
         assert_eq!(fd_path(-1, &mut buf), None);
     }
 
+    /// The runtime directory of pentd is safe only below a directory that
+    /// the sandbox covers, so the two lists must agree.
+    #[test]
+    fn test_hidden_roots_are_the_private_dirs() {
+        let private: Vec<&str> = PRIVATE_DIRS.iter().map(|d| d.path).collect();
+        let mut hidden = pent_settings::HIDDEN_ROOTS.to_vec();
+        let mut sorted = private.clone();
+        hidden.sort_unstable();
+        sorted.sort_unstable();
+        assert_eq!(hidden, sorted);
+    }
+
     #[test]
     fn test_escape_sockets_hold_the_system_bus() {
         assert!(ESCAPE_SOCKETS.contains(&"/run/dbus/system_bus_socket"));

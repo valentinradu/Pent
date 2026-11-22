@@ -63,6 +63,18 @@ pub(crate) enum DaemonError {
         path: PathBuf,
     },
 
+    /// Another process listens on the path of the socket, for example
+    /// systemd with `pentd.socket` before its pentd starts.
+    #[error(
+        "another process listens on {}; with pentd.socket enabled, systemd \
+         starts pentd (systemctl --user status pentd.socket)",
+        path.display()
+    )]
+    Listening {
+        /// The path of the socket.
+        path: PathBuf,
+    },
+
     /// The variables of socket activation are set, but fd 3 is not a socket.
     #[error("LISTEN_FDS is set, but fd 3 is not a listening Unix socket")]
     BadActivation,

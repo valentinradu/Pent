@@ -789,7 +789,7 @@ mod linux {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(
-            !staging_dirs(pid).is_empty(),
+            !staging_dirs(&env, pid).is_empty(),
             "the run has no overlay staging directory"
         );
         let sleepers = || sleep_processes(&nap);
@@ -810,7 +810,7 @@ mod linux {
             "pent must exit like the child (SIGTERM): {status:?}"
         );
         assert!(sleepers().is_empty(), "the child still runs");
-        assert_eq!(staging_dirs(pid), Vec::<std::path::PathBuf>::new());
+        assert_eq!(staging_dirs(&env, pid), Vec::<std::path::PathBuf>::new());
         Ok(())
     }
 

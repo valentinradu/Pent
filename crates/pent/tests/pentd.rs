@@ -477,3 +477,175 @@ fn pentd_does_not_remove_a_socket_that_another_process_put_at_its_path() -> Test
     drop(other);
     Ok(())
 }
+
+/// A socket where another process listens, as systemd does with
+/// `pentd.socket` before its pentd starts.
+fn foreign_listener(rt: &Runtime) -> std::io::Result<std::os::unix::net::UnixListener> {
+    std::fs::create_dir_all(rt.pent_dir())?;
+    std::fs::set_permissions(rt.pent_dir(), std::fs::Permissions::from_mode(0o700))?;
+    std::os::unix::net::UnixListener::bind(rt.socket())
+}
+
+#[test]
+fn pentd_does_not_take_a_socket_where_another_process_listens() -> TestResult {
+    let rt = Runtime::new()?;
+    let listener = foreign_listener(&rt)?;
+    listener.set_nonblocking(true)?;
+
+    let mut foreground = Reap(rt.pent(&["daemon"]).stderr(Stdio::piped()).spawn()?);
+    let status = wait_exit(&mut foreground.0, WAIT)?;
+    assert!(
+        status.is_some_and(|s| !s.success()),
+        "pent daemon must fail at once, not serve: {status:?}"
+    );
+    let mut err = String::new();
+    if let Some(mut stderr) = foreground.0.stderr.take() {
+        stderr.read_to_string(&mut err)?;
+    }
+    assert!(err.contains("another process listens on"), "{err}");
+
+    // A spawned pentd stops in silence: the other process serves.
+    let mut spawned = Reap(rt.pent(&["daemon", "--spawned"]).spawn()?);
+    let status = wait_exit(&mut spawned.0, WAIT)?;
+    assert!(status.is_some_and(|s| s.success()), "{status:?}");
+
+    // The socket is still the one of the other process.
+    let _client = UnixStream::connect(rt.socket())?;
+    std::thread::sleep(Duration::from_millis(50));
+    let mut got = false;
+    while listener.accept().is_ok() {
+        got = true;
+    }
+    assert!(got, "the socket of the other process does not work");
+    Ok(())
+}
+
+#[test]
+fn an_activated_pentd_waits_for_the_lock_of_a_pentd_that_stops() -> TestResult {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::process::CommandExt as _;
+    let rt = Runtime::new()?;
+    let mut spawned = Reap(rt.pent(&["daemon", "--spawned"]).spawn()?);
+    let hold = loop {
+        if let Ok(stream) = rt.hold() {
+            break stream;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    // systemd takes the path while the spawned pentd serves.
+    std::fs::remove_file(rt.socket())?;
+    let listener = std::os::unix::net::UnixListener::bind(rt.socket())?;
+    let fd = listener.as_raw_fd();
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", "LISTEN_PID=$$ LISTEN_FDS=1 exec \"$0\" daemon", PENT]);
+    rt.apply(&mut cmd);
+    // SAFETY: the hook runs in the child after the fork and calls only
+    // `dup2` and `fcntl`, which are async-signal-safe.
+    unsafe {
+        cmd.pre_exec(move || {
+            let rc = if fd == 3 {
+                libc::fcntl(3, libc::F_SETFD, 0)
+            } else {
+                libc::dup2(fd, 3)
+            };
+            if rc < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut activated = Reap(cmd.spawn()?);
+    drop(listener);
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        activated.0.try_wait()?.is_none(),
+        "the activated pentd must wait for the lock"
+    );
+
+    // The spawned pentd stops, and the activated pentd takes the lock.
+    drop(hold);
+    let status = wait_exit(&mut spawned.0, WAIT)?;
+    assert!(status.is_some_and(|s| s.success()), "{status:?}");
+    std::thread::sleep(Duration::from_millis(600));
+    assert!(
+        activated.0.try_wait()?.is_none(),
+        "the activated pentd stopped"
+    );
+    let mut stream = UnixStream::connect(rt.socket())?;
+    stream.set_read_timeout(Some(WAIT))?;
+    stream.write_all(b"not json\n")?;
+    let mut buf = [0_u8; 16];
+    assert_eq!(
+        stream.read(&mut buf).unwrap_or(0),
+        0,
+        "the activated pentd does not serve"
+    );
+    Ok(())
+}
+
+#[test]
+fn pent_run_does_not_wait_for_a_pentd_that_cannot_start() -> TestResult {
+    let test = "pent_run_does_not_wait_for_a_pentd_that_cannot_start";
+    if !sandbox_ready(test) {
+        return Ok(());
+    }
+    let rt = Runtime::new()?;
+    std::fs::create_dir(rt.pent_dir())?;
+    std::fs::set_permissions(rt.pent_dir(), std::fs::Permissions::from_mode(0o700))?;
+    std::fs::write(rt.socket(), "not a socket")?;
+    let env = TestEnv::new()?;
+    env.install_profile("sh", "")?;
+    let begin = Instant::now();
+    let out = env
+        .command(&["run", "--profile", "sh", "--", "sh", "-c", "exit 0"])
+        .env("XDG_RUNTIME_DIR", rt.xdg())
+        .output()?;
+    let took = begin.elapsed();
+    assert!(out.status.success(), "{out:?}");
+    // The client gives up when the pentd that it started stops. The limit
+    // of the wait is 3 s, so a run below 2 s did not wait for it.
+    assert!(took < Duration::from_secs(2), "the run took {took:?}");
+    Ok(())
+}
+
+#[test]
+fn pentd_does_not_spin_at_the_limit_of_file_descriptors() -> TestResult {
+    let rt = Runtime::new()?;
+    // A small limit of file descriptors: the runtime and the listener use
+    // a few, and the connections below use the rest.
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", "ulimit -n 24 && exec \"$0\" daemon", PENT]);
+    rt.apply(&mut cmd);
+    let pentd = Reap(cmd.spawn()?);
+    assert!(rt.wait_for_socket(), "pentd never listened");
+    let clients: Vec<UnixStream> = (0..40)
+        .filter_map(|_| UnixStream::connect(rt.socket()).ok())
+        .collect();
+    assert!(
+        clients.len() > 24,
+        "the test needs more connections than fds"
+    );
+
+    // The CPU time of pentd in one second. A loop that spins on the error
+    // of `accept(2)` uses nearly all of it.
+    let ticks = |pid: u32| -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+        let after = stat.rsplit_once(')').ok_or("bad stat")?.1;
+        let fields: Vec<&str> = after.split_whitespace().collect();
+        let utime: u64 = fields.get(11).ok_or("no utime")?.parse()?;
+        let stime: u64 = fields.get(12).ok_or("no stime")?.parse()?;
+        Ok(utime + stime)
+    };
+    std::thread::sleep(Duration::from_millis(200));
+    let before = ticks(pentd.0.id())?;
+    std::thread::sleep(Duration::from_secs(1));
+    let used = ticks(pentd.0.id())? - before;
+    // SAFETY: sysconf has no preconditions.
+    let per_second = u64::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) })?;
+    assert!(
+        used < per_second / 4,
+        "pentd used {used} of {per_second} ticks in one second"
+    );
+    drop(clients);
+    Ok(())
+}

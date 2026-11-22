@@ -29,9 +29,13 @@ use super::{read_message, DaemonError};
 /// The first fd of socket activation (`SD_LISTEN_FDS_START`).
 const LISTEN_FDS_START: i32 = 3;
 
-/// How long a spawned pentd waits for the lock. A pentd that stops gives
-/// the lock to the next one in this time.
-const SPAWNED_LOCK_WAIT: Duration = Duration::from_secs(5);
+/// How long a spawned or an activated pentd waits for the lock. A pentd
+/// that stops gives the lock to the next one in this time.
+const LOCK_WAIT: Duration = Duration::from_secs(5);
+
+/// The pause after a failed `accept(2)`, for example at the limit of file
+/// descriptors, so the loop does not spin.
+const ACCEPT_PAUSE: Duration = Duration::from_millis(100);
 
 /// How a pentd starts.
 #[derive(Debug)]
@@ -64,10 +68,10 @@ pub(crate) fn activated_listener() -> Result<Option<std::os::unix::net::UnixList
     if !ours || !one {
         return Ok(None);
     }
-    // The children of pentd must not see the variables.
-    std::env::remove_var("LISTEN_PID");
-    std::env::remove_var("LISTEN_FDS");
-    std::env::remove_var("LISTEN_FDNAMES");
+    // pentd keeps the variables. A change of the environment in a process
+    // with more than one thread is not safe, and the runtime of tokio runs
+    // already. A child of pentd sees `LISTEN_PID` with the PID of pentd, not
+    // its own PID, so it ignores the variables, as systemd says.
 
     // SAFETY: `fstat` writes only into `stat`, a valid buffer of the right
     // size, and an invalid fd gives an error, not undefined behaviour.
@@ -92,9 +96,10 @@ struct Lock {
     _file: std::fs::File,
 }
 
-/// Take the lock in `path`. `Foreground` and `Activated` try one time;
-/// `Spawned` waits up to [`SPAWNED_LOCK_WAIT`]. Returns `None` for a
-/// `Spawned` pentd that did not get the lock.
+/// Take the lock in `path`. `Foreground` tries one time. `Spawned` and
+/// `Activated` wait up to [`LOCK_WAIT`], because another pentd can stop in
+/// that time. Returns `None` for a `Spawned` pentd that did not get the
+/// lock: the other pentd serves.
 async fn take_lock(path: &Path, start: &Start) -> Result<Option<Lock>, DaemonError> {
     use std::os::unix::fs::OpenOptionsExt as _;
     let io = |source| DaemonError::Io {
@@ -110,26 +115,22 @@ async fn take_lock(path: &Path, start: &Start) -> Result<Option<Lock>, DaemonErr
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)
         .map_err(io)?;
-    let deadline = Instant::now() + SPAWNED_LOCK_WAIT;
+    let deadline = Instant::now() + LOCK_WAIT;
+    let waits = matches!(start, Start::Spawned | Start::Activated(_));
     loop {
         match file.try_lock() {
             Ok(()) => break,
             Err(std::fs::TryLockError::WouldBlock) => {
-                if matches!(start, Start::Spawned) && Instant::now() < deadline {
+                if waits && Instant::now() < deadline {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                     continue;
                 }
                 if matches!(start, Start::Spawned) {
                     return Ok(None);
                 }
-                let mut text = String::new();
-                // The PID is only for the message; an unreadable file gives
-                // the message without it.
-                let pid = file
-                    .read_to_string(&mut text)
-                    .ok()
-                    .and_then(|_| text.trim().parse().ok());
-                return Err(DaemonError::Busy { pid });
+                return Err(DaemonError::Busy {
+                    pid: holder_pid(&mut file).await,
+                });
             }
             Err(std::fs::TryLockError::Error(e)) => return Err(io(e)),
         }
@@ -139,6 +140,23 @@ async fn take_lock(path: &Path, start: &Start) -> Result<Option<Lock>, DaemonErr
     file.write_all(std::process::id().to_string().as_bytes())
         .map_err(io)?;
     Ok(Some(Lock { _file: file }))
+}
+
+/// The PID in the lock file of the holder. The holder writes it just after
+/// it takes the lock, so the file can still be empty: read it again for a
+/// short time. The PID is only for the message; an unreadable file gives
+/// `None`.
+async fn holder_pid(file: &mut std::fs::File) -> Option<u32> {
+    for _ in 0..20 {
+        let mut text = String::new();
+        if file.rewind().is_ok() && file.read_to_string(&mut text).is_ok() {
+            if let Ok(pid) = text.trim().parse() {
+                return Some(pid);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    None
 }
 
 /// The identity of a socket file: its device and its inode.
@@ -176,8 +194,12 @@ fn remove_own_socket(path: &Path, id: FileId) {
     }
 }
 
-/// Bind the socket at `path` with the mode `0600`. The caller holds the
-/// lock, so a socket at the path is stale: no other pentd serves it.
+/// Bind the socket at `path` with the mode `0600`.
+///
+/// The caller holds the lock, so no other pentd serves a socket at the path.
+/// But systemd can listen there before its pentd starts, and systemd does
+/// not hold the lock. Thus pentd removes a socket only when a connection to
+/// it fails: then nobody listens, and the socket is stale.
 fn bind(path: &Path) -> Result<(UnixListener, FileId), DaemonError> {
     use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
     let io = |source| DaemonError::Io {
@@ -185,7 +207,14 @@ fn bind(path: &Path) -> Result<(UnixListener, FileId), DaemonError> {
         source,
     };
     match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_socket() => std::fs::remove_file(path).map_err(io)?,
+        Ok(meta) if meta.file_type().is_socket() => {
+            if std::os::unix::net::UnixStream::connect(path).is_ok() {
+                return Err(DaemonError::Listening {
+                    path: path.to_path_buf(),
+                });
+            }
+            std::fs::remove_file(path).map_err(io)?;
+        }
         Ok(_) => {
             return Err(DaemonError::NotASocket {
                 path: path.to_path_buf(),
@@ -224,10 +253,15 @@ pub(crate) async fn serve(
             let (listener, id) = bind(&socket)?;
             (listener, true, Some(id))
         }
-        Start::Spawned => {
-            let (listener, id) = bind(&socket)?;
-            (listener, false, Some(id))
-        }
+        Start::Spawned => match bind(&socket) {
+            Ok((listener, id)) => (listener, false, Some(id)),
+            // systemd listens: its pentd serves, so this one stops.
+            Err(DaemonError::Listening { .. }) => {
+                tracing::debug!("another process listens on the socket; this pentd stops");
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        },
         Start::Activated(listener) => {
             listener
                 .set_nonblocking(true)
@@ -270,7 +304,7 @@ async fn accept_loop(
 
     let holds = Arc::new(watch::Sender::new(0_usize));
     let mut changes = holds.subscribe();
-    let own_uid = current_uid();
+    let own_uid = pent_settings::current_uid();
     let mut idle_since = (!holds_itself).then(tokio::time::Instant::now);
 
     loop {
@@ -280,7 +314,10 @@ async fn accept_loop(
                 Ok((stream, _)) => {
                     tokio::spawn(connection(stream, Arc::clone(&holds), own_uid));
                 }
-                Err(e) => tracing::warn!("pentd cannot accept a connection: {e}"),
+                Err(e) => {
+                    tracing::warn!("pentd cannot accept a connection: {e}");
+                    tokio::time::sleep(ACCEPT_PAUSE).await;
+                }
             },
             Ok(()) = changes.changed() => {
                 let count = *changes.borrow_and_update();
@@ -363,12 +400,6 @@ async fn connection(stream: UnixStream, holds: Arc<watch::Sender<usize>>, own_ui
         }
     }
     drop(hold);
-}
-
-/// The user ID of this process.
-fn current_uid() -> u32 {
-    // SAFETY: getuid has no preconditions and cannot fail.
-    unsafe { libc::getuid() }
 }
 
 #[cfg(test)]

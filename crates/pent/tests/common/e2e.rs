@@ -148,9 +148,14 @@ pub fn private_proc_ready(test: &str) -> bool {
 /// The directories of one test.
 pub struct TestEnv {
     _dir: TempDir,
+    _runtime: TempDir,
     /// The root of the test. It contains `home` and `ws`. The sandbox does
     /// not give access to other paths in it.
     pub root: PathBuf,
+    /// The value of `XDG_RUNTIME_DIR`: a short directory in `/tmp`, because
+    /// the path of the socket of pentd has at most 107 bytes. Thus the
+    /// pentd of a test never touches the pentd of the user.
+    pub runtime: PathBuf,
     /// The value of `HOME`.
     pub home: PathBuf,
     /// The workspace: the current directory of pent.
@@ -173,8 +178,12 @@ impl TestEnv {
         let ws = root.join("ws");
         std::fs::create_dir_all(&home)?;
         std::fs::create_dir_all(&ws)?;
+        let runtime_dir = super::runtime_dir()?;
+        let runtime = runtime_dir.path().to_path_buf();
         Ok(Self {
             _dir: dir,
+            _runtime: runtime_dir,
+            runtime,
             root,
             home,
             ws,
@@ -279,6 +288,7 @@ impl TestEnv {
             .env("HOME", &self.home)
             .env("XDG_CONFIG_HOME", self.config_dir())
             .env("XDG_STATE_HOME", self.state_dir())
+            .env("XDG_RUNTIME_DIR", &self.runtime)
             // `pent run` starts pentd when no pentd runs. A short linger
             // makes that pentd stop soon after the test.
             .env("PENTD_LINGER_MS", "200");
@@ -663,17 +673,17 @@ impl Pty {
     }
 }
 
-/// The overlay staging directories of the pent process `pid`.
+/// The overlay staging directories of the pent process `pid` of `env`.
 ///
 /// Pent puts them in `/tmp/pent-<uid>` or in `$XDG_RUNTIME_DIR/pent`, with
-/// the name `ovl-<pid>-...`.
-pub fn staging_dirs(pid: u32) -> Vec<PathBuf> {
+/// the name `ovl-<pid>-...`. The runtime directory is the one of `env`.
+pub fn staging_dirs(env: &TestEnv, pid: u32) -> Vec<PathBuf> {
     // SAFETY: getuid() has no preconditions and cannot fail.
     let uid = unsafe { libc::getuid() };
-    let mut roots = vec![PathBuf::from(format!("/tmp/pent-{uid}"))];
-    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
-        roots.push(PathBuf::from(runtime).join("pent"));
-    }
+    let roots = [
+        PathBuf::from(format!("/tmp/pent-{uid}")),
+        env.runtime.join("pent"),
+    ];
     let prefix = format!("ovl-{pid}-");
     roots
         .iter()

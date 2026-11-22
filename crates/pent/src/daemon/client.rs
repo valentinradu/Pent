@@ -3,7 +3,9 @@
 //! `pent run` holds pentd for the whole run. When no pentd answers, it
 //! starts one (`pent daemon --spawned`) and connects again. When the
 //! connection ends during the run, for example because a pentd stopped at
-//! the moment of the connect, the client connects again, a few times.
+//! the moment of the connect, the client connects again, a few times. A
+//! connection that lasts [`STABLE`] resets the count, so a long run keeps
+//! its hold over each restart of pentd.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -21,8 +23,11 @@ const START_WAIT: Duration = Duration::from_secs(3);
 /// The pause between two tries to connect.
 const RETRY_PAUSE: Duration = Duration::from_millis(25);
 
-/// How many times the client holds again after a lost connection.
+/// How many times in a row the client holds again after a lost connection.
 const MAX_RECONNECTS: u32 = 3;
+
+/// A connection that lasts this long resets the count of reconnects.
+const STABLE: Duration = Duration::from_secs(30);
 
 /// A hold on pentd. The hold ends when the value drops.
 #[derive(Debug)]
@@ -53,6 +58,7 @@ pub(crate) async fn hold(runtime: &RuntimeDir, hold: Hold) -> Result<HoldHandle,
 async fn keep(runtime: RuntimeDir, socket: PathBuf, line: String, mut stream: UnixStream) {
     let mut reconnects = 0_u32;
     loop {
+        let since = tokio::time::Instant::now();
         // pentd sends nothing on a hold yet, so a read returns only at the
         // end of the connection. Any byte that comes is not used.
         let mut buf = [0_u8; 256];
@@ -61,6 +67,9 @@ async fn keep(runtime: RuntimeDir, socket: PathBuf, line: String, mut stream: Un
                 Ok(0) | Err(_) => break,
                 Ok(_) => {}
             }
+        }
+        if since.elapsed() >= STABLE {
+            reconnects = 0;
         }
         if reconnects >= MAX_RECONNECTS {
             tracing::debug!("the hold on pentd ended; no more tries");
@@ -78,7 +87,10 @@ async fn keep(runtime: RuntimeDir, socket: PathBuf, line: String, mut stream: Un
 }
 
 /// Connect and send the hold. When no pentd answers, start one and try
-/// again until [`START_WAIT`].
+/// again until [`START_WAIT`]. When the started pentd stops before a
+/// connection works, the client stops at once: pentd cannot start (for
+/// example, a file is at the path of the socket), and the run must not wait
+/// for nothing.
 async fn connect_or_start(
     runtime: &RuntimeDir,
     socket: &Path,
@@ -88,12 +100,15 @@ async fn connect_or_start(
         return Ok(stream);
     }
     runtime.ensure()?;
-    start_pentd(socket)?;
+    let started = start_pentd(socket)?;
     let deadline = tokio::time::Instant::now() + START_WAIT;
     loop {
+        // Read the end of pentd before the connect, so a pentd that served
+        // and then stopped still gets its last try.
+        let ended = started.try_recv().is_ok();
         match connect_and_send(socket, line).await {
             Ok(stream) => return Ok(stream),
-            Err(source) if tokio::time::Instant::now() >= deadline => {
+            Err(source) if ended || tokio::time::Instant::now() >= deadline => {
                 return Err(DaemonError::Unreachable {
                     path: socket.to_path_buf(),
                     source,
@@ -113,7 +128,8 @@ async fn connect_and_send(socket: &Path, line: &str) -> std::io::Result<UnixStre
 
 /// Start `pent daemon --spawned` in its own process group, with no
 /// terminal, so a Ctrl-C in the terminal of `pent run` does not stop it.
-fn start_pentd(socket: &Path) -> Result<(), DaemonError> {
+/// The receiver gets a message when that pentd ends.
+fn start_pentd(socket: &Path) -> Result<std::sync::mpsc::Receiver<()>, DaemonError> {
     use std::os::unix::process::CommandExt as _;
     let io = |source| DaemonError::Io {
         path: socket.to_path_buf(),
@@ -130,10 +146,13 @@ fn start_pentd(socket: &Path) -> Result<(), DaemonError> {
         .map_err(io)?;
     // Reap the child when it ends, so it does not stay as a zombie while
     // `pent run` runs. pentd normally ends after `pent run`.
+    let (ended, ended_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         if let Err(e) = child.wait() {
             tracing::debug!("cannot wait for pentd: {e}");
         }
+        // The client can be gone already; then nobody needs the message.
+        let _ = ended.send(());
     });
-    Ok(())
+    Ok(ended_rx)
 }
