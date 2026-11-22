@@ -89,7 +89,7 @@ Keep these facts true. `docs/security/linux-sandbox.md` and
   only the paths that the session needs, each path itself and never a parent
   (`bind_back_paths`), from an `O_PATH` descriptor that the child opens
   before the tmpfs hides the source. `ESCAPE_SOCKETS`, `RESOLVER_SOCKETS` and
-  `HOME_AGENT_SOCKETS` are data in one place.
+  `HOME_AGENT_SOCKETS` are data in one place (`pent-profile/src/class.rs`).
 - **The PID namespace** with its own `proc`, where the kernel gives the mount
   (`proc_isolation`). Where it does not (a container), pent runs without it
   and says so: never fail a run for this, and never lose the protection in

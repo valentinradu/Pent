@@ -15,9 +15,12 @@
 //! - [`rule`]: the rules, the answers that pent keeps for the next run (see
 //!   `docs/design/pent.md`).
 //! - [`rule_file`]: the TOML form of the rules of one program.
+//! - [`class`]: the class of an access (normal, sensitive, pent) and the
+//!   width menu of a question.
 //!
 //! See `docs/design/watch.md` for the full design.
 
+pub mod class;
 pub mod doc;
 pub mod event;
 pub mod guard;
@@ -30,6 +33,10 @@ pub mod rule;
 pub mod rule_file;
 pub mod summary;
 
+pub use class::{
+    Class, Classifier, Sensitive, ESCAPE_SOCKETS, HOME_AGENT_SOCKETS, PENT_HOME_DIRS,
+    RESOLVER_SOCKETS,
+};
 pub use doc::{DocError, FilesystemRules, NetworkRules, ProfileDoc};
 pub use event::{FsOp, GuardClass, NetProtocol, Outcome, ProcessInfo, WatchEvent};
 pub use guard::{

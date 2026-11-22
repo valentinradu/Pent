@@ -1,6 +1,6 @@
 # Plan: the new pent
 
-**Cursor: step 1.3.** Steps with `[x]` are done. Work on the branch `next`,
+**Cursor: step 1.4.** Steps with `[x]` are done. Work on the branch `next`,
 one commit for each step, and move this cursor when a step is done.
 
 This plan builds the design in `docs/design/pent.md`. Each step names its
@@ -42,14 +42,17 @@ ready for users.
   - Done: tests for a round trip, a hand edit, a bad file, a symbolic link
     at the path, a FIFO, parallel changes and the comments; the fuzz target
     `rule_file`; `docs/security/rules.md`.
-- [ ] **1.3 The classes and the width menu.** The sensitive class comes from
+- [x] **1.3 The classes and the width menu.** The sensitive class comes from
   the guard list, `ESCAPE_SOCKETS`, `HOME_AGENT_SOCKETS` and
   `CONTROL_PORTS`, kept as data in one place. The pent class covers
   `~/.config/pent`, `~/.local/state/pent` and `~/.local/share/pent`. The
   width menu for an access: the exact path, the parent directory, a
   subtree, a domain wildcard (stopped by `psl.rs`). A sensitive access gets
   only the exact path.
-  - Done: unit tests for each class and each menu.
+  - Files: `pent-profile/src/class.rs`. The socket lists move there from
+    `pent-sandbox/src/linux.rs`.
+  - Done: unit tests for each class and each menu; CL-1 to CL-8 in
+    `docs/security/rules.md`.
 - [ ] **1.4 The protocol.** The types `Question`, `Answer`, `Event` and
   `Hold`, with a JSON lines codec and a version number.
   - Done: round-trip tests; a fuzz target for the decoder.

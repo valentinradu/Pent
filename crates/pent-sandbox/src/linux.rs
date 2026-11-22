@@ -91,6 +91,7 @@
 
 use crate::linux_landlock::{access, PreparedRuleset};
 use crate::{NetworkMode, SandboxConfig, SandboxError};
+use pent_profile::{ESCAPE_SOCKETS, HOME_AGENT_SOCKETS, RESOLVER_SOCKETS};
 use std::collections::HashSet;
 use std::ffi::{CStr, CString};
 use std::path::{Path, PathBuf};
@@ -140,54 +141,12 @@ pub(crate) const DEV_READ_PATHS: &[&str] = &["/dev/random", "/dev/urandom"];
 /// Proc paths to allow read access.
 const PROC_PATHS: &[&str] = &["/proc"];
 
-/// Unix sockets that give a way out of the sandbox. The child hides each one
-/// that exists with a bind mount of `/dev/null`, unless the configuration
-/// names it.
-///
-/// A fixed list can never be complete: each daemon that keeps a control
-/// socket and offers a dial or an exec operation is an escape. The private
-/// directories of [`PRIVATE_DIRS`] hide every socket under `/run`, `/tmp`
-/// and `/var/tmp`, so this list is a second layer. It is also the list that
-/// a user setting can extend later.
-const ESCAPE_SOCKETS: &[&str] = &[
-    "/run/docker.sock",
-    "/var/run/docker.sock",
-    "/run/podman/podman.sock",
-    // The system message bus. It gives access to systemd-resolved (name
-    // resolution past the proxy), NetworkManager and polkit.
-    "/run/dbus/system_bus_socket",
-    "/var/run/dbus/system_bus_socket",
-];
-
-/// Unix sockets of host resolvers and of host network agents. A query or a
-/// connection through them goes to the network of the host, past the proxy.
-/// When the network is not `Unrestricted`, the child hides each one that
-/// exists, like [`ESCAPE_SOCKETS`]. Then the C library uses
-/// `/etc/resolv.conf`.
-const RESOLVER_SOCKETS: &[&str] = &[
-    "/run/nscd/socket",
-    "/var/run/nscd/socket",
-    "/run/systemd/resolve/io.systemd.Resolve",
-    // The Tailscale daemon. Its LocalAPI has a "ts-dial" upgrade that opens
-    // a TCP stream to any host of the tailnet, and through an exit node or a
-    // subnet route to the public internet.
-    "/run/tailscale/tailscaled.sock",
-    "/var/run/tailscale/tailscaled.sock",
-];
-
-/// Unix sockets of an agent in the home directory, as a directory and a name
-/// prefix. The agent signs a challenge or decrypts a secret for any program
-/// that reaches its socket, so the child must not see it. The child hides
-/// each socket in `<home>/<dir>` whose name starts with `prefix`, unless the
-/// configuration names the socket.
-///
-/// The sockets under `/run/user/<uid>` need no entry here: [`PRIVATE_DIRS`]
-/// hides all of `/run`.
-const HOME_AGENT_SOCKETS: &[(&str, &str)] = &[
-    (".gnupg", "S.gpg-agent"),
-    (".gnupg", "S.dirmngr"),
-    (".ssh", "agent."),
-];
+// The sockets that the child hides are data in one place, in
+// `pent_profile::class`: `ESCAPE_SOCKETS` (unless the configuration names
+// the socket), `RESOLVER_SOCKETS` (when the network is not `Unrestricted`;
+// then the C library uses `/etc/resolv.conf`) and `HOME_AGENT_SOCKETS`
+// (unless the configuration names the socket). The sockets under
+// `/run/user/<uid>` need no entry: [`PRIVATE_DIRS`] hides all of `/run`.
 
 /// A directory that an empty tmpfs covers in the mount namespace of the
 /// child.

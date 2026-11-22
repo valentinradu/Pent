@@ -1,9 +1,9 @@
-# The rules and the rule files
+# The rules, the classes and the rule files
 
-Status: the branch `next`, steps 1.1 and 1.2 of `PLAN.md` (2026-11-22).
-This report lists the security properties of the rule model and of the rule
-files, the test of each property, and the properties that later steps must
-add.
+Status: the branch `next`, steps 1.1 to 1.3 of `PLAN.md` (2026-11-22).
+This report lists the security properties of the rule model, of the classes
+and the width menu, and of the rule files, the test of each property, and
+the properties that later steps must add.
 
 `pent run` does not read the rules yet. On `next`, `pent run` still uses the
 profiles and the trust store of version 0.2.x (see
@@ -14,6 +14,8 @@ profiles and the trust store of version 0.2.x (see
 - `crates/pent-profile/src/rule.rs`: the rule, the key, the widths and the
   decision of a set of rules.
 - `crates/pent-profile/src/rule_file.rs`: the TOML form of a set of rules.
+- `crates/pent-profile/src/class.rs`: the class of an access and the width
+  menu of a question.
 - `crates/pent-settings/src/store.rs`, the type `RuleStore`: the files in
   `~/.local/state/pent/rules/`.
 
@@ -27,6 +29,9 @@ question. Thus:
 - The program must not write a rule. Later steps hide the rule files from
   the sandbox (the pent class, step 1.3) and make pentd the only writer
   (step 2.2). Until then, nothing in the sandbox reads or writes them.
+- An answer must not be wider than the question. The width menu is the
+  only source of the targets of an answer, so the model and the human pick
+  a number, and nobody writes a path.
 - A user edits a rule file by hand. A bad edit must give an error that
   names the problem, never a rule that differs from the text.
 - Another process of the user can put a link, a FIFO or a very large file at
@@ -36,6 +41,7 @@ question. Thus:
 
 ```bash
 cargo test -p pent-profile rule
+cargo test -p pent-profile class
 cargo test -p pent-settings store::tests::rules
 
 cd crates/pent-profile
@@ -54,6 +60,19 @@ cargo +nightly fuzz run rule_file -- -max_total_time=150 -rss_limit_mb=4096
 | RU-6 | A wildcard cannot cover a public suffix (`*.com`, `*.co.uk`, `*.github.io`), also in a file that a user edits. | `a_wildcard_cannot_cover_a_public_suffix`, `rule_file::tests::bad_values_are_errors` |
 | RU-7 | A socket rule and a port rule match exactly, and a file rule never answers a socket access. | `sockets_and_ports_match_exactly` |
 | RU-8 | A key has 1 to 64 characters from `[A-Za-z0-9._-]` and does not start with `.`, so a key is always a safe file name in the rule directory. | `a_key_comes_from_the_file_name_of_the_command` |
+
+## The classes and the width menu
+
+| ID | Property | Test |
+|---|---|---|
+| CL-1 | Each path in a directory of pent is in the pent class, for each kind: `~/.config/pent`, `~/.local/state/pent`, `~/.local/share/pent`, the real XDG directories and the directory of `pentd.sock`. A sibling with a longer name (`~/.config/pentagon`) is not. | `class::tests::the_files_of_pent_are_in_the_pent_class_for_each_kind` |
+| CL-2 | A credential of the guard list is sensitive to a read, a list, a write and an exec. A write is sensitive because it can create or replace a token (`gh auth login`). | `a_credential_is_sensitive_to_read_list_write_and_exec` |
+| CL-3 | A file of the guard list that runs code later is sensitive to a write. An exec of a tool that gives more privilege is sensitive. | `a_start_file_is_sensitive_to_write_only` |
+| CL-4 | Each socket of `ESCAPE_SOCKETS`, `RESOLVER_SOCKETS` and `HOME_AGENT_SOCKETS`, and each port of `CONTROL_PORTS`, is sensitive. The three socket lists moved from `pent-sandbox` to `class.rs`, so the sandbox masks and the classes use one list. | `the_sockets_of_the_lists_are_sensitive`, `a_control_port_is_sensitive_and_a_domain_is_normal` |
+| CL-5 | A sensitive access gets only the exact target in its menu, and a pent access gets an empty menu. | `a_sensitive_access_gets_only_the_exact_target_and_pent_gets_none` |
+| CL-6 | A file menu has no subtree on `/`, on a directory directly below `/`, on the home directory or on a parent of it. | `a_file_menu_goes_up_to_the_home_directory`, `a_file_menu_outside_home_stops_below_the_root`, `a_list_menu_starts_with_the_directory_itself` |
+| CL-7 | A domain menu stops at the registrable domain, and no wildcard covers a public suffix or a shared host (`*.github.io`). | `a_domain_menu_stops_at_the_registrable_domain` |
+| CL-8 | Each entry of a menu covers the access that made the menu, so an answer always answers its question. | `each_menu_entry_covers_the_access` |
 
 ## The rule files
 
@@ -85,6 +104,8 @@ cargo +nightly fuzz run rule_file -- -max_total_time=150 -rss_limit_mb=4096
 
 | Step | Property |
 |---|---|
-| 1.3, 5.4 | The rule directory is in the pent class, and the program gets `ENOENT` for it. |
+| 3.1, 5.4 | A sensitive access is answered only by an exact rule, never by a wider rule that contains it. |
+| 5.4 | The program gets `ENOENT` for each path of the pent class (CL-1). |
+| 2.5, 7.2 | `pent monitor` and the judge take the targets of an answer only from the width menu. |
 | 2.2 | pentd is the only writer of the rules. A late answer becomes a rule for the next run. |
 | 3.1 | `pent run` decides each access from the rules of its key before it asks. |

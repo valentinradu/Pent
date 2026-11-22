@@ -58,7 +58,7 @@ the victim.
 **Why pent does not stop this.** Landlock does not control `connect(2)` on a
 Unix socket that has a path. pent hides a fixed list of dangerous sockets with
 a bind mount of `/dev/null`: the container sockets (`ESCAPE_SOCKETS`) and the
-host resolver sockets (`RESOLVER_SOCKETS`) in `crates/pent-sandbox/src/linux.rs`.
+host resolver sockets (`RESOLVER_SOCKETS`) in `crates/pent-profile/src/class.rs`.
 The Tailscale socket is a network-egress socket, like the resolver sockets,
 but it is not on the list.
 
