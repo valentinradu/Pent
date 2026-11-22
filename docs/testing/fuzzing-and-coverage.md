@@ -9,7 +9,7 @@ holds the audit of the tests that cannot fail.
 
 ## The rule that the run checks
 
-`AGENTS.md` says: library code must never panic for any input; a parser must
+`CLAUDE.md` says: library code must never panic for any input; a parser must
 not index a slice without a check; arithmetic must not overflow. Each parser
 of pent reads bytes that an attacker chooses, so each of these rules is a
 security rule, not a style rule. A panic in the proxy stops the DNS server

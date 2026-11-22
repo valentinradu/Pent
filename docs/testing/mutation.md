@@ -437,7 +437,7 @@ time, so the ports collided. The mutants did not fail the tests; the
 ports did. A false catch is worse than a survivor, because it hides the
 gap.
 
-AGENTS.md says that a test must not rely on a specific open port. This
+CLAUDE.md says that a test must not rely on a specific open port. This
 change gives each of those tests the port 0 and reads the real address
 from the handle. Two tests bind the port again after a shutdown, to
 show that the proxy let it go; they now retry for two seconds, because

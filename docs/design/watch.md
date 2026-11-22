@@ -1,6 +1,11 @@
 # Watch mode and recorded profiles
 
-Status: accepted (2026-10-25). This document replaces the built-in `@profiles`.
+Status: replaced. `docs/design/pent.md` is the new design: pent asks while
+the program runs, and the answers are a cache, not a profile. This document
+describes the old flow that version 0.2.x still uses. It goes when the code
+changes.
+
+Status before: accepted (2026-10-25). This document replaces the built-in `@profiles`.
 
 ## Goal
 
