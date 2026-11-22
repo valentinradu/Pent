@@ -64,6 +64,17 @@ makes one mutation by hand. The test must fail on the mutant. No
 | 2.3 | A second `Watch` adds the connection again. | `a_watcher_that_answers_gets_one_verdict_and_a_second_watch_changes_nothing` |
 | 2.3 | A run has no limit of open questions. | `one_session_has_at_most_the_limit_of_open_questions` |
 | 2.3 | The sandbox does not mask the runtime directory of pent. | `a_profile_that_names_a_parent_does_not_bring_back_the_socket_of_pentd` |
+| 2.4 | pentd keeps the number of the session that the event names. | `denials::tests::only_a_refusal_is_kept_with_the_number_of_its_session`, `pent_denials_shows_the_refusals_of_each_session` |
+| 2.4 | pentd keeps an allow as a refusal. | `denials::tests::only_a_refusal_is_kept_with_the_number_of_its_session`, `pent_denials_shows_the_refusals_of_each_session` |
+| 2.4 | A client that is not a session may send an event. | `only_a_session_sends_events_and_a_session_cannot_read_or_forget` |
+| 2.4 | A session may forget a rule. | `only_a_session_sends_events_and_a_session_cannot_read_or_forget` |
+| 2.4 | A session may read the refusals. | `only_a_session_sends_events_and_a_session_cannot_read_or_forget` |
+| 2.4 | pentd sends no `rule_not_kept` before the verdicts. | `a_rule_that_pentd_cannot_write_gives_a_verdict_for_this_run_and_an_error` |
+| 2.4 | A forget with a target removes each rule of the key. | `pent_rules_forget_goes_through_pentd_and_keeps_the_other_rules`, `a_forget_by_target_removes_only_that_target` |
+| 2.4 | A forget of a key with no rule writes a file. | `pent_rules_forget_goes_through_pentd_and_keeps_the_other_rules` |
+| 2.4 | The refusals of an ended session stay for ever. | `denials::tests::an_ended_session_stays_for_its_time` |
+| 2.4 | The limit of ended sessions is off. | `denials::tests::the_oldest_ended_session_goes_above_the_limit` |
+| 2.4 | A full session keeps its oldest refusals. | `denials::tests::a_session_keeps_its_newest_refusals` |
 
 The first form of `pent_run_starts_pentd_and_holds_it_for_the_run` passed on
 the mutant: the client started a new pentd each time that it lost one. The

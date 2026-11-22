@@ -5,13 +5,15 @@
 //!
 //! | Role | May send | Gets |
 //! |---|---|---|
-//! | session (`Hold::Run`) | `Ask` | `Question` (with its number), `Verdict` |
-//! | holder (`Hold::Daemon`, `Hold::Unit`) | `Answer`, `Watch` | as a client |
-//! | client (no hold) | `Answer`, `Watch` | `Verdict` for its answer, `Rejected` |
+//! | session (`Hold::Run`) | `Ask`, `Event` | `Question` (with its number), `Verdict` |
+//! | holder (`Hold::Daemon`, `Hold::Unit`) | as a client | as a client |
+//! | client (no hold) | `Answer`, `Watch`, `Questions`, `Denials`, `Forget` | `Verdict` for its answer, the replies, `Rejected` |
 //!
-//! A session cannot answer or watch, so a bug in `pent run` cannot allow
-//! its own access or mix the questions of other runs into its own. pentd is
-//! the only writer of the rules, one write at a time.
+//! A session cannot answer, watch, read the questions or the refusals, or
+//! forget a rule, so a bug in `pent run` cannot allow its own access or mix
+//! the questions of other runs into its own. Only a session sends events,
+//! and pentd puts the number of that session in each event. pentd is the
+//! only writer of the rules, one write at a time.
 //!
 //! Each connection has a bounded [`Outbox`]. A client that does not read
 //! fills it, and pentd then closes that connection: a lost message would
@@ -26,11 +28,13 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use pent_profile::{
-    Answer, Hold, Message, QuestionId, RejectReason, Rejected, RuleKey, Scope, SessionId,
+    Answer, Forget, Forgotten, Hold, Message, QuestionId, RejectReason, Rejected, RuleKey, Scope,
+    SessionId,
 };
 use pent_settings::RuleStore;
 use tokio::sync::{mpsc, watch, Notify};
 
+use super::denials::Denials;
 use super::queue::{Plan, Queue};
 
 /// How many messages wait for one connection before pentd closes it.
@@ -99,6 +103,7 @@ impl Activity {
 /// The state behind the lock.
 struct State {
     queue: Queue,
+    denials: Denials,
     next_session: u64,
     sessions: HashMap<SessionId, Outbox>,
     watchers: Vec<Outbox>,
@@ -164,6 +169,7 @@ impl Hub {
         Arc::new(Self {
             state: Mutex::new(State {
                 queue: Queue::default(),
+                denials: Denials::default(),
                 next_session: 0,
                 sessions: HashMap::new(),
                 watchers: Vec::new(),
@@ -242,6 +248,45 @@ impl Hub {
                 }
                 self.answer(outbox, &answer).await;
             }
+            Message::Event(event) => {
+                let Role::Session { id, .. } = role else {
+                    reject(outbox, None, RejectReason::NotPermitted);
+                    return;
+                };
+                self.lock().denials.record(*id, event);
+            }
+            Message::Questions => {
+                if matches!(role, Role::Session { .. }) {
+                    reject(outbox, None, RejectReason::NotPermitted);
+                    return;
+                }
+                let state = self.lock();
+                for question in state.queue.open() {
+                    send(outbox, Message::Question(question.clone()));
+                }
+                send(outbox, Message::End);
+            }
+            Message::Denials(session) => {
+                if matches!(role, Role::Session { .. }) {
+                    reject(outbox, None, RejectReason::NotPermitted);
+                    return;
+                }
+                let Some(denials) = self.lock().denials.list(session) else {
+                    reject(outbox, None, RejectReason::UnknownSession);
+                    return;
+                };
+                for denial in denials {
+                    send(outbox, Message::Denial(denial));
+                }
+                send(outbox, Message::End);
+            }
+            Message::Forget(forget) => {
+                if matches!(role, Role::Session { .. }) {
+                    reject(outbox, None, RejectReason::NotPermitted);
+                    return;
+                }
+                self.forget(outbox, forget).await;
+            }
             Message::Watch => {
                 if matches!(role, Role::Session { .. }) {
                     reject(outbox, None, RejectReason::NotPermitted);
@@ -273,6 +318,7 @@ impl Hub {
                 let id = SessionId(state.next_session);
                 state.next_session = state.next_session.saturating_add(1);
                 state.sessions.insert(id, outbox.clone());
+                state.denials.start(id, key.clone());
                 Role::Session { id, key }
             }
             Hold::Daemon | Hold::Unit => Role::Holder,
@@ -317,8 +363,10 @@ impl Hub {
     /// answers in the order of the queue. pentd resolves the questions only
     /// after the write: when the write fails, the answer holds only for the
     /// run of the question, as an answer with the scope `run` does, and the
-    /// client that answered gets `RuleNotKept`. A question that came during
-    /// the write is resolved too.
+    /// client that answered gets `RuleNotKept` before the verdicts. A
+    /// question that came during the write is resolved too. When the
+    /// answered question went during the write, the client gets
+    /// `UnknownQuestion` and no verdict.
     async fn answer(&self, outbox: &Outbox, answer: &Answer) {
         let _write = self.writes.lock().await;
         let plan = match self.lock().queue.check(answer) {
@@ -336,6 +384,13 @@ impl Hub {
         let mut state = self.lock();
         let verdicts = state.queue.resolve(&plan, scope);
         self.publish(&state);
+        if !verdicts.iter().any(|(_, v)| v.id == plan.id) {
+            // The question went during the write: its session ended long
+            // ago, and the queue dropped it. A kept rule stays.
+            reject(outbox, Some(answer.id), RejectReason::UnknownQuestion);
+        } else if !kept {
+            reject(outbox, Some(answer.id), RejectReason::RuleNotKept);
+        }
         let answerer_watches = state.watches(outbox);
         for (session, verdict) in verdicts {
             let message = Message::Verdict(verdict);
@@ -348,8 +403,50 @@ impl Hub {
                 send(outbox, message);
             }
         }
-        if !kept {
-            reject(outbox, Some(answer.id), RejectReason::RuleNotKept);
+    }
+
+    /// Remove the rules of `forget` from the rule file of its key, and send
+    /// the count. One write at a time takes this path, as for an answer.
+    async fn forget(&self, outbox: &Outbox, forget: Forget) {
+        let _write = self.writes.lock().await;
+        let Some(store) = self.rules.clone() else {
+            tracing::warn!("pentd cannot find the rule files; nothing to forget");
+            reject(outbox, None, RejectReason::RulesNotWritten);
+            return;
+        };
+        let Forget { key, target } = forget;
+        let file_key = key.clone();
+        let write = tokio::task::spawn_blocking(move || {
+            // A key with no rule needs no write, and pentd does not create
+            // an empty file for it.
+            if store.load(&file_key)?.rules.is_empty() {
+                return Ok(0);
+            }
+            store.update(&file_key, |set| {
+                let before = set.rules.len();
+                match &target {
+                    Some(target) => set.rules.retain(|r| r.target != *target),
+                    None => set.rules.clear(),
+                }
+                before.saturating_sub(set.rules.len())
+            })
+        });
+        match write.await {
+            Ok(Ok(count)) => send(
+                outbox,
+                Message::Forgotten(Forgotten {
+                    key,
+                    count: u32::try_from(count).unwrap_or(u32::MAX),
+                }),
+            ),
+            Ok(Err(e)) => {
+                tracing::warn!("pentd cannot change the rules of {key}: {e}");
+                reject(outbox, None, RejectReason::RulesNotWritten);
+            }
+            Err(e) => {
+                tracing::warn!("the change of the rules of {key} failed: {e}");
+                reject(outbox, None, RejectReason::RulesNotWritten);
+            }
         }
     }
 
@@ -388,8 +485,10 @@ impl Hub {
         let mut state = self.lock();
         state.watchers.retain(|w| !w.same(outbox));
         if let Role::Session { id, .. } = role {
+            let now = std::time::Instant::now();
             state.sessions.remove(&id);
-            state.queue.end_session(id, std::time::Instant::now());
+            state.queue.end_session(id, now);
+            state.denials.end(id, now);
         }
         self.publish(&state);
     }
@@ -397,7 +496,9 @@ impl Hub {
     /// Drop the orphans that are too old.
     pub(crate) fn expire(&self) {
         let mut state = self.lock();
-        let dropped = state.queue.expire(std::time::Instant::now());
+        let now = std::time::Instant::now();
+        let dropped = state.queue.expire(now);
+        state.denials.expire(now);
         if dropped > 0 {
             tracing::debug!("pentd drops {dropped} old questions of ended sessions");
         }

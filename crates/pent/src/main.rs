@@ -38,6 +38,13 @@ async fn dispatch(cli: Cli) -> Result<(), CliError> {
         Command::Check => commands::check::check(cwd).await,
         Command::Config(args) => commands::config::config(args, &cwd),
         Command::Daemon(args) => daemon::daemon(&args).await,
+        Command::Allow(args) => {
+            commands::answer::answer(&args, pent_profile::Decision::Allow).await
+        }
+        Command::Deny(args) => commands::answer::answer(&args, pent_profile::Decision::Deny).await,
+        Command::Questions(args) => commands::answer::questions(&args).await,
+        Command::Denials(args) => commands::answer::denials(&args).await,
+        Command::Rules(args) => commands::rules::rules(&args).await,
     }
 }
 

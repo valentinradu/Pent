@@ -272,6 +272,17 @@ pub enum FileKind {
 }
 
 impl FileKind {
+    /// The name of the kind, as the rule file writes it.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::List => "list",
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::Exec => "exec",
+        }
+    }
+
     /// Return true if a rule of this kind also permits an access of the kind
     /// `access`. A read, write or exec rule includes the listings inside its
     /// width, and a write or exec rule includes reads.
@@ -407,6 +418,27 @@ pub enum Target {
     Localhost(NonZeroU16),
 }
 
+/// The text of a target, as `read /home/u/.cargo/**`: a subtree ends with
+/// `/**`. The text holds the path or the name as it is, so a caller that
+/// prints it escapes it.
+impl fmt::Display for Target {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::File { kind, width } => match width {
+                PathWidth::Exact(p) => write!(f, "{} {}", kind.name(), p.as_path().display()),
+                PathWidth::Subtree(base) => {
+                    let base = base.as_path().display().to_string();
+                    let sep = if base.ends_with('/') { "" } else { "/" };
+                    write!(f, "{} {base}{sep}**", kind.name())
+                }
+            },
+            Self::Domain(width) => write!(f, "domain {width}"),
+            Self::UnixSocket(p) => write!(f, "unix-socket {}", p.as_path().display()),
+            Self::Localhost(port) => write!(f, "localhost {port}"),
+        }
+    }
+}
+
 /// The decision of a rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -417,6 +449,17 @@ pub enum Decision {
     Deny,
 }
 
+impl Decision {
+    /// The name of the decision, as the rule file writes it.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+        }
+    }
+}
+
 /// Who made a rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -425,6 +468,17 @@ pub enum Source {
     Human,
     /// The judge model.
     Model,
+}
+
+impl Source {
+    /// The name of the source, as the rule file writes it.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Human => "human",
+            Self::Model => "model",
+        }
+    }
 }
 
 /// One answer that pent keeps.
@@ -862,6 +916,39 @@ mod tests {
             Decision::Allow,
         )])?;
         assert_eq!(file_rules.decide(&Access::UnixSocket(&sock)), None);
+        Ok(())
+    }
+
+    #[test]
+    fn a_target_has_a_short_text() -> TestResult {
+        let file = |kind, width| Target::File { kind, width };
+        let port = NonZeroU16::new(8080).ok_or(RuleError::EmptyKey)?;
+        for (target, text) in [
+            (
+                file(FileKind::Read, PathWidth::Exact(path("/etc/hosts")?)),
+                "read /etc/hosts",
+            ),
+            (
+                file(FileKind::Write, PathWidth::Subtree(path("/home/u/.cargo")?)),
+                "write /home/u/.cargo/**",
+            ),
+            (
+                file(FileKind::Exec, PathWidth::Subtree(path("/")?)),
+                "exec /**",
+            ),
+            (
+                file(FileKind::List, PathWidth::Exact(path("/tmp")?)),
+                "list /tmp",
+            ),
+            (Target::Domain("*.npmjs.org".parse()?), "domain *.npmjs.org"),
+            (
+                Target::UnixSocket(path("/run/x.sock")?),
+                "unix-socket /run/x.sock",
+            ),
+            (Target::Localhost(port), "localhost 8080"),
+        ] {
+            assert_eq!(target.to_string(), text);
+        }
         Ok(())
     }
 }

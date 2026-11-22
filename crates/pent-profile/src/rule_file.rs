@@ -471,6 +471,14 @@ impl RuleSet {
 // Low-Level Date Algorithms"). The years stay from 1970 to 9999, so the
 // arithmetic on `i64` cannot overflow.
 
+/// The date in UTC of `time` as the rule file writes it, for example
+/// `2026-11-22T12:00:00Z`. Returns `None` for a time before 1970 or after
+/// the year 9999.
+#[must_use]
+pub fn format_date(time: SystemTime) -> Option<String> {
+    to_datetime(time).ok().map(|date| date.to_string())
+}
+
 /// The date in UTC of `time`, in whole seconds.
 fn to_datetime(time: SystemTime) -> Result<Datetime, RuleFileError> {
     let secs = time

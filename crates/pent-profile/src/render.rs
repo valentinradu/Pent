@@ -129,7 +129,8 @@ pub(crate) fn is_unsafe_char(c: char) -> bool {
 /// Replace with escapes (`\u{1b}`) each character that
 /// [`is_unsafe_char`] names, the newline too. Use this function for one
 /// field of one line.
-pub(crate) fn safe(text: &str) -> Cow<'_, str> {
+#[must_use]
+pub fn safe(text: &str) -> Cow<'_, str> {
     escape_with(text, is_unsafe_char)
 }
 

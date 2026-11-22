@@ -1,9 +1,9 @@
 # pentd
 
-Status: the branch `next`, steps 2.1 to 2.3 of `PLAN.md` (2026-11-22).
+Status: the branch `next`, steps 2.1 to 2.4 of `PLAN.md` (2026-11-22).
 This report lists the security properties of the daemon, its socket, its
-lock, its queue and its notification hook, the test of each property, and
-the properties that later steps must add.
+lock, its queue, its notification hook and the clients of the CLI, the test
+of each property, and the properties that later steps must add.
 
 pentd has the queue of questions, and it writes the rules. `pent run`
 holds pentd for the whole run and starts it when no pentd runs, but it asks
@@ -13,8 +13,12 @@ no question yet (phase 3). A failure of pentd does not stop a run.
 
 - `crates/pent/src/daemon/`: the server (`server.rs`), the shared state
   and the roles (`hub.rs`), the queue (`queue.rs`), the notification hook
-  (`notify.rs`), the session of `pent run` (`client.rs`) and the line reader
-  (`mod.rs`).
+  (`notify.rs`), the refusals of each session (`denials.rs`), the session of
+  `pent run` (`client.rs`), the request of a command of the CLI (`call.rs`)
+  and the line reader (`mod.rs`).
+- `crates/pent/src/commands/answer.rs` (`pent allow`, `pent deny`,
+  `pent questions`, `pent denials`) and `crates/pent/src/commands/rules.rs`
+  (`pent rules list`, `show`, `forget`).
 - `[notify]` in `crates/pent-settings/src/lib.rs` (`NotifySettings`).
 - `crates/pent-settings/src/runtime.rs`: the runtime directory.
 - `packaging/systemd/pentd.socket` and `pentd.service`.
@@ -36,12 +40,18 @@ pentd will decide what each sandboxed program can do. Thus:
 - An answer must not be wider than its question, must not resolve a
   sensitive question that it did not name, and must not come from `pent run`
   itself.
+- A session must not put a refusal in the list of another session, and it
+  must not read the questions or the refusals of other runs.
+- The clients of the CLI print paths, names and command lines that the
+  program chose. That text must not reach the terminal as a control
+  sequence.
 
 ## How to run the tests
 
 ```bash
 cargo test -p pent --test pentd
 cargo test -p pent daemon::
+cargo test -p pent commands::
 cargo test -p pent-settings runtime
 ```
 
@@ -72,11 +82,11 @@ soon after the last hold.
 | ID | Property | Test |
 |---|---|---|
 | QU-1 | pentd gives each question its number, and the session and the key of the connection that asked. The values in the `Ask` do not count. The same access of the same session is one question. | `queue::tests::pentd_gives_the_number_the_session_and_the_key`, `an_answer_reaches_the_session_the_watcher_and_the_rule_file` |
-| QU-2 | The first `Hold` gives the role of a connection. A session (`Hold::Run`) may ask, and it may not answer (also its own question) or watch (the questions of other runs). Another connection may answer and watch, and may not ask. | `pentd_refuses_a_bad_answer_and_a_message_of_the_wrong_role` |
+| QU-2 | The first `Hold` gives the role of a connection. A session (`Hold::Run`) may ask and send events, and it may not answer (also its own question) or watch (the questions of other runs). Another connection may answer and watch, and may not ask. CC-1 has the messages of step 2.4. | `pentd_refuses_a_bad_answer_and_a_message_of_the_wrong_role` |
 | QU-3 | pentd checks each answer: the question is open, the `MenuIndex` is in its menu, the source is the human, and the target has the kind of the access and covers it, so a faulty menu cannot turn a read question into a wide write rule. The judge will run inside pentd, so no client on the socket may answer as the model. A refused answer leaves the question open. | `queue::tests::an_answer_is_checked`, `a_target_must_have_the_kind_of_the_access_and_cover_it`, `pentd_refuses_a_bad_answer_and_a_message_of_the_wrong_role` |
 | QU-4 | An answer resolves each open question of the same key that its target covers with the same kind: with the scope `remember` in each session, with the scope `run` only in the session of the question. The verdict carries the target, so each session applies the same width. | `queue::tests::a_wide_answer_resolves_each_question_inside_its_width`, `the_scope_decides_which_sessions_share_the_answer`, `a_deny_does_not_resolve_a_question_with_another_kind`, `one_wide_answer_resolves_each_question_inside_its_width` |
 | QU-5 | A sensitive question takes only its exact target. pentd computes that target from the access, not from the menu of the session, so a faulty menu with a wider entry does not help. A wider answer to another question never resolves a sensitive question either. | `queue::tests::a_wide_answer_does_not_resolve_a_sensitive_question`, `a_sensitive_question_takes_only_its_exact_target_whatever_its_menu` |
-| QU-6 | pentd is the only writer of the rules. An answer with the scope `remember` becomes a rule in the file of the key, in the place of an old rule for the same target. The scope `run` writes nothing. One answer at a time goes from the queue to the file, outside the threads of the runtime, so the file gets the answers in the order of the queue. pentd writes the rule before it resolves any question. When the write fails, the answer holds only for the run of the question, as `run` does: the questions of other runs stay open, and the client that answered gets `rule_not_kept`. A question that comes during the write is resolved too. | `an_answer_reaches_the_session_the_watcher_and_the_rule_file`, `pentd_refuses_a_bad_answer_and_a_message_of_the_wrong_role`, `a_rule_that_pentd_cannot_write_gives_a_verdict_for_this_run_and_an_error`, `queue::tests::a_failed_write_resolves_only_the_session_of_the_question`, `a_question_that_comes_during_the_write_is_resolved_too` |
+| QU-6 | pentd is the only writer of the rules. An answer with the scope `remember` becomes a rule in the file of the key, in the place of an old rule for the same target. The scope `run` writes nothing. One answer at a time goes from the queue to the file, outside the threads of the runtime, so the file gets the answers in the order of the queue. pentd writes the rule before it resolves any question. When the write fails, the answer holds only for the run of the question, as `run` does: the questions of other runs stay open, and the client that answered gets `rule_not_kept` before the verdicts. A question that comes during the write is resolved too. | `an_answer_reaches_the_session_the_watcher_and_the_rule_file`, `pentd_refuses_a_bad_answer_and_a_message_of_the_wrong_role`, `a_rule_that_pentd_cannot_write_gives_a_verdict_for_this_run_and_an_error`, `queue::tests::a_failed_write_resolves_only_the_session_of_the_question`, `a_question_that_comes_during_the_write_is_resolved_too` |
 | QU-7 | Each question has a deadline in `pent run`: 120 s for a file, a Unix socket and a port, 20 s for the proxy, 4 s for DNS. At the deadline the access gets the error of a refusal, and not before. The question stays open in pentd. | `client::tests::each_deadline_gives_a_refusal_at_its_time_and_not_before` |
 | QU-8 | A late answer with the scope `remember` becomes a rule. An open question of an ended session keeps pentd alive for at most 5 minutes, so the answer has time to come. | `queue::tests::a_question_of_an_ended_session_stays_for_a_late_answer_then_goes`, `a_late_answer_becomes_a_rule_and_the_open_question_keeps_pentd_alive` |
 | QU-9 | When pentd fails or refuses a question, each waiting access gets the error of a refusal at once, and so does each later question. | `client::tests::a_failure_of_pentd_refuses_at_once`, `a_rejected_ask_is_a_refusal` |
@@ -97,6 +107,18 @@ soon after the last hold.
 | NH-4 | Without a command, or with a settings file that is not valid, pentd runs nothing and goes on. pentd reads the settings at each burst, so a new command applies without a restart. | `no_command_gives_no_run_and_a_new_command_applies_at_once` |
 | NH-5 | The hook does not get the listening socket from systemd (`FD_CLOEXEC`, PD-7). | `the_hook_does_not_get_the_socket_from_systemd` |
 
+## The clients of the CLI
+
+| ID | Property | Test |
+|---|---|---|
+| CC-1 | Only a session sends events, and pentd puts the number of that session in each event, so a session cannot put a refusal in the list of another session. A session may not send `questions`, `denials` or `forget`: it gets `not_permitted`. | `only_a_session_sends_events_and_a_session_cannot_read_or_forget`, `denials::tests::only_a_refusal_is_kept_with_the_number_of_its_session` |
+| CC-2 | pentd keeps only the refusals (a deny of a flag, a rule or an answer, a deadline, a hidden file), in memory, with limits: at most 128 for each session (a new one pushes out the oldest), the refusals of an ended session for 5 minutes, and at most 64 ended sessions. A refusal that cannot go on one line with its key is not kept. An unknown session gives `unknown_session`. | `denials::tests::a_session_keeps_its_newest_refusals`, `an_ended_session_stays_for_its_time`, `the_oldest_ended_session_goes_above_the_limit`, `an_unknown_session_gives_none_and_keeps_nothing`, `pent_denials_shows_the_refusals_of_each_session` |
+| CC-3 | `pent allow ID` and `pent deny ID` send an answer of the human with the place in the menu (`--width N`, default 0, the exact target) and the scope (`--remember`, default `run`). pentd checks it as each answer (QU-3). A refused answer stops the command with the reason, and the question stays open. | `pent_questions_and_pent_allow_answer_with_a_width_and_a_rule`, `pent_deny_with_a_bad_width_fails_and_the_question_stays` |
+| CC-4 | A client that waits for the verdict of its answer always gets an end: pentd sends `rule_not_kept` before the verdicts, and `unknown_question` with no verdict when the question went during the write of the rule. Each read of a client of the CLI waits at most 10 s. | `a_rule_that_pentd_cannot_write_gives_a_verdict_for_this_run_and_an_error` (the order). No test covers a question that goes during the write, or the time limit. |
+| CC-5 | `pent rules forget` goes through pentd, the only writer of the rules, one write at a time with the answers. The CLI reads the target of the rule number in the file and sends the target, and pentd removes each rule with that target. Thus a change of the file between `show` and `forget` cannot remove another rule. pentd keeps the other rules and the comments, and it creates no file for a key with no rule. | `pent_rules_forget_goes_through_pentd_and_keeps_the_other_rules`, `a_forget_by_target_removes_only_that_target` |
+| CC-6 | No client of the CLI starts pentd. Without pentd, `pent allow`, `deny`, `questions`, `denials` and `rules forget` stop with an error, and no socket appears. `pent rules list` and `show` read the files and need no pentd. | `each_client_fails_when_no_pentd_runs_and_starts_none` |
+| CC-7 | Each text that the program chose (a path, a name, the program) goes through `safe` before it reaches the terminal, so a control character shows as an escape. `pent questions --json` gives JSON, which escapes each control character. | `answer::tests::a_question_shows_its_menu_and_escapes_the_program`, `a_denial_names_what_refused_it`, `rules::tests::a_rule_shows_its_number_target_source_and_date` |
+
 ## The limits
 
 - **The same user.** A process of the same user outside the sandbox can
@@ -112,6 +134,12 @@ soon after the last hold.
   the rules before it queues a question: `pent run` asks only when no rule
   answers. A rule that the user adds by hand during a run does not resolve
   a question that is open already.
+- **The refusals are in memory.** A stop or a restart of pentd loses
+  them. `pent run` sends no event yet (phase 3), so today only a test
+  fills the list.
+- **A session with no refusal** does not show in `pent denials`, and the
+  number of a session shows only next to its refusals. `pent run` does not
+  print its number.
 - **A long run and the restarts of pentd.** The client holds pentd again
   after a lost connection, three times in a row. A connection that lasts
   30 s resets the count, so a long run keeps its hold over each restart. No

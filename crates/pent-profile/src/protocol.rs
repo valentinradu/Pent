@@ -26,7 +26,16 @@
 //! - [`Rejected`]: pentd refuses a message of a client, and says why.
 //! - [`Event`]: a decision of `pent run`, for `pent denials` and for the
 //!   events of a session in `pent monitor`.
+//! - [`Message::Questions`]: a client asks for each open question
+//!   (`pent questions`). pentd sends each [`Question`], then
+//!   [`Message::End`].
+//! - [`Message::Denials`]: a client asks for the refusals of one session or
+//!   of each session (`pent denials`). pentd sends each [`Denial`], then
+//!   [`Message::End`].
+//! - [`Forget`]: a client asks pentd to remove rules (`pent rules forget`).
+//!   pentd answers with [`Forgotten`].
 
+use std::fmt;
 use std::num::NonZeroU16;
 use std::time::{Duration, SystemTime};
 
@@ -207,6 +216,19 @@ impl Request {
     }
 }
 
+/// The text of a request, as `read /home/u/.cargo`. The text holds the
+/// path or the name as it is, so a caller that prints it escapes it.
+impl fmt::Display for Request {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::File { kind, path } => write!(f, "{} {}", kind.name(), path.as_path().display()),
+            Self::Domain(name) => write!(f, "domain {name}"),
+            Self::UnixSocket(path) => write!(f, "unix-socket {}", path.as_path().display()),
+            Self::Localhost(port) => write!(f, "localhost {port}"),
+        }
+    }
+}
+
 /// The two mappings between [`Access`] and [`Request`] are exhaustive, so a
 /// new kind of access does not compile until the protocol can carry it.
 impl From<Access<'_>> for Request {
@@ -326,6 +348,19 @@ pub enum DecidedBy {
     Hidden,
 }
 
+impl DecidedBy {
+    /// Return true if the access got the error of a refusal.
+    #[must_use]
+    pub const fn is_refusal(self) -> bool {
+        match self {
+            Self::Flag(decision) | Self::Rule(decision) | Self::Answer { decision, .. } => {
+                matches!(decision, Decision::Deny)
+            }
+            Self::Deadline { .. } | Self::Hidden => true,
+        }
+    }
+}
+
 /// A decision of `pent run`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -340,6 +375,38 @@ pub struct Event {
     pub request: Request,
     /// What decided it.
     pub decided_by: DecidedBy,
+}
+
+/// A refusal of a session, as pentd keeps it for `pent denials`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Denial {
+    /// The key of the session.
+    pub key: RuleKey,
+    /// The event of the refusal.
+    pub event: Event,
+}
+
+/// A request to remove rules of one key. pentd is the only writer of the
+/// rules, so `pent rules forget` sends this message to pentd.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Forget {
+    /// The key of the rules.
+    pub key: RuleKey,
+    /// The target of the rules to remove: each rule with this target goes.
+    /// `None` removes each rule of the key.
+    pub target: Option<Target>,
+}
+
+/// The result of a [`Forget`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Forgotten {
+    /// The key of the rules.
+    pub key: RuleKey,
+    /// The number of rules that pentd removed.
+    pub count: u32,
 }
 
 /// The result of an answer for one question: the target that the answer
@@ -381,8 +448,32 @@ pub enum RejectReason {
     TooMany,
     /// pentd could not write the rule of an answer with the scope
     /// `remember`. The verdicts have the scope `run`: the answer holds only
-    /// for the runs that wait now.
+    /// for the runs that wait now. pentd sends this message before the
+    /// verdicts.
     RuleNotKept,
+    /// pentd knows no session with this number: the session never existed,
+    /// or it ended too long ago.
+    UnknownSession,
+    /// pentd could not change the rule file of a [`Forget`].
+    RulesNotWritten,
+}
+
+impl fmt::Display for RejectReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::UnknownQuestion => "no open question has this number",
+            Self::BadWidth => "the width is not in the menu of the question, or it does not fit",
+            Self::NotHuman => "only the human answers on the socket",
+            Self::NotPermitted => "this connection may not send this message",
+            Self::TooLong => "the question does not fit on one line",
+            Self::TooMany => "the session has too many open questions",
+            Self::RuleNotKept => {
+                "pentd could not write the rule; the answer holds only for this run"
+            }
+            Self::UnknownSession => "pentd knows no session with this number",
+            Self::RulesNotWritten => "pentd could not change the rule file; see the log of pentd",
+        })
+    }
 }
 
 /// pentd refused a message of the client.
@@ -415,6 +506,20 @@ pub enum Message {
     Rejected(Rejected),
     /// See [`Event`].
     Event(Event),
+    /// Send each open question, then [`Message::End`].
+    Questions,
+    /// Send each refusal of the session, or of each session for `None`,
+    /// then [`Message::End`].
+    Denials(Option<SessionId>),
+    /// See [`Denial`].
+    Denial(Denial),
+    /// See [`Forget`].
+    Forget(Forget),
+    /// See [`Forgotten`].
+    Forgotten(Forgotten),
+    /// The end of the reply to [`Message::Questions`] or
+    /// [`Message::Denials`].
+    End,
 }
 
 /// The frame of one line, for the encoder.
@@ -612,6 +717,36 @@ mod tests {
                 id: None,
                 reason: RejectReason::NotPermitted,
             }),
+            Message::Rejected(Rejected {
+                id: None,
+                reason: RejectReason::UnknownSession,
+            }),
+            Message::Questions,
+            Message::Denials(None),
+            Message::Denials(Some(SessionId(4))),
+            Message::Denial(Denial {
+                key: "cargo".parse().unwrap_or_else(|e| panic!("{e}")),
+                event: Event {
+                    session: SessionId(4),
+                    time: Timestamp(10),
+                    program: "rustc".into(),
+                    request: domain("z.org"),
+                    decided_by: DecidedBy::Rule(Decision::Deny),
+                },
+            }),
+            Message::Forget(Forget {
+                key: "cargo".parse().unwrap_or_else(|e| panic!("{e}")),
+                target: Some(Target::Localhost(port)),
+            }),
+            Message::Forget(Forget {
+                key: "cargo".parse().unwrap_or_else(|e| panic!("{e}")),
+                target: None,
+            }),
+            Message::Forgotten(Forgotten {
+                key: "cargo".parse().unwrap_or_else(|e| panic!("{e}")),
+                count: 2,
+            }),
+            Message::End,
         ]
     }
 
@@ -798,6 +933,49 @@ mod tests {
         );
         assert!(Deadline::new(MAX_DEADLINE + Duration::from_millis(1)).is_err());
         assert!(Deadline::new(Duration::MAX).is_err());
+    }
+
+    #[test]
+    fn only_a_deny_a_deadline_and_a_hidden_file_are_refusals() {
+        let question = QuestionId(1);
+        for (decided_by, refusal) in [
+            (DecidedBy::Flag(Decision::Allow), false),
+            (DecidedBy::Flag(Decision::Deny), true),
+            (DecidedBy::Rule(Decision::Allow), false),
+            (DecidedBy::Rule(Decision::Deny), true),
+            (
+                DecidedBy::Answer {
+                    question,
+                    decision: Decision::Allow,
+                },
+                false,
+            ),
+            (
+                DecidedBy::Answer {
+                    question,
+                    decision: Decision::Deny,
+                },
+                true,
+            ),
+            (DecidedBy::Deadline { question }, true),
+            (DecidedBy::Hidden, true),
+        ] {
+            assert_eq!(decided_by.is_refusal(), refusal, "{decided_by:?}");
+        }
+    }
+
+    #[test]
+    fn a_request_has_a_short_text() {
+        let name: DomainName = "a.example".parse().unwrap_or_else(|e| panic!("{e}"));
+        let port = NonZeroU16::new(5432).unwrap_or(NonZeroU16::MIN);
+        for (request, text) in [
+            (ask().request, "read /home/u/.cargo/registry/x"),
+            (Request::Domain(name), "domain a.example"),
+            (Request::UnixSocket(path("/run/a")), "unix-socket /run/a"),
+            (Request::Localhost(port), "localhost 5432"),
+        ] {
+            assert_eq!(request.to_string(), text);
+        }
     }
 
     #[test]

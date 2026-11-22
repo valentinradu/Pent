@@ -10,6 +10,9 @@ pub(crate) enum CliError {
     Store(#[from] pent_settings::StoreError),
 
     #[error("{0}")]
+    Rule(#[from] pent_profile::RuleError),
+
+    #[error("{0}")]
     ProfileName(#[from] pent_profile::ProfileNameError),
 
     #[error("{0}")]

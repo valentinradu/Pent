@@ -47,21 +47,21 @@ pub use guard::{
 pub use localhost::{control_port, is_localhost_name, is_loopback, CONTROL_PORTS};
 pub use name::{ProfileName, ProfileNameError};
 pub use protocol::{
-    Answer, Ask, Deadline, DeadlineTooLong, DecidedBy, Event, Hold, MenuIndex, Message,
-    ProtocolError, Question, QuestionId, RejectReason, Rejected, Request, Scope, SessionId,
-    Timestamp, Verdict, DNS_DEADLINE, FILE_DEADLINE, MAX_DEADLINE, MAX_LINE_LEN, PROTOCOL_VERSION,
-    PROXY_DEADLINE,
+    Answer, Ask, Deadline, DeadlineTooLong, DecidedBy, Denial, Event, Forget, Forgotten, Hold,
+    MenuIndex, Message, ProtocolError, Question, QuestionId, RejectReason, Rejected, Request,
+    Scope, SessionId, Timestamp, Verdict, DNS_DEADLINE, FILE_DEADLINE, MAX_DEADLINE, MAX_LINE_LEN,
+    PROTOCOL_VERSION, PROXY_DEADLINE,
 };
 pub use render::{
-    render_draft, render_draft_with, render_header, render_profile, render_terminal, safe_lines,
-    DraftSource, Reasons, Warnings, WatchHeader,
+    render_draft, render_draft_with, render_header, render_profile, render_terminal, safe,
+    safe_lines, DraftSource, Reasons, Warnings, WatchHeader,
 };
 pub use review::{review, Selection};
 pub use rule::{
     Access, Decision, DomainName, DomainWidth, FileKind, PathWidth, Rule, RuleError, RuleKey,
     RulePath, RuleSet, Source, Target,
 };
-pub use rule_file::{EntryError, Kind as RuleFileKind, RuleFileError};
+pub use rule_file::{format_date, EntryError, Kind as RuleFileKind, RuleFileError};
 pub use summary::{
     summarize, FsAccess, Grant, Item, ItemNote, Section, Stats, Summary, SummaryContext,
 };

@@ -1,28 +1,14 @@
 # Plan: the new pent
 
-**Cursor: step 2.4.** Steps with `[x]` are done. Work on the branch `next`,
+**Cursor: step 2.5.** Steps with `[x]` are done. Work on the branch `next`,
 one commit for each step, and move this cursor when a step is done.
 
-**Handoff (2026-11-22).** Steps 1.1 to 2.3 are done, reviewed and pushed.
-pentd has its lock, socket, holds, queue and notification hook
-(`crates/pent/src/daemon/`, `docs/security/pentd.md`). `pent run` holds
-pentd but asks no question yet (phase 3).
-
-- **The way of work.** One commit for each step. Then the user runs
-  `/code-review origin/main..HEAD`, and each finding gets a fix in one more
-  commit. Push only when the user approves that push. Each new test gets a
-  mutation check by hand (`docs/testing/mutation.md`). When the protocol
-  changes, run the fuzz target `protocol_line` again and write the number
-  in the documents.
-- **Open points for step 2.4.**
-  - `pent denials` needs the events of each session. pentd reads
-    `Message::Event` today and keeps nothing: decide where pentd keeps them
-    and for how long.
-  - `pent allow ID` must name a width and a scope (for example `--width N`
-    and `--remember`); the default is the exact target and the scope `run`.
-  - `pent rules forget` must go through pentd, the only writer of the
-    rules, so the protocol needs messages for the rules. `pent rules list`
-    and `show` can read the files.
+**The way of work.** One commit for each step. Then the user runs
+`/code-review origin/main..HEAD`, and each finding gets a fix in one more
+commit. Push only when the user approves that push. Each new test gets a
+mutation check by hand (`docs/testing/mutation.md`). When the protocol
+changes, run the fuzz target `protocol_line` again and write the number in
+the documents.
 
 This plan builds the design in `docs/design/pent.md`. Each step names its
 goal, the main files, and the condition for "done". A step is done only
@@ -108,11 +94,15 @@ ready for users.
   - Files: `pent/src/daemon/notify.rs`; `[notify]` in `pent-settings`.
   - Done: a test with a command that writes its environment to a file;
     NH-1 to NH-4 in `docs/security/pentd.md`.
-- [ ] **2.4 The CLI clients.** `pent allow ID`, `pent deny ID`,
-  `pent denials [SESSION]`, `pent rules list`, `pent rules show KEY` and
-  `pent rules forget KEY [RULE]`.
+- [x] **2.4 The CLI clients.** `pent allow ID`, `pent deny ID`,
+  `pent questions`, `pent denials [SESSION]`, `pent rules list`,
+  `pent rules show KEY` and `pent rules forget KEY [RULE]`. pentd keeps the
+  refusals in memory; no client starts pentd.
+  - Files: `pent/src/commands/answer.rs`, `rules.rs`,
+    `pent/src/daemon/call.rs`, `denials.rs`; the messages `Questions`,
+    `Denials`, `Denial`, `Forget`, `Forgotten` and `End` in the protocol.
   - Done: end-to-end tests against a pentd in a temporary
-    `XDG_RUNTIME_DIR`.
+    `XDG_RUNTIME_DIR`; CC-1 to CC-7 in `docs/security/pentd.md`.
 - [ ] **2.5 `pent monitor`.** A terminal screen: the questions grouped by
   root program and by width, the keys allow, deny, width, scope and
   details, and the warning of a sensitive question.

@@ -672,19 +672,19 @@ mod queue {
     }
 
     impl Client {
-        fn connect(rt: &Runtime) -> std::io::Result<Self> {
+        pub(super) fn connect(rt: &Runtime) -> std::io::Result<Self> {
             let write = UnixStream::connect(rt.socket())?;
             write.set_read_timeout(Some(WAIT))?;
             let read = BufReader::new(write.try_clone()?);
             Ok(Self { write, read })
         }
 
-        fn send(&mut self, message: Message) -> TestResult {
+        pub(super) fn send(&mut self, message: Message) -> TestResult {
             self.write.write_all(message.encode_line()?.as_bytes())?;
             Ok(())
         }
 
-        fn recv(&mut self) -> Result<Message, common::e2e::BoxError> {
+        pub(super) fn recv(&mut self) -> Result<Message, common::e2e::BoxError> {
             let mut line = String::new();
             if self.read.read_line(&mut line)? == 0 {
                 return Err("pentd closed the connection".into());
@@ -727,7 +727,7 @@ mod queue {
         })
     }
 
-    fn read_ask(path: &str, parent: &str) -> Result<Ask, common::e2e::BoxError> {
+    pub(super) fn read_ask(path: &str, parent: &str) -> Result<Ask, common::e2e::BoxError> {
         let rp = RulePath::new(path)?;
         Ok(Ask {
             request: Request::File {
@@ -759,7 +759,7 @@ mod queue {
     }
 
     /// A pentd in the foreground with its own state directory.
-    fn pentd(rt: &Runtime, state: &Path, args: &[&str]) -> std::io::Result<Reap> {
+    pub(super) fn pentd(rt: &Runtime, state: &Path, args: &[&str]) -> std::io::Result<Reap> {
         let mut cmd = rt.pent(args);
         cmd.env("XDG_STATE_HOME", state).env("HOME", state);
         Ok(Reap(cmd.spawn()?))
@@ -975,15 +975,17 @@ mod queue {
         let other_id = other.ask(read_ask("/home/u/reg/b", "/home/u/reg")?)?;
         let mut client = Client::connect(&rt)?;
         client.send(Message::Answer(answer(id, 1, Scope::Remember)))?;
-        match client.recv()? {
-            Message::Verdict(v) => assert_eq!(v.scope, Scope::Run),
-            other => return Err(format!("{other:?}").into()),
-        }
+        // The error comes before the verdicts, so a client that waits for
+        // one verdict sees it.
         match client.recv()? {
             Message::Rejected(r) => {
                 assert_eq!(r.id, Some(id));
                 assert_eq!(r.reason, RejectReason::RuleNotKept);
             }
+            other => return Err(format!("{other:?}").into()),
+        }
+        match client.recv()? {
+            Message::Verdict(v) => assert_eq!(v.scope, Scope::Run),
             other => return Err(format!("{other:?}").into()),
         }
         match session.recv()? {
@@ -1115,6 +1117,376 @@ mod queue {
         let mut answerer = Client::connect(&rt)?;
         answerer.send(Message::Answer(answer(id, 0, Scope::Run)))?;
         assert!(matches!(client.recv()?, Message::Verdict(v) if v.id == id));
+        Ok(())
+    }
+}
+
+// ── The clients of the CLI ──────────────────────────────────────────────────
+
+mod clients {
+    use std::process::Output;
+
+    use pent_profile::{
+        DecidedBy, Decision, Event, FileKind, Message, PathWidth, Question, RejectReason, Request,
+        RulePath, SessionId, Target, Timestamp,
+    };
+
+    use super::queue::{pentd, port_ask, read_ask, Client};
+    use super::*;
+
+    /// Run `pent ARGS` with the runtime directory of `rt` and the state
+    /// directory `state`, and return its output.
+    fn pent(rt: &Runtime, state: &Path, args: &[&str]) -> std::io::Result<Output> {
+        rt.pent(args)
+            .env("XDG_STATE_HOME", state)
+            .env("HOME", state)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+    }
+
+    fn text(bytes: &[u8]) -> String {
+        String::from_utf8_lossy(bytes).into_owned()
+    }
+
+    /// Return the output of a command that must succeed.
+    fn ok(output: &Output) -> Result<(String, String), common::e2e::BoxError> {
+        let (out, err) = (text(&output.stdout), text(&output.stderr));
+        if !output.status.success() {
+            return Err(format!("{:?}\nstdout: {out}\nstderr: {err}", output.status).into());
+        }
+        Ok((out, err))
+    }
+
+    /// Return stderr of a command that must fail.
+    fn fails(output: &Output) -> Result<String, common::e2e::BoxError> {
+        let err = text(&output.stderr);
+        if output.status.success() {
+            return Err(format!("the command succeeded: {err}").into());
+        }
+        Ok(err)
+    }
+
+    /// A pentd in the foreground, ready for connections.
+    fn ready(rt: &Runtime, state: &Path) -> Result<Reap, common::e2e::BoxError> {
+        let pentd = pentd(rt, state, &["daemon"])?;
+        if !rt.wait_for_socket() {
+            return Err("pentd never listened".into());
+        }
+        Ok(pentd)
+    }
+
+    #[test]
+    fn pent_questions_and_pent_allow_answer_with_a_width_and_a_rule() -> TestResult {
+        let rt = Runtime::new()?;
+        let state = tempfile::tempdir()?;
+        let _pentd = ready(&rt, state.path())?;
+        let mut session = Client::session(&rt, "cargo")?;
+        let id = session.ask(read_ask("/home/u/reg/a", "/home/u/reg")?)?;
+
+        let (out, _) = ok(&pent(&rt, state.path(), &["questions"])?)?;
+        assert!(
+            out.starts_with(&format!("{}  cargo  read /home/u/reg/a\n", id.0)),
+            "{out}"
+        );
+        assert!(
+            out.contains("    --width 1  read /home/u/reg/**\n"),
+            "{out}"
+        );
+        let (json, _) = ok(&pent(&rt, state.path(), &["questions", "--json"])?)?;
+        let question: Question = serde_json::from_str(json.trim())?;
+        assert_eq!(question.id, id);
+
+        let number = id.0.to_string();
+        let args = ["allow", number.as_str(), "--width", "1", "--remember"];
+        let (_, err) = ok(&pent(&rt, state.path(), &args)?)?;
+        assert!(
+            err.contains("allow read /home/u/reg/** (remembered)"),
+            "{err}"
+        );
+        match session.recv()? {
+            Message::Verdict(v) => {
+                assert_eq!(v.id, id);
+                assert_eq!(v.decision, Decision::Allow);
+                assert_eq!(
+                    v.target,
+                    Target::File {
+                        kind: FileKind::Read,
+                        width: PathWidth::Subtree(RulePath::new("/home/u/reg")?),
+                    }
+                );
+            }
+            other => return Err(format!("{other:?}").into()),
+        }
+
+        let (out, _) = ok(&pent(&rt, state.path(), &["rules", "list"])?)?;
+        assert_eq!(out, format!("{:<24} 1 rule\n", "cargo"));
+        let (out, _) = ok(&pent(&rt, state.path(), &["rules", "show", "cargo"])?)?;
+        assert!(
+            out.starts_with("  1  allow  read /home/u/reg/**  human  "),
+            "{out}"
+        );
+        let (_, err) = ok(&pent(&rt, state.path(), &["questions"])?)?;
+        assert!(err.contains("none"), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    fn pent_deny_with_a_bad_width_fails_and_the_question_stays() -> TestResult {
+        let rt = Runtime::new()?;
+        let state = tempfile::tempdir()?;
+        let _pentd = ready(&rt, state.path())?;
+        let mut session = Client::session(&rt, "psql")?;
+        let id = session.ask(port_ask(5432)?)?;
+        let number = id.0.to_string();
+
+        let err = fails(&pent(
+            &rt,
+            state.path(),
+            &["deny", &number, "--width", "5"],
+        )?)?;
+        assert!(err.contains("the width is not in the menu"), "{err}");
+        let err = fails(&pent(&rt, state.path(), &["allow", "999"])?)?;
+        assert!(err.contains("no open question has this number"), "{err}");
+
+        let (_, err) = ok(&pent(&rt, state.path(), &["deny", &number])?)?;
+        assert!(err.contains("deny localhost 5432 (this run)"), "{err}");
+        assert!(
+            matches!(session.recv()?, Message::Verdict(v) if v.id == id && v.decision == Decision::Deny)
+        );
+        // The scope `run` writes no rule.
+        assert!(!state.path().join("pent/rules/psql.toml").exists());
+        Ok(())
+    }
+
+    fn event(time: i64, request: Request, decided_by: DecidedBy) -> Message {
+        Message::Event(Event {
+            // A false number: pentd puts the number of the session.
+            session: SessionId(42),
+            time: Timestamp(time),
+            program: "node".into(),
+            request,
+            decided_by,
+        })
+    }
+
+    #[test]
+    fn pent_denials_shows_the_refusals_of_each_session() -> TestResult {
+        let rt = Runtime::new()?;
+        let state = tempfile::tempdir()?;
+        let _pentd = ready(&rt, state.path())?;
+        let domain = |name: &str| -> Result<Request, common::e2e::BoxError> {
+            Ok(Request::Domain(name.parse()?))
+        };
+        let mut first = Client::session(&rt, "npm")?;
+        first.send(event(
+            1,
+            domain("evil.example")?,
+            DecidedBy::Rule(Decision::Deny),
+        ))?;
+        first.send(event(
+            2,
+            domain("ok.example")?,
+            DecidedBy::Rule(Decision::Allow),
+        ))?;
+        // An ask after the events: pentd has the events when it numbers it.
+        let first_q = first.ask(port_ask(1)?)?;
+        let mut second = Client::session(&rt, "cargo")?;
+        second.send(event(3, domain("x.example")?, DecidedBy::Hidden))?;
+        second.ask(port_ask(2)?)?;
+        let first_session = {
+            let mut c = Client::connect(&rt)?;
+            c.send(Message::Questions)?;
+            match c.recv()? {
+                Message::Question(q) if q.id == first_q => q.ask.session,
+                other => return Err(format!("{other:?}").into()),
+            }
+        };
+
+        let (out, _) = ok(&pent(&rt, state.path(), &["denials"])?)?;
+        assert!(out.contains("  npm\n"), "{out}");
+        assert!(
+            out.contains("domain evil.example  by node  (a rule)"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("ok.example"),
+            "an allow is not a refusal: {out}"
+        );
+        assert!(out.contains("  cargo\n"), "{out}");
+        assert!(
+            out.contains("domain x.example  by node  (a file of pent (ENOENT))"),
+            "{out}"
+        );
+
+        let number = first_session.0.to_string();
+        let (out, _) = ok(&pent(&rt, state.path(), &["denials", &number])?)?;
+        assert!(
+            out.starts_with(&format!("session {number}  npm\n")),
+            "{out}"
+        );
+        assert!(!out.contains("x.example"), "{out}");
+
+        let err = fails(&pent(&rt, state.path(), &["denials", "4242"])?)?;
+        assert!(err.contains("knows no session"), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    fn only_a_session_sends_events_and_a_session_cannot_read_or_forget() -> TestResult {
+        let rt = Runtime::new()?;
+        let state = tempfile::tempdir()?;
+        let _pentd = ready(&rt, state.path())?;
+        let rejected = |client: &mut Client,
+                        message: Message|
+         -> Result<RejectReason, common::e2e::BoxError> {
+            client.send(message)?;
+            match client.recv()? {
+                Message::Rejected(r) => Ok(r.reason),
+                other => Err(format!("pentd sent {other:?}").into()),
+            }
+        };
+        let mut client = Client::connect(&rt)?;
+        let fake = event(
+            1,
+            Request::Localhost(std::num::NonZeroU16::MIN),
+            DecidedBy::Hidden,
+        );
+        assert_eq!(rejected(&mut client, fake)?, RejectReason::NotPermitted);
+
+        let mut session = Client::session(&rt, "cargo")?;
+        let forget = Message::Forget(pent_profile::Forget {
+            key: "cargo".parse()?,
+            target: None,
+        });
+        for message in [Message::Questions, Message::Denials(None), forget] {
+            assert_eq!(rejected(&mut session, message)?, RejectReason::NotPermitted);
+        }
+        // The client event left no refusal.
+        let (_, err) = ok(&pent(&rt, state.path(), &["denials"])?)?;
+        assert!(err.contains("none"), "{err}");
+        Ok(())
+    }
+
+    const TWO_RULES: &str = r#"version = 1
+
+# The registry.
+[[rule]]
+kind = "read"
+width = "subtree"
+path = "/home/u/reg"
+decision = "allow"
+source = "human"
+created = 2026-11-22T12:00:00Z
+
+# The database.
+[[rule]]
+kind = "localhost"
+port = 5432
+decision = "deny"
+source = "human"
+created = 2026-11-22T12:00:01Z
+"#;
+
+    #[test]
+    fn pent_rules_forget_goes_through_pentd_and_keeps_the_other_rules() -> TestResult {
+        let rt = Runtime::new()?;
+        let state = tempfile::tempdir()?;
+        let rules = state.path().join("pent/rules");
+        std::fs::create_dir_all(&rules)?;
+        let file = rules.join("cargo.toml");
+        std::fs::write(&file, TWO_RULES)?;
+        let _pentd = ready(&rt, state.path())?;
+
+        let err = fails(&pent(
+            &rt,
+            state.path(),
+            &["rules", "forget", "cargo", "3"],
+        )?)?;
+        assert!(err.contains("cargo has no rule 3"), "{err}");
+        let err = fails(&pent(
+            &rt,
+            state.path(),
+            &["rules", "forget", "cargo", "0"],
+        )?)?;
+        assert!(err.contains("cargo has no rule 0"), "{err}");
+
+        let (_, err) = ok(&pent(
+            &rt,
+            state.path(),
+            &["rules", "forget", "cargo", "1"],
+        )?)?;
+        assert!(
+            err.contains("forgot 1 rule of cargo: read /home/u/reg/**"),
+            "{err}"
+        );
+        let text = std::fs::read_to_string(&file)?;
+        assert!(!text.contains("/home/u/reg"), "{text}");
+        assert!(text.contains("# The database."), "{text}");
+        assert!(text.contains("port = 5432"), "{text}");
+
+        let (_, err) = ok(&pent(&rt, state.path(), &["rules", "forget", "cargo"])?)?;
+        assert!(err.contains("forgot 1 rule of cargo"), "{err}");
+        let (out, err) = ok(&pent(&rt, state.path(), &["rules", "show", "cargo"])?)?;
+        assert!(out.is_empty() && err.contains("none"), "{out}{err}");
+
+        // A key with no file gets no file.
+        let (_, err) = ok(&pent(&rt, state.path(), &["rules", "forget", "node"])?)?;
+        assert!(err.contains("node has no such rule now"), "{err}");
+        assert!(!rules.join("node.toml").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn a_forget_by_target_removes_only_that_target() -> TestResult {
+        // The CLI sends the target, not the number, so a change of the
+        // order of the file cannot make pentd remove another rule.
+        let rt = Runtime::new()?;
+        let state = tempfile::tempdir()?;
+        let rules = state.path().join("pent/rules");
+        std::fs::create_dir_all(&rules)?;
+        std::fs::write(rules.join("cargo.toml"), TWO_RULES)?;
+        let _pentd = ready(&rt, state.path())?;
+        let mut client = Client::connect(&rt)?;
+        let port = std::num::NonZeroU16::new(5432).ok_or("port 0")?;
+        let key: pent_profile::RuleKey = "cargo".parse()?;
+        let forget = |target| {
+            Message::Forget(pent_profile::Forget {
+                key: key.clone(),
+                target: Some(target),
+            })
+        };
+        client.send(forget(Target::Localhost(port)))?;
+        assert!(matches!(client.recv()?, Message::Forgotten(f) if f.count == 1));
+        // The same target again: nothing goes, and the other rule stays.
+        client.send(forget(Target::Localhost(port)))?;
+        assert!(matches!(client.recv()?, Message::Forgotten(f) if f.count == 0));
+        let (out, _) = ok(&pent(&rt, state.path(), &["rules", "show", "cargo"])?)?;
+        assert_eq!(out.lines().count(), 1, "{out}");
+        assert!(out.contains("read /home/u/reg/**"), "{out}");
+        Ok(())
+    }
+
+    #[test]
+    fn each_client_fails_when_no_pentd_runs_and_starts_none() -> TestResult {
+        let rt = Runtime::new()?;
+        let state = tempfile::tempdir()?;
+        std::fs::create_dir_all(state.path().join("pent/rules"))?;
+        std::fs::write(state.path().join("pent/rules/cargo.toml"), TWO_RULES)?;
+        for args in [
+            &["allow", "1"][..],
+            &["deny", "1"],
+            &["questions"],
+            &["denials"],
+            &["rules", "forget", "cargo"],
+        ] {
+            let err = fails(&pent(&rt, state.path(), args)?)?;
+            assert!(err.contains("pentd does not run"), "{args:?}: {err}");
+        }
+        assert!(!rt.socket().exists(), "a client started pentd");
+        // `list` and `show` read the files and need no pentd.
+        let (out, _) = ok(&pent(&rt, state.path(), &["rules", "list"])?)?;
+        assert!(out.contains("2 rules"), "{out}");
         Ok(())
     }
 }

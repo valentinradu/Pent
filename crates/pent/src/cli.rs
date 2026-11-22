@@ -37,6 +37,70 @@ pub(crate) enum Command {
     Config(ConfigArgs),
     /// Run pentd, the daemon that holds the questions, in the foreground
     Daemon(DaemonArgs),
+    /// Allow one open question. `pent questions` shows the numbers
+    Allow(AnswerArgs),
+    /// Deny one open question. `pent questions` shows the numbers
+    Deny(AnswerArgs),
+    /// List the open questions with their width menus
+    Questions(QuestionsArgs),
+    /// Show the accesses that pent refused in a session, or in each session
+    Denials(DenialsArgs),
+    /// List, show or forget the rules
+    Rules(RulesArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct AnswerArgs {
+    /// The number of the question
+    pub id: u64,
+
+    /// The place of the target in the width menu of the question. 0 is
+    /// the exact target. `pent questions` shows the menu
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    pub width: u16,
+
+    /// Keep the answer as a rule for the next runs. Without this flag, the
+    /// answer holds only for the runs that wait now
+    #[arg(long)]
+    pub remember: bool,
+}
+
+#[derive(Args)]
+pub(crate) struct QuestionsArgs {
+    /// Print each question as one line of JSON (for scripts)
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args)]
+pub(crate) struct DenialsArgs {
+    /// The number of the session. Without it, pent shows each session
+    pub session: Option<u64>,
+}
+
+#[derive(Args)]
+pub(crate) struct RulesArgs {
+    #[command(subcommand)]
+    pub subcommand: RulesSubcommand,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum RulesSubcommand {
+    /// List the keys that have rules
+    List,
+    /// Show the rules of a key, with their numbers
+    Show {
+        /// The key: the file name of the root program
+        key: String,
+    },
+    /// Remove one rule of a key, or each rule of the key. pentd must run
+    Forget {
+        /// The key: the file name of the root program
+        key: String,
+        /// The number of the rule in `pent rules show KEY`. Without it,
+        /// pent removes each rule of the key
+        rule: Option<usize>,
+    },
 }
 
 #[derive(Args)]

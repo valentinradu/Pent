@@ -387,9 +387,10 @@ command = ["sh", "-c", "notify-send -A open=Open pent \"$PENT_PENDING programs n
 |---|---|
 | `pent run [-w [DIR]] [FLAGS] -- CMD` | Run a command. The flags are answers in advance for this run. |
 | `pent monitor` | Answer the questions. |
-| `pent allow ID`, `pent deny ID` | Answer one question from a script. |
-| `pent denials [SESSION]` | Show the denials of a session. |
-| `pent rules list`, `pent rules show KEY`, `pent rules forget KEY [RULE]` | Read and change the rules. |
+| `pent allow ID`, `pent deny ID` | Answer one question from a script. `--width N` names the target in the menu (the default 0 is the exact target), and `--remember` keeps the answer as a rule. |
+| `pent questions` | List the open questions with their menus (`--json` for a script). |
+| `pent denials [SESSION]` | Show the denials of a session, or of each session. pentd keeps them in memory, for 5 minutes after the end of the session. |
+| `pent rules list`, `pent rules show KEY`, `pent rules forget KEY [RULE]` | Read and change the rules. `show` numbers the rules, and `forget` takes that number. `forget` goes through pentd. |
 | `pent daemon` | Run pentd in the foreground. |
 | `pent judge download NAME` | Download a tested model. |
 | `pent check` | Show what the kernel gives (Landlock, user namespaces, FUSE, the PID namespace). |

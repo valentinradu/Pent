@@ -5,12 +5,16 @@
 //! - [`server`]: the daemon itself. `pent daemon` runs it.
 //! - [`client`]: the connection of `pent run`, which holds pentd and starts
 //!   it when no pentd runs.
+//! - [`call`]: one request of a command of the CLI, for example
+//!   `pent allow`. It never starts pentd.
 //!
 //! A hold is a live connection. pentd stops [`linger`] after the last hold
 //! ends. `pent daemon` in the foreground and the systemd unit hold pentd
 //! themselves, so they never stop for this reason.
 
+pub(crate) mod call;
 pub(crate) mod client;
+pub(crate) mod denials;
 pub(crate) mod hub;
 pub(crate) mod notify;
 pub(crate) mod queue;
@@ -19,7 +23,7 @@ pub(crate) mod server;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use pent_profile::{Message, ProtocolError, MAX_LINE_LEN};
+use pent_profile::{Message, ProtocolError, RejectReason, MAX_LINE_LEN};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt as _, AsyncReadExt as _};
 
 use crate::cli::DaemonArgs;
@@ -94,6 +98,32 @@ pub(crate) enum DaemonError {
     /// A message could not be encoded or decoded.
     #[error(transparent)]
     Protocol(#[from] ProtocolError),
+
+    /// No pentd listens. A command of the CLI does not start one.
+    #[error(
+        "pentd does not run (no listener at {}); start it with `pent daemon`",
+        path.display()
+    )]
+    NotRunning {
+        /// The path of the socket.
+        path: PathBuf,
+    },
+
+    /// pentd sent no reply in time.
+    #[error("pentd sent no reply in time")]
+    NoReply,
+
+    /// pentd closed the connection before its reply.
+    #[error("pentd closed the connection before its reply")]
+    Closed,
+
+    /// pentd sent a line that is not valid.
+    #[error("pentd sent a line that is not valid: {0}")]
+    Read(LineError),
+
+    /// pentd refused the request.
+    #[error("pentd refused the request: {0}")]
+    Rejected(RejectReason),
 }
 
 /// How long pentd waits after the last hold before it stops.
