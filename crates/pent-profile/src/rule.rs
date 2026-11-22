@@ -63,8 +63,23 @@ pub enum RuleError {
 ///
 /// A key has 1 to 64 characters from `[A-Za-z0-9._-]`, and it does not start
 /// with `.`. Thus a key is always a safe file name.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
 pub struct RuleKey(String);
+
+impl TryFrom<String> for RuleKey {
+    type Error = RuleError;
+
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        s.parse()
+    }
+}
+
+impl From<RuleKey> for String {
+    fn from(key: RuleKey) -> Self {
+        key.0
+    }
+}
 
 impl RuleKey {
     /// Make a key from the command that the user gave. Pent uses the file
@@ -118,8 +133,23 @@ impl fmt::Display for RuleKey {
 // ── Paths and domains ───────────────────────────────────────────────────────
 
 /// An absolute path with no `.` and no `..` component.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "PathBuf", into = "PathBuf")]
 pub struct RulePath(PathBuf);
+
+impl TryFrom<PathBuf> for RulePath {
+    type Error = RuleError;
+
+    fn try_from(path: PathBuf) -> Result<Self, Self::Error> {
+        Self::new(path)
+    }
+}
+
+impl From<RulePath> for PathBuf {
+    fn from(path: RulePath) -> Self {
+        path.0
+    }
+}
 
 impl RulePath {
     /// Check and wrap `path`.
@@ -157,8 +187,23 @@ impl RulePath {
 }
 
 /// A domain name in normal form: lowercase ASCII, no trailing dot.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
 pub struct DomainName(String);
+
+impl TryFrom<String> for DomainName {
+    type Error = RuleError;
+
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        s.parse()
+    }
+}
+
+impl From<DomainName> for String {
+    fn from(name: DomainName) -> Self {
+        name.0
+    }
+}
 
 impl DomainName {
     /// The name as text.
@@ -202,7 +247,8 @@ impl fmt::Display for DomainName {
 
 /// The kind of a file access. "See" (`stat`, an existence check) is free and
 /// never needs a rule, so it is not in this list.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum FileKind {
     /// Learn the names in a directory (`readdir`).
     List,
@@ -251,7 +297,8 @@ pub enum Access<'a> {
 // ── Rules ───────────────────────────────────────────────────────────────────
 
 /// The paths that a file rule covers.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum PathWidth {
     /// The path itself. For a listing, the names of this directory only.
     Exact(RulePath),
@@ -262,7 +309,8 @@ pub enum PathWidth {
 /// The domains that a network rule covers. The forms follow the proxy:
 /// `*.example.com` is exactly one more label, `**.example.com` is any depth.
 /// Neither form covers `example.com` itself.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
 pub enum DomainWidth {
     /// The name itself.
     Exact(DomainName),
@@ -287,6 +335,20 @@ impl DomainWidth {
         } else {
             Self::OneLabel(base)
         })
+    }
+}
+
+impl TryFrom<String> for DomainWidth {
+    type Error = RuleError;
+
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        s.parse()
+    }
+}
+
+impl From<DomainWidth> for String {
+    fn from(width: DomainWidth) -> Self {
+        width.to_string()
     }
 }
 
@@ -316,7 +378,8 @@ impl fmt::Display for DomainWidth {
 }
 
 /// What a rule covers.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Target {
     /// File accesses of one kind within a width.
     File {

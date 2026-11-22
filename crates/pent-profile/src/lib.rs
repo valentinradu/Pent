@@ -17,6 +17,7 @@
 //! - [`rule_file`]: the TOML form of the rules of one program.
 //! - [`class`]: the class of an access (normal, sensitive, pent) and the
 //!   width menu of a question.
+//! - [`protocol`]: the messages of `pentd.sock` and their JSON lines codec.
 //!
 //! See `docs/design/watch.md` for the full design.
 
@@ -26,6 +27,7 @@ pub mod event;
 pub mod guard;
 pub mod localhost;
 pub mod name;
+pub mod protocol;
 pub mod psl;
 pub mod render;
 pub mod review;
@@ -44,6 +46,10 @@ pub use guard::{
 };
 pub use localhost::{control_port, is_localhost_name, is_loopback, CONTROL_PORTS};
 pub use name::{ProfileName, ProfileNameError};
+pub use protocol::{
+    Answer, Event, Hold, MenuIndex, Message, Outcome as EventOutcome, ProtocolError, Question,
+    QuestionId, Request, Scope, SessionId, MAX_LINE_LEN, PROTOCOL_VERSION,
+};
 pub use render::{
     render_draft, render_draft_with, render_header, render_profile, render_terminal, safe_lines,
     DraftSource, Reasons, Warnings, WatchHeader,

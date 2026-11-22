@@ -48,6 +48,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "protocol_line"
+path = "fuzz_targets/protocol_line.rs"
+test = false
+doc = false
+bench = false
+
 # The fuzz crate is its own workspace: the root workspace of pent must not
 # build it with `cargo build --workspace`.
 [workspace]

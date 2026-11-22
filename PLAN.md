@@ -1,6 +1,6 @@
 # Plan: the new pent
 
-**Cursor: step 1.4.** Steps with `[x]` are done. Work on the branch `next`,
+**Cursor: step 2.1.** Steps with `[x]` are done. Work on the branch `next`,
 one commit for each step, and move this cursor when a step is done.
 
 This plan builds the design in `docs/design/pent.md`. Each step names its
@@ -53,9 +53,12 @@ ready for users.
     `pent-sandbox/src/linux.rs`.
   - Done: unit tests for each class and each menu; CL-1 to CL-8 in
     `docs/security/rules.md`.
-- [ ] **1.4 The protocol.** The types `Question`, `Answer`, `Event` and
+- [x] **1.4 The protocol.** The types `Question`, `Answer`, `Event` and
   `Hold`, with a JSON lines codec and a version number.
-  - Done: round-trip tests; a fuzz target for the decoder.
+  - Files: `pent-profile/src/protocol.rs`; serde forms with checks for the
+    rule types.
+  - Done: round-trip tests; the fuzz target `protocol_line`;
+    `docs/security/protocol.md`.
 
 ## Phase 2: pentd and its clients
 

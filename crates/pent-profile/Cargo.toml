@@ -8,7 +8,7 @@ description = "Recorded access events, profile files, grouping and review for pe
 
 [dependencies]
 serde = { workspace = true }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 thiserror = { workspace = true }
 toml = "0.8"
 toml_edit = { version = "0.22", features = ["serde"] }

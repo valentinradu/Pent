@@ -19,6 +19,8 @@
 
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
 use crate::guard::{guard_rules_with, GuardAccess, GuardRule};
 use crate::localhost::CONTROL_PORTS;
 use crate::psl;
@@ -71,7 +73,8 @@ pub const HOME_AGENT_SOCKETS: &[(&str, &str)] = &[
 pub const PENT_HOME_DIRS: &[&str] = &[".config/pent", ".local/state/pent", ".local/share/pent"];
 
 /// Why an access is sensitive. The text of the warning comes from here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Sensitive {
     /// A credential: a key, a token, a password store, a browser profile.
     /// A write is sensitive too: it can create or replace a token.
@@ -108,7 +111,8 @@ impl Sensitive {
 }
 
 /// The class of an access.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Class {
     /// The model or the human answers, with any width of the menu.
     Normal,

@@ -108,10 +108,11 @@ commit.
 | Step | Crate | Target | What it reads | Inputs |
 |------|-------|--------|---------------|-------:|
 | 1.2 | `pent-profile` | `rule_file` | The text of a rule file. A file that `RuleSet::from_toml` accepts must give the same rules after `to_toml`, and after `update_toml` with no change, with the first rule removed, and with a rule added. | 1,833,666 |
+| 1.4 | `pent-profile` | `protocol_line` | One line of the protocol of `pentd.sock`. A line that `Message::decode_line` accepts must encode to one line that decodes to the same message. | 7,843,626 |
 
-The run of 2026-11-22 took 151 seconds on a NixOS machine with Linux 7.3.3,
-with no finding.
-`docs/security/rules.md` (RF-11) names the property.
+Each run of 2026-11-22 took 151 seconds on a NixOS machine with Linux
+7.3.3, with no finding. `docs/security/rules.md` (RF-11) and
+`docs/security/protocol.md` (PR-7) name the properties.
 
 ## The property tests
 
