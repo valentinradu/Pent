@@ -145,6 +145,7 @@ impl Waiting {
             let _ = reply.send(None);
         }
         for reply in self.numbered.drain().flat_map(|(_, r)| r) {
+            // The caller can be gone after its deadline.
             let _ = reply.send(None);
         }
     }
@@ -170,6 +171,7 @@ impl Waiting {
             }
             Message::Verdict(verdict) => {
                 for reply in self.numbered.remove(&verdict.id).unwrap_or_default() {
+                    // The caller can be gone after its deadline.
                     let _ = reply.send(Some(verdict.clone()));
                 }
             }
@@ -177,6 +179,7 @@ impl Waiting {
             // number is for an answer, and a session does not answer.
             Message::Rejected(rejected) if rejected.id.is_none() => {
                 if let Some(reply) = self.unnumbered.pop_front() {
+                    // The caller can be gone after its deadline.
                     let _ = reply.send(None);
                 }
             }
@@ -218,6 +221,7 @@ async fn run(
     }
     // Without pentd, each later question gets the error of a refusal.
     while let Some(Command::Ask(_, reply)) = commands.recv().await {
+        // The caller can be gone after its deadline.
         let _ = reply.send(None);
     }
 }
@@ -257,6 +261,7 @@ async fn serve(stream: UnixStream, commands: &mut mpsc::UnboundedReceiver<Comman
                         Ok(line) => line,
                         Err(e) => {
                             tracing::debug!("the session cannot send a question: {e}");
+                            // The caller can be gone after its deadline.
                             let _ = reply.send(None);
                             continue;
                         }

@@ -108,7 +108,7 @@ commit.
 | Step | Crate | Target | What it reads | Inputs |
 |------|-------|--------|---------------|-------:|
 | 1.2 | `pent-profile` | `rule_file` | The text of a rule file. A file that `RuleSet::from_toml` accepts must give the same rules after `to_toml` and after `update_toml` with no change. With the first rule removed or with a rule added, the file must hold the same rules with the same count of each rule, in any order. | 2,014,385 |
-| 1.4, 2.2 | `pent-profile` | `protocol_line` | One line of the protocol of `pentd.sock`, with the messages and the reasons of step 2.2. A line that `Message::decode_line` accepts must encode to one line that decodes to the same message. | 6,290,727 |
+| 1.4, 2.2 | `pent-profile` | `protocol_line` | One line of the protocol of `pentd.sock`, with the messages and the reasons of steps 2.2 and 2.3. A line that `Message::decode_line` accepts must encode to one line that decodes to the same message. | 13,620,427 |
 
 Each run of 2026-11-22 took 151 seconds on a NixOS machine with Linux
 7.3.3, with no finding. An earlier run of `rule_file` found that an update

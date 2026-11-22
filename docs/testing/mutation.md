@@ -56,6 +56,14 @@ makes one mutation by hand. The test must fail on the mutant. No
 | 2.3 | A new question gives no signal to the hook. | the three tests of `notify::` in `tests/pentd.rs` |
 | 2.3 | The questions of the window do not belong to its run. | `one_burst_gives_one_run_with_the_number_of_open_questions` |
 | 2.3 | The hook has no window. | `one_burst_gives_one_run_with_the_number_of_open_questions` |
+| 2.3 | The socket from systemd keeps no `FD_CLOEXEC`. | `the_hook_does_not_get_the_socket_from_systemd` |
+| 2.3 | A failed write resolves with the asked scope. | `a_rule_that_pentd_cannot_write_gives_a_verdict_for_this_run_and_an_error` |
+| 2.3 | pentd takes any menu entry as the target. | `a_target_must_have_the_kind_of_the_access_and_cover_it` |
+| 2.3 | A watcher that answers gets each verdict two times. | `a_watcher_that_answers_gets_one_verdict_and_a_second_watch_changes_nothing` |
+| 2.3 | A connection counts only after its first message. | `a_new_connection_keeps_pentd_alive_before_its_first_message` |
+| 2.3 | A second `Watch` adds the connection again. | `a_watcher_that_answers_gets_one_verdict_and_a_second_watch_changes_nothing` |
+| 2.3 | A run has no limit of open questions. | `one_session_has_at_most_the_limit_of_open_questions` |
+| 2.3 | The sandbox does not mask the runtime directory of pent. | `a_profile_that_names_a_parent_does_not_bring_back_the_socket_of_pentd` |
 
 The first form of `pent_run_starts_pentd_and_holds_it_for_the_run` passed on
 the mutant: the client started a new pentd each time that it lost one. The

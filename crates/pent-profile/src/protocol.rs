@@ -376,6 +376,9 @@ pub enum RejectReason {
     /// pentd cannot send the question with its number on one line. pentd
     /// does not queue it, so the order of the numbers stays true.
     TooLong,
+    /// The session has the most open questions that pentd keeps for one
+    /// run. The access gets the error of a refusal.
+    TooMany,
     /// pentd could not write the rule of an answer with the scope
     /// `remember`. The verdicts have the scope `run`: the answer holds only
     /// for the runs that wait now.

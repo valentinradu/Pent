@@ -10,19 +10,22 @@
 //!   menu that the session sent, so a menu with a wider entry does not help.
 //!   A wider answer to another question never resolves it either.
 //! - **pentd checks each answer:** the question exists, the `MenuIndex` is
-//!   in its menu, and the source is the human (the judge runs in pentd).
+//!   in its menu, the source is the human (the judge runs in pentd), and
+//!   the target has the kind of the access and covers it.
+//! - **One run has at most [`MAX_OPEN_PER_SESSION`] open questions.** An
+//!   index finds the same access again without a scan.
 //! - **The deadline is the work of `pent run`:** the access gets the error
 //!   of a refusal there, and the question stays open here. A late answer
 //!   with the scope `remember` becomes a rule.
 //! - **A question of a session that ended** stays open for [`ORPHAN_TTL`],
 //!   so a late answer still becomes a rule. Then the queue drops it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
 use pent_profile::{
-    exact_target, Answer, Ask, Class, Decision, Question, QuestionId, RejectReason, Rule, RuleKey,
-    RuleSet, Scope, SessionId, Source, Target, Verdict,
+    exact_target, Access, Answer, Ask, Class, Decision, Question, QuestionId, RejectReason,
+    Request, Rule, RuleKey, RuleSet, Scope, SessionId, Source, Target, Verdict,
 };
 
 /// How long a question of a session that ended stays open.
@@ -36,7 +39,43 @@ struct Entry {
     orphaned: Option<std::time::Instant>,
 }
 
-/// The result of an accepted answer.
+/// The most open questions of one session. A run waits on far fewer; the
+/// limit stops a faulty run from making pentd grow without a limit.
+pub(crate) const MAX_OPEN_PER_SESSION: usize = 1024;
+
+/// An answer that [`Queue::check`] accepted, before pentd resolves it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Plan {
+    /// The answered question.
+    pub(crate) id: QuestionId,
+    /// The key of the answered question.
+    pub(crate) key: RuleKey,
+    /// The session of the answered question.
+    pub(crate) session: SessionId,
+    /// The target of the answer.
+    pub(crate) target: Target,
+    /// Allow or deny.
+    pub(crate) decision: Decision,
+    /// The scope that the answer asks for.
+    pub(crate) scope: Scope,
+    /// Who answered.
+    pub(crate) source: Source,
+}
+
+impl Plan {
+    /// The rule of the answer.
+    pub(crate) fn rule(&self) -> Rule {
+        Rule {
+            target: self.target.clone(),
+            decision: self.decision,
+            source: self.source,
+            created: SystemTime::now(),
+        }
+    }
+}
+
+/// The result of an accepted answer, for the tests.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Resolution {
     /// The key of the answered question.
@@ -52,6 +91,10 @@ pub(crate) struct Resolution {
 pub(crate) struct Queue {
     next_id: u64,
     open: BTreeMap<QuestionId, Entry>,
+    /// The open question of each access of each session.
+    index: HashMap<(SessionId, Request), QuestionId>,
+    /// The number of open questions of each session.
+    per_session: HashMap<SessionId, usize>,
 }
 
 impl Queue {
@@ -59,23 +102,33 @@ impl Queue {
     /// pentd gives the session and the key, so the values in `ask` do not
     /// count. Returns the question and `true` when it is new; the same
     /// access of the same session gives the open question again.
+    ///
+    /// # Errors
+    /// Returns `TooMany` when the session has [`MAX_OPEN_PER_SESSION`] open
+    /// questions.
     pub(crate) fn ask(
         &mut self,
         session: SessionId,
         key: &RuleKey,
         mut ask: Ask,
-    ) -> (Question, bool) {
+    ) -> Result<(Question, bool), RejectReason> {
         ask.session = session;
         ask.key = key.clone();
         if let Some(entry) = self
-            .open
-            .values()
-            .find(|e| e.question.ask.session == session && e.question.ask.request == ask.request)
+            .index
+            .get(&(session, ask.request.clone()))
+            .and_then(|id| self.open.get(id))
         {
-            return (entry.question.clone(), false);
+            return Ok((entry.question.clone(), false));
         }
+        let count = self.per_session.entry(session).or_default();
+        if *count >= MAX_OPEN_PER_SESSION {
+            return Err(RejectReason::TooMany);
+        }
+        *count = count.saturating_add(1);
         let id = QuestionId(self.next_id);
         self.next_id = self.next_id.saturating_add(1);
+        self.index.insert((session, ask.request.clone()), id);
         let question = Question { id, ask };
         self.open.insert(
             id,
@@ -84,15 +137,19 @@ impl Queue {
                 orphaned: None,
             },
         );
-        (question, true)
+        Ok((question, true))
     }
 
-    /// Check `answer` and resolve each question that it covers.
+    /// Check `answer` without a change to the queue.
     ///
     /// # Errors
-    /// Returns the reason when the question is not open, when the
-    /// `MenuIndex` is not in its menu, or when the source is not the human.
-    pub(crate) fn answer(&mut self, answer: &Answer) -> Result<Resolution, RejectReason> {
+    /// Returns the reason when the source is not the human, when the
+    /// question is not open, when the `MenuIndex` is not in its menu, or
+    /// when the target does not fit the question: a sensitive question
+    /// takes only its exact target, and each target must have the kind of
+    /// the access and cover it. pentd computes these from the access, not
+    /// from the menu that the session sent.
+    pub(crate) fn check(&self, answer: &Answer) -> Result<Plan, RejectReason> {
         if answer.source != Source::Human {
             return Err(RejectReason::NotHuman);
         }
@@ -106,66 +163,106 @@ impl Queue {
             .get(usize::from(answer.width.0))
             .cloned()
             .ok_or(RejectReason::BadWidth)?;
-        if matches!(ask.class, Class::Sensitive(_))
-            && target != exact_target(&ask.request.as_access())
-        {
+        let access = ask.request.as_access();
+        if matches!(ask.class, Class::Sensitive(_)) && target != exact_target(&access) {
             return Err(RejectReason::BadWidth);
         }
-        let key = ask.key.clone();
-        let session = ask.session;
-        let scope = answer.scope;
+        let same_kind = match (&target, &access) {
+            (Target::File { kind, .. }, Access::File { kind: want, .. }) => kind == want,
+            _ => true,
+        };
+        let covers = covering_set(&ask.key, &target, answer.decision)
+            .decide(&access)
+            .is_some();
+        if !same_kind || !covers {
+            return Err(RejectReason::BadWidth);
+        }
+        Ok(Plan {
+            id: answer.id,
+            key: ask.key.clone(),
+            session: ask.session,
+            target,
+            decision: answer.decision,
+            scope: answer.scope,
+            source: answer.source,
+        })
+    }
 
-        let covers = covering_set(&key, &target, answer.decision);
+    /// Resolve `plan` with `scope`: the answered question, and each open
+    /// question of the same key that the target covers, in each session for
+    /// `remember` and in the session of the question for `run`. pentd calls
+    /// this after the write of the rule, with `run` when the write failed.
+    pub(crate) fn resolve(&mut self, plan: &Plan, scope: Scope) -> Vec<(SessionId, Verdict)> {
+        let covers = covering_set(&plan.key, &plan.target, plan.decision);
         let resolved: Vec<QuestionId> = self
             .open
             .iter()
             .filter(|(id, e)| {
                 let q = &e.question.ask;
-                if **id == answer.id {
+                if **id == plan.id {
                     return true;
                 }
-                let same_group = q.key == key && (scope == Scope::Remember || q.session == session);
+                let same_group =
+                    q.key == plan.key && (scope == Scope::Remember || q.session == plan.session);
                 let access = q.request.as_access();
                 let covered = covers.decide(&access).is_some();
                 // A sensitive question needs its own exact answer.
                 let allowed =
-                    !matches!(q.class, Class::Sensitive(_)) || exact_target(&access) == target;
+                    !matches!(q.class, Class::Sensitive(_)) || exact_target(&access) == plan.target;
                 same_group && covered && allowed
             })
             .map(|(id, _)| *id)
             .collect();
-
         let mut verdicts = Vec::with_capacity(resolved.len());
         for id in resolved {
-            if let Some(entry) = self.open.remove(&id) {
+            if let Some(entry) = self.take(id) {
                 verdicts.push((
                     entry.question.ask.session,
                     Verdict {
                         id,
-                        decision: answer.decision,
-                        target: target.clone(),
+                        decision: plan.decision,
+                        target: plan.target.clone(),
                         scope,
-                        source: answer.source,
+                        source: plan.source,
                     },
                 ));
             }
         }
-        let rule = (scope == Scope::Remember).then(|| Rule {
-            target,
-            decision: answer.decision,
-            source: answer.source,
-            created: SystemTime::now(),
-        });
+        verdicts
+    }
+
+    /// Check `answer` and resolve it with its own scope, for the tests.
+    ///
+    /// # Errors
+    /// Returns the errors of [`Queue::check`].
+    #[cfg(test)]
+    pub(crate) fn answer(&mut self, answer: &Answer) -> Result<Resolution, RejectReason> {
+        let plan = self.check(answer)?;
+        let verdicts = self.resolve(&plan, plan.scope);
         Ok(Resolution {
-            key,
-            rule,
+            key: plan.key.clone(),
+            rule: (plan.scope == Scope::Remember).then(|| plan.rule()),
             verdicts,
         })
     }
 
     /// Remove the question `id`, for a question that pentd cannot send.
     pub(crate) fn remove(&mut self, id: QuestionId) {
-        self.open.remove(&id);
+        self.take(id);
+    }
+
+    /// Remove the question `id` from the queue and from the index.
+    fn take(&mut self, id: QuestionId) -> Option<Entry> {
+        let entry = self.open.remove(&id)?;
+        let ask = &entry.question.ask;
+        self.index.remove(&(ask.session, ask.request.clone()));
+        if let Some(count) = self.per_session.get_mut(&ask.session) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.per_session.remove(&ask.session);
+            }
+        }
+        Some(entry)
     }
 
     /// Mark the questions of `session` as orphans: the session ended.
@@ -180,12 +277,19 @@ impl Queue {
     /// Drop each orphan older than [`ORPHAN_TTL`]. Returns how many it
     /// dropped.
     pub(crate) fn expire(&mut self, now: std::time::Instant) -> usize {
-        let before = self.open.len();
-        self.open.retain(|_, e| {
-            e.orphaned
-                .is_none_or(|t| now.saturating_duration_since(t) < ORPHAN_TTL)
-        });
-        before.saturating_sub(self.open.len())
+        let old: Vec<QuestionId> = self
+            .open
+            .iter()
+            .filter(|(_, e)| {
+                e.orphaned
+                    .is_some_and(|t| now.saturating_duration_since(t) >= ORPHAN_TTL)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in &old {
+            self.take(*id);
+        }
+        old.len()
     }
 
     /// The open questions, in the order of their numbers.
@@ -282,18 +386,18 @@ mod tests {
     #[test]
     fn pentd_gives_the_number_the_session_and_the_key() {
         let mut q = Queue::default();
-        let (a, new_a) = q.ask(S1, &key("cargo"), read("/home/u/a"));
-        let (b, new_b) = q.ask(S1, &key("cargo"), read("/home/u/b"));
+        let (a, new_a) = q.ask(S1, &key("cargo"), read("/home/u/a")).unwrap();
+        let (b, new_b) = q.ask(S1, &key("cargo"), read("/home/u/b")).unwrap();
         assert!(new_a && new_b);
         assert_eq!((a.id, b.id), (QuestionId(0), QuestionId(1)));
         assert_eq!(a.ask.session, S1);
         assert_eq!(a.ask.key, key("cargo"));
         // The same access of the same session is the same question.
-        let (again, new) = q.ask(S1, &key("cargo"), read("/home/u/a"));
+        let (again, new) = q.ask(S1, &key("cargo"), read("/home/u/a")).unwrap();
         assert!(!new);
         assert_eq!(again.id, a.id);
         // Another session gets its own question.
-        let (other, new) = q.ask(S2, &key("cargo"), read("/home/u/a"));
+        let (other, new) = q.ask(S2, &key("cargo"), read("/home/u/a")).unwrap();
         assert!(new);
         assert_ne!(other.id, a.id);
         assert_eq!(q.len(), 3);
@@ -302,7 +406,7 @@ mod tests {
     #[test]
     fn an_answer_is_checked() {
         let mut q = Queue::default();
-        let (a, _) = q.ask(S1, &key("cargo"), read("/home/u/x/a"));
+        let (a, _) = q.ask(S1, &key("cargo"), read("/home/u/x/a")).unwrap();
         assert_eq!(
             q.answer(&answer(QuestionId(42), Decision::Allow, 0, Scope::Run)),
             Err(RejectReason::UnknownQuestion)
@@ -321,9 +425,13 @@ mod tests {
     #[test]
     fn a_wide_answer_resolves_each_question_inside_its_width() {
         let mut q = Queue::default();
-        let (a, _) = q.ask(S1, &key("cargo"), read("/home/u/reg/src/a.rs"));
-        let (b, _) = q.ask(S1, &key("cargo"), read("/home/u/reg/src/b.rs"));
-        let (c, _) = q.ask(S1, &key("cargo"), read("/home/u/other/c"));
+        let (a, _) = q
+            .ask(S1, &key("cargo"), read("/home/u/reg/src/a.rs"))
+            .unwrap();
+        let (b, _) = q
+            .ask(S1, &key("cargo"), read("/home/u/reg/src/b.rs"))
+            .unwrap();
+        let (c, _) = q.ask(S1, &key("cargo"), read("/home/u/other/c")).unwrap();
         // Width 2: the subtree `/home/u/reg`.
         let res = q
             .answer(&answer(a.id, Decision::Allow, 2, Scope::Run))
@@ -346,9 +454,9 @@ mod tests {
     #[test]
     fn the_scope_decides_which_sessions_share_the_answer() {
         let mut q = Queue::default();
-        let (a1, _) = q.ask(S1, &key("cargo"), read("/home/u/reg/a"));
-        let (a2, _) = q.ask(S2, &key("cargo"), read("/home/u/reg/b"));
-        let (other_key, _) = q.ask(S2, &key("npm"), read("/home/u/reg/c"));
+        let (a1, _) = q.ask(S1, &key("cargo"), read("/home/u/reg/a")).unwrap();
+        let (a2, _) = q.ask(S2, &key("cargo"), read("/home/u/reg/b")).unwrap();
+        let (other_key, _) = q.ask(S2, &key("npm"), read("/home/u/reg/c")).unwrap();
         let res = q
             .answer(&answer(a1.id, Decision::Allow, 1, Scope::Run))
             .unwrap();
@@ -359,7 +467,7 @@ mod tests {
         );
         assert_eq!(res.verdicts[0].0, S1);
 
-        let (a1b, _) = q.ask(S1, &key("cargo"), read("/home/u/reg/d"));
+        let (a1b, _) = q.ask(S1, &key("cargo"), read("/home/u/reg/d")).unwrap();
         let res = q
             .answer(&answer(a1b.id, Decision::Deny, 1, Scope::Remember))
             .unwrap();
@@ -385,11 +493,13 @@ mod tests {
     #[test]
     fn a_wide_answer_does_not_resolve_a_sensitive_question() {
         let mut q = Queue::default();
-        let (normal, _) = q.ask(S1, &key("sh"), read("/home/u/.ssh/known_hosts"));
+        let (normal, _) = q
+            .ask(S1, &key("sh"), read("/home/u/.ssh/known_hosts"))
+            .unwrap();
         let mut secret = read("/home/u/.ssh/id_ed25519");
         secret.class = Class::Sensitive(Sensitive::Credential);
         secret.menu.truncate(1);
-        let (secret, _) = q.ask(S1, &key("sh"), secret);
+        let (secret, _) = q.ask(S1, &key("sh"), secret).unwrap();
         // The subtree `/home/u/.ssh` covers both paths.
         let res = q
             .answer(&answer(normal.id, Decision::Allow, 1, Scope::Remember))
@@ -411,7 +521,7 @@ mod tests {
         // question.
         let mut secret = read("/home/u/.ssh/id_ed25519");
         secret.class = Class::Sensitive(Sensitive::Credential);
-        let (secret, _) = q.ask(S1, &key("sh"), secret);
+        let (secret, _) = q.ask(S1, &key("sh"), secret).unwrap();
         assert!(secret.ask.menu.len() > 1);
         assert_eq!(
             q.answer(&answer(secret.id, Decision::Allow, 1, Scope::Remember)),
@@ -421,7 +531,7 @@ mod tests {
         let mut swapped = read("/home/u/.aws/credentials");
         swapped.class = Class::Sensitive(Sensitive::Credential);
         swapped.menu.reverse();
-        let (swapped, _) = q.ask(S1, &key("sh"), swapped);
+        let (swapped, _) = q.ask(S1, &key("sh"), swapped).unwrap();
         assert_eq!(
             q.answer(&answer(swapped.id, Decision::Allow, 0, Scope::Remember)),
             Err(RejectReason::BadWidth)
@@ -439,15 +549,100 @@ mod tests {
     }
 
     #[test]
+    fn a_target_must_have_the_kind_of_the_access_and_cover_it() {
+        let mut q = Queue::default();
+        // A faulty session puts a write rule on `/home` and a rule for
+        // another path in the menu of a read question.
+        let mut faulty = read("/home/u/a");
+        faulty.menu.push(Target::File {
+            kind: FileKind::Write,
+            width: PathWidth::Subtree(path("/home/u")),
+        });
+        faulty.menu.push(Target::File {
+            kind: FileKind::Read,
+            width: PathWidth::Exact(path("/etc/shadow")),
+        });
+        let (faulty, _) = q.ask(S1, &key("sh"), faulty).unwrap();
+        let last = u16::try_from(faulty.ask.menu.len() - 1).unwrap();
+        for width in [last - 1, last] {
+            assert_eq!(
+                q.answer(&answer(faulty.id, Decision::Allow, width, Scope::Remember)),
+                Err(RejectReason::BadWidth),
+                "width {width}"
+            );
+        }
+        assert!(q
+            .answer(&answer(faulty.id, Decision::Allow, 0, Scope::Run))
+            .is_ok());
+    }
+
+    #[test]
+    fn a_failed_write_resolves_only_the_session_of_the_question() {
+        let mut q = Queue::default();
+        let (a1, _) = q.ask(S1, &key("cargo"), read("/home/u/reg/a")).unwrap();
+        let (a2, _) = q.ask(S2, &key("cargo"), read("/home/u/reg/b")).unwrap();
+        let plan = q
+            .check(&answer(a1.id, Decision::Allow, 1, Scope::Remember))
+            .unwrap();
+        // pentd could not write the rule: it resolves with `run`.
+        let verdicts = q.resolve(&plan, Scope::Run);
+        assert_eq!(verdicts.len(), 1);
+        assert_eq!(verdicts[0].0, S1);
+        assert_eq!(verdicts[0].1.scope, Scope::Run);
+        assert_eq!(q.open().map(|x| x.id).collect::<Vec<_>>(), vec![a2.id]);
+    }
+
+    #[test]
+    fn a_question_that_comes_during_the_write_is_resolved_too() {
+        let mut q = Queue::default();
+        let (a, _) = q.ask(S1, &key("cargo"), read("/home/u/reg/a")).unwrap();
+        let plan = q
+            .check(&answer(a.id, Decision::Allow, 1, Scope::Remember))
+            .unwrap();
+        // The write takes time; the session asks inside the width.
+        let (late, _) = q.ask(S1, &key("cargo"), read("/home/u/reg/late")).unwrap();
+        let ids: Vec<QuestionId> = q
+            .resolve(&plan, Scope::Remember)
+            .iter()
+            .map(|(_, v)| v.id)
+            .collect();
+        assert_eq!(ids, vec![a.id, late.id]);
+    }
+
+    #[test]
+    fn one_session_has_at_most_the_limit_of_open_questions() {
+        let mut q = Queue::default();
+        for i in 0..MAX_OPEN_PER_SESSION {
+            assert!(q
+                .ask(S1, &key("sh"), read(&format!("/home/u/f{i}")))
+                .is_ok());
+        }
+        assert_eq!(
+            q.ask(S1, &key("sh"), read("/home/u/one-more"))
+                .map(|(q, _)| q.id),
+            Err(RejectReason::TooMany)
+        );
+        // The same access again is no new question, and another session
+        // has its own limit.
+        assert!(q.ask(S1, &key("sh"), read("/home/u/f0")).is_ok());
+        assert!(q.ask(S2, &key("sh"), read("/home/u/f0")).is_ok());
+        // An answer makes room.
+        let first = q.open().next().map(|x| x.id).unwrap();
+        q.answer(&answer(first, Decision::Allow, 0, Scope::Run))
+            .unwrap();
+        assert!(q.ask(S1, &key("sh"), read("/home/u/one-more")).is_ok());
+    }
+
+    #[test]
     fn a_deny_does_not_resolve_a_question_with_another_kind() {
         let mut q = Queue::default();
-        let (r, _) = q.ask(S1, &key("sh"), read("/home/u/x/a"));
+        let (r, _) = q.ask(S1, &key("sh"), read("/home/u/x/a")).unwrap();
         let mut write = read("/home/u/x/b");
         write.request = Request::File {
             kind: FileKind::Write,
             path: path("/home/u/x/b"),
         };
-        let (w, _) = q.ask(S1, &key("sh"), write);
+        let (w, _) = q.ask(S1, &key("sh"), write).unwrap();
         // A read rule on the subtree does not cover a write.
         let res = q
             .answer(&answer(r.id, Decision::Allow, 1, Scope::Run))
@@ -459,9 +654,9 @@ mod tests {
     #[test]
     fn a_question_of_an_ended_session_stays_for_a_late_answer_then_goes() {
         let mut q = Queue::default();
-        let (a, _) = q.ask(S1, &key("cargo"), read("/home/u/a"));
-        let (b, _) = q.ask(S1, &key("cargo"), read("/home/u/b"));
-        let (live, _) = q.ask(S2, &key("cargo"), read("/home/u/c"));
+        let (a, _) = q.ask(S1, &key("cargo"), read("/home/u/a")).unwrap();
+        let (b, _) = q.ask(S1, &key("cargo"), read("/home/u/b")).unwrap();
+        let (live, _) = q.ask(S2, &key("cargo"), read("/home/u/c")).unwrap();
         let t0 = Instant::now();
         q.end_session(S1, t0);
         assert_eq!(q.expire(t0 + ORPHAN_TTL - Duration::from_secs(1)), 0);

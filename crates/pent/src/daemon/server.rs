@@ -22,7 +22,7 @@ use pent_settings::RuntimeDir;
 use tokio::io::BufReader;
 use tokio::net::{UnixListener, UnixStream};
 
-use super::hub::{Hub, Outbox, Role};
+use super::hub::{ConnectionGuard, Hub, Outbox, Role};
 use super::{read_message, DaemonError};
 
 /// The first fd of socket activation (`SD_LISTEN_FDS_START`).
@@ -78,6 +78,18 @@ pub(crate) fn activated_listener() -> Result<Option<std::os::unix::net::UnixList
     // SAFETY: see above.
     let rc = unsafe { libc::fstat(LISTEN_FDS_START, &raw mut stat) };
     if rc != 0 || stat.st_mode & libc::S_IFMT != libc::S_IFSOCK {
+        return Err(DaemonError::BadActivation);
+    }
+    // systemd passes fd 3 without `FD_CLOEXEC`. Without the flag, each child
+    // of pentd (the notification hook) would get the listening socket of
+    // pentd.sock and could accept the connections of `pent run`.
+    // SAFETY: `fcntl` with `F_GETFD` and `F_SETFD` on a fd only reads and
+    // sets the flags of the fd; it has no effect on memory.
+    let flags = unsafe { libc::fcntl(LISTEN_FDS_START, libc::F_GETFD) };
+    // SAFETY: see above.
+    if flags < 0
+        || unsafe { libc::fcntl(LISTEN_FDS_START, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0
+    {
         return Err(DaemonError::BadActivation);
     }
     // SAFETY: systemd gave fd 3 to this process for this purpose, the check
@@ -326,7 +338,10 @@ async fn accept_loop(
         tokio::select! {
             accepted = listener.accept() => match accepted {
                 Ok((stream, _)) => {
-                    tokio::spawn(connection(stream, Arc::clone(&hub), own_uid));
+                    // The count starts here, before the task, so the linger
+                    // cannot stop pentd before the first message.
+                    let live = hub.connection();
+                    tokio::spawn(connection(stream, Arc::clone(&hub), own_uid, live));
                 }
                 Err(e) => {
                     tracing::warn!("pentd cannot accept a connection: {e}");
@@ -379,7 +394,7 @@ const fn peer_allowed(peer: u32, own: u32) -> bool {
 
 /// Serve one connection: a reader, and a writer task for the messages of
 /// pentd.
-async fn connection(stream: UnixStream, hub: Arc<Hub>, own_uid: u32) {
+async fn connection(stream: UnixStream, hub: Arc<Hub>, own_uid: u32, live: ConnectionGuard) {
     match stream.peer_cred() {
         Ok(cred) if peer_allowed(cred.uid(), own_uid) => {}
         Ok(cred) => {
@@ -444,6 +459,7 @@ async fn connection(stream: UnixStream, hub: Arc<Hub>, own_uid: u32) {
         // does not keep the task alive.
         writer.abort();
     }
+    drop(live);
 }
 
 #[cfg(test)]

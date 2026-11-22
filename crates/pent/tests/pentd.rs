@@ -969,9 +969,12 @@ mod queue {
         let _pentd = pentd(&rt, state.path(), &["daemon"])?;
         assert!(rt.wait_for_socket());
         let mut session = Client::session(&rt, "cargo")?;
-        let id = session.ask(port_ask(5432)?)?;
+        let id = session.ask(read_ask("/home/u/reg/a", "/home/u/reg")?)?;
+        // Another run of the same key waits inside the width.
+        let mut other = Client::session(&rt, "cargo")?;
+        let other_id = other.ask(read_ask("/home/u/reg/b", "/home/u/reg")?)?;
         let mut client = Client::connect(&rt)?;
-        client.send(Message::Answer(answer(id, 0, Scope::Remember)))?;
+        client.send(Message::Answer(answer(id, 1, Scope::Remember)))?;
         match client.recv()? {
             Message::Verdict(v) => assert_eq!(v.scope, Scope::Run),
             other => return Err(format!("{other:?}").into()),
@@ -991,6 +994,14 @@ mod queue {
             std::fs::read_to_string(rules.join("cargo.toml"))?,
             "this is not toml ["
         );
+        // The answer holds only for the run of the question, as `run`
+        // does: the other run still waits, and its question is open.
+        other
+            .write
+            .set_read_timeout(Some(Duration::from_millis(500)))?;
+        assert!(other.recv().is_err(), "the other run got a verdict");
+        client.send(Message::Answer(answer(other_id, 0, Scope::Run)))?;
+        assert!(matches!(client.recv()?, Message::Verdict(v) if v.id == other_id));
         Ok(())
     }
 
@@ -1022,12 +1033,18 @@ mod queue {
         assert!(rt.wait_for_socket());
         let mut watcher = Client::connect(&rt)?;
         watcher.send(Message::Watch)?;
-        let mut session = Client::session(&rt, "cargo")?;
         // Far more questions than the buffers of the socket and the outbox
-        // hold. The watcher reads nothing meanwhile.
-        for port in 1..=6000_u16 {
-            session.ask(port_ask(port)?)?;
+        // hold, in six runs, because one run has at most 1024 open
+        // questions. The watcher reads nothing meanwhile.
+        let mut sessions = Vec::new();
+        for run in 0..6_u16 {
+            let mut session = Client::session(&rt, "cargo")?;
+            for port in 1..=1000_u16 {
+                session.ask(port_ask(run * 1000 + port)?)?;
+            }
+            sessions.push(session);
         }
+        let mut session = sessions.pop().ok_or("no session")?;
         // pentd closed the watcher: a read of all that waits ends with the
         // end of the connection, not with the time limit.
         let mut seen = 0_usize;
@@ -1046,6 +1063,58 @@ mod queue {
         let mut client = Client::connect(&rt)?;
         client.send(Message::Answer(answer(id, 0, Scope::Run)))?;
         assert!(matches!(session.recv()?, Message::Verdict(v) if v.id == id));
+        Ok(())
+    }
+
+    #[test]
+    fn a_watcher_that_answers_gets_one_verdict_and_a_second_watch_changes_nothing() -> TestResult {
+        let rt = Runtime::new()?;
+        let state = tempfile::tempdir()?;
+        let _pentd = pentd(&rt, state.path(), &["daemon"])?;
+        assert!(rt.wait_for_socket());
+        let mut monitor = Client::connect(&rt)?;
+        monitor.send(Message::Watch)?;
+        monitor.send(Message::Watch)?;
+        let mut session = Client::session(&rt, "cargo")?;
+        let id = session.ask(port_ask(5432)?)?;
+        // One copy of the question, then one copy of the verdict.
+        assert!(matches!(monitor.recv()?, Message::Question(q) if q.id == id));
+        monitor.send(Message::Answer(answer(id, 0, Scope::Run)))?;
+        assert!(matches!(monitor.recv()?, Message::Verdict(v) if v.id == id));
+        monitor
+            .write
+            .set_read_timeout(Some(Duration::from_millis(500)))?;
+        match monitor.recv() {
+            Err(_) => Ok(()),
+            Ok(extra) => Err(format!("a second copy: {extra:?}").into()),
+        }
+    }
+
+    #[test]
+    fn a_new_connection_keeps_pentd_alive_before_its_first_message() -> TestResult {
+        let rt = Runtime::new()?;
+        let state = tempfile::tempdir()?;
+        let mut pentd = pentd(&rt, state.path(), &["daemon", "--spawned"])?;
+        let mut client = loop {
+            if let Ok(client) = Client::connect(&rt) {
+                break client;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        // Silent for longer than the linger time.
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(
+            pentd.0.try_wait()?.is_none(),
+            "pentd stopped under a live connection"
+        );
+        client.send(Message::Hold(Hold::Run {
+            key: "cargo".parse()?,
+            command: vec![],
+        }))?;
+        let id = client.ask(port_ask(80)?)?;
+        let mut answerer = Client::connect(&rt)?;
+        answerer.send(Message::Answer(answer(id, 0, Scope::Run)))?;
+        assert!(matches!(client.recv()?, Message::Verdict(v) if v.id == id));
         Ok(())
     }
 }
@@ -1220,6 +1289,117 @@ mod notify {
         let runs = hooked.wait_runs(1)?;
         assert_eq!(runs.len(), 1, "{} runs", runs.len());
         assert_eq!(pending(&runs[0]), Some("3"));
+        Ok(())
+    }
+}
+
+#[test]
+fn a_profile_that_names_a_parent_does_not_bring_back_the_socket_of_pentd() -> TestResult {
+    let test = "a_profile_that_names_a_parent_does_not_bring_back_the_socket_of_pentd";
+    if !sandbox_ready(test) {
+        return Ok(());
+    }
+    let env = TestEnv::new()?;
+    // The profile names the runtime directory of the test itself, the
+    // parent of `pent/`, as a profile can name `/run/user/<uid>`.
+    let runtime = env.runtime.display().to_string();
+    env.install_profile("sh", &format!("[filesystem]\nread = [\"{runtime}\"]\n"))?;
+    std::fs::write(env.runtime.join("visible"), "PENT_VISIBLE")?;
+    let script = format!(
+        "cat '{runtime}/visible'; echo; echo PENTLS $(ls -A '{runtime}/pent' 2>&1 | tr '\\n' ' ')"
+    );
+    let out = env
+        .command(&["run", "--profile", "sh", "--", "sh", "-c", &script])
+        .output()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    // The positive control: the profile brought the directory back.
+    assert!(text.contains("PENT_VISIBLE"), "{text}");
+    // `pent run` started pentd there, so the host has the socket.
+    assert!(
+        env.runtime.join("pent/pentd.sock").exists()
+            || env.runtime.join("pent/pentd.lock").exists()
+    );
+    let line = text
+        .lines()
+        .find(|l| l.starts_with("PENTLS"))
+        .ok_or("no listing")?;
+    assert_eq!(
+        line.trim(),
+        "PENTLS",
+        "the child sees the files of pent: {line}"
+    );
+    Ok(())
+}
+
+mod hook_fds {
+    use super::queue::{port_ask, Client};
+    use super::*;
+
+    #[test]
+    fn the_hook_does_not_get_the_socket_from_systemd() -> TestResult {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::process::CommandExt as _;
+        let rt = Runtime::new()?;
+        let home = tempfile::tempdir()?;
+        let out = home.path().join("fds");
+        let config = home.path().join("config/pent");
+        std::fs::create_dir_all(&config)?;
+        // The hook lists its open files.
+        std::fs::write(
+            config.join("pent.toml"),
+            format!(
+                "[notify]\ncommand = [\"sh\", \"-c\", \"for f in /proc/$$/fd/*; do readlink $f; done > '{}'\"]\n",
+                out.display()
+            ),
+        )?;
+        std::fs::create_dir(rt.pent_dir())?;
+        std::fs::set_permissions(rt.pent_dir(), std::fs::Permissions::from_mode(0o700))?;
+        let listener = std::os::unix::net::UnixListener::bind(rt.socket())?;
+        let fd = listener.as_raw_fd();
+        let inode = std::fs::read_link(format!("/proc/self/fd/{fd}"))?;
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "LISTEN_PID=$$ LISTEN_FDS=1 exec \"$0\" daemon", PENT]);
+        rt.apply(&mut cmd)
+            .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", home.path().join("config"))
+            .env("XDG_STATE_HOME", home.path().join("state"));
+        // SAFETY: the hook runs in the child after the fork and calls only
+        // `dup2` and `fcntl`, which are async-signal-safe.
+        unsafe {
+            cmd.pre_exec(move || {
+                let rc = if fd == 3 {
+                    libc::fcntl(3, libc::F_SETFD, 0)
+                } else {
+                    libc::dup2(fd, 3)
+                };
+                if rc < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let _pentd = Reap(cmd.spawn()?);
+        drop(listener);
+
+        let mut session = loop {
+            if let Ok(client) = Client::session(&rt, "cargo") {
+                break client;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        session.ask(port_ask(5432)?)?;
+        let deadline = Instant::now() + WAIT;
+        while !out.exists() || std::fs::read_to_string(&out)?.is_empty() {
+            assert!(Instant::now() < deadline, "the hook did not run");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        let fds = std::fs::read_to_string(&out)?;
+        let socket = inode.display().to_string();
+        assert!(
+            !fds.lines().any(|l| l == socket),
+            "the hook has the listening socket {socket}"
+        );
         Ok(())
     }
 }

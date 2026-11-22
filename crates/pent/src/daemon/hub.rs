@@ -1,5 +1,5 @@
 //! The shared state of pentd: the queue, the sessions, the watchers and
-//! the count of holds and open questions.
+//! the count of connections and open questions.
 //!
 //! Each connection has a role, which its first `Hold` decides:
 //!
@@ -17,17 +17,21 @@
 //! fills it, and pentd then closes that connection: a lost message would
 //! break the order of the numbers, and an unbounded outbox would let a
 //! client make pentd grow without a limit.
+//!
+//! Each live connection keeps pentd alive, and so does each open question.
+//! Thus pentd never stops between the accept of a connection and its first
+//! message, and it stays while `pent monitor` is open.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use pent_profile::{
-    Answer, Hold, Message, QuestionId, RejectReason, Rejected, Rule, RuleKey, Scope, SessionId,
+    Answer, Hold, Message, QuestionId, RejectReason, Rejected, RuleKey, Scope, SessionId,
 };
 use pent_settings::RuleStore;
 use tokio::sync::{mpsc, watch, Notify};
 
-use super::queue::Queue;
+use super::queue::{Plan, Queue};
 
 /// How many messages wait for one connection before pentd closes it.
 pub(crate) const OUTBOX_LEN: usize = 256;
@@ -78,8 +82,8 @@ impl Outbox {
 /// What keeps pentd alive.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct Activity {
-    /// The live holds.
-    pub(crate) holds: usize,
+    /// The live connections.
+    pub(crate) connections: usize,
     /// The open questions. A question of an ended session keeps pentd
     /// alive, so a late answer can still become a rule.
     pub(crate) questions: usize,
@@ -88,7 +92,7 @@ pub(crate) struct Activity {
 impl Activity {
     /// Return true when nothing keeps pentd alive.
     pub(crate) const fn is_idle(self) -> bool {
-        self.holds == 0 && self.questions == 0
+        self.connections == 0 && self.questions == 0
     }
 }
 
@@ -98,6 +102,13 @@ struct State {
     next_session: u64,
     sessions: HashMap<SessionId, Outbox>,
     watchers: Vec<Outbox>,
+}
+
+impl State {
+    /// Return true if `outbox` is a watcher.
+    fn watches(&self, outbox: &Outbox) -> bool {
+        self.watchers.iter().any(|w| w.same(outbox))
+    }
 }
 
 /// The shared state of pentd.
@@ -118,51 +129,37 @@ pub(crate) enum Role {
     /// No hold yet.
     Client,
     /// A holder that is not a session.
-    Holder {
-        /// The hold, which ends when the role drops.
-        _hold: HoldGuard,
-    },
+    Holder,
     /// A run of `pent run`.
     Session {
         /// The number that pentd gave the session.
         id: SessionId,
         /// The key of the run.
         key: RuleKey,
-        /// The hold of the run.
-        _hold: HoldGuard,
     },
 }
 
-/// One hold. The count goes down when the value drops, also when the task
-/// of the connection ends with an error.
-pub(crate) struct HoldGuard(Arc<Hub>);
+/// One live connection. The count goes down when the value drops, also
+/// when the task of the connection ends with an error.
+pub(crate) struct ConnectionGuard(Arc<Hub>);
 
-impl std::fmt::Debug for HoldGuard {
+impl std::fmt::Debug for ConnectionGuard {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("HoldGuard")
+        f.write_str("ConnectionGuard")
     }
 }
 
-impl HoldGuard {
-    fn new(hub: &Arc<Hub>) -> Self {
-        hub.activity
-            .send_modify(|a| a.holds = a.holds.saturating_add(1));
-        Self(Arc::clone(hub))
-    }
-}
-
-impl Drop for HoldGuard {
+impl Drop for ConnectionGuard {
     fn drop(&mut self) {
         self.0
             .activity
-            .send_modify(|a| a.holds = a.holds.saturating_sub(1));
+            .send_modify(|a| a.connections = a.connections.saturating_sub(1));
     }
 }
 
 impl Hub {
     /// A new hub. `rules` is `None` when pent cannot find the rule files;
-    /// then an answer with the scope `remember` acts only on the open
-    /// questions.
+    /// then an answer with the scope `remember` holds only for this run.
     pub(crate) fn new(rules: Option<RuleStore>) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(State {
@@ -181,6 +178,25 @@ impl Hub {
     /// Watch the activity.
     pub(crate) fn subscribe(&self) -> watch::Receiver<Activity> {
         self.activity.subscribe()
+    }
+
+    /// Count a new connection until the guard drops. The accept loop takes
+    /// the guard before it starts the task of the connection.
+    pub(crate) fn connection(self: &Arc<Self>) -> ConnectionGuard {
+        self.activity
+            .send_modify(|a| a.connections = a.connections.saturating_add(1));
+        ConnectionGuard(Arc::clone(self))
+    }
+
+    /// Watch the count of new questions. The receiver sees a change for
+    /// each question since its last look.
+    pub(crate) fn watch_new_questions(&self) -> watch::Receiver<u64> {
+        self.new_questions.subscribe()
+    }
+
+    /// The number of open questions.
+    pub(crate) fn open_questions(&self) -> usize {
+        self.lock().queue.len()
     }
 
     /// The lock of the state. A panic in another task cannot leave the
@@ -213,32 +229,11 @@ impl Hub {
         match message {
             Message::Hold(hold) => self.hold(role, outbox, hold),
             Message::Ask(ask) => {
-                let Role::Session { id, key, .. } = role else {
+                let Role::Session { id, key } = role else {
                     reject(outbox, None, RejectReason::NotPermitted);
                     return;
                 };
-                let mut state = self.lock();
-                let (question, new) = state.queue.ask(*id, key, ask);
-                let id = question.id;
-                let message = Message::Question(question);
-                // pentd adds the number and the key, so a question can be
-                // too long for one line where its ask was not. The session
-                // then gets a refusal in its place, and the order of the
-                // numbers stays true.
-                if message.encode_line().is_err() {
-                    if new {
-                        state.queue.remove(id);
-                    }
-                    reject(outbox, None, RejectReason::TooLong);
-                    self.publish(&state);
-                    return;
-                }
-                send(outbox, message.clone());
-                if new {
-                    broadcast(&mut state.watchers, &message);
-                    self.new_questions.send_modify(|n| *n = n.wrapping_add(1));
-                }
-                self.publish(&state);
+                self.ask(*id, key, outbox, ask);
             }
             Message::Answer(answer) => {
                 if matches!(role, Role::Session { .. }) {
@@ -253,6 +248,11 @@ impl Hub {
                     return;
                 }
                 let mut state = self.lock();
+                // A second `Watch` changes nothing: one connection is one
+                // watcher, so it gets each message one time.
+                if state.watches(outbox) {
+                    return;
+                }
                 for question in state.queue.open() {
                     send(outbox, Message::Question(question.clone()));
                 }
@@ -263,7 +263,7 @@ impl Hub {
     }
 
     /// Take the first hold of a connection.
-    fn hold(self: &Arc<Self>, role: &mut Role, outbox: &Outbox, hold: Hold) {
+    fn hold(&self, role: &mut Role, outbox: &Outbox, hold: Hold) {
         if !matches!(role, Role::Client) {
             return;
         }
@@ -273,71 +273,98 @@ impl Hub {
                 let id = SessionId(state.next_session);
                 state.next_session = state.next_session.saturating_add(1);
                 state.sessions.insert(id, outbox.clone());
-                Role::Session {
-                    id,
-                    key,
-                    _hold: HoldGuard::new(self),
-                }
+                Role::Session { id, key }
             }
-            Hold::Daemon | Hold::Unit => Role::Holder {
-                _hold: HoldGuard::new(self),
-            },
+            Hold::Daemon | Hold::Unit => Role::Holder,
         };
     }
 
-    /// Check `answer`, write the rule, then send each verdict.
+    /// Queue the question `ask` of the session `session`.
+    fn ask(&self, session: SessionId, key: &RuleKey, outbox: &Outbox, ask: pent_profile::Ask) {
+        let mut state = self.lock();
+        let (question, new) = match state.queue.ask(session, key, ask) {
+            Ok(asked) => asked,
+            Err(reason) => {
+                reject(outbox, None, reason);
+                return;
+            }
+        };
+        let id = question.id;
+        let message = Message::Question(question);
+        // pentd adds the number and the key, so a question can be too long
+        // for one line where its ask was not. The session then gets a
+        // refusal in its place, and the order of the numbers stays true.
+        if message.encode_line().is_err() {
+            if new {
+                state.queue.remove(id);
+            }
+            reject(outbox, None, RejectReason::TooLong);
+            self.publish(&state);
+            return;
+        }
+        send(outbox, message.clone());
+        if new {
+            broadcast(&mut state.watchers, &message);
+            self.new_questions.send_modify(|n| *n = n.wrapping_add(1));
+        }
+        self.publish(&state);
+    }
+
+    /// Check `answer`, write the rule, then resolve the questions and send
+    /// each verdict.
     ///
     /// One answer at a time takes this path, so the rule file gets the
-    /// answers in the order of the queue. When the rule cannot be written,
-    /// each verdict gets the scope `run`, and the client that answered gets
-    /// `Rejected` with `RuleNotKept`.
+    /// answers in the order of the queue. pentd resolves the questions only
+    /// after the write: when the write fails, the answer holds only for the
+    /// run of the question, as an answer with the scope `run` does, and the
+    /// client that answered gets `RuleNotKept`. A question that came during
+    /// the write is resolved too.
     async fn answer(&self, outbox: &Outbox, answer: &Answer) {
         let _write = self.writes.lock().await;
-        let resolution = {
-            let mut state = self.lock();
-            match state.queue.answer(answer) {
-                Ok(resolution) => {
-                    self.publish(&state);
-                    resolution
-                }
-                Err(reason) => {
-                    reject(outbox, Some(answer.id), reason);
-                    return;
-                }
+        let plan = match self.lock().queue.check(answer) {
+            Ok(plan) => plan,
+            Err(reason) => {
+                reject(outbox, Some(answer.id), reason);
+                return;
             }
         };
-        let kept = match resolution.rule {
-            Some(rule) => self.write_rule(&resolution.key, rule).await,
-            None => true,
+        let scope = match plan.scope {
+            Scope::Remember if self.write_rule(&plan).await => Scope::Remember,
+            Scope::Remember | Scope::Run => Scope::Run,
         };
+        let kept = scope == plan.scope;
         let mut state = self.lock();
-        for (session, mut verdict) in resolution.verdicts {
-            if !kept {
-                verdict.scope = Scope::Run;
-            }
+        let verdicts = state.queue.resolve(&plan, scope);
+        self.publish(&state);
+        let answerer_watches = state.watches(outbox);
+        for (session, verdict) in verdicts {
             let message = Message::Verdict(verdict);
             if let Some(target) = state.sessions.get(&session) {
                 send(target, message.clone());
             }
             broadcast(&mut state.watchers, &message);
-            send(outbox, message);
+            // A watcher got the verdict above; one copy is enough.
+            if !answerer_watches {
+                send(outbox, message);
+            }
         }
         if !kept {
             reject(outbox, Some(answer.id), RejectReason::RuleNotKept);
         }
     }
 
-    /// Write `rule` in the rule file of `key`, outside the threads of the
-    /// runtime. A rule for the same target takes the place of the old one.
-    /// Returns true when the rule is in the file.
-    async fn write_rule(&self, key: &RuleKey, rule: Rule) -> bool {
+    /// Write the rule of `plan` in the rule file of its key, outside the
+    /// threads of the runtime. A rule for the same target takes the place of
+    /// the old one. Returns true when the rule is in the file.
+    async fn write_rule(&self, plan: &Plan) -> bool {
         let Some(store) = self.rules.clone() else {
             tracing::warn!("pentd cannot find the rule files; the answer is not kept");
             return false;
         };
-        let file_key = key.clone();
+        let key = plan.key.clone();
+        let rule = plan.rule();
         let write = tokio::task::spawn_blocking(move || {
-            store.update(&file_key, |set| {
+            store.update(&key, |set| {
                 set.rules.retain(|r| r.target != rule.target);
                 set.rules.push(rule);
             })
@@ -345,11 +372,11 @@ impl Hub {
         match write.await {
             Ok(Ok(())) => true,
             Ok(Err(e)) => {
-                tracing::warn!("pentd cannot write the rule of {key}: {e}");
+                tracing::warn!("pentd cannot write the rule of {}: {e}", plan.key);
                 false
             }
             Err(e) => {
-                tracing::warn!("the write of the rule of {key} failed: {e}");
+                tracing::warn!("the write of the rule of {} failed: {e}", plan.key);
                 false
             }
         }
@@ -365,17 +392,6 @@ impl Hub {
             state.queue.end_session(id, std::time::Instant::now());
         }
         self.publish(&state);
-    }
-
-    /// Watch the count of new questions. The receiver sees a change for
-    /// each question since its last look.
-    pub(crate) fn watch_new_questions(&self) -> watch::Receiver<u64> {
-        self.new_questions.subscribe()
-    }
-
-    /// The number of open questions.
-    pub(crate) fn open_questions(&self) -> usize {
-        self.lock().queue.len()
     }
 
     /// Drop the orphans that are too old.

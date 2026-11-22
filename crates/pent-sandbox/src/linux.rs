@@ -3068,6 +3068,16 @@ pub(crate) fn spawn_linux(
             mask_dirs.push(staging_root.to_path_buf());
         }
     }
+    // The runtime directory of pent holds `pentd.sock`. A profile that names
+    // a parent of it (for example `/run/user/<uid>`) binds it back, and the
+    // program has the same user ID, so `SO_PEERCRED` would let it answer
+    // its own questions. The mask hides the directory always, also when a
+    // profile names it: no answer opens the files of pent.
+    if let Ok(runtime) = std::fs::canonicalize(pent_settings::RuntimeDir::from_env().path()) {
+        if !mask_dirs.iter().any(|d| runtime.starts_with(d)) {
+            mask_dirs.push(runtime);
+        }
+    }
     let mask_dirs: Vec<PathBuf> = mask_dirs
         .into_iter()
         .filter(|p| !private.hides(p))
