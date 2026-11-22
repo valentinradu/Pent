@@ -1,6 +1,6 @@
 # Plan: the new pent
 
-**Cursor: step 2.2.** Steps with `[x]` are done. Work on the branch `next`,
+**Cursor: step 2.3.** Steps with `[x]` are done. Work on the branch `next`,
 one commit for each step, and move this cursor when a step is done.
 
 This plan builds the design in `docs/design/pent.md`. Each step names its
@@ -73,12 +73,15 @@ ready for users.
     `/tmp/pent-<uid>` without `XDG_RUNTIME_DIR`.
   - Done: tests for the three ways to start, for two starts at the same
     time, and for a crash of a holder; `docs/security/pentd.md`.
-- [ ] **2.2 The queue.** A question waits for an answer, for its deadline
+- [x] **2.2 The queue.** A question waits for an answer, for its deadline
   (file, Unix socket and port 120 s; proxy 20 s; DNS about 4 s), or for the
   end of its session. Questions inside one width share one answer. pentd is
   the only writer of the rules. A late answer becomes a rule for the next
   run. If pentd fails, a waiting access gets the error of a refusal.
-  - Done: tests for each deadline, for the grouping and for a late answer.
+  - Files: `pent/src/daemon/queue.rs`, `hub.rs`, `client.rs`; the messages
+    `Verdict`, `Watch` and `Rejected` in the protocol.
+  - Done: tests for each deadline, for the grouping and for a late answer;
+    QU-1 to QU-10 in `docs/security/pentd.md`.
 - [ ] **2.3 The notification hook.** pentd runs `[notify] command` with
   `PENT_PENDING`, one time for each burst of questions.
   - Done: a test with a command that writes its environment to a file.

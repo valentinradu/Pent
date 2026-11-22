@@ -649,3 +649,276 @@ fn pentd_does_not_spin_at_the_limit_of_file_descriptors() -> TestResult {
     drop(clients);
     Ok(())
 }
+
+// ── The queue ───────────────────────────────────────────────────────────────
+
+mod queue {
+    use std::io::{BufRead as _, BufReader};
+    use std::num::NonZeroU16;
+    use std::os::unix::net::UnixStream;
+
+    use pent_profile::{
+        Answer, Ask, Class, Deadline, Decision, FileKind, Hold, MenuIndex, Message, PathWidth,
+        QuestionId, RejectReason, Rejected, Request, RulePath, Scope, SessionId, Source, Target,
+        Timestamp, FILE_DEADLINE,
+    };
+
+    use super::*;
+
+    /// A client of pentd that speaks lines.
+    struct Client {
+        write: UnixStream,
+        read: BufReader<UnixStream>,
+    }
+
+    impl Client {
+        fn connect(rt: &Runtime) -> std::io::Result<Self> {
+            let write = UnixStream::connect(rt.socket())?;
+            write.set_read_timeout(Some(WAIT))?;
+            let read = BufReader::new(write.try_clone()?);
+            Ok(Self { write, read })
+        }
+
+        fn send(&mut self, message: Message) -> TestResult {
+            self.write.write_all(message.encode_line()?.as_bytes())?;
+            Ok(())
+        }
+
+        fn recv(&mut self) -> Result<Message, common::e2e::BoxError> {
+            let mut line = String::new();
+            if self.read.read_line(&mut line)? == 0 {
+                return Err("pentd closed the connection".into());
+            }
+            Ok(Message::decode_line(&line)?)
+        }
+
+        /// A session of `pent run` with the key `key`.
+        fn session(rt: &Runtime, key: &str) -> Result<Self, common::e2e::BoxError> {
+            let mut client = Self::connect(rt)?;
+            client.send(Message::Hold(Hold::Run {
+                key: key.parse()?,
+                command: vec![key.to_string()],
+            }))?;
+            Ok(client)
+        }
+
+        /// Ask `ask` and return the number that pentd gives it.
+        fn ask(&mut self, ask: Ask) -> Result<QuestionId, common::e2e::BoxError> {
+            self.send(Message::Ask(ask))?;
+            match self.recv()? {
+                Message::Question(q) => Ok(q.id),
+                other => Err(format!("pentd sent {other:?} in place of a number").into()),
+            }
+        }
+    }
+
+    fn port_ask(port: u16) -> Result<Ask, common::e2e::BoxError> {
+        let port = NonZeroU16::new(port).ok_or("port 0")?;
+        Ok(Ask {
+            // pentd replaces these two values.
+            session: SessionId(77),
+            key: "ignored".parse()?,
+            program: "psql".into(),
+            request: Request::Localhost(port),
+            class: Class::Normal,
+            menu: vec![Target::Localhost(port)],
+            asked: Timestamp(0),
+            deadline: Deadline::new(FILE_DEADLINE)?,
+        })
+    }
+
+    fn read_ask(path: &str, parent: &str) -> Result<Ask, common::e2e::BoxError> {
+        let rp = RulePath::new(path)?;
+        Ok(Ask {
+            request: Request::File {
+                kind: FileKind::Read,
+                path: rp.clone(),
+            },
+            menu: vec![
+                Target::File {
+                    kind: FileKind::Read,
+                    width: PathWidth::Exact(rp),
+                },
+                Target::File {
+                    kind: FileKind::Read,
+                    width: PathWidth::Subtree(RulePath::new(parent)?),
+                },
+            ],
+            ..port_ask(1)?
+        })
+    }
+
+    fn answer(id: QuestionId, width: u16, scope: Scope) -> Answer {
+        Answer {
+            id,
+            decision: Decision::Allow,
+            width: MenuIndex(width),
+            scope,
+            source: Source::Human,
+        }
+    }
+
+    /// A pentd in the foreground with its own state directory.
+    fn pentd(rt: &Runtime, state: &Path, args: &[&str]) -> std::io::Result<Reap> {
+        let mut cmd = rt.pent(args);
+        cmd.env("XDG_STATE_HOME", state).env("HOME", state);
+        Ok(Reap(cmd.spawn()?))
+    }
+
+    #[test]
+    fn an_answer_reaches_the_session_the_watcher_and_the_rule_file() -> TestResult {
+        let rt = Runtime::new()?;
+        let state = tempfile::tempdir()?;
+        let _pentd = pentd(&rt, state.path(), &["daemon"])?;
+        assert!(rt.wait_for_socket());
+
+        let mut session = Client::session(&rt, "cargo")?;
+        session.send(Message::Ask(port_ask(5432)?))?;
+        let question = match session.recv()? {
+            Message::Question(q) => q,
+            other => return Err(format!("{other:?}").into()),
+        };
+        // pentd gives the key of the session, not the key of the ask.
+        assert_eq!(question.ask.key.as_str(), "cargo");
+
+        let mut watcher = Client::connect(&rt)?;
+        watcher.send(Message::Watch)?;
+        assert!(matches!(watcher.recv()?, Message::Question(q) if q.id == question.id));
+
+        let mut answerer = Client::connect(&rt)?;
+        answerer.send(Message::Answer(answer(question.id, 0, Scope::Remember)))?;
+        for client in [&mut answerer, &mut session, &mut watcher] {
+            match client.recv()? {
+                Message::Verdict(v) => {
+                    assert_eq!(v.id, question.id);
+                    assert_eq!(v.decision, Decision::Allow);
+                    assert_eq!(v.target, question.ask.menu[0]);
+                }
+                other => return Err(format!("{other:?}").into()),
+            }
+        }
+
+        // pentd wrote the rule.
+        let file = state.path().join("pent/rules/cargo.toml");
+        let deadline = Instant::now() + WAIT;
+        while !file.exists() {
+            assert!(Instant::now() < deadline, "pentd wrote no rule");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let text = std::fs::read_to_string(&file)?;
+        assert!(text.contains("kind = \"localhost\""), "{text}");
+        assert!(text.contains("port = 5432"), "{text}");
+        assert!(text.contains("decision = \"allow\""), "{text}");
+        Ok(())
+    }
+
+    #[test]
+    fn pentd_refuses_a_bad_answer_and_a_message_of_the_wrong_role() -> TestResult {
+        let rt = Runtime::new()?;
+        let state = tempfile::tempdir()?;
+        let _pentd = pentd(&rt, state.path(), &["daemon"])?;
+        assert!(rt.wait_for_socket());
+        let mut session = Client::session(&rt, "cargo")?;
+        let id = session.ask(port_ask(5432)?)?;
+
+        let rejected =
+            |client: &mut Client, message: Message| -> Result<Rejected, common::e2e::BoxError> {
+                client.send(message)?;
+                match client.recv()? {
+                    Message::Rejected(r) => Ok(r),
+                    other => Err(format!("pentd sent {other:?}").into()),
+                }
+            };
+        // A session cannot answer, also its own question.
+        let r = rejected(&mut session, Message::Answer(answer(id, 0, Scope::Run)))?;
+        assert_eq!(r.reason, RejectReason::NotPermitted);
+
+        let mut client = Client::connect(&rt)?;
+        let r = rejected(&mut client, Message::Ask(port_ask(80)?))?;
+        assert_eq!(r.reason, RejectReason::NotPermitted);
+        let r = rejected(
+            &mut client,
+            Message::Answer(answer(QuestionId(999), 0, Scope::Run)),
+        )?;
+        assert_eq!(r.reason, RejectReason::UnknownQuestion);
+        let r = rejected(&mut client, Message::Answer(answer(id, 1, Scope::Run)))?;
+        assert_eq!(r.reason, RejectReason::BadWidth);
+        let mut model = answer(id, 0, Scope::Remember);
+        model.source = Source::Model;
+        let r = rejected(&mut client, Message::Answer(model))?;
+        assert_eq!(r.reason, RejectReason::NotHuman);
+
+        // The question is still open, and pentd wrote no rule.
+        client.send(Message::Answer(answer(id, 0, Scope::Run)))?;
+        assert!(matches!(client.recv()?, Message::Verdict(v) if v.id == id));
+        assert!(!state.path().join("pent/rules/cargo.toml").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn one_wide_answer_resolves_each_question_inside_its_width() -> TestResult {
+        let rt = Runtime::new()?;
+        let state = tempfile::tempdir()?;
+        let _pentd = pentd(&rt, state.path(), &["daemon"])?;
+        assert!(rt.wait_for_socket());
+        let mut session = Client::session(&rt, "cargo")?;
+        let a = session.ask(read_ask("/home/u/reg/a", "/home/u/reg")?)?;
+        let b = session.ask(read_ask("/home/u/reg/b", "/home/u/reg")?)?;
+        let c = session.ask(read_ask("/home/u/other/c", "/home/u/other")?)?;
+        let mut client = Client::connect(&rt)?;
+        client.send(Message::Answer(answer(a, 1, Scope::Run)))?;
+        let mut got = Vec::new();
+        for _ in 0..2 {
+            match session.recv()? {
+                Message::Verdict(v) => got.push(v.id),
+                other => return Err(format!("{other:?}").into()),
+            }
+        }
+        got.sort();
+        assert_eq!(got, vec![a, b]);
+        // `c` is still open: an answer to it works.
+        client.send(Message::Answer(answer(c, 0, Scope::Run)))?;
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            if let Message::Verdict(v) = client.recv()? {
+                ids.push(v.id);
+            }
+        }
+        assert_eq!(ids, vec![a, b, c]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_late_answer_becomes_a_rule_and_the_open_question_keeps_pentd_alive() -> TestResult {
+        let rt = Runtime::new()?;
+        let state = tempfile::tempdir()?;
+        let mut pentd = pentd(&rt, state.path(), &["daemon", "--spawned"])?;
+        let mut session = loop {
+            if let Ok(client) = Client::session(&rt, "psql") {
+                break client;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let id = session.ask(port_ask(5432)?)?;
+        // The run ends before an answer; the deadline passed in `pent run`.
+        drop(session);
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(
+            pentd.0.try_wait()?.is_none(),
+            "the open question must keep pentd alive"
+        );
+
+        let mut client = Client::connect(&rt)?;
+        client.send(Message::Answer(answer(id, 0, Scope::Remember)))?;
+        assert!(matches!(client.recv()?, Message::Verdict(v) if v.id == id));
+        drop(client);
+        let file = state.path().join("pent/rules/psql.toml");
+        let text = std::fs::read_to_string(&file)?;
+        assert!(text.contains("port = 5432"), "{text}");
+
+        // With no hold and no open question, pentd stops.
+        let status = wait_exit(&mut pentd.0, WAIT)?;
+        assert!(status.is_some_and(|s| s.success()), "{status:?}");
+        Ok(())
+    }
+}

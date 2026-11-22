@@ -48,8 +48,9 @@ pub use localhost::{control_port, is_localhost_name, is_loopback, CONTROL_PORTS}
 pub use name::{ProfileName, ProfileNameError};
 pub use protocol::{
     Answer, Ask, Deadline, DeadlineTooLong, DecidedBy, Event, Hold, MenuIndex, Message,
-    ProtocolError, Question, QuestionId, Request, Scope, SessionId, Timestamp, MAX_DEADLINE,
-    MAX_LINE_LEN, PROTOCOL_VERSION,
+    ProtocolError, Question, QuestionId, RejectReason, Rejected, Request, Scope, SessionId,
+    Timestamp, Verdict, DNS_DEADLINE, FILE_DEADLINE, MAX_DEADLINE, MAX_LINE_LEN, PROTOCOL_VERSION,
+    PROXY_DEADLINE,
 };
 pub use render::{
     render_draft, render_draft_with, render_header, render_profile, render_terminal, safe_lines,

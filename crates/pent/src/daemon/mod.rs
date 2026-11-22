@@ -11,6 +11,8 @@
 //! themselves, so they never stop for this reason.
 
 pub(crate) mod client;
+pub(crate) mod hub;
+pub(crate) mod queue;
 pub(crate) mod server;
 
 use std::path::PathBuf;

@@ -1,16 +1,18 @@
 # pentd
 
-Status: the branch `next`, step 2.1 of `PLAN.md` (2026-11-22). This report
-lists the security properties of the daemon, its socket and its lock, the
-test of each property, and the properties that later steps must add.
+Status: the branch `next`, steps 2.1 and 2.2 of `PLAN.md` (2026-11-22).
+This report lists the security properties of the daemon, its socket, its
+lock and its queue, the test of each property, and the properties that
+later steps must add.
 
-In step 2.1 pentd only counts its holds. It answers no question yet: the
-queue comes in step 2.2. `pent run` holds pentd for the whole run and starts
-it when no pentd runs, but the run continues without pentd.
+pentd has the queue of questions, and it writes the rules. `pent run`
+holds pentd for the whole run and starts it when no pentd runs, but it asks
+no question yet (phase 3). A failure of pentd does not stop a run.
 
 ## Scope
 
-- `crates/pent/src/daemon/`: the server (`server.rs`), the client of
+- `crates/pent/src/daemon/`: the server (`server.rs`), the shared state
+  and the roles (`hub.rs`), the queue (`queue.rs`), the session of
   `pent run` (`client.rs`) and the line reader (`mod.rs`).
 - `crates/pent-settings/src/runtime.rs`: the runtime directory.
 - `packaging/systemd/pentd.socket` and `pentd.service`.
@@ -27,6 +29,9 @@ pentd will decide what each sandboxed program can do. Thus:
   not remove a file that is not its own socket.
 - A client with a bug, or a process of the user, must not make pentd use
   memory without a limit or stop.
+- An answer must not be wider than its question, must not resolve a
+  sensitive question that it did not name, and must not come from `pent run`
+  itself.
 
 ## How to run the tests
 
@@ -58,6 +63,21 @@ soon after the last hold.
 | PD-10 | The sandboxed program cannot see the socket of pentd or its directory. | `the_program_cannot_see_the_socket_of_pentd`, and for `/run/user/<uid>` `security_linux_sandbox::test_runtime_dir_masked` |
 | PD-11 | After a failed `accept(2)`, for example at the limit of file descriptors, pentd pauses 100 ms, so the loop does not spin. | `pentd_does_not_spin_at_the_limit_of_file_descriptors` |
 
+## The queue
+
+| ID | Property | Test |
+|---|---|---|
+| QU-1 | pentd gives each question its number, and the session and the key of the connection that asked. The values in the `Ask` do not count. The same access of the same session is one question. | `queue::tests::pentd_gives_the_number_the_session_and_the_key`, `an_answer_reaches_the_session_the_watcher_and_the_rule_file` |
+| QU-2 | The first `Hold` gives the role of a connection. A session (`Hold::Run`) may ask and may not answer, also its own question. Another connection may answer and may not ask. | `pentd_refuses_a_bad_answer_and_a_message_of_the_wrong_role` |
+| QU-3 | pentd checks each answer: the question is open, the `MenuIndex` is in its menu, and the source is the human. The judge will run inside pentd, so no client on the socket may answer as the model. A refused answer leaves the question open. | `queue::tests::an_answer_is_checked`, `pentd_refuses_a_bad_answer_and_a_message_of_the_wrong_role` |
+| QU-4 | An answer resolves each open question of the same key that its target covers with the same kind: with the scope `remember` in each session, with the scope `run` only in the session of the question. The verdict carries the target, so each session applies the same width. | `queue::tests::a_wide_answer_resolves_each_question_inside_its_width`, `the_scope_decides_which_sessions_share_the_answer`, `a_deny_does_not_resolve_a_question_with_another_kind`, `one_wide_answer_resolves_each_question_inside_its_width` |
+| QU-5 | A wider answer to another question never resolves a sensitive question; only an answer with its exact target does. | `queue::tests::a_wide_answer_does_not_resolve_a_sensitive_question` |
+| QU-6 | pentd is the only writer of the rules. An answer with the scope `remember` becomes a rule in the file of the key, in the place of an old rule for the same target. The scope `run` writes nothing. | `an_answer_reaches_the_session_the_watcher_and_the_rule_file`, `pentd_refuses_a_bad_answer_and_a_message_of_the_wrong_role` |
+| QU-7 | Each question has a deadline in `pent run`: 120 s for a file, a Unix socket and a port, 20 s for the proxy, 4 s for DNS. At the deadline the access gets the error of a refusal, and not before. The question stays open in pentd. | `client::tests::each_deadline_gives_a_refusal_at_its_time_and_not_before` |
+| QU-8 | A late answer with the scope `remember` becomes a rule. An open question of an ended session keeps pentd alive for at most 15 minutes, so the answer has time to come. | `queue::tests::a_question_of_an_ended_session_stays_for_a_late_answer_then_goes`, `a_late_answer_becomes_a_rule_and_the_open_question_keeps_pentd_alive` |
+| QU-9 | When pentd fails or refuses a question, each waiting access gets the error of a refusal at once, and so does each later question. | `client::tests::a_failure_of_pentd_refuses_at_once`, `a_rejected_ask_is_a_refusal` |
+| QU-10 | Two asks of one access in one session get one number and one verdict. | `client::tests::a_verdict_answers_each_ask_of_the_same_question` |
+
 ## The limits
 
 - **The same user.** A process of the same user outside the sandbox can
@@ -69,6 +89,10 @@ soon after the last hold.
   the socket of systemd (PD-7). The activated pentd waits up to 5 s for the
   lock (PD-4). A spawned pentd that holds the lock longer than that makes
   the activated pentd fail; the next connection starts the unit again.
+- **A rule from a hand edit and an open question.** pentd does not check
+  the rules before it queues a question: `pent run` asks only when no rule
+  answers. A rule that the user adds by hand during a run does not resolve
+  a question that is open already.
 - **A long run and the restarts of pentd.** The client holds pentd again
   after a lost connection, three times in a row. A connection that lasts
   30 s resets the count, so a long run keeps its hold over each restart. No
@@ -78,6 +102,5 @@ soon after the last hold.
 
 | Step | Property |
 |---|---|
-| 2.2 | pentd checks the `MenuIndex` of an answer against the menu that it made itself, and an answer for a sensitive question comes only from the human. |
-| 2.2 | If pentd fails, each access that waits for an answer gets the error of a refusal. |
+| 3.1 | pentd makes the menu of a question itself from the access, with the classes of the user, and does not take the menu of the `Ask`. Until then, `pent run` makes it, and no `pent run` asks yet. |
 | 3.1 | The pent class includes the runtime directory, so the program gets `ENOENT` for it, also when it guesses the path. |

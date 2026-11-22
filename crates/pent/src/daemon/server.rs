@@ -22,8 +22,8 @@ use pent_profile::Message;
 use pent_settings::RuntimeDir;
 use tokio::io::BufReader;
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::watch;
 
+use super::hub::{Hub, Role};
 use super::{read_message, DaemonError};
 
 /// The first fd of socket activation (`SD_LISTEN_FDS_START`).
@@ -287,8 +287,11 @@ pub(crate) async fn serve(
     result
 }
 
+/// How often pentd drops the old questions of ended sessions.
+const EXPIRE_EVERY: Duration = Duration::from_secs(30);
+
 /// Accept connections until a signal, or until the linger time after the
-/// last hold.
+/// last hold and the last open question.
 async fn accept_loop(
     listener: &UnixListener,
     holds_itself: bool,
@@ -302,17 +305,25 @@ async fn accept_loop(
     let mut term = signal(SignalKind::terminate()).map_err(signal_err)?;
     let mut int = signal(SignalKind::interrupt()).map_err(signal_err)?;
 
-    let holds = Arc::new(watch::Sender::new(0_usize));
-    let mut changes = holds.subscribe();
+    let rules = match pent_settings::RuleStore::open_default() {
+        Ok(store) => Some(store),
+        Err(e) => {
+            tracing::warn!("pentd cannot find the rule files: {e}");
+            None
+        }
+    };
+    let hub = Hub::new(rules);
+    let mut changes = hub.subscribe();
     let own_uid = pent_settings::current_uid();
     let mut idle_since = (!holds_itself).then(tokio::time::Instant::now);
+    let mut expire = tokio::time::interval(EXPIRE_EVERY);
 
     loop {
         let stop_at = idle_since.map(|t| t + linger);
         tokio::select! {
             accepted = listener.accept() => match accepted {
                 Ok((stream, _)) => {
-                    tokio::spawn(connection(stream, Arc::clone(&holds), own_uid));
+                    tokio::spawn(connection(stream, Arc::clone(&hub), own_uid));
                 }
                 Err(e) => {
                     tracing::warn!("pentd cannot accept a connection: {e}");
@@ -320,11 +331,19 @@ async fn accept_loop(
                 }
             },
             Ok(()) = changes.changed() => {
-                let count = *changes.borrow_and_update();
-                idle_since = (count == 0 && !holds_itself).then(tokio::time::Instant::now);
+                let idle = changes.borrow_and_update().is_idle();
+                idle_since = match (idle && !holds_itself, idle_since) {
+                    (true, Some(since)) => Some(since),
+                    (true, None) => Some(tokio::time::Instant::now()),
+                    (false, _) => None,
+                };
             }
+            _ = expire.tick() => hub.expire(),
             () = sleep_until(stop_at) => {
-                tracing::info!("pentd stops: no hold for {} ms", linger.as_millis());
+                tracing::info!(
+                    "pentd stops: no hold and no open question for {} ms",
+                    linger.as_millis()
+                );
                 return Ok(());
             }
             _ = term.recv() => return Ok(()),
@@ -341,30 +360,14 @@ async fn sleep_until(at: Option<tokio::time::Instant>) {
     }
 }
 
-/// One hold. The count goes down when the value drops, also when the task
-/// of the connection ends with an error.
-struct HoldGuard(Arc<watch::Sender<usize>>);
-
-impl HoldGuard {
-    fn new(holds: Arc<watch::Sender<usize>>) -> Self {
-        holds.send_modify(|n| *n = n.saturating_add(1));
-        Self(holds)
-    }
-}
-
-impl Drop for HoldGuard {
-    fn drop(&mut self) {
-        self.0.send_modify(|n| *n = n.saturating_sub(1));
-    }
-}
-
 /// Return true if a peer with the user ID `peer` may talk to pentd.
 const fn peer_allowed(peer: u32, own: u32) -> bool {
     peer == own
 }
 
-/// Serve one connection.
-async fn connection(stream: UnixStream, holds: Arc<watch::Sender<usize>>, own_uid: u32) {
+/// Serve one connection: a reader, and a writer task for the messages of
+/// pentd.
+async fn connection(stream: UnixStream, hub: Arc<Hub>, own_uid: u32) {
     match stream.peer_cred() {
         Ok(cred) if peer_allowed(cred.uid(), own_uid) => {}
         Ok(cred) => {
@@ -377,21 +380,29 @@ async fn connection(stream: UnixStream, holds: Arc<watch::Sender<usize>>, own_ui
         }
     }
     let fd = stream.as_raw_fd();
-    let mut reader = BufReader::new(stream);
-    let mut hold: Option<HoldGuard> = None;
+    let (read, mut write) = stream.into_split();
+    let (outbox, mut inbox) = tokio::sync::mpsc::unbounded_channel::<Message>();
+    let writer = tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt as _;
+        while let Some(message) = inbox.recv().await {
+            let line = match message.encode_line() {
+                Ok(line) => line,
+                Err(e) => {
+                    tracing::warn!("pentd cannot encode a message: {e}");
+                    continue;
+                }
+            };
+            if write.write_all(line.as_bytes()).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut reader = BufReader::new(read);
+    let mut role = Role::Client;
     loop {
         match read_message(&mut reader).await {
-            Ok(Some(Message::Hold(holder))) => {
-                if hold.is_none() {
-                    tracing::debug!("fd {fd}: hold {holder:?}");
-                    hold = Some(HoldGuard::new(Arc::clone(&holds)));
-                }
-            }
-            Ok(Some(message)) => {
-                // Step 2.2 of PLAN.md adds the queue. Until then pentd reads
-                // the other messages and does nothing with them.
-                tracing::debug!("fd {fd}: no handler yet for {message:?}");
-            }
+            Ok(Some(message)) => hub.handle(&mut role, &outbox, message),
             Ok(None) => break,
             Err(e) => {
                 tracing::debug!("fd {fd}: pentd closes the connection: {e}");
@@ -399,7 +410,12 @@ async fn connection(stream: UnixStream, holds: Arc<watch::Sender<usize>>, own_ui
             }
         }
     }
-    drop(hold);
+    hub.end(role);
+    // The writer sends what is left, then ends when the outbox closes.
+    drop(outbox);
+    if let Err(e) = writer.await {
+        tracing::debug!("fd {fd}: the writer ended with {e}");
+    }
 }
 
 #[cfg(test)]
@@ -411,18 +427,6 @@ mod tests {
         assert!(peer_allowed(1000, 1000));
         assert!(!peer_allowed(0, 1000));
         assert!(!peer_allowed(1001, 1000));
-    }
-
-    #[test]
-    fn a_hold_guard_counts_up_and_down() {
-        let holds = Arc::new(watch::Sender::new(0_usize));
-        let a = HoldGuard::new(Arc::clone(&holds));
-        let b = HoldGuard::new(Arc::clone(&holds));
-        assert_eq!(*holds.borrow(), 2);
-        drop(a);
-        assert_eq!(*holds.borrow(), 1);
-        drop(b);
-        assert_eq!(*holds.borrow(), 0);
     }
 
     #[test]

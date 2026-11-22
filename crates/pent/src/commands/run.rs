@@ -35,10 +35,10 @@ enum RunEvent {
 
 /// Hold pentd for this run, and start it when no pentd runs.
 ///
-/// pentd answers no question yet (step 2.2 of PLAN.md), so a failure does
+/// `pent run` asks no question yet (phase 3 of PLAN.md), so a failure does
 /// not stop the run. The design asks the same: without pentd, the rules
 /// still apply (`docs/design/pent.md`, section 2).
-async fn hold_pentd(command: &[String]) -> Option<crate::daemon::client::HoldHandle> {
+async fn hold_pentd(command: &[String]) -> Option<crate::daemon::client::Session> {
     let key = command
         .first()
         .and_then(|c| pent_profile::RuleKey::from_command(c).ok())?;
@@ -47,7 +47,7 @@ async fn hold_pentd(command: &[String]) -> Option<crate::daemon::client::HoldHan
         command: command.to_vec(),
     };
     let runtime = pent_settings::RuntimeDir::from_env();
-    match crate::daemon::client::hold(&runtime, hold).await {
+    match crate::daemon::client::Session::connect(&runtime, hold).await {
         Ok(handle) => Some(handle),
         Err(e) => {
             tracing::debug!("pent runs without pentd: {e}");

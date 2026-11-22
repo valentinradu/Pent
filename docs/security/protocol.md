@@ -5,12 +5,14 @@ lists the security properties of the messages and of the codec of
 `pentd.sock`, the test of each property, and the properties that later
 steps must add.
 
-No process speaks the protocol yet: pentd comes in step 2.1.
+pentd speaks the protocol since step 2.1, and it has the queue since step
+2.2.
 
 ## Scope
 
 - `crates/pent-profile/src/protocol.rs`: the messages `Hold`, `Ask`,
-  `Question`, `Answer` and `Event`, and the JSON lines codec.
+  `Question`, `Answer`, `Verdict`, `Watch`, `Rejected` and `Event`, and the
+  JSON lines codec. [pentd.md](pentd.md) has the rules of the queue.
 - The serde forms of the rule types in `rule.rs` and `class.rs`, which the
   messages carry.
 
@@ -51,7 +53,7 @@ cargo +nightly fuzz run protocol_line -- -max_total_time=150 -rss_limit_mb=4096
 | PR-4 | The decoder checks each value with the type of the rules: a path is absolute, has no `..` component and no NUL byte, a key is a safe file name, a port is not 0, and a wildcard does not cover a public suffix. | `a_line_with_a_bad_value_is_refused` |
 | PR-5 | An unknown field is an error at each level, also in a target of a menu. An unknown message and an unknown value are errors. | `a_line_with_a_bad_value_is_refused` |
 | PR-6 | A test holds the form of a line, so a change of the form is a decision, not an accident. | `the_form_of_a_line_is_stable` |
-| PR-7 | A line that the decoder accepts encodes to one line that decodes to the same message. | The fuzz target `protocol_line`: 13,980,706 inputs in 151 seconds, no finding (2026-11-22). |
+| PR-7 | A line that the decoder accepts encodes to one line that decodes to the same message. | The fuzz target `protocol_line`: 5,618,240 inputs in 151 seconds with the messages of step 2.2, no finding (2026-11-22). |
 | PR-8 | A deadline has at most 600 s (`MAX_DEADLINE`). The decoder refuses a longer one, so `Instant::now() + deadline` in pentd cannot overflow. | `a_line_with_a_bad_value_is_refused`, `a_deadline_has_a_limit` |
 | PR-9 | A time is a signed number of milliseconds since 1970. A host with a clock before 1970 can still encode each message. | `a_time_before_1970_is_negative_and_survives` |
 | PR-10 | `pent run` sends an `Ask`, which has no number. Only pentd gives a number, in a `Question`. Thus no number has a special meaning. | `each_message_survives_a_round_trip_on_one_line` |

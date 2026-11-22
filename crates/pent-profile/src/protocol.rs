@@ -18,7 +18,12 @@
 //! - [`Question`]: an [`Ask`] with the number that pentd gives it, from
 //!   pentd to `pent monitor`.
 //! - [`Answer`]: the answer to a question, from `pent monitor` or
-//!   `pent allow` to pentd, and from pentd to `pent run`.
+//!   `pent allow` to pentd.
+//! - [`Verdict`]: the result of an answer, from pentd to each session with
+//!   a question that the answer covers, and to each watcher.
+//! - [`Message::Watch`]: a client asks pentd for each open question and
+//!   each new one (`pent monitor`).
+//! - [`Rejected`]: pentd refuses a message of a client, and says why.
 //! - [`Event`]: a decision of `pent run`, for `pent denials` and for the
 //!   events of a session in `pent monitor`.
 
@@ -42,6 +47,15 @@ pub const MAX_LINE_LEN: usize = 64 * 1024;
 /// 120 s (section 7), so this limit leaves room and stays far from an
 /// overflow of `Instant`.
 pub const MAX_DEADLINE: Duration = Duration::from_secs(600);
+
+/// The deadline of a file access, a Unix socket and a port on localhost.
+pub const FILE_DEADLINE: Duration = Duration::from_secs(120);
+
+/// The deadline of a connection through the proxy.
+pub const PROXY_DEADLINE: Duration = Duration::from_secs(20);
+
+/// The deadline of a DNS query. glibc waits 5 s, so pent answers before.
+pub const DNS_DEADLINE: Duration = Duration::from_secs(4);
 
 /// An error of the codec.
 #[derive(Debug, thiserror::Error)]
@@ -328,6 +342,49 @@ pub struct Event {
     pub decided_by: DecidedBy,
 }
 
+/// The result of an answer for one question: the target that the answer
+/// names, so the session can apply it also to a question with another
+/// menu.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Verdict {
+    /// The question that the answer resolves.
+    pub id: QuestionId,
+    /// Allow or deny.
+    pub decision: Decision,
+    /// The target of the answer.
+    pub target: Target,
+    /// How long the answer lasts.
+    pub scope: Scope,
+    /// Who answered.
+    pub source: Source,
+}
+
+/// Why pentd refused a message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RejectReason {
+    /// No open question has this number.
+    UnknownQuestion,
+    /// The `MenuIndex` is not in the menu of the question.
+    BadWidth,
+    /// Only the human answers on the socket: the judge runs in pentd.
+    NotHuman,
+    /// This connection may not send this message: a session cannot answer,
+    /// and only a session can ask.
+    NotPermitted,
+}
+
+/// pentd refused a message of the client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Rejected {
+    /// The question of the refused answer, when the message named one.
+    pub id: Option<QuestionId>,
+    /// Why.
+    pub reason: RejectReason,
+}
+
 /// One message of the protocol.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -340,6 +397,12 @@ pub enum Message {
     Question(Question),
     /// See [`Answer`].
     Answer(Answer),
+    /// See [`Verdict`].
+    Verdict(Verdict),
+    /// Send each open question, then each new question and each verdict.
+    Watch,
+    /// See [`Rejected`].
+    Rejected(Rejected),
     /// See [`Event`].
     Event(Event),
 }
@@ -523,6 +586,22 @@ mod tests {
             ),
             event(8, domain("x.org"), DecidedBy::Rule(Decision::Allow)),
             event(9, domain("y.org"), DecidedBy::Flag(Decision::Allow)),
+            Message::Verdict(Verdict {
+                id: QuestionId(7),
+                decision: Decision::Allow,
+                target: Target::Localhost(port),
+                scope: Scope::Run,
+                source: Source::Human,
+            }),
+            Message::Watch,
+            Message::Rejected(Rejected {
+                id: Some(QuestionId(9)),
+                reason: RejectReason::BadWidth,
+            }),
+            Message::Rejected(Rejected {
+                id: None,
+                reason: RejectReason::NotPermitted,
+            }),
         ]
     }
 

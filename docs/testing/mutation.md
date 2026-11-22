@@ -42,6 +42,9 @@ makes one mutation by hand. The test must fail on the mutant. No
 | 2.1 | The pentd of systemd does not wait for the lock. | `an_activated_pentd_waits_for_the_lock_of_a_pentd_that_stops` |
 | 2.1 | The client waits the full 3 s for a pentd that stopped. | `pent_run_does_not_wait_for_a_pentd_that_cannot_start` |
 | 2.1 | pentd does not pause after a failed `accept(2)`. | `pentd_does_not_spin_at_the_limit_of_file_descriptors` |
+| 2.2 | A session may answer. | `pentd_refuses_a_bad_answer_and_a_message_of_the_wrong_role` |
+| 2.2 | An answer resolves only its own question. | `one_wide_answer_resolves_each_question_inside_its_width` |
+| 2.2 | An open question does not keep pentd alive. | `a_late_answer_becomes_a_rule_and_the_open_question_keeps_pentd_alive` |
 
 The first form of `pent_run_starts_pentd_and_holds_it_for_the_run` passed on
 the mutant: the client started a new pentd each time that it lost one. The
