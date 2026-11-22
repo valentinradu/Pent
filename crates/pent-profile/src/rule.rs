@@ -17,6 +17,8 @@ use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 use std::time::SystemTime;
 
+use serde::{Deserialize, Serialize};
+
 use crate::psl;
 
 /// The maximum length of a rule key.
@@ -288,6 +290,31 @@ impl DomainWidth {
     }
 }
 
+impl FromStr for DomainWidth {
+    type Err = RuleError;
+
+    /// Parse the form of the proxy: `name`, `*.base` or `**.base`.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if let Some(base) = s.strip_prefix("**.") {
+            Self::wildcard(base.parse()?, true)
+        } else if let Some(base) = s.strip_prefix("*.") {
+            Self::wildcard(base.parse()?, false)
+        } else {
+            s.parse().map(Self::Exact)
+        }
+    }
+}
+
+impl fmt::Display for DomainWidth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Exact(name) => write!(f, "{name}"),
+            Self::OneLabel(base) => write!(f, "*.{base}"),
+            Self::AnyDepth(base) => write!(f, "**.{base}"),
+        }
+    }
+}
+
 /// What a rule covers.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Target {
@@ -307,7 +334,8 @@ pub enum Target {
 }
 
 /// The decision of a rule.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Decision {
     /// Permit the access.
     Allow,
@@ -316,7 +344,8 @@ pub enum Decision {
 }
 
 /// Who made a rule.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Source {
     /// The human, in `pent monitor` or with `pent allow`.
     Human,
@@ -691,6 +720,26 @@ mod tests {
                 "{base}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn a_domain_width_parses_the_form_of_the_proxy() -> TestResult {
+        for text in ["api.example.com", "*.npmjs.org", "**.cdn.example"] {
+            assert_eq!(text.parse::<DomainWidth>()?.to_string(), text);
+        }
+        assert!(matches!(
+            "*.co.uk".parse::<DomainWidth>(),
+            Err(RuleError::WildcardTooWide(_))
+        ));
+        assert!(matches!(
+            "*.".parse::<DomainWidth>(),
+            Err(RuleError::InvalidDomain(_))
+        ));
+        assert!(matches!(
+            "a.*.com".parse::<DomainWidth>(),
+            Err(RuleError::InvalidDomain(_))
+        ));
         Ok(())
     }
 

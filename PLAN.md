@@ -1,6 +1,6 @@
 # Plan: the new pent
 
-**Cursor: step 1.2.** Steps with `[x]` are done. Work on the branch `next`,
+**Cursor: step 1.3.** Steps with `[x]` are done. Work on the branch `next`,
 one commit for each step, and move this cursor when a step is done.
 
 This plan builds the design in `docs/design/pent.md`. Each step names its
@@ -24,7 +24,7 @@ ready for users.
     step 8.2).
   - Done: unit tests for each kind and each width, also a wildcard domain
     at a public suffix.
-- [ ] **1.2 The rule files.** One TOML file for each key in
+- [x] **1.2 The rule files.** One TOML file for each key in
   `~/.local/state/pent/rules/`, written atomically with mode `0600`
   (`write_atomic_private`). Unknown keys are an error that names the key.
   - Files: `pent-settings/src/store.rs`.

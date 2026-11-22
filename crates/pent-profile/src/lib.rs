@@ -14,6 +14,7 @@
 //! - [`psl`]: a compact subset of the public suffix list.
 //! - [`rule`]: the rules, the answers that pent keeps for the next run (see
 //!   `docs/design/pent.md`).
+//! - [`rule_file`]: the TOML form of the rules of one program.
 //!
 //! See `docs/design/watch.md` for the full design.
 
@@ -26,6 +27,7 @@ pub mod psl;
 pub mod render;
 pub mod review;
 pub mod rule;
+pub mod rule_file;
 pub mod summary;
 
 pub use doc::{DocError, FilesystemRules, NetworkRules, ProfileDoc};
@@ -44,6 +46,7 @@ pub use rule::{
     Access, Decision, DomainName, DomainWidth, FileKind, PathWidth, Rule, RuleError, RuleKey,
     RulePath, RuleSet, Source, Target,
 };
+pub use rule_file::{EntryError, Kind as RuleFileKind, RuleFileError};
 pub use summary::{
     summarize, FsAccess, Grant, Item, ItemNote, Section, Stats, Summary, SummaryContext,
 };

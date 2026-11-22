@@ -9,19 +9,22 @@
 //! | `<state>/drafts/<name>.toml` | The draft that `pent watch` writes. |
 //! | `<state>/watch/<name>/<run>.jsonl` | The raw events of one watch run. |
 //! | `<state>/denied/<name>.jsonl` | The accesses that `pent run` denied. |
+//! | `<state>/rules/<key>.toml` | The rules of one program (see `docs/design/pent.md`). |
 //!
 //! `<config>` is `$XDG_CONFIG_HOME/pent` (default `~/.config/pent`) and
 //! `<state>` is `$XDG_STATE_HOME/pent` (default `~/.local/state/pent`).
 //!
-//! Pent writes profiles, drafts and the trust store atomically, with the mode
-//! `0600`. The directories get the mode `0700` when pent creates them.
+//! Pent writes profiles, drafts, rules and the trust store atomically, with
+//! the mode `0600`. The directories get the mode `0700` when pent creates them.
 
 use std::ffi::OsString;
 use std::fmt;
 use std::io::{BufRead as _, Write as _};
 use std::path::{Path, PathBuf};
 
-use pent_profile::{DocError, ProfileDoc, ProfileName, WatchEvent};
+use pent_profile::{
+    DocError, ProfileDoc, ProfileName, RuleFileError, RuleKey, RuleSet, WatchEvent,
+};
 use thiserror::Error;
 
 use crate::trust::write_atomic_private;
@@ -31,6 +34,8 @@ use crate::{TrustError, TrustStatus, TrustStore};
 const TRUST_FILE: &str = "trusted.toml";
 /// File extension of the event logs.
 const LOG_EXTENSION: &str = "jsonl";
+/// File extension of the rule files.
+const RULES_EXTENSION: &str = "toml";
 
 /// Errors from profile store operations.
 #[derive(Error, Debug)]
@@ -65,6 +70,23 @@ pub enum StoreError {
     #[error("{} is not valid UTF-8", path.display())]
     NotUtf8 {
         /// The file.
+        path: PathBuf,
+    },
+
+    /// A rule file is not valid, or pent cannot encode the rules.
+    #[error("{}: {source}", path.display())]
+    Rules {
+        /// The rule file.
+        path: PathBuf,
+        /// The problem. It is in a box because a TOML error is large.
+        source: Box<RuleFileError>,
+    },
+
+    /// A rule file is a symbolic link. Pent does not follow it: the rules
+    /// decide what a program can do, so they must be the file in the store.
+    #[error("{} is a symbolic link; pent reads only a regular file here", path.display())]
+    RulesLink {
+        /// The rule file.
         path: PathBuf,
     },
 
@@ -162,6 +184,12 @@ impl PentDirs {
     #[must_use]
     pub fn trust_store(&self) -> PathBuf {
         self.config.join(TRUST_FILE)
+    }
+
+    /// The directory of the rule files: `<state>/rules`.
+    #[must_use]
+    pub fn rules_dir(&self) -> PathBuf {
+        self.state.join("rules")
     }
 }
 
@@ -739,6 +767,133 @@ impl ProfileStore {
     pub fn clear_denied(&self, name: &ProfileName) -> Result<(), StoreError> {
         remove_optional(&self.denied_path(name)).map(|_| ())
     }
+}
+
+/// The rule files: one TOML file for each key in `<state>/rules/`.
+///
+/// pentd is the only writer. A user can read and edit a file; pent reads it
+/// again at the next load.
+#[derive(Debug, Clone)]
+pub struct RuleStore {
+    dir: PathBuf,
+}
+
+impl RuleStore {
+    /// Open the store at the default location (see [`PentDirs::from_env`]).
+    ///
+    /// # Errors
+    /// Returns `StoreError::NoHome` when the location is not known.
+    pub fn open_default() -> Result<Self, StoreError> {
+        PentDirs::from_env()
+            .map(|dirs| Self::new(&dirs))
+            .ok_or(StoreError::NoHome)
+    }
+
+    /// Open the store in the given directories.
+    #[must_use]
+    pub fn new(dirs: &PentDirs) -> Self {
+        Self {
+            dir: dirs.rules_dir(),
+        }
+    }
+
+    /// The path of the rule file of `key`. A key is always a safe file
+    /// name, so the path stays in the directory.
+    #[must_use]
+    pub fn path(&self, key: &RuleKey) -> PathBuf {
+        self.dir.join(format!("{key}.{RULES_EXTENSION}"))
+    }
+
+    /// Read the rules of `key`. A missing file gives no rules.
+    ///
+    /// # Errors
+    /// Returns `StoreError::RulesLink` when the file is a symbolic link,
+    /// `StoreError::Rules` when the file is not valid, and `StoreError::Io`
+    /// when the read fails.
+    pub fn load(&self, key: &RuleKey) -> Result<RuleSet, StoreError> {
+        let path = self.path(key);
+        let Some(text) = read_text_nofollow(&path)? else {
+            return Ok(RuleSet::new(key.clone()));
+        };
+        RuleSet::from_toml(key.clone(), &text).map_err(|source| StoreError::Rules {
+            path,
+            source: Box::new(source),
+        })
+    }
+
+    /// Write the rules of `rules.key` atomically, with the mode `0600`.
+    /// A symbolic link at the path is replaced, and its target does not
+    /// change. Returns the path of the file.
+    ///
+    /// # Errors
+    /// Returns `StoreError::Rules` when pent cannot encode the rules, and
+    /// `StoreError::Io` when the write fails.
+    pub fn save(&self, rules: &RuleSet) -> Result<PathBuf, StoreError> {
+        let path = self.path(&rules.key);
+        let text = rules.to_toml().map_err(|source| StoreError::Rules {
+            path: path.clone(),
+            source: Box::new(source),
+        })?;
+        write_atomic_private(&path, text.as_bytes()).map_err(|source| StoreError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        Ok(path)
+    }
+
+    /// The keys that have a rule file, in order. Pent skips a file whose
+    /// name is not a valid key.
+    ///
+    /// # Errors
+    /// Returns `StoreError::Io` when pent cannot read the directory.
+    pub fn keys(&self) -> Result<Vec<RuleKey>, StoreError> {
+        let mut keys: Vec<RuleKey> = read_dir_optional(&self.dir)?
+            .iter()
+            .filter(|p| p.extension().is_some_and(|e| e == RULES_EXTENSION))
+            .filter_map(|p| p.file_stem()?.to_str()?.parse().ok())
+            .collect();
+        keys.sort();
+        Ok(keys)
+    }
+
+    /// Remove the rule file of `key`. Returns `true` when the file existed.
+    ///
+    /// # Errors
+    /// Returns `StoreError::Io` when the removal fails.
+    pub fn remove(&self, key: &RuleKey) -> Result<bool, StoreError> {
+        remove_optional(&self.path(key))
+    }
+}
+
+/// Read a text file with `O_NOFOLLOW`. A missing file gives `None`.
+fn read_text_nofollow(path: &Path) -> Result<Option<String>, StoreError> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let io_err = |source| StoreError::Io {
+        path: path.to_path_buf(),
+        source,
+    };
+    let mut file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(StoreError::RulesLink {
+                path: path.to_path_buf(),
+            })
+        }
+        Err(e) => return Err(io_err(e)),
+    };
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(io_err)?;
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| StoreError::NotUtf8 {
+            path: path.to_path_buf(),
+        })
 }
 
 /// Parse the bytes of a profile or a draft.
@@ -1418,5 +1573,153 @@ mod tests {
         f.store.clear_denied(&n).unwrap();
         assert!(f.store.read_denied(&n).unwrap().is_empty());
         f.store.clear_denied(&n).unwrap();
+    }
+
+    mod rules {
+        use super::*;
+        use pent_profile::{Decision, PathWidth, Rule, RulePath, Source, Target};
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::time::{Duration, SystemTime};
+
+        fn rules_fixture() -> (tempfile::TempDir, RuleStore) {
+            let root = tempfile::tempdir().unwrap();
+            let store = RuleStore::new(&PentDirs {
+                config: root.path().join("config/pent"),
+                state: root.path().join("state/pent"),
+            });
+            (root, store)
+        }
+
+        fn key(s: &str) -> RuleKey {
+            s.parse().unwrap()
+        }
+
+        fn sample(k: &str) -> RuleSet {
+            let mut set = RuleSet::new(key(k));
+            set.rules.push(Rule {
+                target: Target::File {
+                    kind: pent_profile::FileKind::Read,
+                    width: PathWidth::Subtree(RulePath::new("/home/u/.cargo").unwrap()),
+                },
+                decision: Decision::Allow,
+                source: Source::Human,
+                created: SystemTime::UNIX_EPOCH + Duration::from_secs(1_795_348_800),
+            });
+            set.rules.push(Rule {
+                target: Target::Domain("*.npmjs.org".parse().unwrap()),
+                decision: Decision::Deny,
+                source: Source::Model,
+                created: SystemTime::UNIX_EPOCH + Duration::from_secs(1_795_348_801),
+            });
+            set
+        }
+
+        #[test]
+        fn the_rules_survive_a_round_trip_in_a_private_file() {
+            let (_root, store) = rules_fixture();
+            let set = sample("claude");
+            let path = store.save(&set).unwrap();
+            assert!(path.ends_with("state/pent/rules/claude.toml"), "{path:?}");
+            assert_eq!(store.load(&key("claude")).unwrap(), set);
+
+            let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&path), 0o600);
+            assert_eq!(mode(path.parent().unwrap()), 0o700);
+
+            // A second save replaces the file and leaves no temporary file.
+            store.save(&sample("claude")).unwrap();
+            store.save(&sample("cargo")).unwrap();
+            let names: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            assert_eq!(names.len(), 2, "{names:?}");
+            assert_eq!(store.keys().unwrap(), vec![key("cargo"), key("claude")]);
+        }
+
+        #[test]
+        fn a_missing_file_gives_no_rules_and_remove_reports_it() {
+            let (_root, store) = rules_fixture();
+            assert_eq!(
+                store.load(&key("claude")).unwrap(),
+                RuleSet::new(key("claude"))
+            );
+            assert!(store.keys().unwrap().is_empty());
+            assert!(!store.remove(&key("claude")).unwrap());
+            store.save(&sample("claude")).unwrap();
+            assert!(store.remove(&key("claude")).unwrap());
+            assert!(store.keys().unwrap().is_empty());
+        }
+
+        #[test]
+        fn a_hand_edit_is_read_at_the_next_load() {
+            let (_root, store) = rules_fixture();
+            let path = store.save(&sample("claude")).unwrap();
+            let text = std::fs::read_to_string(&path).unwrap();
+            let edited = text.replace("decision = \"deny\"", "decision = \"allow\"")
+                + "\n# a note of the user\n[[rule]]\nkind = \"localhost\"\nport = 5432\n\
+                   decision = \"allow\"\nsource = \"human\"\ncreated = 2026-11-22T13:00:00+01:00\n";
+            std::fs::write(&path, edited).unwrap();
+            let set = store.load(&key("claude")).unwrap();
+            assert_eq!(set.rules.len(), 3);
+            assert!(set.rules.iter().all(|r| r.decision == Decision::Allow));
+        }
+
+        #[test]
+        fn a_bad_file_is_an_error_that_names_the_file_and_the_field() {
+            let (_root, store) = rules_fixture();
+            let path = store.save(&sample("claude")).unwrap();
+            let text = std::fs::read_to_string(&path).unwrap();
+            std::fs::write(
+                &path,
+                text.replace("source = \"human\"", "colour = \"red\""),
+            )
+            .unwrap();
+            let err = store.load(&key("claude")).unwrap_err();
+            assert!(matches!(err, StoreError::Rules { .. }), "{err:?}");
+            let message = err.to_string();
+            assert!(message.contains("claude.toml"), "{message}");
+            assert!(message.contains("colour"), "{message}");
+
+            std::fs::write(&path, [0xff, 0xfe]).unwrap();
+            assert!(matches!(
+                store.load(&key("claude")),
+                Err(StoreError::NotUtf8 { .. })
+            ));
+        }
+
+        #[test]
+        fn a_symbolic_link_at_the_path_is_not_followed() {
+            let (root, store) = rules_fixture();
+            let path = store.save(&sample("claude")).unwrap();
+            let target = root.path().join("elsewhere.toml");
+            std::fs::write(&target, sample("claude").to_toml().unwrap()).unwrap();
+            std::fs::remove_file(&path).unwrap();
+            std::os::unix::fs::symlink(&target, &path).unwrap();
+
+            // The load refuses the link, also when the target is valid.
+            assert!(matches!(
+                store.load(&key("claude")),
+                Err(StoreError::RulesLink { .. })
+            ));
+
+            // The save replaces the link with a regular file, and the
+            // target does not change.
+            let before = std::fs::read(&target).unwrap();
+            store.save(&RuleSet::new(key("claude"))).unwrap();
+            assert_eq!(std::fs::read(&target).unwrap(), before);
+            assert!(std::fs::symlink_metadata(&path).unwrap().is_file());
+            assert!(store.load(&key("claude")).unwrap().rules.is_empty());
+        }
+
+        #[test]
+        fn a_file_with_a_name_that_is_not_a_key_is_skipped() {
+            let (_root, store) = rules_fixture();
+            let path = store.save(&sample("claude")).unwrap();
+            let dir = path.parent().unwrap();
+            std::fs::write(dir.join(".hidden.toml"), "").unwrap();
+            std::fs::write(dir.join("notes.txt"), "").unwrap();
+            assert_eq!(store.keys().unwrap(), vec![key("claude")]);
+        }
     }
 }
