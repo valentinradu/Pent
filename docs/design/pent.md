@@ -240,10 +240,12 @@ costs nothing that matters.
 
 - **After a "deny", or at the deadline (120 s):** `EACCES` for a socket,
   `ECONNREFUSED` for a port.
-- **The sensitive class applies.** The sockets of `ESCAPE_SOCKETS` and
-  `HOME_AGENT_SOCKETS` (Docker, `ssh-agent`, `gpg-agent`, D-Bus) and the
-  control ports of `CONTROL_PORTS` (for example the debug port of a
-  browser) are sensitive: only the human answers.
+- **The sensitive class applies.** The sockets of `ESCAPE_SOCKETS`,
+  `RESOLVER_SOCKETS` and `HOME_AGENT_SOCKETS` (Docker, D-Bus, `nscd`,
+  `systemd-resolved`, Tailscale, `ssh-agent`, `gpg-agent`) and the control
+  ports of `CONTROL_PORTS` (for example the debug port of a browser) are
+  sensitive: only the human answers. A resolver socket reaches the network
+  past the proxy.
 
 ## 7. The chain of deciders
 

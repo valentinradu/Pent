@@ -24,7 +24,7 @@ use pent_profile::{
 };
 
 /// How long a question of a session that ended stays open.
-pub(crate) const ORPHAN_TTL: Duration = Duration::from_secs(15 * 60);
+pub(crate) const ORPHAN_TTL: Duration = Duration::from_secs(5 * 60);
 
 /// One open question.
 #[derive(Debug, Clone)]
