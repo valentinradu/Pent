@@ -107,11 +107,14 @@ commit.
 
 | Step | Crate | Target | What it reads | Inputs |
 |------|-------|--------|---------------|-------:|
-| 1.2 | `pent-profile` | `rule_file` | The text of a rule file. A file that `RuleSet::from_toml` accepts must give the same rules after `to_toml`, and after `update_toml` with no change, with the first rule removed, and with a rule added. | 1,833,666 |
-| 1.4 | `pent-profile` | `protocol_line` | One line of the protocol of `pentd.sock`. A line that `Message::decode_line` accepts must encode to one line that decodes to the same message. | 7,843,626 |
+| 1.2 | `pent-profile` | `rule_file` | The text of a rule file. A file that `RuleSet::from_toml` accepts must give the same rules after `to_toml` and after `update_toml` with no change. With the first rule removed or with a rule added, the file must hold the same rules with the same count of each rule, in any order. | 2,014,385 |
+| 1.4 | `pent-profile` | `protocol_line` | One line of the protocol of `pentd.sock`. A line that `Message::decode_line` accepts must encode to one line that decodes to the same message. | 13,980,706 |
 
 Each run of 2026-11-22 took 151 seconds on a NixOS machine with Linux
-7.3.3, with no finding. `docs/security/rules.md` (RF-11) and
+7.3.3, with no finding. An earlier run of `rule_file` found that an update
+can change the order of equal rules. The order has no effect on a
+decision, so the property of the target now compares the rules in any
+order. `docs/security/rules.md` (RF-11) and
 `docs/security/protocol.md` (PR-7) name the properties.
 
 ## The property tests

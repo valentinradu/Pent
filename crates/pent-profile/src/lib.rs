@@ -47,8 +47,9 @@ pub use guard::{
 pub use localhost::{control_port, is_localhost_name, is_loopback, CONTROL_PORTS};
 pub use name::{ProfileName, ProfileNameError};
 pub use protocol::{
-    Answer, Event, Hold, MenuIndex, Message, Outcome as EventOutcome, ProtocolError, Question,
-    QuestionId, Request, Scope, SessionId, MAX_LINE_LEN, PROTOCOL_VERSION,
+    Answer, Ask, Deadline, DeadlineTooLong, DecidedBy, Event, Hold, MenuIndex, Message,
+    ProtocolError, Question, QuestionId, Request, Scope, SessionId, Timestamp, MAX_DEADLINE,
+    MAX_LINE_LEN, PROTOCOL_VERSION,
 };
 pub use render::{
     render_draft, render_draft_with, render_header, render_profile, render_terminal, safe_lines,

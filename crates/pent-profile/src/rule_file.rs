@@ -398,7 +398,9 @@ impl RuleSet {
     /// comments, its form and its place. A rule of `old` that is not in
     /// this set loses its table and the comment above it. A rule of this set
     /// that is not in `old` gets a new table at the end. The other comments
-    /// of the file stay.
+    /// of the file stay. When the file has equal rules, the first copies in
+    /// the file keep their tables, so the order of the rules can change. The
+    /// order has no effect on a decision.
     ///
     /// # Errors
     /// Returns an error if `old` is not a valid rule file: pent does not
@@ -919,6 +921,21 @@ created = 2026-11-22T12:00:00Z
         let text = set.update_toml(&twice)?;
         assert_eq!(text.matches("[[rule]]").count(), 1, "{text}");
         assert_eq!(parse(&text)?, set);
+        Ok(())
+    }
+
+    #[test]
+    fn an_update_with_equal_rules_keeps_the_first_copies() -> Result<(), RuleFileError> {
+        let a = port_rule(22, 1);
+        let b = port_rule(80, 2);
+        let mut set = RuleSet::new(key());
+        set.rules = vec![a.clone(), b.clone(), a.clone(), b.clone()];
+        let text = set.to_toml()?;
+        // Remove the first copy of `a`: the file keeps the first copy and
+        // drops the second, with the same rules in another order.
+        set.rules.remove(0);
+        let after = parse(&set.update_toml(&text)?)?;
+        assert_eq!(after.rules, vec![a, b.clone(), b]);
         Ok(())
     }
 

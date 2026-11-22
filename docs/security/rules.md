@@ -55,7 +55,7 @@ cargo +nightly fuzz run rule_file -- -max_total_time=150 -rss_limit_mb=4096
 | RU-1 | When more than one rule matches, the most specific rule wins: an exact path before a subtree, a deeper subtree before a shallower one, an exact domain before a wildcard. On a tie, `Deny` wins. | `rule::tests::the_most_specific_rule_wins`, `deny_wins_a_tie` |
 | RU-2 | A rule covers only its kind. A list rule gives the names, not the content. A read rule does not permit a write. A write or an exec rule includes reads, and each rule includes the listings inside its width. | `each_file_kind_covers_the_expected_kinds`, `an_exact_list_rule_covers_only_that_directory`, `a_subtree_covers_the_paths_below_it_and_not_its_siblings` |
 | RU-3 | A subtree compares whole path components: `~/.cargo/registry` does not cover `~/.cargo/registry-old`. | `a_subtree_covers_the_paths_below_it_and_not_its_siblings` |
-| RU-4 | A rule path is absolute and has no `.` or `..` component, so a path cannot leave its width. | `a_rule_path_is_absolute_and_normal`, `rule_file::tests::bad_values_are_errors` |
+| RU-4 | A rule path is absolute and has no `..` component and no NUL byte, so a path cannot leave its width. A path has one normal form (`//a//b/` becomes `/a/b`), so one rule has one text in a question and in a rule file. | `a_rule_path_is_absolute_and_normal`, `a_rule_path_has_one_normal_form_and_no_nul`, `rule_file::tests::bad_values_are_errors` |
 | RU-5 | The domain forms follow the proxy. `*.base` is one more label, `**.base` is any depth, and neither covers `base`. A wildcard compares whole labels: `*.npmjs.org` does not cover `evilnpmjs.org`. | `domain_widths_follow_the_proxy`, `a_domain_width_parses_the_form_of_the_proxy` |
 | RU-6 | A wildcard cannot cover a public suffix (`*.com`, `*.co.uk`, `*.github.io`), also in a file that a user edits. | `a_wildcard_cannot_cover_a_public_suffix`, `rule_file::tests::bad_values_are_errors` |
 | RU-7 | A socket rule and a port rule match exactly, and a file rule never answers a socket access. | `sockets_and_ports_match_exactly` |
@@ -88,7 +88,7 @@ cargo +nightly fuzz run rule_file -- -max_total_time=150 -rss_limit_mb=4096
 | RF-8 | A change holds a lock on the key (`flock`) from the read to the write, so parallel changes lose no rule. The test fails when the lock is removed. | `parallel_updates_lose_no_rule` |
 | RF-9 | A change reads the file again, so it keeps an edit of the user that came after an earlier load. Pent does not write over a file that it cannot read. | `an_update_sees_an_edit_that_came_after_a_load`, `rule_file::tests::an_update_refuses_a_file_that_is_not_valid` |
 | RF-10 | A change keeps the comments and the form of each rule that stays. A removed rule loses its table and the comment above it. | `an_update_keeps_the_comments_and_the_form_of_each_kept_rule`, `an_update_with_no_change_gives_the_same_text`, `store::tests::rules::a_save_keeps_the_comments_of_the_user` |
-| RF-11 | A file that the parser accepts gives the same rules after a new render, and after an update that keeps, removes or adds a rule. | The fuzz target `rule_file`: 1,833,666 inputs in 151 seconds, no finding (2026-11-22). |
+| RF-11 | A file that the parser accepts gives the same rules after a new render and after an update with no change. After an update that removes or adds a rule, the file holds the same rules with the same count of each rule. | The fuzz target `rule_file`: 2,014,385 inputs in 151 seconds, no finding (2026-11-22). An earlier run found that the order can change when a file has equal rules; the property now says "the same rules", and `an_update_with_equal_rules_keeps_the_first_copies` holds the case. |
 
 ## The limits
 
@@ -98,7 +98,8 @@ cargo +nightly fuzz run rule_file -- -max_total_time=150 -rss_limit_mb=4096
   time of one write.
 - **Duplicate rules.** A file can hold two equal rules. They give the same
   decision, and an update keeps one table for each copy that stays in the
-  set.
+  set: the first copies in the file. Thus the order of the rules can change,
+  and the order has no effect on a decision.
 
 ## The properties that later steps add
 

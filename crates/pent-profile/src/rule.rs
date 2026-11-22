@@ -48,6 +48,9 @@ pub enum RuleError {
     /// The path has a `.` or `..` component.
     #[error("the path {0:?} has a '.' or '..' component")]
     PathNotNormal(PathBuf),
+    /// The path has a NUL byte, so no system call can take it.
+    #[error("the path {0:?} has a NUL byte")]
+    PathHasNul(PathBuf),
     /// The domain name is not valid.
     #[error("the domain name {0:?} is not valid")]
     InvalidDomain(String),
@@ -132,7 +135,9 @@ impl fmt::Display for RuleKey {
 
 // ── Paths and domains ───────────────────────────────────────────────────────
 
-/// An absolute path with no `.` and no `..` component.
+/// An absolute path with no `.` and no `..` component and no NUL byte, in one
+/// normal form: `//a//b/` becomes `/a/b`. Thus one path has one text, in a
+/// question and in a rule file.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(try_from = "PathBuf", into = "PathBuf")]
 pub struct RulePath(PathBuf);
@@ -152,15 +157,19 @@ impl From<RulePath> for PathBuf {
 }
 
 impl RulePath {
-    /// Check and wrap `path`.
+    /// Check `path` and give it the normal form.
     ///
     /// # Errors
-    /// Returns an error if the path is relative, or if it has a `.` or `..`
-    /// component.
+    /// Returns an error if the path is relative, if it has a `..`
+    /// component, or if it has a NUL byte. A `.` component in the middle
+    /// is not an error: the normal form drops it, as the kernel does.
     pub fn new(path: impl Into<PathBuf>) -> Result<Self, RuleError> {
         let path = path.into();
         if !path.is_absolute() {
             return Err(RuleError::RelativePath(path));
+        }
+        if path.as_os_str().as_encoded_bytes().contains(&0) {
+            return Err(RuleError::PathHasNul(path));
         }
         if path
             .components()
@@ -168,7 +177,9 @@ impl RulePath {
         {
             return Err(RuleError::PathNotNormal(path));
         }
-        Ok(Self(path))
+        // `components` drops a repeated `/`, a `.` in the middle and a final
+        // `/`, so the collected path is the normal form.
+        Ok(Self(path.components().collect()))
     }
 
     /// The path.
@@ -379,7 +390,7 @@ impl fmt::Display for DomainWidth {
 
 /// What a rule covers.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Target {
     /// File accesses of one kind within a width.
     File {
@@ -598,6 +609,24 @@ mod tests {
         assert!(matches!(
             "x".repeat(65).parse::<RuleKey>(),
             Err(RuleError::KeyTooLong(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn a_rule_path_has_one_normal_form_and_no_nul() -> TestResult {
+        for (text, normal) in [
+            ("//home//u/x/", "/home/u/x"),
+            ("/home/./u", "/home/u"),
+            ("/", "/"),
+        ] {
+            let p = RulePath::new(text)?;
+            assert_eq!(p.as_path().as_os_str(), normal, "{text}");
+        }
+        assert_eq!(RulePath::new("//a//b/")?, RulePath::new("/a/b")?);
+        assert!(matches!(
+            RulePath::new("/run/x\0y"),
+            Err(RuleError::PathHasNul(_))
         ));
         Ok(())
     }
