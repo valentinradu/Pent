@@ -666,7 +666,7 @@ mod queue {
     use super::*;
 
     /// A client of pentd that speaks lines.
-    struct Client {
+    pub(super) struct Client {
         write: UnixStream,
         read: BufReader<UnixStream>,
     }
@@ -693,7 +693,7 @@ mod queue {
         }
 
         /// A session of `pent run` with the key `key`.
-        fn session(rt: &Runtime, key: &str) -> Result<Self, common::e2e::BoxError> {
+        pub(super) fn session(rt: &Runtime, key: &str) -> Result<Self, common::e2e::BoxError> {
             let mut client = Self::connect(rt)?;
             client.send(Message::Hold(Hold::Run {
                 key: key.parse()?,
@@ -703,7 +703,7 @@ mod queue {
         }
 
         /// Ask `ask` and return the number that pentd gives it.
-        fn ask(&mut self, ask: Ask) -> Result<QuestionId, common::e2e::BoxError> {
+        pub(super) fn ask(&mut self, ask: Ask) -> Result<QuestionId, common::e2e::BoxError> {
             self.send(Message::Ask(ask))?;
             match self.recv()? {
                 Message::Question(q) => Ok(q.id),
@@ -712,7 +712,7 @@ mod queue {
         }
     }
 
-    fn port_ask(port: u16) -> Result<Ask, common::e2e::BoxError> {
+    pub(super) fn port_ask(port: u16) -> Result<Ask, common::e2e::BoxError> {
         let port = NonZeroU16::new(port).ok_or("port 0")?;
         Ok(Ask {
             // pentd replaces these two values.
@@ -1046,6 +1046,180 @@ mod queue {
         let mut client = Client::connect(&rt)?;
         client.send(Message::Answer(answer(id, 0, Scope::Run)))?;
         assert!(matches!(session.recv()?, Message::Verdict(v) if v.id == id));
+        Ok(())
+    }
+}
+
+// ── The notification hook ───────────────────────────────────────────────────
+
+mod notify {
+    use super::queue::{port_ask, Client};
+    use super::*;
+
+    /// A pentd with a global `pent.toml` in `config` (when `command` is
+    /// given) and a marker variable in its environment.
+    struct Hooked {
+        rt: Runtime,
+        home: tempfile::TempDir,
+        out: PathBuf,
+        _pentd: Reap,
+    }
+
+    impl Hooked {
+        /// `command` runs in `sh -c`, with the path prefix of the output
+        /// files as `$0`.
+        fn start(command: Option<&str>) -> Result<Self, common::e2e::BoxError> {
+            let rt = Runtime::new()?;
+            let home = tempfile::tempdir()?;
+            let out = home.path().join("out");
+            std::fs::create_dir(&out)?;
+            let hooked = Self {
+                _pentd: Reap(
+                    rt.pent(&["daemon"])
+                        .env("HOME", home.path())
+                        .env("XDG_CONFIG_HOME", home.path().join("config"))
+                        .env("XDG_STATE_HOME", home.path().join("state"))
+                        .env("PENT_TEST_MARK", "inherited")
+                        .spawn()?,
+                ),
+                rt,
+                out,
+                home,
+            };
+            if let Some(command) = command {
+                hooked.set_command(command)?;
+            }
+            if !hooked.rt.wait_for_socket() {
+                return Err("pentd never listened".into());
+            }
+            Ok(hooked)
+        }
+
+        /// Write the global `pent.toml` with `command`.
+        fn set_command(&self, command: &str) -> TestResult {
+            let dir = self.home.path().join("config/pent");
+            std::fs::create_dir_all(&dir)?;
+            let prefix = self.out.join("run");
+            let toml = format!(
+                "[notify]\ncommand = [\"sh\", \"-c\", {}, {}]\n",
+                toml_string(command),
+                toml_string(&prefix.display().to_string())
+            );
+            std::fs::write(dir.join("pent.toml"), toml)?;
+            Ok(())
+        }
+
+        /// The environment of each run so far, in the order of the runs.
+        fn runs(&self) -> Result<Vec<String>, common::e2e::BoxError> {
+            let mut files: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(&self.out)?
+                .filter_map(Result::ok)
+                .map(|e| (e.metadata().and_then(|m| m.modified()), e.path()))
+                .filter_map(|(t, p)| t.ok().map(|t| (t, p)))
+                .collect();
+            files.sort();
+            files
+                .iter()
+                .map(|(_, p)| Ok(std::fs::read_to_string(p)?))
+                .collect()
+        }
+
+        /// Wait until there are `n` runs, then a while more, so a run too
+        /// many shows.
+        fn wait_runs(&self, n: usize) -> Result<Vec<String>, common::e2e::BoxError> {
+            let deadline = Instant::now() + WAIT;
+            while self.runs()?.len() < n {
+                if Instant::now() >= deadline {
+                    return Err(format!("only {} runs of the hook", self.runs()?.len()).into());
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            std::thread::sleep(Duration::from_millis(1500));
+            self.runs()
+        }
+    }
+
+    /// A TOML basic string.
+    fn toml_string(text: &str) -> String {
+        format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
+    }
+
+    /// The value of `PENT_PENDING` in the environment of one run.
+    fn pending(env: &str) -> Option<&str> {
+        env.lines().find_map(|l| l.strip_prefix("PENT_PENDING="))
+    }
+
+    /// The hook writes its environment, one file for each run.
+    const WRITE_ENV: &str = "env > \"$0.$$\"";
+
+    #[test]
+    fn one_burst_gives_one_run_with_the_number_of_open_questions() -> TestResult {
+        let hooked = Hooked::start(Some(WRITE_ENV))?;
+        let mut session = Client::session(&hooked.rt, "cargo")?;
+        for port in [5432, 5433, 5434] {
+            session.ask(port_ask(port)?)?;
+        }
+        let runs = hooked.wait_runs(1)?;
+        assert_eq!(runs.len(), 1, "{} runs", runs.len());
+        assert_eq!(pending(&runs[0]), Some("3"));
+        // The hook gets the environment of pentd.
+        assert!(runs[0].lines().any(|l| l == "PENT_TEST_MARK=inherited"));
+
+        // The same access again is no new question: no run.
+        session.ask(port_ask(5432)?)?;
+        std::thread::sleep(Duration::from_millis(1500));
+        assert_eq!(hooked.runs()?.len(), 1);
+
+        // A new question later is a new burst.
+        session.ask(port_ask(80)?)?;
+        let runs = hooked.wait_runs(2)?;
+        assert_eq!(runs.len(), 2, "{} runs", runs.len());
+        assert_eq!(pending(&runs[1]), Some("4"));
+        Ok(())
+    }
+
+    #[test]
+    fn questions_during_a_run_give_one_more_run_after_it() -> TestResult {
+        // The hook takes one second.
+        let hooked = Hooked::start(Some("env > \"$0.$$\"; sleep 1"))?;
+        let mut session = Client::session(&hooked.rt, "cargo")?;
+        session.ask(port_ask(1)?)?;
+        // Wait until the first run started, then ask during it.
+        let deadline = Instant::now() + WAIT;
+        while hooked.runs()?.is_empty() {
+            assert!(Instant::now() < deadline, "no first run");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        session.ask(port_ask(2)?)?;
+        session.ask(port_ask(3)?)?;
+        let runs = hooked.wait_runs(2)?;
+        assert_eq!(runs.len(), 2, "{} runs", runs.len());
+        assert_eq!(pending(&runs[0]), Some("1"));
+        assert_eq!(pending(&runs[1]), Some("3"));
+        Ok(())
+    }
+
+    #[test]
+    fn no_command_gives_no_run_and_a_new_command_applies_at_once() -> TestResult {
+        let hooked = Hooked::start(None)?;
+        let mut session = Client::session(&hooked.rt, "cargo")?;
+        session.ask(port_ask(1)?)?;
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(hooked.runs()?.is_empty());
+
+        // A broken file gives no run, and pentd goes on.
+        let dir = hooked.home.path().join("config/pent");
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join("pent.toml"), "[notify]\ncommand = []\n")?;
+        session.ask(port_ask(2)?)?;
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(hooked.runs()?.is_empty());
+
+        // pentd reads the settings at each burst: no restart.
+        hooked.set_command(WRITE_ENV)?;
+        session.ask(port_ask(3)?)?;
+        let runs = hooked.wait_runs(1)?;
+        assert_eq!(runs.len(), 1, "{} runs", runs.len());
+        assert_eq!(pending(&runs[0]), Some("3"));
         Ok(())
     }
 }

@@ -23,6 +23,11 @@ const STARTER: &str = "\
 # tcp_idle_timeout_secs = 300
 # private_destinations = \"deny\"
 
+# The command that pentd runs when new questions come, with no shell. It
+# gets the number of open questions in PENT_PENDING.
+# [notify]
+# command = [\"sh\", \"-c\", \"notify-send pent \\\"$PENT_PENDING questions wait\\\"\"]
+
 # Linux only: more mount points in the sandbox.
 # [[sandbox.mounts]]
 # path = \"/opt/tools\"

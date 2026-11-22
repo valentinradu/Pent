@@ -53,6 +53,9 @@ makes one mutation by hand. The test must fail on the mutant. No
 | 2.2 | A sensitive question takes a wide entry of its menu. | `a_sensitive_question_takes_only_its_exact_target_whatever_its_menu` |
 | 2.2 | The client keeps the replies of expired questions. | `the_replies_of_expired_questions_go` |
 | 2.2 | An ask that the client cannot encode counts as a lost connection. | `an_ask_that_cannot_be_one_line_fails_alone` |
+| 2.3 | A new question gives no signal to the hook. | the three tests of `notify::` in `tests/pentd.rs` |
+| 2.3 | The questions of the window do not belong to its run. | `one_burst_gives_one_run_with_the_number_of_open_questions` |
+| 2.3 | The hook has no window. | `one_burst_gives_one_run_with_the_number_of_open_questions` |
 
 The first form of `pent_run_starts_pentd_and_holds_it_for_the_run` passed on
 the mutant: the client started a new pentd each time that it lost one. The
@@ -62,7 +65,11 @@ its mutant: the mutant pentd served, and the test waited for its end. The
 test now has a time limit and fails with a message. The first form of
 `a_watcher_that_closes_its_side_gets_the_end_of_the_connection` passed on its
 mutant after 5 s, because the drain limit of the writer ended the
-connection. The test now asks for the end within 2 s.
+connection. The test now asks for the end within 2 s. The first form of the
+hook (step 2.3) used `Notify`, which keeps one signal: the questions of the
+collection window left a signal, and one burst gave two runs.
+`one_burst_gives_one_run_with_the_number_of_open_questions` found it; the
+hook now counts the questions with a `watch` channel.
 
 ## How to repeat the run
 

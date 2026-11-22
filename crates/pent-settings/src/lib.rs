@@ -391,6 +391,62 @@ pub struct ProxySettings {
     pub private_destinations: Option<PrivateDestinations>,
 }
 
+/// TOML `[notify]` section: the hook that pentd runs when new questions
+/// come.
+///
+/// Only the global `pent.toml` can set it: the hook runs outside the
+/// sandbox, and pent has no settings file in a workspace.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotifySettings {
+    /// The program and its arguments. pentd runs it with no shell, and with
+    /// the number of open questions in `PENT_PENDING`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<NotifyCommand>,
+}
+
+/// The command of the notification hook is empty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("the notify command is empty; give the program as the first element")]
+pub struct EmptyNotifyCommand;
+
+/// A command for the notification hook: a program and its arguments, with
+/// a program that is not empty.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "Vec<String>", into = "Vec<String>")]
+pub struct NotifyCommand(Vec<String>);
+
+impl NotifyCommand {
+    /// The program.
+    #[must_use]
+    pub fn program(&self) -> &str {
+        self.0.first().map_or("", String::as_str)
+    }
+
+    /// The arguments after the program.
+    #[must_use]
+    pub fn args(&self) -> &[String] {
+        self.0.get(1..).unwrap_or_default()
+    }
+}
+
+impl TryFrom<Vec<String>> for NotifyCommand {
+    type Error = EmptyNotifyCommand;
+
+    fn try_from(parts: Vec<String>) -> Result<Self, Self::Error> {
+        if parts.first().is_none_or(String::is_empty) {
+            return Err(EmptyNotifyCommand);
+        }
+        Ok(Self(parts))
+    }
+}
+
+impl From<NotifyCommand> for Vec<String> {
+    fn from(command: NotifyCommand) -> Self {
+        command.0
+    }
+}
+
 /// The keys that older versions of pent used, and where each setting went.
 ///
 /// Each entry is `(table, key, message)`. An empty table is the top level.
@@ -447,6 +503,10 @@ pub struct PentConfig {
     /// Proxy configuration.
     #[serde(default)]
     pub proxy: ProxySettings,
+
+    /// The notification hook of pentd.
+    #[serde(default)]
+    pub notify: NotifySettings,
 }
 
 impl PentConfig {
@@ -551,6 +611,26 @@ fn dedup_preserve_order(v: &mut Vec<String>) {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+
+    #[test]
+    fn the_notify_command_is_a_program_and_its_arguments() {
+        let config = PentConfig::parse(
+            "[notify]\ncommand = [\"notify-send\", \"pent\", \"$PENT_PENDING\"]\n",
+        )
+        .unwrap();
+        let command = config.notify.command.unwrap();
+        assert_eq!(command.program(), "notify-send");
+        assert_eq!(command.args(), ["pent", "$PENT_PENDING"]);
+        assert!(PentConfig::parse("").unwrap().notify.command.is_none());
+        for bad in [
+            "[notify]\ncommand = []\n",
+            "[notify]\ncommand = [\"\"]\n",
+            "[notify]\ncommand = \"notify-send\"\n",
+            "[notify]\ncmd = [\"x\"]\n",
+        ] {
+            assert!(PentConfig::parse(bad).is_err(), "{bad}");
+        }
+    }
     use super::*;
 
     #[test]

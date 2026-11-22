@@ -1,6 +1,6 @@
 # Plan: the new pent
 
-**Cursor: step 2.3.** Steps with `[x]` are done. Work on the branch `next`,
+**Cursor: step 2.4.** Steps with `[x]` are done. Work on the branch `next`,
 one commit for each step, and move this cursor when a step is done.
 
 This plan builds the design in `docs/design/pent.md`. Each step names its
@@ -82,9 +82,11 @@ ready for users.
     `Verdict`, `Watch` and `Rejected` in the protocol.
   - Done: tests for each deadline, for the grouping and for a late answer;
     QU-1 to QU-10 in `docs/security/pentd.md`.
-- [ ] **2.3 The notification hook.** pentd runs `[notify] command` with
+- [x] **2.3 The notification hook.** pentd runs `[notify] command` with
   `PENT_PENDING`, one time for each burst of questions.
-  - Done: a test with a command that writes its environment to a file.
+  - Files: `pent/src/daemon/notify.rs`; `[notify]` in `pent-settings`.
+  - Done: a test with a command that writes its environment to a file;
+    NH-1 to NH-4 in `docs/security/pentd.md`.
 - [ ] **2.4 The CLI clients.** `pent allow ID`, `pent deny ID`,
   `pent denials [SESSION]`, `pent rules list`, `pent rules show KEY` and
   `pent rules forget KEY [RULE]`.

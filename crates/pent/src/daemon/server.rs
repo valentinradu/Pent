@@ -315,6 +315,7 @@ async fn accept_loop(
         }
     };
     let hub = Hub::new(rules);
+    let _notifier = NotifyTask(tokio::spawn(super::notify::run(Arc::clone(&hub))));
     let mut changes = hub.subscribe();
     let own_uid = pent_settings::current_uid();
     let mut idle_since = (!holds_itself).then(tokio::time::Instant::now);
@@ -351,6 +352,15 @@ async fn accept_loop(
             _ = term.recv() => return Ok(()),
             _ = int.recv() => return Ok(()),
         }
+    }
+}
+
+/// The task of the notification hook. It stops when pentd stops.
+struct NotifyTask(tokio::task::JoinHandle<()>);
+
+impl Drop for NotifyTask {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 

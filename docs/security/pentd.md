@@ -1,9 +1,9 @@
 # pentd
 
-Status: the branch `next`, steps 2.1 and 2.2 of `PLAN.md` (2026-11-22).
+Status: the branch `next`, steps 2.1 to 2.3 of `PLAN.md` (2026-11-22).
 This report lists the security properties of the daemon, its socket, its
-lock and its queue, the test of each property, and the properties that
-later steps must add.
+lock, its queue and its notification hook, the test of each property, and
+the properties that later steps must add.
 
 pentd has the queue of questions, and it writes the rules. `pent run`
 holds pentd for the whole run and starts it when no pentd runs, but it asks
@@ -12,8 +12,10 @@ no question yet (phase 3). A failure of pentd does not stop a run.
 ## Scope
 
 - `crates/pent/src/daemon/`: the server (`server.rs`), the shared state
-  and the roles (`hub.rs`), the queue (`queue.rs`), the session of
-  `pent run` (`client.rs`) and the line reader (`mod.rs`).
+  and the roles (`hub.rs`), the queue (`queue.rs`), the notification hook
+  (`notify.rs`), the session of `pent run` (`client.rs`) and the line reader
+  (`mod.rs`).
+- `[notify]` in `crates/pent-settings/src/lib.rs` (`NotifySettings`).
 - `crates/pent-settings/src/runtime.rs`: the runtime directory.
 - `packaging/systemd/pentd.socket` and `pentd.service`.
 
@@ -29,6 +31,8 @@ pentd will decide what each sandboxed program can do. Thus:
   not remove a file that is not its own socket.
 - A client with a bug, or a process of the user, must not make pentd use
   memory without a limit or stop.
+- The notification hook runs a command outside the sandbox. Only the user
+  may choose it.
 - An answer must not be wider than its question, must not resolve a
   sensitive question that it did not name, and must not come from `pent run`
   itself.
@@ -80,6 +84,15 @@ soon after the last hold.
 | QU-11 | The order of the numbers stays true. pentd sends one number or one refusal for each ask, in order. A question that is too long for one line (pentd adds the number and the key) gets `too_long`, and pentd does not queue it. An ask that the client cannot encode fails alone, and the connection stays. | `a_question_too_long_for_one_line_is_refused_and_the_numbers_stay_true`, `client::tests::an_ask_that_cannot_be_one_line_fails_alone`, `a_refusal_with_a_number_does_not_take_the_place_of_a_number` |
 | QU-12 | Each connection has an outbox of 256 messages. pentd closes a client that does not read, so it does not grow without a limit and never drops a message in silence. A watcher that closes its side gets the end of the connection. | `pentd_closes_a_watcher_that_does_not_read`, `a_watcher_that_closes_its_side_gets_the_end_of_the_connection` |
 | QU-13 | The client forgets the replies of the questions whose deadline passed, so a long run with many unanswered questions does not grow. | `client::tests::the_replies_of_expired_questions_go` |
+
+## The notification hook
+
+| ID | Property | Test |
+|---|---|---|
+| NH-1 | Only `[notify] command` of the global `pent.toml` sets the hook. Pent has no settings file in a workspace, so the program cannot choose a command that runs outside the sandbox. The command is a program and its arguments, with no shell, and the program cannot be empty. | `tests::the_notify_command_is_a_program_and_its_arguments` (in `pent-settings`) |
+| NH-2 | One burst of new questions gives one run, after a window of 500 ms, with the number of open questions in `PENT_PENDING` and the environment of pentd. The same access asked again is no new question. | `one_burst_gives_one_run_with_the_number_of_open_questions` |
+| NH-3 | pentd does not start the command again while it runs. A question that comes meanwhile gives one more run after it. A command that does not end blocks the next run for at most 5 minutes; pentd does not stop it. | `questions_during_a_run_give_one_more_run_after_it` |
+| NH-4 | Without a command, or with a settings file that is not valid, pentd runs nothing and goes on. pentd reads the settings at each burst, so a new command applies without a restart. | `no_command_gives_no_run_and_a_new_command_applies_at_once` |
 
 ## The limits
 

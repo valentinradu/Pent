@@ -108,6 +108,8 @@ pub(crate) struct Hub {
     /// One answer at a time from the queue to the rule file, so the file
     /// gets the answers in the order of the queue.
     writes: tokio::sync::Mutex<()>,
+    /// The count of new questions, for the notification hook.
+    new_questions: watch::Sender<u64>,
 }
 
 /// The role of one connection.
@@ -172,6 +174,7 @@ impl Hub {
             activity: watch::Sender::new(Activity::default()),
             rules,
             writes: tokio::sync::Mutex::new(()),
+            new_questions: watch::Sender::new(0),
         })
     }
 
@@ -233,6 +236,7 @@ impl Hub {
                 send(outbox, message.clone());
                 if new {
                     broadcast(&mut state.watchers, &message);
+                    self.new_questions.send_modify(|n| *n = n.wrapping_add(1));
                 }
                 self.publish(&state);
             }
@@ -361,6 +365,17 @@ impl Hub {
             state.queue.end_session(id, std::time::Instant::now());
         }
         self.publish(&state);
+    }
+
+    /// Watch the count of new questions. The receiver sees a change for
+    /// each question since its last look.
+    pub(crate) fn watch_new_questions(&self) -> watch::Receiver<u64> {
+        self.new_questions.subscribe()
+    }
+
+    /// The number of open questions.
+    pub(crate) fn open_questions(&self) -> usize {
+        self.lock().queue.len()
     }
 
     /// Drop the orphans that are too old.

@@ -12,6 +12,7 @@
 
 pub(crate) mod client;
 pub(crate) mod hub;
+pub(crate) mod notify;
 pub(crate) mod queue;
 pub(crate) mod server;
 
