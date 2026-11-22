@@ -13,7 +13,7 @@ ready for users.
 
 ## Phase 1: the rules and the protocol
 
-- [ ] **1.1 The rule model.** A `Rule` has a kind (list, read, write, exec,
+- [x] **1.1 The rule model.** A `Rule` has a kind (list, read, write, exec,
   domain, Unix socket, localhost port), a width, a decision (allow or deny),
   a source (human or model) and a date. A `Key` is the file name of the root
   program. A function answers "does a rule of this key cover this access?".

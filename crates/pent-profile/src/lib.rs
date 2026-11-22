@@ -12,6 +12,8 @@
 //! - [`review`](mod@review): the interactive review at the end of watch mode.
 //! - [`render`]: the text of the summary, the draft file and a profile.
 //! - [`psl`]: a compact subset of the public suffix list.
+//! - [`rule`]: the rules, the answers that pent keeps for the next run (see
+//!   `docs/design/pent.md`).
 //!
 //! See `docs/design/watch.md` for the full design.
 
@@ -23,6 +25,7 @@ pub mod name;
 pub mod psl;
 pub mod render;
 pub mod review;
+pub mod rule;
 pub mod summary;
 
 pub use doc::{DocError, FilesystemRules, NetworkRules, ProfileDoc};
@@ -37,6 +40,10 @@ pub use render::{
     DraftSource, Reasons, Warnings, WatchHeader,
 };
 pub use review::{review, Selection};
+pub use rule::{
+    Access, Decision, DomainName, DomainWidth, FileKind, PathWidth, Rule, RuleError, RuleKey,
+    RulePath, RuleSet, Source, Target,
+};
 pub use summary::{
     summarize, FsAccess, Grant, Item, ItemNote, Section, Stats, Summary, SummaryContext,
 };
