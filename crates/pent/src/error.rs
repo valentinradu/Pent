@@ -22,5 +22,8 @@ pub(crate) enum CliError {
     Io(#[from] std::io::Error),
 
     #[error("{0}")]
+    Daemon(#[from] crate::daemon::DaemonError),
+
+    #[error("{0}")]
     Other(String),
 }

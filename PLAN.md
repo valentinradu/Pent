@@ -1,6 +1,6 @@
 # Plan: the new pent
 
-**Cursor: step 2.1.** Steps with `[x]` are done. Work on the branch `next`,
+**Cursor: step 2.2.** Steps with `[x]` are done. Work on the branch `next`,
 one commit for each step, and move this cursor when a step is done.
 
 This plan builds the design in `docs/design/pent.md`. Each step names its
@@ -62,14 +62,17 @@ ready for users.
 
 ## Phase 2: pentd and its clients
 
-- [ ] **2.1 pentd.** One instance for each user (`flock` on
+- [x] **2.1 pentd.** One instance for each user (`flock` on
   `$XDG_RUNTIME_DIR/pent/pentd.lock`). `pentd.sock` with mode `0600` and a
   check of `SO_PEERCRED`. A hold is a live connection. pentd stops a few
   seconds after the last hold. `pent daemon` runs it in the foreground.
   `pent run` starts it when it does not run. A systemd user unit with
   socket activation (`LISTEN_FDS`) goes into `packaging/`.
+  - Files: `pent/src/daemon/`, `pent-settings/src/runtime.rs`,
+    `packaging/systemd/`. The runtime directory falls back to
+    `/tmp/pent-<uid>` without `XDG_RUNTIME_DIR`.
   - Done: tests for the three ways to start, for two starts at the same
-    time, and for a crash of a holder.
+    time, and for a crash of a holder; `docs/security/pentd.md`.
 - [ ] **2.2 The queue.** A question waits for an answer, for its deadline
   (file, Unix socket and port 120 s; proxy 20 s; DNS about 4 s), or for the
   end of its session. Questions inside one width share one answer. pentd is

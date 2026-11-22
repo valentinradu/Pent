@@ -1,0 +1,20 @@
+# The socket of pentd for the systemd user manager.
+#
+# systemd makes the socket, and the first connection starts pentd.service.
+# pentd takes the socket from LISTEN_FDS and holds itself, so it does not
+# stop after the last `pent run`. Without this unit, `pent run` starts
+# pentd when no pentd runs.
+#
+#   systemctl --user enable --now pentd.socket
+
+[Unit]
+Description=pent decision daemon (socket)
+Documentation=man:pent-daemon(1)
+
+[Socket]
+ListenStream=%t/pent/pentd.sock
+SocketMode=0600
+DirectoryMode=0700
+
+[Install]
+WantedBy=sockets.target

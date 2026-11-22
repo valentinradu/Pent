@@ -23,10 +23,12 @@
 //! ```
 
 mod loader;
+mod runtime;
 mod store;
 mod trust;
 
 pub use loader::ConfigLoader;
+pub use runtime::{RuntimeDir, RuntimeDirError};
 pub use store::{
     open_log_nofollow, EventLog, LoadedProfile, LogOpen, PentDirs, ProfileEntry, ProfileStatus,
     ProfileStore, RuleStore, StoreError, WatchLock, WatchRunMode,

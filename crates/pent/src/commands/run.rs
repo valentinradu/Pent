@@ -36,6 +36,29 @@ enum RunEvent {
 // The function is long because it lists the steps of one run in order. To
 // split it would hide this order.
 #[allow(clippy::too_many_lines)]
+/// Hold pentd for this run, and start it when no pentd runs.
+///
+/// pentd answers no question yet (step 2.2 of PLAN.md), so a failure does
+/// not stop the run. The design asks the same: without pentd, the rules
+/// still apply (`docs/design/pent.md`, section 2).
+async fn hold_pentd(command: &[String]) -> Option<crate::daemon::client::HoldHandle> {
+    let key = command
+        .first()
+        .and_then(|c| pent_profile::RuleKey::from_command(c).ok())?;
+    let hold = pent_profile::Hold::Run {
+        key,
+        command: command.to_vec(),
+    };
+    let runtime = pent_settings::RuntimeDir::from_env();
+    match crate::daemon::client::hold(&runtime, hold).await {
+        Ok(handle) => Some(handle),
+        Err(e) => {
+            tracing::debug!("pent runs without pentd: {e}");
+            None
+        }
+    }
+}
+
 pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
     // ── Profile ──────────────────────────────────────────────────────────────
     let selected = select_profile(args.profile.as_deref(), &args.command)?;
@@ -45,6 +68,7 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
     let store = ProfileStore::open_default()?;
     let profile = load_trusted(&store, &selected, &args.command)?;
     let name = selected.name;
+    let _pentd = hold_pentd(&args.command).await;
     let settings = ConfigLoader::load(&cwd, pent_settings::PentDirs::from_env().as_ref())?;
 
     let mut paths = profile_paths(&profile);

@@ -3,6 +3,7 @@ compile_error!("pent runs on Linux only");
 
 mod cli;
 mod commands;
+mod daemon;
 mod error;
 mod ui;
 
@@ -36,6 +37,7 @@ async fn dispatch(cli: Cli) -> Result<(), CliError> {
         Command::Profile(args) => commands::trust::profile(&args),
         Command::Check => commands::check::check(cwd).await,
         Command::Config(args) => commands::config::config(args, &cwd),
+        Command::Daemon(args) => daemon::daemon(&args).await,
     }
 }
 

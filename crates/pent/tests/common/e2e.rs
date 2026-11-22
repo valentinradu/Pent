@@ -278,7 +278,10 @@ impl TestEnv {
             .current_dir(&self.ws)
             .env("HOME", &self.home)
             .env("XDG_CONFIG_HOME", self.config_dir())
-            .env("XDG_STATE_HOME", self.state_dir());
+            .env("XDG_STATE_HOME", self.state_dir())
+            // `pent run` starts pentd when no pentd runs. A short linger
+            // makes that pentd stop soon after the test.
+            .env("PENTD_LINGER_MS", "200");
         cmd
     }
 

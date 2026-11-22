@@ -16,7 +16,7 @@ License: MIT.
 ## Crates
 
 ```
-pent          the CLI: run, watch, trust, profile, config, check
+pent          the CLI: run, watch, trust, profile, config, check, daemon (pentd)
 pent-profile  watch events, profile files, the guard list, summary, review, psl
 pent-settings pent.toml (PentConfig), the profile store, the trust store
 pent-sandbox  namespaces, Landlock, overlayfs, the seccomp supervisor

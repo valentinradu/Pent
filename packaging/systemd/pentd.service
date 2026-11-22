@@ -1,0 +1,9 @@
+# pentd for the systemd user manager. pentd.socket starts it.
+
+[Unit]
+Description=pent decision daemon
+Documentation=man:pent-daemon(1)
+Requires=pentd.socket
+
+[Service]
+ExecStart=/usr/bin/pent daemon

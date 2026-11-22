@@ -60,10 +60,11 @@ cargo +nightly fuzz run protocol_line -- -max_total_time=150 -rss_limit_mb=4096
 
 ## The properties that later steps add
 
+Step 2.1 added the mode of `pentd.sock`, the check of `SO_PEERCRED` and the
+limit of the reader. [pentd.md](pentd.md) has them (PD-2, PD-3, PD-8).
+
 | Step | Property |
 |---|---|
-| 2.1 | `pentd.sock` has the mode `0600`, and pentd checks the user ID of each client with `SO_PEERCRED`. |
-| 2.1 | A reader stops at 64 KiB without a newline, so a client cannot make pentd buffer without a limit. |
 | 2.2 | pentd checks the `MenuIndex` of an answer against the menu that pentd made, and it makes the menu itself. A client cannot name its own target. |
 | 2.2 | An answer for a sensitive question comes only from the human. |
 | 6.1 | `agent.sock` has its own messages, and none of them can allow. |

@@ -35,6 +35,16 @@ pub(crate) enum Command {
     Check,
     /// Manage the global settings (pent.toml)
     Config(ConfigArgs),
+    /// Run pentd, the daemon that holds the questions, in the foreground
+    Daemon(DaemonArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct DaemonArgs {
+    /// Started by `pent run`: stop a few seconds after the last hold, and
+    /// stop in silence when another pentd runs
+    #[arg(long, hide = true)]
+    pub spawned: bool,
 }
 
 #[derive(Args)]

@@ -27,6 +27,22 @@ This document records two runs:
   files that the first run did not reach: 385 mutants. See "The second
   run" below.
 
+## The branch `next`: the checks by hand
+
+Each step of `PLAN.md` that adds a test of a race or of a lifetime also
+makes one mutation by hand. The test must fail on the mutant. No
+`cargo-mutants` run covers the new code yet.
+
+| Step | Mutation | The test that fails |
+|---|---|---|
+| 1.2 | `RuleStore::lock` takes no lock. | `store::tests::rules::parallel_updates_lose_no_rule` |
+| 2.1 | pentd does not count a hold. | `a_spawned_pentd_stops_after_the_last_hold`, `a_crash_of_a_holder_ends_its_hold`, `two_spawned_starts_give_one_server_and_the_second_stops_in_silence`, `pent_run_starts_pentd_and_holds_it_for_the_run` |
+| 2.1 | pentd removes the socket at its path when it stops, also when the socket is not its own. | `pentd_does_not_remove_a_socket_that_another_process_put_at_its_path` |
+
+The first form of `pent_run_starts_pentd_and_holds_it_for_the_run` passed on
+the mutant: the client started a new pentd each time that it lost one. The
+test now compares the PID in the lock file during the run.
+
 ## How to repeat the run
 
 `cargo-mutants` needs no setting in the repository. It runs the tests of
