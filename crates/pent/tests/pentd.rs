@@ -833,6 +833,10 @@ mod queue {
         let r = rejected(&mut session, Message::Answer(answer(id, 0, Scope::Run)))?;
         assert_eq!(r.reason, RejectReason::NotPermitted);
 
+        // A session cannot watch the questions of other runs.
+        let r = rejected(&mut session, Message::Watch)?;
+        assert_eq!(r.reason, RejectReason::NotPermitted);
+
         let mut client = Client::connect(&rt)?;
         let r = rejected(&mut client, Message::Ask(port_ask(80)?))?;
         assert_eq!(r.reason, RejectReason::NotPermitted);
@@ -919,6 +923,129 @@ mod queue {
         // With no hold and no open question, pentd stops.
         let status = wait_exit(&mut pentd.0, WAIT)?;
         assert!(status.is_some_and(|s| s.success()), "{status:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_question_too_long_for_one_line_is_refused_and_the_numbers_stay_true() -> TestResult {
+        let rt = Runtime::new()?;
+        let state = tempfile::tempdir()?;
+        let _pentd = pentd(&rt, state.path(), &["daemon"])?;
+        assert!(rt.wait_for_socket());
+        // The longest key: pentd puts it in the question.
+        let mut session = Client::session(&rt, &"k".repeat(64))?;
+
+        // An ask just below the limit: its question is longer, because
+        // pentd adds the number and the key.
+        let mut long = port_ask(5432)?;
+        long.key = "x".parse()?;
+        let base = Message::Ask(long.clone()).encode_line()?.len();
+        long.program = "a".repeat(pent_profile::MAX_LINE_LEN - 10 - base);
+        assert!(Message::Ask(long.clone()).encode_line().is_ok());
+        session.send(Message::Ask(long))?;
+        match session.recv()? {
+            Message::Rejected(r) => {
+                assert_eq!(r.id, None);
+                assert_eq!(r.reason, RejectReason::TooLong);
+            }
+            other => return Err(format!("{other:?}").into()),
+        }
+        // The next ask gets its own number, and its answer reaches it.
+        let id = session.ask(port_ask(80)?)?;
+        let mut client = Client::connect(&rt)?;
+        client.send(Message::Answer(answer(id, 0, Scope::Run)))?;
+        assert!(matches!(session.recv()?, Message::Verdict(v) if v.id == id));
+        Ok(())
+    }
+
+    #[test]
+    fn a_rule_that_pentd_cannot_write_gives_a_verdict_for_this_run_and_an_error() -> TestResult {
+        let rt = Runtime::new()?;
+        let state = tempfile::tempdir()?;
+        // The user broke the rule file by hand.
+        let rules = state.path().join("pent/rules");
+        std::fs::create_dir_all(&rules)?;
+        std::fs::write(rules.join("cargo.toml"), "this is not toml [")?;
+        let _pentd = pentd(&rt, state.path(), &["daemon"])?;
+        assert!(rt.wait_for_socket());
+        let mut session = Client::session(&rt, "cargo")?;
+        let id = session.ask(port_ask(5432)?)?;
+        let mut client = Client::connect(&rt)?;
+        client.send(Message::Answer(answer(id, 0, Scope::Remember)))?;
+        match client.recv()? {
+            Message::Verdict(v) => assert_eq!(v.scope, Scope::Run),
+            other => return Err(format!("{other:?}").into()),
+        }
+        match client.recv()? {
+            Message::Rejected(r) => {
+                assert_eq!(r.id, Some(id));
+                assert_eq!(r.reason, RejectReason::RuleNotKept);
+            }
+            other => return Err(format!("{other:?}").into()),
+        }
+        match session.recv()? {
+            Message::Verdict(v) => assert_eq!(v.scope, Scope::Run),
+            other => return Err(format!("{other:?}").into()),
+        }
+        assert_eq!(
+            std::fs::read_to_string(rules.join("cargo.toml"))?,
+            "this is not toml ["
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_watcher_that_closes_its_side_gets_the_end_of_the_connection() -> TestResult {
+        let rt = Runtime::new()?;
+        let state = tempfile::tempdir()?;
+        let _pentd = pentd(&rt, state.path(), &["daemon"])?;
+        assert!(rt.wait_for_socket());
+        let mut watcher = Client::connect(&rt)?;
+        watcher.send(Message::Watch)?;
+        watcher.write.shutdown(std::net::Shutdown::Write)?;
+        // At once, not after the drain limit of the writer (5 s): the end of
+        // the connection removes the watcher, so the writer ends.
+        watcher
+            .write
+            .set_read_timeout(Some(Duration::from_secs(2)))?;
+        let mut line = String::new();
+        let n = watcher.read.read_line(&mut line)?;
+        assert_eq!(n, 0, "pentd must end the connection: {line}");
+        Ok(())
+    }
+
+    #[test]
+    fn pentd_closes_a_watcher_that_does_not_read() -> TestResult {
+        let rt = Runtime::new()?;
+        let state = tempfile::tempdir()?;
+        let _pentd = pentd(&rt, state.path(), &["daemon"])?;
+        assert!(rt.wait_for_socket());
+        let mut watcher = Client::connect(&rt)?;
+        watcher.send(Message::Watch)?;
+        let mut session = Client::session(&rt, "cargo")?;
+        // Far more questions than the buffers of the socket and the outbox
+        // hold. The watcher reads nothing meanwhile.
+        for port in 1..=6000_u16 {
+            session.ask(port_ask(port)?)?;
+        }
+        // pentd closed the watcher: a read of all that waits ends with the
+        // end of the connection, not with the time limit.
+        let mut seen = 0_usize;
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match watcher.read.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => seen += 1,
+                Err(e) => return Err(format!("no end after {seen} lines: {e}").into()),
+            }
+        }
+        assert!(seen < 6000, "pentd sent all {seen} lines");
+        // The session still works.
+        let id = session.ask(port_ask(6001)?)?;
+        let mut client = Client::connect(&rt)?;
+        client.send(Message::Answer(answer(id, 0, Scope::Run)))?;
+        assert!(matches!(session.recv()?, Message::Verdict(v) if v.id == id));
         Ok(())
     }
 }

@@ -19,7 +19,6 @@ use std::time::Duration;
 use pent_profile::{Ask, Hold, Message, QuestionId, Verdict};
 use pent_settings::RuntimeDir;
 use tokio::io::{AsyncWriteExt as _, BufReader};
-use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::UnixStream;
 use tokio::sync::{mpsc, oneshot};
 
@@ -150,6 +149,16 @@ impl Waiting {
         }
     }
 
+    /// Forget each numbered question whose callers are gone: their deadline
+    /// passed. Thus a long run with many unanswered questions does not
+    /// grow. The unnumbered replies stay, because their order matters.
+    fn forget_gone(&mut self) {
+        self.numbered.retain(|_, replies| {
+            replies.retain(|reply| !reply.is_closed());
+            !replies.is_empty()
+        });
+    }
+
     /// Handle one message of pentd.
     fn take(&mut self, message: Message) {
         match message {
@@ -157,14 +166,16 @@ impl Waiting {
                 if let Some(reply) = self.unnumbered.pop_front() {
                     self.numbered.entry(question.id).or_default().push(reply);
                 }
+                self.forget_gone();
             }
             Message::Verdict(verdict) => {
                 for reply in self.numbered.remove(&verdict.id).unwrap_or_default() {
                     let _ = reply.send(Some(verdict.clone()));
                 }
             }
-            // pentd refused an ask in place of a number.
-            Message::Rejected(_) => {
+            // pentd refused an ask in place of a number. A refusal with a
+            // number is for an answer, and a session does not answer.
+            Message::Rejected(rejected) if rejected.id.is_none() => {
                 if let Some(reply) = self.unnumbered.pop_front() {
                     let _ = reply.send(None);
                 }
@@ -240,8 +251,18 @@ async fn serve(stream: UnixStream, commands: &mut mpsc::UnboundedReceiver<Comman
             command = commands.recv() => match command {
                 None => break Served::SessionGone,
                 Some(Command::Ask(ask, reply)) => {
+                    // An ask that cannot be one line fails alone: it is no
+                    // reason to fail the other questions of the run.
+                    let line = match Message::Ask(*ask).encode_line() {
+                        Ok(line) => line,
+                        Err(e) => {
+                            tracing::debug!("the session cannot send a question: {e}");
+                            let _ = reply.send(None);
+                            continue;
+                        }
+                    };
                     waiting.unnumbered.push_back(reply);
-                    if send_ask(&mut write, *ask).await.is_err() {
+                    if write.write_all(line.as_bytes()).await.is_err() {
                         break Served::Lost;
                     }
                 }
@@ -255,14 +276,6 @@ async fn serve(stream: UnixStream, commands: &mut mpsc::UnboundedReceiver<Comman
     reader.abort();
     waiting.fail_all();
     result
-}
-
-/// Write one ask.
-async fn send_ask(write: &mut OwnedWriteHalf, ask: Ask) -> std::io::Result<()> {
-    let line = Message::Ask(ask)
-        .encode_line()
-        .map_err(std::io::Error::other)?;
-    write.write_all(line.as_bytes()).await
 }
 
 /// Connect and send the hold. When no pentd answers, start one and try
@@ -466,6 +479,57 @@ mod tests {
         server.await.unwrap();
         // A later question gets the refusal too, at once.
         assert_eq!(session.ask(ask(FILE_DEADLINE)).await, Outcome::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn an_ask_that_cannot_be_one_line_fails_alone() {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        tokio::spawn(fake_pentd(theirs, |q| {
+            let id = q.id;
+            vec![
+                Message::Question(q),
+                Message::Verdict(Verdict { id, ..verdict(0) }),
+            ]
+        }));
+        let session = Session::over(ours, None);
+        let mut long = ask(FILE_DEADLINE);
+        long.program = "x".repeat(pent_profile::MAX_LINE_LEN);
+        assert_eq!(session.ask(long).await, Outcome::Unavailable);
+        // The connection is still good: the next question gets its verdict.
+        assert_eq!(
+            session.ask(ask(FILE_DEADLINE)).await,
+            Outcome::Answered(verdict(0))
+        );
+    }
+
+    #[test]
+    fn the_replies_of_expired_questions_go() {
+        let mut waiting = Waiting::default();
+        for _ in 0..3 {
+            let (reply, receiver) = oneshot::channel();
+            waiting.unnumbered.push_back(reply);
+            drop(receiver);
+        }
+        for id in 0..3 {
+            waiting.take(Message::Question(Question {
+                id: QuestionId(id),
+                ask: ask(FILE_DEADLINE),
+            }));
+        }
+        assert!(waiting.numbered.is_empty(), "the dead replies stay");
+    }
+
+    #[test]
+    fn a_refusal_with_a_number_does_not_take_the_place_of_a_number() {
+        let mut waiting = Waiting::default();
+        let (reply, mut receiver) = oneshot::channel();
+        waiting.unnumbered.push_back(reply);
+        waiting.take(Message::Rejected(Rejected {
+            id: Some(QuestionId(5)),
+            reason: RejectReason::RuleNotKept,
+        }));
+        assert_eq!(waiting.unnumbered.len(), 1);
+        assert!(receiver.try_recv().is_err());
     }
 
     #[tokio::test]

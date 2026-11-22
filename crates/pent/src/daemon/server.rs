@@ -18,12 +18,11 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use pent_profile::Message;
 use pent_settings::RuntimeDir;
 use tokio::io::BufReader;
 use tokio::net::{UnixListener, UnixStream};
 
-use super::hub::{Hub, Role};
+use super::hub::{Hub, Outbox, Role};
 use super::{read_message, DaemonError};
 
 /// The first fd of socket activation (`SD_LISTEN_FDS_START`).
@@ -287,6 +286,9 @@ pub(crate) async fn serve(
     result
 }
 
+/// How long the writer of an ended connection may send what is left.
+const WRITER_DRAIN: Duration = Duration::from_secs(5);
+
 /// How often pentd drops the old questions of ended sessions.
 const EXPIRE_EVERY: Duration = Duration::from_secs(30);
 
@@ -381,13 +383,16 @@ async fn connection(stream: UnixStream, hub: Arc<Hub>, own_uid: u32) {
     }
     let fd = stream.as_raw_fd();
     let (read, mut write) = stream.into_split();
-    let (outbox, mut inbox) = tokio::sync::mpsc::unbounded_channel::<Message>();
-    let writer = tokio::spawn(async move {
+    let (outbox, mut inbox, close) = Outbox::new();
+    let mut writer = tokio::spawn(async move {
         use tokio::io::AsyncWriteExt as _;
         while let Some(message) = inbox.recv().await {
             let line = match message.encode_line() {
                 Ok(line) => line,
                 Err(e) => {
+                    // The hub checks the length of each question before it
+                    // sends it, so this does not break the order of the
+                    // numbers.
                     tracing::warn!("pentd cannot encode a message: {e}");
                     continue;
                 }
@@ -400,21 +405,34 @@ async fn connection(stream: UnixStream, hub: Arc<Hub>, own_uid: u32) {
 
     let mut reader = BufReader::new(read);
     let mut role = Role::Client;
-    loop {
-        match read_message(&mut reader).await {
-            Ok(Some(message)) => hub.handle(&mut role, &outbox, message),
-            Ok(None) => break,
-            Err(e) => {
-                tracing::debug!("fd {fd}: pentd closes the connection: {e}");
-                break;
+    let full = loop {
+        tokio::select! {
+            read = read_message(&mut reader) => match read {
+                Ok(Some(message)) => hub.handle(&mut role, &outbox, message).await,
+                Ok(None) => break false,
+                Err(e) => {
+                    tracing::debug!("fd {fd}: pentd closes the connection: {e}");
+                    break false;
+                }
+            },
+            () = close.notified() => {
+                tracing::debug!("fd {fd}: the client does not read; pentd closes the connection");
+                break true;
             }
         }
-    }
-    hub.end(role);
-    // The writer sends what is left, then ends when the outbox closes.
+    };
+    hub.end(role, &outbox);
     drop(outbox);
-    if let Err(e) = writer.await {
-        tracing::debug!("fd {fd}: the writer ended with {e}");
+    if full {
+        // The writer waits on a client that does not read.
+        writer.abort();
+    } else if tokio::time::timeout(WRITER_DRAIN, &mut writer)
+        .await
+        .is_err()
+    {
+        // The writer sends what is left; a client that stops reading now
+        // does not keep the task alive.
+        writer.abort();
     }
 }
 

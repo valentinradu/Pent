@@ -243,13 +243,13 @@ impl Classifier {
     pub fn widths(&self, access: &Access<'_>) -> Vec<Target> {
         match self.classify(access) {
             Class::Pent => return Vec::new(),
-            Class::Sensitive(_) => return vec![exact(access)],
+            Class::Sensitive(_) => return vec![exact_target(access)],
             Class::Normal => {}
         }
         match access {
             Access::File { kind, path } => self.file_widths(*kind, path),
             Access::Domain(name) => domain_widths(name),
-            Access::UnixSocket(_) | Access::Localhost(_) => vec![exact(access)],
+            Access::UnixSocket(_) | Access::Localhost(_) => vec![exact_target(access)],
         }
     }
 
@@ -279,8 +279,9 @@ impl Classifier {
     }
 }
 
-/// The exact target of `access`.
-fn exact(access: &Access<'_>) -> Target {
+/// The exact target of `access`: the only width of a sensitive access.
+#[must_use]
+pub fn exact_target(access: &Access<'_>) -> Target {
     match access {
         Access::File { kind, path } => Target::File {
             kind: *kind,

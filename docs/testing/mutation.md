@@ -45,13 +45,24 @@ makes one mutation by hand. The test must fail on the mutant. No
 | 2.2 | A session may answer. | `pentd_refuses_a_bad_answer_and_a_message_of_the_wrong_role` |
 | 2.2 | An answer resolves only its own question. | `one_wide_answer_resolves_each_question_inside_its_width` |
 | 2.2 | An open question does not keep pentd alive. | `a_late_answer_becomes_a_rule_and_the_open_question_keeps_pentd_alive` |
+| 2.2 | pentd sends a question that is too long, and the writer drops it. | `a_question_too_long_for_one_line_is_refused_and_the_numbers_stay_true` |
+| 2.2 | The end of a connection does not remove its watcher. | `a_watcher_that_closes_its_side_gets_the_end_of_the_connection` |
+| 2.2 | A session may watch. | `pentd_refuses_a_bad_answer_and_a_message_of_the_wrong_role` |
+| 2.2 | A failed write of a rule counts as kept. | `a_rule_that_pentd_cannot_write_gives_a_verdict_for_this_run_and_an_error` |
+| 2.2 | A full outbox does not close its connection. | `pentd_closes_a_watcher_that_does_not_read` |
+| 2.2 | A sensitive question takes a wide entry of its menu. | `a_sensitive_question_takes_only_its_exact_target_whatever_its_menu` |
+| 2.2 | The client keeps the replies of expired questions. | `the_replies_of_expired_questions_go` |
+| 2.2 | An ask that the client cannot encode counts as a lost connection. | `an_ask_that_cannot_be_one_line_fails_alone` |
 
 The first form of `pent_run_starts_pentd_and_holds_it_for_the_run` passed on
 the mutant: the client started a new pentd each time that it lost one. The
 test now compares the PID in the lock file during the run. The first form of
 `pentd_does_not_take_a_socket_where_another_process_listens` did not stop on
 its mutant: the mutant pentd served, and the test waited for its end. The
-test now has a time limit and fails with a message.
+test now has a time limit and fails with a message. The first form of
+`a_watcher_that_closes_its_side_gets_the_end_of_the_connection` passed on its
+mutant after 5 s, because the drain limit of the writer ended the
+connection. The test now asks for the end within 2 s.
 
 ## How to repeat the run
 

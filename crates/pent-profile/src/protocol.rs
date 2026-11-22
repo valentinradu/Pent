@@ -370,9 +370,16 @@ pub enum RejectReason {
     BadWidth,
     /// Only the human answers on the socket: the judge runs in pentd.
     NotHuman,
-    /// This connection may not send this message: a session cannot answer,
-    /// and only a session can ask.
+    /// This connection may not send this message: a session cannot answer
+    /// or watch, and only a session can ask.
     NotPermitted,
+    /// pentd cannot send the question with its number on one line. pentd
+    /// does not queue it, so the order of the numbers stays true.
+    TooLong,
+    /// pentd could not write the rule of an answer with the scope
+    /// `remember`. The verdicts have the scope `run`: the answer holds only
+    /// for the runs that wait now.
+    RuleNotKept,
 }
 
 /// pentd refused a message of the client.

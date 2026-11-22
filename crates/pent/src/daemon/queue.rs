@@ -6,7 +6,9 @@
 //!   that its target covers: with the scope `remember` in each session,
 //!   with the scope `run` only in the session of the question.
 //! - **A sensitive question** is resolved only by an answer that names its
-//!   exact target. A wider answer to another question never resolves it.
+//!   exact target. pentd computes that target from the access, not from the
+//!   menu that the session sent, so a menu with a wider entry does not help.
+//!   A wider answer to another question never resolves it either.
 //! - **pentd checks each answer:** the question exists, the `MenuIndex` is
 //!   in its menu, and the source is the human (the judge runs in pentd).
 //! - **The deadline is the work of `pent run`:** the access gets the error
@@ -19,8 +21,8 @@ use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
 use pent_profile::{
-    Answer, Ask, Class, Decision, Question, QuestionId, RejectReason, Rule, RuleKey, RuleSet,
-    Scope, SessionId, Source, Target, Verdict,
+    exact_target, Answer, Ask, Class, Decision, Question, QuestionId, RejectReason, Rule, RuleKey,
+    RuleSet, Scope, SessionId, Source, Target, Verdict,
 };
 
 /// How long a question of a session that ended stays open.
@@ -104,6 +106,11 @@ impl Queue {
             .get(usize::from(answer.width.0))
             .cloned()
             .ok_or(RejectReason::BadWidth)?;
+        if matches!(ask.class, Class::Sensitive(_))
+            && target != exact_target(&ask.request.as_access())
+        {
+            return Err(RejectReason::BadWidth);
+        }
         let key = ask.key.clone();
         let session = ask.session;
         let scope = answer.scope;
@@ -122,7 +129,7 @@ impl Queue {
                 let covered = covers.decide(&access).is_some();
                 // A sensitive question needs its own exact answer.
                 let allowed =
-                    !matches!(q.class, Class::Sensitive(_)) || q.menu.first() == Some(&target);
+                    !matches!(q.class, Class::Sensitive(_)) || exact_target(&access) == target;
                 same_group && covered && allowed
             })
             .map(|(id, _)| *id)
@@ -154,6 +161,11 @@ impl Queue {
             rule,
             verdicts,
         })
+    }
+
+    /// Remove the question `id`, for a question that pentd cannot send.
+    pub(crate) fn remove(&mut self, id: QuestionId) {
+        self.open.remove(&id);
     }
 
     /// Mark the questions of `session` as orphans: the session ended.
@@ -390,6 +402,40 @@ mod tests {
             .unwrap();
         assert_eq!(res.verdicts.len(), 1);
         assert_eq!(q.len(), 0);
+    }
+
+    #[test]
+    fn a_sensitive_question_takes_only_its_exact_target_whatever_its_menu() {
+        let mut q = Queue::default();
+        // A faulty session sends a wide entry in the menu of a sensitive
+        // question.
+        let mut secret = read("/home/u/.ssh/id_ed25519");
+        secret.class = Class::Sensitive(Sensitive::Credential);
+        let (secret, _) = q.ask(S1, &key("sh"), secret);
+        assert!(secret.ask.menu.len() > 1);
+        assert_eq!(
+            q.answer(&answer(secret.id, Decision::Allow, 1, Scope::Remember)),
+            Err(RejectReason::BadWidth)
+        );
+        // A faulty menu with a wide entry first is refused too.
+        let mut swapped = read("/home/u/.aws/credentials");
+        swapped.class = Class::Sensitive(Sensitive::Credential);
+        swapped.menu.reverse();
+        let (swapped, _) = q.ask(S1, &key("sh"), swapped);
+        assert_eq!(
+            q.answer(&answer(swapped.id, Decision::Allow, 0, Scope::Remember)),
+            Err(RejectReason::BadWidth)
+        );
+        let exact = u16::try_from(swapped.ask.menu.len() - 1).unwrap();
+        let res = q
+            .answer(&answer(swapped.id, Decision::Allow, exact, Scope::Remember))
+            .unwrap();
+        assert_eq!(res.verdicts.len(), 1);
+        // The first one is still open, and its exact target works.
+        let res = q
+            .answer(&answer(secret.id, Decision::Deny, 0, Scope::Run))
+            .unwrap();
+        assert_eq!(res.verdicts.len(), 1);
     }
 
     #[test]

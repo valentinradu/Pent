@@ -9,22 +9,71 @@
 //! | holder (`Hold::Daemon`, `Hold::Unit`) | `Answer`, `Watch` | as a client |
 //! | client (no hold) | `Answer`, `Watch` | `Verdict` for its answer, `Rejected` |
 //!
-//! A session cannot answer, so a bug in `pent run` cannot allow its own
-//! access. pentd is the only writer of the rules.
+//! A session cannot answer or watch, so a bug in `pent run` cannot allow
+//! its own access or mix the questions of other runs into its own. pentd is
+//! the only writer of the rules, one write at a time.
+//!
+//! Each connection has a bounded [`Outbox`]. A client that does not read
+//! fills it, and pentd then closes that connection: a lost message would
+//! break the order of the numbers, and an unbounded outbox would let a
+//! client make pentd grow without a limit.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use pent_profile::{
-    Answer, Hold, Message, QuestionId, RejectReason, Rejected, Rule, RuleKey, SessionId,
+    Answer, Hold, Message, QuestionId, RejectReason, Rejected, Rule, RuleKey, Scope, SessionId,
 };
 use pent_settings::RuleStore;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, Notify};
 
 use super::queue::Queue;
 
-/// The sender of the messages to one connection.
-pub(crate) type Outbox = mpsc::UnboundedSender<Message>;
+/// How many messages wait for one connection before pentd closes it.
+pub(crate) const OUTBOX_LEN: usize = 256;
+
+/// The messages to one connection. When the client does not read and the
+/// outbox is full, the outbox asks the connection to close.
+#[derive(Debug, Clone)]
+pub(crate) struct Outbox {
+    tx: mpsc::Sender<Message>,
+    close: Arc<Notify>,
+}
+
+impl Outbox {
+    /// A new outbox, the receiver for the writer of the connection, and the
+    /// signal to close the connection.
+    pub(crate) fn new() -> (Self, mpsc::Receiver<Message>, Arc<Notify>) {
+        let (tx, rx) = mpsc::channel(OUTBOX_LEN);
+        let close = Arc::new(Notify::new());
+        (
+            Self {
+                tx,
+                close: Arc::clone(&close),
+            },
+            rx,
+            close,
+        )
+    }
+
+    /// Send `message`. Returns false when the connection is gone or full;
+    /// a full connection gets the signal to close.
+    fn send(&self, message: Message) -> bool {
+        match self.tx.try_send(message) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.close.notify_one();
+                false
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        }
+    }
+
+    /// Return true if `self` and `other` reach the same connection.
+    fn same(&self, other: &Self) -> bool {
+        self.tx.same_channel(&other.tx)
+    }
+}
 
 /// What keeps pentd alive.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -56,6 +105,9 @@ pub(crate) struct Hub {
     state: Mutex<State>,
     activity: watch::Sender<Activity>,
     rules: Option<RuleStore>,
+    /// One answer at a time from the queue to the rule file, so the file
+    /// gets the answers in the order of the queue.
+    writes: tokio::sync::Mutex<()>,
 }
 
 /// The role of one connection.
@@ -119,6 +171,7 @@ impl Hub {
             }),
             activity: watch::Sender::new(Activity::default()),
             rules,
+            writes: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -148,7 +201,12 @@ impl Hub {
 
     /// Handle `message` from a connection with the role `role`, which
     /// `outbox` reaches.
-    pub(crate) fn handle(self: &Arc<Self>, role: &mut Role, outbox: &Outbox, message: Message) {
+    pub(crate) async fn handle(
+        self: &Arc<Self>,
+        role: &mut Role,
+        outbox: &Outbox,
+        message: Message,
+    ) {
         match message {
             Message::Hold(hold) => self.hold(role, outbox, hold),
             Message::Ask(ask) => {
@@ -158,9 +216,23 @@ impl Hub {
                 };
                 let mut state = self.lock();
                 let (question, new) = state.queue.ask(*id, key, ask);
-                send(outbox, Message::Question(question.clone()));
+                let id = question.id;
+                let message = Message::Question(question);
+                // pentd adds the number and the key, so a question can be
+                // too long for one line where its ask was not. The session
+                // then gets a refusal in its place, and the order of the
+                // numbers stays true.
+                if message.encode_line().is_err() {
+                    if new {
+                        state.queue.remove(id);
+                    }
+                    reject(outbox, None, RejectReason::TooLong);
+                    self.publish(&state);
+                    return;
+                }
+                send(outbox, message.clone());
                 if new {
-                    broadcast(&mut state.watchers, &Message::Question(question));
+                    broadcast(&mut state.watchers, &message);
                 }
                 self.publish(&state);
             }
@@ -169,9 +241,13 @@ impl Hub {
                     reject(outbox, Some(answer.id), RejectReason::NotPermitted);
                     return;
                 }
-                self.answer(outbox, &answer);
+                self.answer(outbox, &answer).await;
             }
             Message::Watch => {
+                if matches!(role, Role::Session { .. }) {
+                    reject(outbox, None, RejectReason::NotPermitted);
+                    return;
+                }
                 let mut state = self.lock();
                 for question in state.queue.open() {
                     send(outbox, Message::Question(question.clone()));
@@ -205,20 +281,18 @@ impl Hub {
         };
     }
 
-    /// Check `answer`, send each verdict, and write the rule.
-    fn answer(&self, outbox: &Outbox, answer: &Answer) {
+    /// Check `answer`, write the rule, then send each verdict.
+    ///
+    /// One answer at a time takes this path, so the rule file gets the
+    /// answers in the order of the queue. When the rule cannot be written,
+    /// each verdict gets the scope `run`, and the client that answered gets
+    /// `Rejected` with `RuleNotKept`.
+    async fn answer(&self, outbox: &Outbox, answer: &Answer) {
+        let _write = self.writes.lock().await;
         let resolution = {
             let mut state = self.lock();
             match state.queue.answer(answer) {
                 Ok(resolution) => {
-                    for (session, verdict) in &resolution.verdicts {
-                        let message = Message::Verdict(verdict.clone());
-                        if let Some(target) = state.sessions.get(session) {
-                            send(target, message.clone());
-                        }
-                        broadcast(&mut state.watchers, &message);
-                        send(outbox, message);
-                    }
                     self.publish(&state);
                     resolution
                 }
@@ -228,36 +302,65 @@ impl Hub {
                 }
             }
         };
-        // The write of the file happens outside of the lock.
-        if let Some(rule) = resolution.rule {
-            self.write_rule(&resolution.key, rule);
-        }
-    }
-
-    /// Write `rule` in the rule file of `key`. A rule for the same target
-    /// takes the place of the old one.
-    fn write_rule(&self, key: &RuleKey, rule: Rule) {
-        let Some(store) = &self.rules else {
-            tracing::warn!("pentd cannot find the rule files; the answer is not kept");
-            return;
+        let kept = match resolution.rule {
+            Some(rule) => self.write_rule(&resolution.key, rule).await,
+            None => true,
         };
-        let result = store.update(key, |set| {
-            set.rules.retain(|r| r.target != rule.target);
-            set.rules.push(rule);
-        });
-        if let Err(e) = result {
-            tracing::warn!("pentd cannot write the rule of {key}: {e}");
+        let mut state = self.lock();
+        for (session, mut verdict) in resolution.verdicts {
+            if !kept {
+                verdict.scope = Scope::Run;
+            }
+            let message = Message::Verdict(verdict);
+            if let Some(target) = state.sessions.get(&session) {
+                send(target, message.clone());
+            }
+            broadcast(&mut state.watchers, &message);
+            send(outbox, message);
+        }
+        if !kept {
+            reject(outbox, Some(answer.id), RejectReason::RuleNotKept);
         }
     }
 
-    /// The connection of `role` ended.
-    pub(crate) fn end(&self, role: Role) {
+    /// Write `rule` in the rule file of `key`, outside the threads of the
+    /// runtime. A rule for the same target takes the place of the old one.
+    /// Returns true when the rule is in the file.
+    async fn write_rule(&self, key: &RuleKey, rule: Rule) -> bool {
+        let Some(store) = self.rules.clone() else {
+            tracing::warn!("pentd cannot find the rule files; the answer is not kept");
+            return false;
+        };
+        let file_key = key.clone();
+        let write = tokio::task::spawn_blocking(move || {
+            store.update(&file_key, |set| {
+                set.rules.retain(|r| r.target != rule.target);
+                set.rules.push(rule);
+            })
+        });
+        match write.await {
+            Ok(Ok(())) => true,
+            Ok(Err(e)) => {
+                tracing::warn!("pentd cannot write the rule of {key}: {e}");
+                false
+            }
+            Err(e) => {
+                tracing::warn!("the write of the rule of {key} failed: {e}");
+                false
+            }
+        }
+    }
+
+    /// The connection of `role`, which `outbox` reached, ended. Its
+    /// watcher goes too, so the writer of the connection can end.
+    pub(crate) fn end(&self, role: Role, outbox: &Outbox) {
+        let mut state = self.lock();
+        state.watchers.retain(|w| !w.same(outbox));
         if let Role::Session { id, .. } = role {
-            let mut state = self.lock();
             state.sessions.remove(&id);
             state.queue.end_session(id, std::time::Instant::now());
-            self.publish(&state);
         }
+        self.publish(&state);
     }
 
     /// Drop the orphans that are too old.
@@ -267,21 +370,22 @@ impl Hub {
         if dropped > 0 {
             tracing::debug!("pentd drops {dropped} old questions of ended sessions");
         }
-        state.watchers.retain(|w| !w.is_closed());
+        state.watchers.retain(|w| !w.tx.is_closed());
         self.publish(&state);
     }
 }
 
-/// Send `message` to one connection. A closed connection is not an error:
-/// its task ends soon.
+/// Send `message` to one connection. A closed or a full connection is not
+/// an error here: its task ends soon.
 fn send(outbox: &Outbox, message: Message) {
-    // The receiver is gone only when the connection ended.
+    // A false result means that the connection ends; nothing else to do.
     let _ = outbox.send(message);
 }
 
-/// Send `message` to each watcher, and forget each watcher that is gone.
+/// Send `message` to each watcher, and forget each watcher that is gone or
+/// full.
 fn broadcast(watchers: &mut Vec<Outbox>, message: &Message) {
-    watchers.retain(|w| w.send(message.clone()).is_ok());
+    watchers.retain(|w| w.send(message.clone()));
 }
 
 /// Refuse a message of a client.

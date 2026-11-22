@@ -35,7 +35,7 @@
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::SandboxError;
 
@@ -313,38 +313,15 @@ pub(crate) fn resolv_conf() -> Result<PathBuf, SandboxError> {
     Ok(path)
 }
 
-/// Return the directory for the runtime files of pent.
-fn runtime_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from) {
-        if dir.is_absolute() && dir.is_dir() {
-            return dir.join("pent");
-        }
-    }
-    let uid = pent_settings::current_uid();
-    std::env::temp_dir().join(format!("pent-{uid}"))
-}
-
-/// Create the runtime directory with mode 0700 and check that this user
-/// owns it and that no other user can write to it.
+/// Create the runtime directory of pent and check that it is private. The
+/// rules are the ones of `pent_settings::RuntimeDir`, so `resolv.conf` and
+/// the socket of pentd are in the same directory, below a directory that
+/// the sandbox hides.
 fn ensure_runtime_dir() -> Result<PathBuf, SandboxError> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
-    let dir = runtime_dir();
-    let fail = |msg: String| SandboxError::NetworkSetupFailed(msg);
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&dir)
-        .map_err(|e| fail(format!("cannot create {}: {e}", dir.display())))?;
-    let meta = std::fs::symlink_metadata(&dir)
-        .map_err(|e| fail(format!("cannot read {}: {e}", dir.display())))?;
-    let uid = pent_settings::current_uid();
-    if !meta.is_dir() || meta.uid() != uid || meta.mode() & 0o022 != 0 {
-        return Err(fail(format!(
-            "{} is not a private directory of this user",
-            dir.display()
-        )));
-    }
-    Ok(dir)
+    pent_settings::RuntimeDir::from_env()
+        .ensure()
+        .map(Path::to_path_buf)
+        .map_err(|e| SandboxError::NetworkSetupFailed(e.to_string()))
 }
 
 #[cfg(test)]
