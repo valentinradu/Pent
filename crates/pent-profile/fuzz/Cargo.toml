@@ -41,6 +41,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "rule_file"
+path = "fuzz_targets/rule_file.rs"
+test = false
+doc = false
+bench = false
+
 # The fuzz crate is its own workspace: the root workspace of pent must not
 # build it with `cargo build --workspace`.
 [workspace]

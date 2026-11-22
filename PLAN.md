@@ -5,8 +5,16 @@ one commit for each step, and move this cursor when a step is done.
 
 This plan builds the design in `docs/design/pent.md`. Each step names its
 goal, the main files, and the condition for "done". A step is done only
-when `cargo clippy --workspace --all-targets -- -D warnings` and
-`cargo test --workspace` pass, and its new tests pass.
+when all of these are true:
+
+- `cargo clippy --workspace --all-targets -- -D warnings` and
+  `cargo test --workspace` pass, and the new tests of the step pass.
+- `docs/security/` names each security claim of the step, with its test.
+  A new area gets a new report; a changed area changes its report.
+- `docs/testing/` names each new fuzz target and its run. A step that adds
+  a parser of untrusted text adds its fuzz target and runs it.
+- The step goes in the same commit as its documents, so the documents
+  always describe the code of `next`.
 
 **Branch.** The work goes on the branch `next`. Each step is one commit or
 more. `main` stays at 0.2.x until phase 9, and then `next` merges as
@@ -27,9 +35,13 @@ ready for users.
 - [x] **1.2 The rule files.** One TOML file for each key in
   `~/.local/state/pent/rules/`, written atomically with mode `0600`
   (`write_atomic_private`). Unknown keys are an error that names the key.
-  - Files: `pent-settings/src/store.rs`.
-  - Done: tests for a round trip, a hand edit, a bad file, and a symbolic
-    link at the path.
+  A change holds a lock on the key, reads the file again, and keeps the
+  comments of the user (`toml_edit`). Pent reads only a regular file of at
+  most 4 MiB, without a link.
+  - Files: `pent-profile/src/rule_file.rs`, `pent-settings/src/store.rs`.
+  - Done: tests for a round trip, a hand edit, a bad file, a symbolic link
+    at the path, a FIFO, parallel changes and the comments; the fuzz target
+    `rule_file`; `docs/security/rules.md`.
 - [ ] **1.3 The classes and the width menu.** The sensitive class comes from
   the guard list, `ESCAPE_SOCKETS`, `HOME_AGENT_SOCKETS` and
   `CONTROL_PORTS`, kept as data in one place. The pent class covers
@@ -191,16 +203,21 @@ section 14 of the design has their results.
 - [ ] **8.2 The crates.** Give `pent-profile` a name that fits its new
   content, for example `pent-rules`.
 - [ ] **8.3 Delete `docs/design/watch.md`,** and the code comments that point
-  to it.
+  to it. Remove the parts of `docs/security/` and `docs/testing/` that
+  describe the removed code, and keep each claim that still holds.
 
 ## Phase 9: the records and the release
 
-- [ ] **9.1 The security records.** Audit the new surface: the FUSE server,
-  the grafts, `pentd.sock`, `agent.sock` and the judge. Rewrite
-  `docs/security/` and `docs/testing/` for the new code, each claim with a
+The documents grow with each step (see the conditions at the top). This
+phase checks the whole, not the parts.
+
+- [ ] **9.1 The audit.** Audit the new surface as one system: the FUSE
+  server, the grafts, `pentd.sock`, `agent.sock` and the judge. Look for
+  attacks that cross two steps, and add each finding to its report with a
   test.
-- [ ] **9.2 Fuzzing.** Targets for the FUSE requests, the protocol codec and
-  the DNS path.
+- [ ] **9.2 The long fuzz run.** Run each fuzz target of the new code (the
+  rule file, the protocol codec, the FUSE requests, the DNS path) for a
+  long time, and record the result in `docs/testing/`.
 - [ ] **9.3 The release.** Remove the status note from the README and from
   `CLAUDE.md`, write the CHANGELOG, merge `next` into `main`, and tag 0.3.0.
 

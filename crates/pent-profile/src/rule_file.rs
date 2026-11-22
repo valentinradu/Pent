@@ -14,6 +14,7 @@
 //! source = "human"
 //! created = 2026-11-22T12:00:00Z
 //!
+//! # Why I allow this.
 //! [[rule]]
 //! kind = "domain"
 //! domain = "*.npmjs.org"
@@ -25,9 +26,12 @@
 //! The kinds are `list`, `read`, `write` and `exec` (with `width` and
 //! `path`), `domain` (with `domain`), `unix-socket` (with `path`) and
 //! `localhost` (with `port`). An unknown field, a missing field and a field
-//! of another kind are errors. The date has whole seconds.
+//! of another kind are errors. The date has whole seconds: pent drops a
+//! fraction of a second when it reads the file.
 //!
-//! The file does not hold the key: the file name gives it.
+//! [`RuleSet::update_toml`] changes an existing file and keeps the comments
+//! and the form of each rule that stays. The file does not hold the key: the
+//! file name gives it.
 
 use std::fmt;
 use std::num::NonZeroU16;
@@ -36,6 +40,7 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use toml::value::{Date, Datetime, Offset, Time};
+use toml_edit::{ArrayOfTables, DocumentMut, Item};
 
 use crate::rule::{
     Decision, DomainWidth, FileKind, PathWidth, Rule, RuleError, RuleKey, RulePath, RuleSet,
@@ -51,11 +56,14 @@ const MAX_SECS: u64 = 253_402_300_799;
 /// The number of seconds in a day.
 const DAY_SECS: u64 = 86_400;
 
-/// The text at the start of each file that pent writes.
+/// The name of the array of rules in the file.
+const RULE_TABLE: &str = "rule";
+
+/// The text at the start of each new file that pent writes.
 const HEADER: &str = "\
 # The rules of pent for one program. Each rule is one answer.
-# You can edit this file. Remove a rule and pent asks again.
-# See `docs/design/pent.md`, section 12.
+# You can edit this file, and pent keeps your comments.
+# Remove a rule and pent asks again.
 
 ";
 
@@ -66,7 +74,9 @@ pub enum RuleFileError {
     /// names the field and its line.
     #[error("{0}")]
     Syntax(#[from] toml::de::Error),
-    /// The file has a version that this pent does not know.
+    /// The file has a version that this pent does not know. Pent checks the
+    /// version before the fields, so a file of a newer pent gives this
+    /// error and not an unknown field.
     #[error("the version {0} is not known; this pent reads version {VERSION}")]
     Version(u32),
     /// One rule is not valid.
@@ -83,6 +93,12 @@ pub enum RuleFileError {
     /// Pent cannot encode the rules as TOML.
     #[error("cannot encode the rules: {0}")]
     Encode(#[from] toml::ser::Error),
+    /// Pent cannot encode one rule as a TOML table.
+    #[error("cannot encode a rule: {0}")]
+    EncodeTable(#[from] toml_edit::ser::Error),
+    /// The editor of the file cannot parse the text.
+    #[error("{0}")]
+    Edit(#[from] toml_edit::TomlError),
 }
 
 /// A problem in one rule of a file.
@@ -105,10 +121,11 @@ pub enum EntryError {
     /// A path or a domain is not valid.
     #[error(transparent)]
     Value(#[from] RuleError),
-    /// The date has no date part, no time part or no offset, or it does not
-    /// exist.
+    /// The date has no date part, no time part or no offset, it does not
+    /// exist, or it is not from 1970 to 9999 in UTC.
     #[error(
-        "the date {0} is not a full date and time with an offset, for example 2026-11-22T12:00:00Z"
+        "the date {0} is not a full date and time with an offset from 1970 to 9999, \
+         for example 2026-11-22T12:00:00Z"
     )]
     Date(Datetime),
 }
@@ -133,7 +150,44 @@ pub enum Kind {
     Localhost,
 }
 
+/// The group of a kind: the shape of its target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Group {
+    File(FileKind),
+    Domain,
+    UnixSocket,
+    Localhost,
+}
+
 impl Kind {
+    /// The kind of a rule with this target.
+    const fn of_target(target: &Target) -> Self {
+        match target {
+            Target::File { kind, .. } => match kind {
+                FileKind::List => Self::List,
+                FileKind::Read => Self::Read,
+                FileKind::Write => Self::Write,
+                FileKind::Exec => Self::Exec,
+            },
+            Target::Domain(_) => Self::Domain,
+            Target::UnixSocket(_) => Self::UnixSocket,
+            Target::Localhost(_) => Self::Localhost,
+        }
+    }
+
+    /// The group of this kind.
+    const fn group(self) -> Group {
+        match self {
+            Self::List => Group::File(FileKind::List),
+            Self::Read => Group::File(FileKind::Read),
+            Self::Write => Group::File(FileKind::Write),
+            Self::Exec => Group::File(FileKind::Exec),
+            Self::Domain => Group::Domain,
+            Self::UnixSocket => Group::UnixSocket,
+            Self::Localhost => Group::Localhost,
+        }
+    }
+
     /// The name in the file.
     const fn name(self) -> &'static str {
         match self {
@@ -150,11 +204,11 @@ impl Kind {
     /// The fields that a rule of this kind has, other than `kind`,
     /// `decision`, `source` and `created`.
     const fn fields(self) -> &'static [&'static str] {
-        match self {
-            Self::List | Self::Read | Self::Write | Self::Exec => &["width", "path"],
-            Self::Domain => &["domain"],
-            Self::UnixSocket => &["path"],
-            Self::Localhost => &["port"],
+        match self.group() {
+            Group::File(_) => &["width", "path"],
+            Group::Domain => &["domain"],
+            Group::UnixSocket => &["path"],
+            Group::Localhost => &["port"],
         }
     }
 }
@@ -171,6 +225,12 @@ impl fmt::Display for Kind {
 enum Width {
     Exact,
     Subtree,
+}
+
+/// The version alone. Pent reads it before the strict parse.
+#[derive(Debug, Deserialize)]
+struct VersionOnly {
+    version: Option<u32>,
 }
 
 /// The whole file.
@@ -204,7 +264,7 @@ impl Entry {
     /// Make the entry of `rule`.
     fn from_rule(rule: &Rule) -> Result<Self, RuleFileError> {
         let mut entry = Self {
-            kind: Kind::Domain,
+            kind: Kind::of_target(&rule.target),
             width: None,
             path: None,
             domain: None,
@@ -214,13 +274,7 @@ impl Entry {
             created: to_datetime(rule.created)?,
         };
         match &rule.target {
-            Target::File { kind, width } => {
-                entry.kind = match kind {
-                    FileKind::List => Kind::List,
-                    FileKind::Read => Kind::Read,
-                    FileKind::Write => Kind::Write,
-                    FileKind::Exec => Kind::Exec,
-                };
+            Target::File { width, .. } => {
                 let (width, path) = match width {
                     PathWidth::Exact(p) => (Width::Exact, p),
                     PathWidth::Subtree(p) => (Width::Subtree, p),
@@ -229,14 +283,8 @@ impl Entry {
                 entry.path = Some(path.as_path().to_path_buf());
             }
             Target::Domain(width) => entry.domain = Some(width.to_string()),
-            Target::UnixSocket(p) => {
-                entry.kind = Kind::UnixSocket;
-                entry.path = Some(p.as_path().to_path_buf());
-            }
-            Target::Localhost(port) => {
-                entry.kind = Kind::Localhost;
-                entry.port = Some(*port);
-            }
+            Target::UnixSocket(p) => entry.path = Some(p.as_path().to_path_buf()),
+            Target::Localhost(port) => entry.port = Some(*port),
         }
         Ok(entry)
     }
@@ -257,14 +305,8 @@ impl Entry {
             return Err(EntryError::NotPermitted { field, kind });
         }
         let missing = |field| EntryError::Missing { field };
-        let target = match kind {
-            Kind::List | Kind::Read | Kind::Write | Kind::Exec => {
-                let file_kind = match kind {
-                    Kind::List => FileKind::List,
-                    Kind::Read => FileKind::Read,
-                    Kind::Write => FileKind::Write,
-                    _ => FileKind::Exec,
-                };
+        let target = match kind.group() {
+            Group::File(file_kind) => {
                 let path = RulePath::new(self.path.ok_or_else(|| missing("path"))?)?;
                 let width = match self.width.ok_or_else(|| missing("width"))? {
                     Width::Exact => PathWidth::Exact(path),
@@ -275,15 +317,15 @@ impl Entry {
                     width,
                 }
             }
-            Kind::Domain => Target::Domain(
+            Group::Domain => Target::Domain(
                 self.domain
                     .ok_or_else(|| missing("domain"))?
                     .parse::<DomainWidth>()?,
             ),
-            Kind::UnixSocket => {
+            Group::UnixSocket => {
                 Target::UnixSocket(RulePath::new(self.path.ok_or_else(|| missing("path"))?)?)
             }
-            Kind::Localhost => Target::Localhost(self.port.ok_or_else(|| missing("port"))?),
+            Group::Localhost => Target::Localhost(self.port.ok_or_else(|| missing("port"))?),
         };
         Ok(Rule {
             target,
@@ -292,6 +334,15 @@ impl Entry {
             created: from_datetime(&self.created).ok_or(EntryError::Date(self.created))?,
         })
     }
+
+    /// The entry as a TOML table for `[[rule]]`.
+    fn to_table(&self) -> Result<toml_edit::Table, RuleFileError> {
+        let doc = toml_edit::ser::to_document(self)?;
+        let mut table = doc.as_table().clone();
+        table.set_implicit(false);
+        table.decor_mut().set_prefix("\n");
+        Ok(table)
+    }
 }
 
 impl RuleSet {
@@ -299,13 +350,16 @@ impl RuleSet {
     ///
     /// # Errors
     /// Returns an error if the text is not valid TOML, if it has an unknown
-    /// field or an unknown version, or if a rule is not valid. The error
+    /// version or an unknown field, or if a rule is not valid. The error
     /// names the field or the rule.
     pub fn from_toml(key: RuleKey, text: &str) -> Result<Self, RuleFileError> {
-        let doc: FileDoc = toml::from_str(text)?;
-        if doc.version != VERSION {
-            return Err(RuleFileError::Version(doc.version));
+        // The version comes first: a newer file can have fields that this
+        // pent does not know.
+        let VersionOnly { version } = toml::from_str(text)?;
+        if let Some(version) = version.filter(|v| *v != VERSION) {
+            return Err(RuleFileError::Version(version));
         }
+        let doc: FileDoc = toml::from_str(text)?;
         let rules = doc
             .rules
             .into_iter()
@@ -320,7 +374,7 @@ impl RuleSet {
         Ok(Self { key, rules })
     }
 
-    /// The text of the rule file, with a header comment. Pent keeps the
+    /// The text of a new rule file, with a header comment. Pent keeps the
     /// order of the rules and drops the fractions of a second.
     ///
     /// # Errors
@@ -336,6 +390,76 @@ impl RuleSet {
                 .collect::<Result<_, _>>()?,
         };
         Ok(format!("{HEADER}{}", toml::to_string(&doc)?))
+    }
+
+    /// The text of the rule file `old` after a change to these rules.
+    ///
+    /// A rule of `old` that is also in this set keeps its table, with its
+    /// comments, its form and its place. A rule of `old` that is not in
+    /// this set loses its table and the comment above it. A rule of this set
+    /// that is not in `old` gets a new table at the end. The other comments
+    /// of the file stay.
+    ///
+    /// # Errors
+    /// Returns an error if `old` is not a valid rule file: pent does not
+    /// write over a file that it cannot read. Also returns the errors of
+    /// [`RuleSet::to_toml`].
+    pub fn update_toml(&self, old: &str) -> Result<String, RuleFileError> {
+        let old_rules = Self::from_toml(self.key.clone(), old)?.rules;
+        let mut doc: DocumentMut = old.parse()?;
+
+        // Match each old rule with one equal new rule, in order.
+        let mut used = vec![false; self.rules.len()];
+        let keep: Vec<bool> = old_rules
+            .iter()
+            .map(|old_rule| {
+                let found = self
+                    .rules
+                    .iter()
+                    .zip(used.iter_mut())
+                    .find(|(rule, taken)| !**taken && *rule == old_rule);
+                found.map(|(_, taken)| *taken = true).is_some()
+            })
+            .collect();
+        let added = self
+            .rules
+            .iter()
+            .zip(&used)
+            .filter(|(_, taken)| !**taken)
+            .map(|(rule, _)| Entry::from_rule(rule)?.to_table())
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let tables = match doc.remove(RULE_TABLE) {
+            None => ArrayOfTables::new(),
+            Some(Item::ArrayOfTables(mut tables)) => {
+                let mut index = 0_usize;
+                tables.retain(|_| {
+                    let kept = keep.get(index).copied().unwrap_or(false);
+                    index = index.saturating_add(1);
+                    kept
+                });
+                tables
+            }
+            // An inline array (`rule = [...]`) has no tables to keep, so
+            // pent writes each kept rule again as a table.
+            Some(_) => {
+                let mut tables = ArrayOfTables::new();
+                for (rule, kept) in old_rules.iter().zip(&keep) {
+                    if *kept {
+                        tables.push(Entry::from_rule(rule)?.to_table()?);
+                    }
+                }
+                tables
+            }
+        };
+        let mut tables = tables;
+        for table in added {
+            tables.push(table);
+        }
+        if !tables.is_empty() {
+            doc.insert(RULE_TABLE, Item::ArrayOfTables(tables));
+        }
+        Ok(doc.to_string())
     }
 }
 
@@ -374,9 +498,9 @@ fn to_datetime(time: SystemTime) -> Result<Datetime, RuleFileError> {
     })
 }
 
-/// The time of a full TOML date with an offset. Returns `None` for a date
-/// that does not exist, a date before 1970, or a value without a date, a
-/// time or an offset.
+/// The time of a full TOML date with an offset, in whole seconds. Returns
+/// `None` for a date that does not exist, a time before 1970 or after
+/// [`MAX_SECS`] in UTC, or a value without a date, a time or an offset.
 fn from_datetime(dt: &Datetime) -> Option<SystemTime> {
     let date = dt.date?;
     let time = dt.time?;
@@ -397,8 +521,10 @@ fn from_datetime(dt: &Datetime) -> Option<SystemTime> {
         + i64::from(time.minute) * 60
         + i64::from(time.second)
         - offset_minutes * 60;
-    let secs = u64::try_from(secs).ok()?;
-    SystemTime::UNIX_EPOCH.checked_add(Duration::new(secs, time.nanosecond))
+    let secs = u64::try_from(secs).ok().filter(|s| *s <= MAX_SECS)?;
+    // The fraction of a second is dropped, as in `to_datetime`, so a load
+    // and a save give the same rule.
+    SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(secs))
 }
 
 /// The number of days from 1970-01-01 to the date.
@@ -648,6 +774,9 @@ created = 2026-11-22T14:00:00+02:00
             "12:00:00",
             "2026-02-30T12:00:00Z",
             "1969-12-31T23:59:59Z",
+            // 9999-12-31T23:59:59-01:00 is after the last second in UTC, so
+            // a save could not write it.
+            "9999-12-31T23:59:59-01:00",
         ] {
             let text = ONE_RULE.replace("2026-11-22T12:00:00Z", date);
             assert!(
@@ -670,7 +799,24 @@ created = 2026-11-22T14:00:00+02:00
             parse(&ONE_RULE.replace("version = 1", "version = 2")),
             Err(RuleFileError::Version(2))
         );
+        // A newer file with a new field gives the version error, not an
+        // unknown field.
+        let newer = format!("{}expires = 2027-01-01T00:00:00Z\n", ONE_RULE)
+            .replace("version = 1", "version = 2");
+        assert_eq!(parse(&newer), Err(RuleFileError::Version(2)));
         assert!(matches!(parse(""), Err(RuleFileError::Syntax(_))));
+    }
+
+    #[test]
+    fn a_fraction_of_a_second_is_dropped_on_the_load() -> Result<(), RuleFileError> {
+        let text = ONE_RULE.replace("12:00:00Z", "12:00:00.5Z");
+        let set = parse(&text)?;
+        let rule = set.rules.first().ok_or(RuleFileError::TimeOutOfRange)?;
+        assert_eq!(rule.created, at(1_795_348_800));
+        // A load, a save and a load give the same rules.
+        assert_eq!(parse(&set.to_toml()?)?, set);
+        assert_eq!(parse(&set.update_toml(&text)?)?, set);
+        Ok(())
     }
 
     #[test]
@@ -684,6 +830,157 @@ created = 2026-11-22T14:00:00+02:00
         });
         assert_eq!(set.to_toml(), Err(RuleFileError::TimeOutOfRange));
         Ok(())
+    }
+
+    /// A file that a user edited: a header, a comment above each rule, an
+    /// inline comment, a domain in upper case and a trailing comment.
+    const EDITED: &str = "\
+# my header
+version = 1
+
+# keep me
+[[rule]]
+kind = \"localhost\"
+port = 22 # ssh
+decision = \"allow\"
+source = \"human\"
+created = 2026-11-22T12:00:00Z
+
+# drop me
+[[rule]]
+kind = \"localhost\"
+port = 23
+decision = \"allow\"
+source = \"human\"
+created = 2026-11-22T12:00:00Z
+
+# also keep me
+[[rule]]
+kind = \"domain\"
+domain = \"API.Example.COM\"
+decision = \"deny\"
+source = \"human\"
+created = 2026-11-22T12:00:00Z
+
+# trailing note
+";
+
+    fn port_rule(port: u16, secs: u64) -> Rule {
+        Rule {
+            target: Target::Localhost(NonZeroU16::new(port).unwrap_or(NonZeroU16::MIN)),
+            decision: Decision::Allow,
+            source: Source::Model,
+            created: at(secs),
+        }
+    }
+
+    #[test]
+    fn an_update_keeps_the_comments_and_the_form_of_each_kept_rule() -> Result<(), RuleFileError> {
+        let mut set = parse(EDITED)?;
+        set.rules.remove(1);
+        set.rules.push(port_rule(5432, 7));
+        let text = set.update_toml(EDITED)?;
+
+        for kept in [
+            "# my header",
+            "# keep me",
+            "port = 22 # ssh",
+            "# also keep me",
+            "domain = \"API.Example.COM\"",
+            "# trailing note",
+        ] {
+            assert!(text.contains(kept), "{kept:?} is lost:\n{text}");
+        }
+        assert!(!text.contains("# drop me"), "{text}");
+        assert!(!text.contains("port = 23"), "{text}");
+        // The kept rules stay in their place, and the new rule comes last.
+        let order: Vec<_> = ["port = 22", "API.Example.COM", "port = 5432"]
+            .iter()
+            .map(|s| text.find(s))
+            .collect();
+        assert!(order.windows(2).all(|w| w[0] < w[1]), "{text}");
+        assert_eq!(parse(&text)?, set);
+        Ok(())
+    }
+
+    #[test]
+    fn an_update_with_no_change_gives_the_same_text() -> Result<(), RuleFileError> {
+        assert_eq!(parse(EDITED)?.update_toml(EDITED)?, EDITED);
+        Ok(())
+    }
+
+    #[test]
+    fn an_update_keeps_one_table_for_each_copy_of_a_rule() -> Result<(), RuleFileError> {
+        // Two equal rules in the file and one in the set: one table stays.
+        let twice = format!("{ONE_RULE}{}", &ONE_RULE["\nversion = 1".len()..]);
+        let mut set = parse(&twice)?;
+        assert_eq!(set.rules.len(), 2);
+        set.rules.pop();
+        let text = set.update_toml(&twice)?;
+        assert_eq!(text.matches("[[rule]]").count(), 1, "{text}");
+        assert_eq!(parse(&text)?, set);
+        Ok(())
+    }
+
+    #[test]
+    fn an_update_to_no_rules_keeps_the_other_comments() -> Result<(), RuleFileError> {
+        let text = RuleSet::new(key()).update_toml(EDITED)?;
+        assert_eq!(text, "# my header\nversion = 1\n\n# trailing note\n");
+        assert!(parse(&text)?.rules.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn an_update_of_an_inline_array_writes_tables() -> Result<(), RuleFileError> {
+        let inline = "version = 1\nrule = [{kind = \"localhost\", port = 22, \
+                      decision = \"allow\", source = \"human\", created = 2026-11-22T12:00:00Z}]\n";
+        let mut set = parse(inline)?;
+        set.rules.push(port_rule(80, 9));
+        let text = set.update_toml(inline)?;
+        assert_eq!(text.matches("[[rule]]").count(), 2, "{text}");
+        assert_eq!(parse(&text)?, set);
+        Ok(())
+    }
+
+    #[test]
+    fn an_update_refuses_a_file_that_is_not_valid() {
+        let set = RuleSet::new(key());
+        assert!(matches!(
+            set.update_toml("version = 1\ncolour = 1\n"),
+            Err(RuleFileError::Syntax(_))
+        ));
+        assert!(matches!(
+            set.update_toml(&ONE_RULE.replace("/home/u/x", "x")),
+            Err(RuleFileError::Entry { .. })
+        ));
+    }
+
+    #[test]
+    fn each_kind_maps_to_its_group_and_back() {
+        let kinds = [
+            Kind::List,
+            Kind::Read,
+            Kind::Write,
+            Kind::Exec,
+            Kind::Domain,
+            Kind::UnixSocket,
+            Kind::Localhost,
+        ];
+        let path = RulePath::new("/x").unwrap_or_else(|e| panic!("{e}"));
+        for kind in kinds {
+            let target = match kind.group() {
+                Group::File(file_kind) => Target::File {
+                    kind: file_kind,
+                    width: PathWidth::Exact(path.clone()),
+                },
+                Group::Domain => Target::Domain(DomainWidth::Exact(
+                    "a.example".parse().unwrap_or_else(|e| panic!("{e}")),
+                )),
+                Group::UnixSocket => Target::UnixSocket(path.clone()),
+                Group::Localhost => Target::Localhost(NonZeroU16::MIN),
+            };
+            assert_eq!(Kind::of_target(&target), kind);
+        }
     }
 
     #[test]

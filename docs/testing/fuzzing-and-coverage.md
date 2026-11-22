@@ -100,6 +100,19 @@ target cannot reach them without a change to the production code. The task
 forbids such a change, so the property tests of those parsers sit next to
 the code.
 
+### The targets of the branch `next`
+
+Each step of `PLAN.md` that adds a parser adds its fuzz target in the same
+commit.
+
+| Step | Crate | Target | What it reads | Inputs |
+|------|-------|--------|---------------|-------:|
+| 1.2 | `pent-profile` | `rule_file` | The text of a rule file. A file that `RuleSet::from_toml` accepts must give the same rules after `to_toml`, and after `update_toml` with no change, with the first rule removed, and with a rule added. | 1,833,666 |
+
+The run of 2026-11-22 took 151 seconds on a NixOS machine with Linux 7.3.3,
+with no finding.
+`docs/security/rules.md` (RF-11) names the property.
+
 ## The property tests
 
 Each test ran with `PENT_PROPERTY_ROUNDS=1000000`. The whole run took 196

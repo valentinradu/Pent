@@ -10,7 +10,22 @@ result.
 | [containment.md](containment.md) | The private directories, the PID namespace, the `connect(2)` supervisor and the guard |
 | [network.md](network.md) | The proxy, the DNS server and the network namespace |
 | [watch-and-profiles.md](watch-and-profiles.md) | The recorder, the guard, the summary, the review and the profile store |
+| [rules.md](rules.md) | The rule model and the rule files of the new design (branch `next`) |
 | [fuzzing.md](fuzzing.md) | The parsers that read bytes which an attacker chooses: the fuzz run and its findings |
+
+## The state of the branch `next`
+
+The branch `next` builds the design in `docs/design/pent.md`, one step of
+`PLAN.md` at a time. Each step adds its claims to these reports, with a test
+for each claim, in the same commit. Thus the reports always describe the
+code of the branch:
+
+- [rules.md](rules.md) describes the parts of the new design that exist:
+  the rule model and the rule files. `pent run` does not use them yet.
+- The other reports describe the flow of version 0.2.x (profiles, `pent
+  watch`, `pent trust`). This flow still runs on `next`, and its tests still
+  pass. Phase 8 of `PLAN.md` removes it, and the reports of the removed code
+  go with it.
 
 ## The threat model
 
