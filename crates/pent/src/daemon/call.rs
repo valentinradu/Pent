@@ -17,9 +17,22 @@ use tokio::net::UnixStream;
 
 use super::{read_message, DaemonError};
 
-/// How long a call waits for each message of pentd. A forget waits for a
-/// write of the rule file, so the time leaves room for a slow disk.
+/// How long a call waits for each message of pentd, when [`REPLY_WAIT_VAR`]
+/// is not set. A forget waits for a write of the rule file, so the time
+/// leaves room for a slow disk.
 const REPLY_WAIT: Duration = Duration::from_secs(10);
+
+/// The variable that sets the reply wait in milliseconds. The tests use it
+/// to see the limit without a wait of 10 s.
+pub(crate) const REPLY_WAIT_VAR: &str = "PENT_REPLY_WAIT_MS";
+
+/// How long a call waits for each message of pentd.
+fn reply_wait() -> Duration {
+    std::env::var(REPLY_WAIT_VAR)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map_or(REPLY_WAIT, Duration::from_millis)
+}
 
 /// One connection to pentd for one request.
 #[derive(Debug)]
@@ -57,11 +70,12 @@ impl Call {
     /// The next message of pentd.
     ///
     /// # Errors
-    /// Returns `DaemonError::NoReply` after [`REPLY_WAIT`] with no message,
+    /// Returns `DaemonError::NoReply` after the reply wait (default
+    /// [`REPLY_WAIT`]) with no message,
     /// `DaemonError::Closed` when pentd closed the connection, and
     /// `DaemonError::Read` for a line that is not valid.
     pub(crate) async fn next(&mut self) -> Result<Message, DaemonError> {
-        match tokio::time::timeout(REPLY_WAIT, read_message(&mut self.reader)).await {
+        match tokio::time::timeout(reply_wait(), read_message(&mut self.reader)).await {
             Err(_) => Err(DaemonError::NoReply),
             Ok(Ok(Some(message))) => Ok(message),
             Ok(Ok(None)) => Err(DaemonError::Closed),

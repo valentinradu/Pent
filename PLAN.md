@@ -108,6 +108,10 @@ ready for users.
   details, and the warning of a sensitive question.
   - Done: tests of the model of the screen; a manual check on a real
     terminal.
+  - Open point from step 2.4: pentd does not tell a session its number,
+    so `pent run` cannot print it, and `pent denials SESSION` needs a
+    number that the user sees only next to a refusal. Decide here (or in
+    step 6.1) the reply to `Hold::Run` that carries the number.
 
 ## Phase 3: questions for the network, sockets and ports
 
@@ -117,6 +121,9 @@ not their structure.
 - [ ] **3.1 The rules in `pent run`.** `pent run` reads the rules of its key
   at the start and asks pentd for each access that no rule answers. It no
   longer reads profiles, and it no longer needs a trusted profile to start.
+  - `pent run` sends an `Event` for each decision, so `pent denials`
+    shows the refusals of a real run. Add an end-to-end test with a real
+    `pent run` (step 2.4 tests the list only with a fake session).
 - [ ] **3.2 The proxy.** A CONNECT or a SOCKS request for a name with no rule
   waits for an answer (20 s).
   - Files: `pent-proxy/src/proxy.rs`, `server.rs`.

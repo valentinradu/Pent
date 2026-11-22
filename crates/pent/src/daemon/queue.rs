@@ -610,6 +610,29 @@ mod tests {
     }
 
     #[test]
+    fn a_question_that_goes_during_the_write_gets_no_verdict() {
+        let mut q = Queue::default();
+        let (a, _) = q.ask(S1, &key("cargo"), read("/home/u/reg/a")).unwrap();
+        let (b, _) = q.ask(S2, &key("cargo"), read("/home/u/reg/b")).unwrap();
+        let plan = q
+            .check(&answer(a.id, Decision::Allow, 1, Scope::Remember))
+            .unwrap();
+        // The write takes time. The session of `a` ended long ago, and the
+        // queue drops its orphan meanwhile.
+        let t0 = Instant::now();
+        q.end_session(S1, t0);
+        assert_eq!(q.expire(t0 + ORPHAN_TTL), 1);
+        // The kept rule still resolves the other question inside the width,
+        // but the answered question gets no verdict.
+        let ids: Vec<QuestionId> = q
+            .resolve(&plan, Scope::Remember)
+            .iter()
+            .map(|(_, v)| v.id)
+            .collect();
+        assert_eq!(ids, vec![b.id]);
+    }
+
+    #[test]
     fn one_session_has_at_most_the_limit_of_open_questions() {
         let mut q = Queue::default();
         for i in 0..MAX_OPEN_PER_SESSION {

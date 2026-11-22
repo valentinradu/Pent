@@ -1468,6 +1468,33 @@ created = 2026-11-22T12:00:01Z
     }
 
     #[test]
+    fn a_client_stops_when_pentd_does_not_reply() -> TestResult {
+        let rt = Runtime::new()?;
+        let state = tempfile::tempdir()?;
+        // A listener that never accepts: the connection and the request go
+        // into the queue of the kernel, and no reply comes.
+        std::fs::create_dir_all(rt.pent_dir())?;
+        std::fs::set_permissions(rt.pent_dir(), std::fs::Permissions::from_mode(0o700))?;
+        let _silent = std::os::unix::net::UnixListener::bind(rt.socket())?;
+        let start = Instant::now();
+        let output = rt
+            .pent(&["questions"])
+            .env("XDG_STATE_HOME", state.path())
+            .env("HOME", state.path())
+            .env("PENT_REPLY_WAIT_MS", "200")
+            .stderr(Stdio::piped())
+            .output()?;
+        let err = fails(&output)?;
+        assert!(err.contains("pentd sent no reply in time"), "{err}");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            start.elapsed()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn each_client_fails_when_no_pentd_runs_and_starts_none() -> TestResult {
         let rt = Runtime::new()?;
         let state = tempfile::tempdir()?;

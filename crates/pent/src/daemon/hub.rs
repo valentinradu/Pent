@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use pent_profile::{
     Answer, Forget, Forgotten, Hold, Message, QuestionId, RejectReason, Rejected, RuleKey, Scope,
-    SessionId,
+    SessionId, Verdict,
 };
 use pent_settings::RuleStore;
 use tokio::sync::{mpsc, watch, Notify};
@@ -384,12 +384,8 @@ impl Hub {
         let mut state = self.lock();
         let verdicts = state.queue.resolve(&plan, scope);
         self.publish(&state);
-        if !verdicts.iter().any(|(_, v)| v.id == plan.id) {
-            // The question went during the write: its session ended long
-            // ago, and the queue dropped it. A kept rule stays.
-            reject(outbox, Some(answer.id), RejectReason::UnknownQuestion);
-        } else if !kept {
-            reject(outbox, Some(answer.id), RejectReason::RuleNotKept);
+        if let Some(reason) = answer_error(plan.id, &verdicts, kept) {
+            reject(outbox, Some(answer.id), reason);
         }
         let answerer_watches = state.watches(outbox);
         for (session, verdict) in verdicts {
@@ -507,6 +503,26 @@ impl Hub {
     }
 }
 
+/// The error for the client that answered `id`, which pentd sends before
+/// the verdicts. When the question went during the write (its session ended
+/// long ago, and the queue dropped it), no verdict names it: the client
+/// gets `UnknownQuestion`, so it does not wait for a verdict that never
+/// comes. A kept rule stays. Else a rule that pentd did not keep gives
+/// `RuleNotKept`.
+fn answer_error(
+    id: QuestionId,
+    verdicts: &[(SessionId, Verdict)],
+    kept: bool,
+) -> Option<RejectReason> {
+    if !verdicts.iter().any(|(_, v)| v.id == id) {
+        Some(RejectReason::UnknownQuestion)
+    } else if !kept {
+        Some(RejectReason::RuleNotKept)
+    } else {
+        None
+    }
+}
+
 /// Send `message` to one connection. A closed or a full connection is not
 /// an error here: its task ends soon.
 fn send(outbox: &Outbox, message: Message) {
@@ -523,4 +539,50 @@ fn broadcast(watchers: &mut Vec<Outbox>, message: &Message) {
 /// Refuse a message of a client.
 fn reject(outbox: &Outbox, id: Option<QuestionId>, reason: RejectReason) {
     send(outbox, Message::Rejected(Rejected { id, reason }));
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroU16;
+
+    use pent_profile::{Decision, Source, Target};
+
+    use super::*;
+
+    fn verdict(id: u64) -> (SessionId, Verdict) {
+        (
+            SessionId(0),
+            Verdict {
+                id: QuestionId(id),
+                decision: Decision::Allow,
+                target: Target::Localhost(NonZeroU16::MIN),
+                scope: Scope::Run,
+                source: Source::Human,
+            },
+        )
+    }
+
+    #[test]
+    fn the_client_gets_an_end_when_its_question_went_or_its_rule_was_not_kept() {
+        let id = QuestionId(1);
+        let with = [verdict(0), verdict(1)];
+        let without = [verdict(0)];
+        assert_eq!(answer_error(id, &with, true), None);
+        assert_eq!(
+            answer_error(id, &with, false),
+            Some(RejectReason::RuleNotKept)
+        );
+        assert_eq!(
+            answer_error(id, &without, true),
+            Some(RejectReason::UnknownQuestion)
+        );
+        assert_eq!(
+            answer_error(id, &without, false),
+            Some(RejectReason::UnknownQuestion)
+        );
+        assert_eq!(
+            answer_error(id, &[], true),
+            Some(RejectReason::UnknownQuestion)
+        );
+    }
 }
