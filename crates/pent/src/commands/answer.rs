@@ -64,7 +64,7 @@ pub(crate) async fn answer(args: &AnswerArgs, decision: Decision) -> Result<(), 
 }
 
 /// The text of a verdict: `question 7: allow read /x/** (this run)`.
-fn verdict_text(verdict: &Verdict) -> String {
+pub(crate) fn verdict_text(verdict: &Verdict) -> String {
     let scope = match verdict.scope {
         Scope::Run => "this run",
         Scope::Remember => "remembered",

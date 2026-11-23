@@ -21,10 +21,10 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::guard::{guard_rules_with, GuardAccess, GuardRule};
+use crate::guard::{guard_rules_with, GuardAccess, GuardRule, GuardTarget};
 use crate::localhost::CONTROL_PORTS;
 use crate::psl;
-use crate::rule::{Access, DomainName, DomainWidth, FileKind, PathWidth, RulePath, Target};
+use crate::rule::{Access, Depth, DomainName, DomainWidth, FileKind, PathWidth, RulePath, Target};
 use crate::GuardClass;
 
 /// Unix sockets that give a way out of the sandbox: a container engine runs
@@ -273,9 +273,30 @@ impl Classifier {
         menu
     }
 
-    /// Return true if a subtree rule on `dir` is narrow enough for the menu.
+    /// Return true if a subtree rule on `dir` is narrow enough for the menu:
+    /// not `/`, not a directory directly below `/`, not the home directory
+    /// or a parent of it, and not a directory that holds a location of the
+    /// guard list. The guard list holds each directory of pent too
+    /// (`GuardClass::PentFiles`). Thus no menu offers `~/.config/**`, which
+    /// holds `~/.config/pent` and many credentials.
     fn subtree_allowed(&self, dir: &Path) -> bool {
-        dir.components().count() > 2 && !self.home.starts_with(dir)
+        dir.components().count() > 2
+            && !self.home.starts_with(dir)
+            && !self
+                .guard
+                .iter()
+                .filter_map(|rule| guard_location(&rule.target))
+                .any(|location| location.starts_with(dir))
+    }
+}
+
+/// The path of a guard target, or `None` for a target that matches a file
+/// name anywhere.
+fn guard_location(target: &GuardTarget) -> Option<&Path> {
+    match target {
+        GuardTarget::Exact(p) | GuardTarget::Subtree(p) => Some(p),
+        GuardTarget::FilesInDir { dir, .. } => Some(dir),
+        GuardTarget::BinaryName(_) => None,
     }
 }
 
@@ -310,11 +331,11 @@ fn domain_widths(name: &DomainName) -> Vec<Target> {
             continue;
         };
         if n == 0 {
-            if let Ok(width) = DomainWidth::wildcard(base.clone(), false) {
+            if let Ok(width) = DomainWidth::wildcard(base.clone(), Depth::OneLabel) {
                 menu.push(Target::Domain(width));
             }
         }
-        if let Ok(width) = DomainWidth::wildcard(base, true) {
+        if let Ok(width) = DomainWidth::wildcard(base, Depth::Any) {
             menu.push(Target::Domain(width));
         }
     }
@@ -537,9 +558,10 @@ mod tests {
                 "Read =/home/u/.cargo/registry/src/x.rs",
                 "Read /home/u/.cargo/registry/src/**",
                 "Read /home/u/.cargo/registry/**",
-                "Read /home/u/.cargo/**",
             ]
         );
+        // No `~/.cargo/**`: it holds the credentials of cargo, which the
+        // guard list names.
         // A file in the home root gets only the exact path.
         let p = path("/home/u/.claude.json");
         let write = Access::File {
@@ -547,6 +569,59 @@ mod tests {
             path: &p,
         };
         assert_eq!(menu(&write), ["Write =/home/u/.claude.json"]);
+    }
+
+    #[test]
+    fn a_file_menu_offers_no_subtree_that_holds_pent_or_a_credential() {
+        let read = |p: &str| {
+            let p = path(p);
+            menu(&Access::File {
+                kind: FileKind::Read,
+                path: &p,
+            })
+        };
+        // `~/.config` holds `~/.config/pent` and the guard list; the menu
+        // stops below it.
+        assert_eq!(
+            read("/home/u/.config/foo/x"),
+            ["Read =/home/u/.config/foo/x", "Read /home/u/.config/foo/**"]
+        );
+        // `~/.local/share` holds `~/.local/share/pent`.
+        let local = read("/home/u/.local/share/app/x");
+        assert!(
+            local.contains(&"Read /home/u/.local/share/app/**".to_string()),
+            "{local:?}"
+        );
+        assert!(
+            !local.iter().any(|m| m == "Read /home/u/.local/share/**"),
+            "{local:?}"
+        );
+        assert!(
+            !local.iter().any(|m| m == "Read /home/u/.local/**"),
+            "{local:?}"
+        );
+        // Only a location of the guard list: `~/.cargo` holds the
+        // credentials of cargo.
+        let cargo = read("/home/u/.cargo/registry/x");
+        assert!(
+            cargo.contains(&"Read /home/u/.cargo/registry/**".to_string()),
+            "{cargo:?}"
+        );
+        assert!(
+            !cargo.iter().any(|m| m == "Read /home/u/.cargo/**"),
+            "{cargo:?}"
+        );
+        // Only a directory of pent: `~/.local/state` holds
+        // `~/.local/state/pent`.
+        let state = read("/home/u/.local/state/app/x");
+        assert!(
+            state.contains(&"Read /home/u/.local/state/app/**".to_string()),
+            "{state:?}"
+        );
+        assert!(
+            !state.iter().any(|m| m == "Read /home/u/.local/state/**"),
+            "{state:?}"
+        );
     }
 
     #[test]

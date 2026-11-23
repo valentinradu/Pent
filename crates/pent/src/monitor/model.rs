@@ -17,9 +17,11 @@
 use std::collections::{HashMap, VecDeque};
 
 use pent_profile::{
-    Answer, Decision, Event, MenuIndex, Message, Question, QuestionId, Rule, RuleKey, RuleSet,
-    Scope, SessionId, SessionInfo, Source, Target,
+    Answer, Decision, Event, MenuIndex, Message, Question, QuestionId, RejectReason, Rule, RuleKey,
+    Scope, SessionId, SessionInfo, Source,
 };
+
+use crate::daemon::queue::Resolving;
 
 /// The most events that the monitor keeps.
 pub(crate) const MAX_EVENTS: usize = 2000;
@@ -192,27 +194,26 @@ impl Model {
         self.widths.get(&question.id).copied().unwrap_or(0)
     }
 
-    /// The number of open questions that the selected target covers: the
-    /// questions of the same key, also the selected one, as an answer with
-    /// the scope `remember` resolves them. A sensitive question counts only
-    /// for its own exact target, as in pentd.
-    pub(crate) fn covered(&self) -> usize {
+    /// The number of open questions that an answer with `decision`, the
+    /// selected target and the selected scope resolves, also the selected
+    /// one. The rule is the one of pentd (`queue::Resolving`).
+    pub(crate) fn covered(&self, decision: Decision) -> usize {
         let Some(question) = self.selected() else {
             return 0;
         };
         let Some(target) = question.ask.menu.get(usize::from(self.width_of(question))) else {
             return 0;
         };
-        let set = covering(&question.ask.key, target);
+        let answer = Resolving {
+            key: &question.ask.key,
+            session: question.ask.session,
+            target,
+            decision,
+            scope: self.scope,
+        };
         self.questions
             .iter()
-            .filter(|q| q.ask.key == question.ask.key)
-            .filter(|q| {
-                let access = q.ask.request.as_access();
-                let sensitive = matches!(q.ask.class, pent_profile::Class::Sensitive(_));
-                set.decide(&access).is_some()
-                    && (!sensitive || pent_profile::exact_target(&access) == *target)
-            })
+            .filter(|q| q.id == question.id || answer.resolves(&q.ask))
             .count()
     }
 
@@ -270,23 +271,23 @@ impl Model {
             }
             Message::Verdict(verdict) => {
                 self.remove(verdict.id);
-                let scope = match verdict.scope {
-                    Scope::Run => "this run",
-                    Scope::Remember => "remembered",
-                };
-                self.status = Some(format!(
-                    "{}: {} {} ({scope})",
-                    verdict.id,
-                    verdict.decision.name(),
-                    pent_profile::safe(&verdict.target.to_string())
-                ));
+                self.status = Some(crate::commands::answer::verdict_text(&verdict));
                 if verdict.scope == Scope::Remember && self.tab == Tab::Rules {
                     return vec![Action::LoadRules];
                 }
             }
             Message::Rejected(rejected) => {
+                // A question that pentd does not know any more leaves the
+                // screen.
+                if let (Some(id), RejectReason::UnknownQuestion) = (rejected.id, rejected.reason) {
+                    self.remove(id);
+                }
                 let id = rejected.id.map(|id| format!("{id}: ")).unwrap_or_default();
                 self.status = Some(format!("{id}{}", rejected.reason));
+            }
+            Message::Gone(id) => {
+                self.remove(id);
+                self.status = Some(format!("{id}: pentd dropped the question of an ended run"));
             }
             Message::Session(info) => match self.sessions.iter_mut().find(|s| s.id == info.id) {
                 Some(old) => *old = info,
@@ -475,19 +476,6 @@ impl Model {
     }
 }
 
-/// A rule set with one rule for `target`, to ask which accesses it covers.
-fn covering(key: &RuleKey, target: &Target) -> RuleSet {
-    RuleSet {
-        key: key.clone(),
-        rules: vec![Rule {
-            target: target.clone(),
-            decision: Decision::Allow,
-            source: Source::Human,
-            created: std::time::SystemTime::UNIX_EPOCH,
-        }],
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic)] // a test fails on a value that it must not get
 pub(crate) mod tests {
@@ -495,7 +483,7 @@ pub(crate) mod tests {
 
     use pent_profile::{
         Ask, Class, Deadline, DecidedBy, EventsDropped, FileKind, PathWidth, RejectReason,
-        Rejected, Request, RulePath, Sensitive, Timestamp, Verdict, FILE_DEADLINE,
+        Rejected, Request, RulePath, Sensitive, Target, Timestamp, Verdict, FILE_DEADLINE,
     };
 
     use super::*;
@@ -651,17 +639,60 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_gone_or_unknown_question_leaves_the_screen() {
+        let mut m = model_with(vec![
+            read(1, "cargo", "/h/r/a", "/h/r"),
+            read(2, "cargo", "/h/r/b", "/h/r"),
+        ]);
+        m.apply(Message::Gone(QuestionId(1)));
+        assert_eq!(m.open(), 1);
+        assert_eq!(m.selected().map(|q| q.id.0), Some(2));
+        m.apply(Message::Rejected(Rejected {
+            id: Some(QuestionId(2)),
+            reason: RejectReason::UnknownQuestion,
+        }));
+        assert_eq!(m.open(), 0);
+        // Another refusal keeps the question.
+        let mut m = model_with(vec![read(3, "cargo", "/h/r/c", "/h/r")]);
+        m.apply(Message::Rejected(Rejected {
+            id: Some(QuestionId(3)),
+            reason: RejectReason::BadWidth,
+        }));
+        assert_eq!(m.open(), 1);
+    }
+
+    #[test]
     fn the_cover_count_follows_the_width() {
         let mut m = model_with(vec![
             read(1, "cargo", "/h/r/a", "/h/r"),
             read(2, "cargo", "/h/r/b", "/h/r"),
             read(3, "node", "/h/r/c", "/h/r"),
         ]);
-        assert_eq!(m.covered(), 1);
+        assert_eq!(m.covered(Decision::Allow), 1);
         m.key(Key::Right);
         // The subtree covers the two questions of `cargo`, not the one of
         // `node`.
-        assert_eq!(m.covered(), 2);
+        assert_eq!(m.covered(Decision::Allow), 2);
+
+        // With the scope `run`, a question of another run of `cargo` does
+        // not count; with `remember`, it does.
+        let mut other = read(4, "cargo", "/h/r/d", "/h/r");
+        other.ask.session = SessionId(9);
+        m.apply(Message::Question(other));
+        assert_eq!(m.covered(Decision::Allow), 2);
+        m.key(Key::Char('s'));
+        assert_eq!(m.covered(Decision::Allow), 3);
+
+        // A deny of a read also resolves a write question; an allow does
+        // not.
+        let mut write = read(5, "cargo", "/h/r/e", "/h/r");
+        write.ask.request = Request::File {
+            kind: FileKind::Write,
+            path: path("/h/r/e"),
+        };
+        m.apply(Message::Question(write));
+        assert_eq!(m.covered(Decision::Allow), 3);
+        assert_eq!(m.covered(Decision::Deny), 4);
     }
 
     #[test]

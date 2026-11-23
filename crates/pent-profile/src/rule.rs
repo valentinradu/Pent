@@ -285,7 +285,9 @@ impl FileKind {
 
     /// Return true if a rule of this kind also permits an access of the kind
     /// `access`. A read, write or exec rule includes the listings inside its
-    /// width, and a write or exec rule includes reads.
+    /// width, and a write or exec rule includes reads. This is the rule of an
+    /// allow; a deny of a kind refuses the kinds that cover it (see
+    /// `Rule::matches`).
     #[must_use]
     pub const fn covers(self, access: Self) -> bool {
         matches!(
@@ -342,20 +344,28 @@ pub enum DomainWidth {
     AnyDepth(DomainName),
 }
 
+/// How deep a domain wildcard goes below its base.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Depth {
+    /// `*.base`: exactly one more label.
+    OneLabel,
+    /// `**.base`: one or more labels.
+    Any,
+}
+
 impl DomainWidth {
-    /// Make a wildcard below `base`.
+    /// Make a wildcard below `base` with the depth `depth`.
     ///
     /// # Errors
     /// Returns an error if the wildcard would cover a public suffix, for
     /// example `*.com` or `*.github.io`.
-    pub fn wildcard(base: DomainName, any_depth: bool) -> Result<Self, RuleError> {
+    pub fn wildcard(base: DomainName, depth: Depth) -> Result<Self, RuleError> {
         if !psl::wildcard_allowed(base.as_str()) {
             return Err(RuleError::WildcardTooWide(base.0));
         }
-        Ok(if any_depth {
-            Self::AnyDepth(base)
-        } else {
-            Self::OneLabel(base)
+        Ok(match depth {
+            Depth::Any => Self::AnyDepth(base),
+            Depth::OneLabel => Self::OneLabel(base),
         })
     }
 }
@@ -380,9 +390,9 @@ impl FromStr for DomainWidth {
     /// Parse the form of the proxy: `name`, `*.base` or `**.base`.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         if let Some(base) = s.strip_prefix("**.") {
-            Self::wildcard(base.parse()?, true)
+            Self::wildcard(base.parse()?, Depth::Any)
         } else if let Some(base) = s.strip_prefix("*.") {
-            Self::wildcard(base.parse()?, false)
+            Self::wildcard(base.parse()?, Depth::OneLabel)
         } else {
             s.parse().map(Self::Exact)
         }
@@ -508,7 +518,16 @@ impl Rule {
     fn matches(&self, access: &Access<'_>) -> Option<Rank> {
         match (&self.target, access) {
             (Target::File { kind, width }, Access::File { kind: want, path }) => {
-                if !kind.covers(*want) {
+                // An allow of a kind permits the narrower kinds too: a
+                // write includes a read. A deny of a kind refuses the wider
+                // kinds too: a write or an exec reads the file, so a deny
+                // of the read refuses them. A deny of a write does not
+                // refuse a read.
+                let kind_fits = match self.decision {
+                    Decision::Allow => kind.covers(*want),
+                    Decision::Deny => want.covers(*kind),
+                };
+                if !kind_fits {
                     return None;
                 }
                 match width {
@@ -808,14 +827,58 @@ mod tests {
     fn deny_wins_a_tie() -> TestResult {
         let p = path("/home/u/x")?;
         let rules = set(vec![
-            file(FileKind::Read, PathWidth::Exact(p.clone()), Decision::Allow),
-            file(FileKind::Write, PathWidth::Exact(p.clone()), Decision::Deny),
+            file(
+                FileKind::Write,
+                PathWidth::Exact(p.clone()),
+                Decision::Allow,
+            ),
+            file(FileKind::Read, PathWidth::Exact(p.clone()), Decision::Deny),
         ])?;
         let read = Access::File {
             kind: FileKind::Read,
             path: &p,
         };
         assert_eq!(rules.decide(&read), Some(Decision::Deny));
+        Ok(())
+    }
+
+    #[test]
+    fn a_deny_refuses_its_kind_and_the_wider_kinds_only() -> TestResult {
+        let p = path("/home/u/x")?;
+        let access = |kind| Access::File { kind, path: &p };
+        let all = [
+            FileKind::List,
+            FileKind::Read,
+            FileKind::Write,
+            FileKind::Exec,
+        ];
+        let refused = |deny: FileKind| -> Result<Vec<FileKind>, RuleError> {
+            let rules = set(vec![file(
+                deny,
+                PathWidth::Exact(p.clone()),
+                Decision::Deny,
+            )])?;
+            Ok(all
+                .into_iter()
+                .filter(|k| rules.decide(&access(*k)) == Some(Decision::Deny))
+                .collect())
+        };
+        use FileKind::{Exec, List, Read, Write};
+        assert_eq!(refused(List)?, [List, Read, Write, Exec]);
+        assert_eq!(refused(Read)?, [Read, Write, Exec]);
+        assert_eq!(refused(Write)?, [Write]);
+        assert_eq!(refused(Exec)?, [Exec]);
+        // An allow keeps the narrower kinds.
+        let rules = set(vec![file(
+            Write,
+            PathWidth::Exact(p.clone()),
+            Decision::Allow,
+        )])?;
+        let allowed: Vec<FileKind> = all
+            .into_iter()
+            .filter(|k| rules.decide(&access(*k)) == Some(Decision::Allow))
+            .collect();
+        assert_eq!(allowed, [List, Read, Write]);
         Ok(())
     }
 
@@ -828,11 +891,11 @@ mod tests {
                 Decision::Allow,
             ),
             rule(
-                Target::Domain(DomainWidth::wildcard(name("npmjs.org")?, false)?),
+                Target::Domain(DomainWidth::wildcard(name("npmjs.org")?, Depth::OneLabel)?),
                 Decision::Allow,
             ),
             rule(
-                Target::Domain(DomainWidth::wildcard(name("cdn.net.example")?, true)?),
+                Target::Domain(DomainWidth::wildcard(name("cdn.net.example")?, Depth::Any)?),
                 Decision::Allow,
             ),
         ])?;
@@ -860,7 +923,7 @@ mod tests {
     #[test]
     fn a_wildcard_cannot_cover_a_public_suffix() -> TestResult {
         for base in ["com", "co.uk", "github.io"] {
-            let result = DomainWidth::wildcard(base.parse()?, false);
+            let result = DomainWidth::wildcard(base.parse()?, Depth::OneLabel);
             assert!(
                 matches!(result, Err(RuleError::WildcardTooWide(_))),
                 "{base}"

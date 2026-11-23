@@ -59,8 +59,8 @@ pub use render::{
 };
 pub use review::{review, Selection};
 pub use rule::{
-    Access, Decision, DomainName, DomainWidth, FileKind, PathWidth, Rule, RuleError, RuleKey,
-    RulePath, RuleSet, Source, Target,
+    Access, Decision, Depth, DomainName, DomainWidth, FileKind, PathWidth, Rule, RuleError,
+    RuleKey, RulePath, RuleSet, Source, Target,
 };
 pub use rule_file::{format_date, EntryError, Kind as RuleFileKind, RuleFileError};
 pub use summary::{

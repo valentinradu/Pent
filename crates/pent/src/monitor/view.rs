@@ -3,7 +3,7 @@
 //! Each text that a program chose (a path, a name, a command line) goes
 //! through [`safe`], so it cannot hold a control sequence for the terminal.
 
-use pent_profile::{safe, Class, Question, Scope};
+use pent_profile::{safe, Class, Decision, Question, Scope};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -163,8 +163,9 @@ fn detail_lines(model: &Model) -> Vec<Line<'static>> {
     };
     lines.push(Line::raw(format!("scope  {scope}")));
     lines.push(Line::raw(format!(
-        "covers {} of the open questions of {}",
-        model.covered(),
+        "resolves: allow {}, deny {} of the open questions of {}",
+        model.covered(Decision::Allow),
+        model.covered(Decision::Deny),
         ask.key
     )));
     if model.details() {
@@ -356,7 +357,7 @@ mod tests {
         assert!(text.contains("       (•) 1 read /h/r/**"), "{text}");
         assert!(text.contains("scope  [this run]  remember"), "{text}");
         assert!(
-            text.contains("covers 1 of the open questions of claude"),
+            text.contains("resolves: allow 1, deny 1 of the open questions of claude"),
             "{text}"
         );
         // The command line of the session is escaped.

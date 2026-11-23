@@ -90,6 +90,41 @@ impl Plan {
     }
 }
 
+/// An answer as it resolves the open questions: the key and the session of
+/// the answered question, the target, the decision and the scope.
+/// `pent monitor` uses the same rule to count what an answer would resolve.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Resolving<'a> {
+    /// The key of the answered question.
+    pub(crate) key: &'a RuleKey,
+    /// The session of the answered question.
+    pub(crate) session: SessionId,
+    /// The target of the answer.
+    pub(crate) target: &'a Target,
+    /// Allow or deny.
+    pub(crate) decision: Decision,
+    /// The scope that holds.
+    pub(crate) scope: Scope,
+}
+
+impl Resolving<'_> {
+    /// Return true if this answer resolves the open question `other`: the
+    /// same key, and with the scope `run` the same session; the target
+    /// covers the access; and a sensitive question needs its own exact
+    /// target.
+    pub(crate) fn resolves(&self, other: &Ask) -> bool {
+        let same_group = other.key == *self.key
+            && (self.scope == Scope::Remember || other.session == self.session);
+        let access = other.request.as_access();
+        let covered = covering_set(self.key, self.target, self.decision)
+            .decide(&access)
+            .is_some();
+        let allowed =
+            !matches!(other.class, Class::Sensitive(_)) || exact_target(&access) == *self.target;
+        same_group && covered && allowed
+    }
+}
+
 /// The result of an accepted answer, for the tests.
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,24 +247,17 @@ impl Queue {
     /// `remember` and in the session of the question for `run`. pentd calls
     /// this after the write of the rule, with `run` when the write failed.
     pub(crate) fn resolve(&mut self, plan: &Plan, scope: Scope) -> Vec<(SessionId, Verdict)> {
-        let covers = covering_set(&plan.key, &plan.target, plan.decision);
+        let answer = Resolving {
+            key: &plan.key,
+            session: plan.session,
+            target: &plan.target,
+            decision: plan.decision,
+            scope,
+        };
         let resolved: Vec<QuestionId> = self
             .open
             .values()
-            .filter(|e| {
-                let q = &e.question.ask;
-                if e.question.id == plan.id {
-                    return true;
-                }
-                let same_group =
-                    q.key == plan.key && (scope == Scope::Remember || q.session == plan.session);
-                let access = q.request.as_access();
-                let covered = covers.decide(&access).is_some();
-                // A sensitive question needs its own exact answer.
-                let allowed =
-                    !matches!(q.class, Class::Sensitive(_)) || exact_target(&access) == plan.target;
-                same_group && covered && allowed
-            })
+            .filter(|e| e.question.id == plan.id || answer.resolves(&e.question.ask))
             .map(|e| e.question.id)
             .collect();
         let mut verdicts = Vec::with_capacity(resolved.len());
@@ -296,9 +324,9 @@ impl Queue {
         }
     }
 
-    /// Drop each orphan older than [`ORPHAN_TTL`]. Returns how many it
-    /// dropped.
-    pub(crate) fn expire(&mut self, now: std::time::Instant) -> usize {
+    /// Drop each orphan older than [`ORPHAN_TTL`]. Returns the dropped
+    /// questions, so pentd can tell the watchers.
+    pub(crate) fn expire(&mut self, now: std::time::Instant) -> Vec<QuestionId> {
         let old: Vec<QuestionId> = self
             .open
             .values()
@@ -311,7 +339,7 @@ impl Queue {
         for id in &old {
             self.take(*id);
         }
-        old.len()
+        old
     }
 
     /// The open questions, in the order of the asks.
@@ -645,7 +673,7 @@ mod tests {
         // queue drops its orphan meanwhile.
         let t0 = Instant::now();
         q.end_session(S1, t0);
-        assert_eq!(q.expire(t0 + ORPHAN_TTL), 1);
+        assert_eq!(q.expire(t0 + ORPHAN_TTL).len(), 1);
         // The kept rule still resolves the other question inside the width,
         // but the answered question gets no verdict.
         let ids: Vec<QuestionId> = q
@@ -706,13 +734,13 @@ mod tests {
         let (live, _) = q.ask(S2, &key("cargo"), read("/home/u/c")).unwrap();
         let t0 = Instant::now();
         q.end_session(S1, t0);
-        assert_eq!(q.expire(t0 + ORPHAN_TTL - Duration::from_secs(1)), 0);
+        assert_eq!(q.expire(t0 + ORPHAN_TTL - Duration::from_secs(1)).len(), 0);
         // A late answer becomes a rule.
         let res = q
             .answer(&answer(a.id, Decision::Allow, 0, Scope::Remember))
             .unwrap();
         assert!(res.rule.is_some());
-        assert_eq!(q.expire(t0 + ORPHAN_TTL), 1, "the other orphan goes");
+        assert_eq!(q.expire(t0 + ORPHAN_TTL).len(), 1, "the other orphan goes");
         assert_eq!(q.open().map(|x| x.id).collect::<Vec<_>>(), vec![live.id]);
         assert!(!q.open().any(|x| x.id == b.id));
     }

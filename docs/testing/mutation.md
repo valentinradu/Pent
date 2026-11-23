@@ -95,6 +95,12 @@ makes one mutation by hand. The test must fail on the mutant. No
 | 2.5 | The monitor answers with the first place of the menu. | `model::tests::an_answer_names_the_selected_width_and_scope`, `pent_monitor_answers_with_a_width_and_shows_the_new_rule` |
 | 2.5 | The monitor does not escape the command line of a session. | `view::tests::the_questions_show_by_key_with_the_menu_of_the_selected_one` |
 | 2.5 | The rules tab does not load the rules when it opens. | `model::tests::the_rules_tab_loads_the_rules_when_it_opens_and_after_a_kept_answer`, `pent_monitor_answers_with_a_width_and_shows_the_new_rule` |
+| 2.5 | A deny refuses the narrower kinds, as an allow permits them. | `rule::tests::a_deny_refuses_its_kind_and_the_wider_kinds_only` |
+| 2.5 | A subtree in a menu may hold a location of the guard list. | `class::tests::a_file_menu_offers_no_subtree_that_holds_pent_or_a_credential` |
+| 2.5 | pentd drops an old orphan with no message to the watchers. | `hub::tests::each_watcher_learns_that_an_old_orphan_is_gone` |
+| 2.5 | A watcher that answers gets its batch after the broadcast. | `hub::tests::a_watcher_that_answers_gets_rule_not_kept_before_the_verdicts` |
+| 2.5 | The monitor ignores `gone`. | `model::tests::a_gone_or_unknown_question_leaves_the_screen` |
+| 2.5 | An answer with the scope `run` resolves the questions of other sessions. | `model::tests::the_cover_count_follows_the_width`, `queue::tests::the_scope_decides_which_sessions_share_the_answer` |
 
 The first form of `pent_run_starts_pentd_and_holds_it_for_the_run` passed on
 the mutant: the client started a new pentd each time that it lost one. The
@@ -114,7 +120,9 @@ its mutant: the background session of `pent run` made the directory before
 the sandbox computed its masks. The test now runs a program whose file name
 is not a valid key, so `pent run` holds no pentd. A mutation by hand also
 leaves a restored file with an older time than the last build, so the next
-`cargo test` can run the mutant: touch each restored file.
+`cargo test` can run the mutant: touch each restored file. A check of the pent
+directories in `subtree_allowed` survived its mutant: the guard list holds
+those directories already, so the check went.
 
 ## How to repeat the run
 

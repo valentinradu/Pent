@@ -730,22 +730,20 @@ enum RootCreate {
     Existing,
 }
 
-fn current_uid() -> libc::uid_t {
-    pent_settings::current_uid()
-}
-
 /// Returns the possible staging roots, in the order of preference.
 ///
 /// The first root is `/tmp/pent-<uid>`. It keeps the filesystem that older
-/// versions used. The second root is `$XDG_RUNTIME_DIR/pent`. Pent uses it
-/// when another user owns the first root.
+/// versions used. The second root is the runtime directory of pent
+/// (`RuntimeDir`), which is `$XDG_RUNTIME_DIR/pent` only when the sandbox
+/// hides that place. Pent uses it when another user owns the first root.
 fn staging_root_candidates() -> Vec<PathBuf> {
-    let mut roots = vec![PathBuf::from(format!("/tmp/pent-{}", current_uid()))];
-    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
-        let runtime = PathBuf::from(runtime);
-        if runtime.is_absolute() {
-            roots.push(runtime.join("pent"));
-        }
+    let mut roots = vec![PathBuf::from(format!(
+        "/tmp/pent-{}",
+        pent_settings::current_uid()
+    ))];
+    let runtime = pent_settings::RuntimeDir::from_env().path().to_path_buf();
+    if !roots.contains(&runtime) {
+        roots.push(runtime);
     }
     roots
 }
@@ -770,7 +768,7 @@ fn open_private_dir(path: &Path, create: RootCreate) -> io::Result<OwnedFd> {
     }
     let fd = open_path(path, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW)?;
     let st = fstat_fd(fd.as_fd())?;
-    if st.st_uid != current_uid() {
+    if st.st_uid != pent_settings::current_uid() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!("another user owns '{}'", path.display()),
@@ -2385,7 +2383,7 @@ fn cleanup_stale_in(root: &Path) {
     let Ok(entries) = std::fs::read_dir(proc_fd_path(root_fd.as_fd(), None)) else {
         return;
     };
-    let uid = current_uid();
+    let uid = pent_settings::current_uid();
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some((pid, start)) = parse_staging_name(&name) else {
@@ -2453,7 +2451,7 @@ fn cleanup_legacy_tmp() {
     let Ok(entries) = std::fs::read_dir("/tmp") else {
         return;
     };
-    let uid = current_uid();
+    let uid = pent_settings::current_uid();
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(pid) = name
@@ -2509,6 +2507,22 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::time::{Duration, Instant, SystemTime};
+
+    #[test]
+    fn the_staging_roots_are_the_old_root_and_the_runtime_directory_of_pent() {
+        let roots = super::staging_root_candidates();
+        let old = PathBuf::from(format!("/tmp/pent-{}", pent_settings::current_uid()));
+        let runtime = pent_settings::RuntimeDir::from_env().path().to_path_buf();
+        assert_eq!(roots.first(), Some(&old));
+        assert!(roots.contains(&runtime), "{roots:?}");
+        // No other place, and no root two times.
+        assert!(
+            roots.iter().all(|r| *r == old || *r == runtime),
+            "{roots:?}"
+        );
+        let unique: HashSet<&PathBuf> = roots.iter().collect();
+        assert_eq!(unique.len(), roots.len(), "{roots:?}");
+    }
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 

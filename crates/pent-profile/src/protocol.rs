@@ -36,6 +36,8 @@
 //!   pentd answers with [`Forgotten`].
 //! - [`SessionInfo`]: pentd tells each watcher the start and the end of a
 //!   session, so `pent monitor` can name the session of an event.
+//! - [`Message::Gone`]: pentd dropped an open question with no answer (an
+//!   orphan of an ended session, after its time). Each watcher removes it.
 //! - [`EventsDropped`]: a watcher fell behind, and pentd dropped events for
 //!   it. pentd never drops a question or a verdict.
 
@@ -654,6 +656,8 @@ pub enum Message {
     Session(SessionInfo),
     /// See [`EventsDropped`].
     EventsDropped(EventsDropped),
+    /// pentd dropped this open question with no answer.
+    Gone(QuestionId),
     /// The end of the reply to [`Message::Questions`] or
     /// [`Message::Denials`].
     End,
@@ -788,7 +792,8 @@ mod tests {
         sensitive.menu = vec![
             Target::UnixSocket(path("/run/docker.sock")),
             Target::Domain(
-                DomainWidth::wildcard(name.clone(), true).unwrap_or_else(|e| panic!("{e}")),
+                DomainWidth::wildcard(name.clone(), crate::rule::Depth::Any)
+                    .unwrap_or_else(|e| panic!("{e}")),
             ),
             Target::Localhost(port),
         ];
@@ -894,6 +899,7 @@ mod tests {
                 live: true,
             }),
             Message::EventsDropped(EventsDropped { count: 12 }),
+            Message::Gone(QuestionId(3)),
             Message::End,
         ]
     }

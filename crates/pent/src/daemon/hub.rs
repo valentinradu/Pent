@@ -564,8 +564,10 @@ impl Hub {
         if !state.watches(outbox) {
             to_answerer.0.push_str(&to_watchers.0);
         }
-        broadcast(&mut state.watchers, &to_watchers);
+        // The answerer gets its batch first: when it watches, its
+        // `RuleNotKept` must come before the verdicts of the broadcast.
         outbox.send(to_answerer);
+        broadcast(&mut state.watchers, &to_watchers);
     }
 
     /// Remove the rules of `forget` from the rule file of its key, and send
@@ -668,12 +670,25 @@ impl Hub {
 
     /// Drop the orphans that are too old.
     pub(crate) fn expire(&self) {
+        self.expire_at(std::time::Instant::now());
+    }
+
+    /// Drop what is too old at `now`. Each watcher gets `Gone` for each
+    /// dropped question, so `pent monitor` does not keep it on the screen.
+    fn expire_at(&self, now: std::time::Instant) {
         let mut state = self.lock();
-        let now = std::time::Instant::now();
         let dropped = state.queue.expire(now);
         state.denials.expire(now);
-        if dropped > 0 {
-            tracing::debug!("pentd drops {dropped} old questions of ended sessions");
+        if !dropped.is_empty() {
+            tracing::debug!(
+                "pentd drops {} old questions of ended sessions",
+                dropped.len()
+            );
+            let mut batch = Batch::default();
+            for id in dropped {
+                batch.push(&Message::Gone(id));
+            }
+            broadcast(&mut state.watchers, &batch);
         }
         state.watchers.retain(|w| !w.outbox.tx.is_closed());
         self.publish(&state);
@@ -786,7 +801,7 @@ fn reject(outbox: &Outbox, id: Option<QuestionId>, reason: RejectReason) {
 mod tests {
     use std::num::NonZeroU16;
 
-    use pent_profile::{DecidedBy, Decision, Event, Request, Source, Target, Timestamp};
+    use pent_profile::{DecidedBy, Decision, Event, MenuIndex, Request, Source, Target, Timestamp};
 
     use super::*;
 
@@ -878,6 +893,100 @@ mod tests {
         let all: Vec<&Message> = batches.iter().flatten().collect();
         assert!(
             matches!(&all[..], [Message::Event(e), Message::Session(i)] if e.time.0 == 6 && !i.live)
+        );
+    }
+
+    /// A hub with the classes of the home `/home/u` and the rule store
+    /// `rules`.
+    fn hub_with(rules: Option<RuleStore>) -> Arc<Hub> {
+        Hub::new(
+            rules,
+            Some(Classifier::new(std::path::Path::new("/home/u"), &[])),
+        )
+    }
+
+    /// Hold a session of `cargo` and ask for the port `port`.
+    async fn ask_port(hub: &Arc<Hub>, port: u16) -> (Role, Outbox, QuestionId) {
+        let (session, mut rx, _c) = Outbox::new();
+        let mut role = Role::Client;
+        let hold = Hold::Run {
+            key: "cargo".parse().unwrap(),
+            command: vec![],
+        };
+        hub.handle(&mut role, &session, Message::Hold(hold)).await;
+        let port = NonZeroU16::new(port).unwrap();
+        let ask = pent_profile::Ask {
+            session: SessionId(0),
+            key: "cargo".parse().unwrap(),
+            program: "psql".into(),
+            request: Request::Localhost(port),
+            class: Class::Normal,
+            menu: vec![],
+            asked: Timestamp(0),
+            deadline: pent_profile::Deadline::new(pent_profile::FILE_DEADLINE).unwrap(),
+        };
+        hub.handle(&mut role, &session, Message::Ask(ask)).await;
+        let id = drain(&mut rx)
+            .into_iter()
+            .flatten()
+            .find_map(|m| match m {
+                Message::Question(q) => Some(q.id),
+                _ => None,
+            })
+            .unwrap();
+        (role, session, id)
+    }
+
+    #[tokio::test]
+    async fn each_watcher_learns_that_an_old_orphan_is_gone() {
+        let hub = hub_with(None);
+        let (watcher, mut watched, _c) = Outbox::new();
+        hub.handle(&mut Role::Client, &watcher, Message::Watch)
+            .await;
+        let (role, session, id) = ask_port(&hub, 5432).await;
+        let ended = std::time::Instant::now();
+        hub.end(role, &session);
+        drain(&mut watched);
+        hub.expire_at(ended + super::super::queue::ORPHAN_TTL + std::time::Duration::from_secs(1));
+        let all: Vec<Message> = drain(&mut watched).into_iter().flatten().collect();
+        assert_eq!(all, [Message::Gone(id)]);
+        assert_eq!(hub.open_questions(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_watcher_that_answers_gets_rule_not_kept_before_the_verdicts() {
+        let state = tempfile::tempdir().unwrap();
+        let dirs = pent_settings::PentDirs::from_vars(
+            None,
+            Some(state.path().into()),
+            Some(state.path().into()),
+        )
+        .unwrap();
+        std::fs::create_dir_all(dirs.rules_dir()).unwrap();
+        std::fs::write(dirs.rules_dir().join("cargo.toml"), "not toml [").unwrap();
+        let hub = hub_with(Some(RuleStore::new(&dirs)));
+        let (_role, _session, id) = ask_port(&hub, 5432).await;
+        let (monitor, mut rx, _c) = Outbox::new();
+        let mut role = Role::Client;
+        hub.handle(&mut role, &monitor, Message::Watch).await;
+        drain(&mut rx);
+        let answer = Answer {
+            id,
+            decision: Decision::Allow,
+            width: MenuIndex(0),
+            scope: Scope::Remember,
+            source: Source::Human,
+        };
+        hub.handle(&mut role, &monitor, Message::Answer(answer))
+            .await;
+        let all: Vec<Message> = drain(&mut rx).into_iter().flatten().collect();
+        assert!(
+            matches!(
+                &all[..],
+                [Message::Rejected(r), Message::Verdict(v)]
+                    if r.reason == RejectReason::RuleNotKept && v.id == id && v.scope == Scope::Run
+            ),
+            "{all:?}"
         );
     }
 
