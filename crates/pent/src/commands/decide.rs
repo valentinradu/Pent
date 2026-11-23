@@ -327,6 +327,35 @@ impl pent_proxy::DomainDecider for ProxyDecider {
     }
 }
 
+/// The chain of deciders as the decider of the supervisor (Unix sockets
+/// and ports). The supervisor calls it in a worker thread, which waits on
+/// the runtime of `pent run` for the decision.
+pub(crate) struct SandboxDecider {
+    pub decider: std::sync::Arc<Decider>,
+    pub runtime: tokio::runtime::Handle,
+}
+
+impl std::fmt::Debug for SandboxDecider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("SandboxDecider")
+            .field(self.decider.key())
+            .finish()
+    }
+}
+
+impl pent_sandbox::AccessDecider for SandboxDecider {
+    fn decide(&self, program: &str, request: Request, deadline: Duration) -> Decision {
+        let decided_by = self
+            .runtime
+            .block_on(self.decider.decide(program, request, deadline));
+        if decided_by.is_refusal() {
+            Decision::Deny
+        } else {
+            Decision::Allow
+        }
+    }
+}
+
 /// The decision of `rules` for `access`. For a sensitive access, an allow
 /// counts only when an exact rule gives it.
 fn decide_in(rules: &RuleSet, access: &Access<'_>, sensitive: bool) -> Option<Decision> {

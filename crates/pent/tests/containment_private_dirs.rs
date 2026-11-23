@@ -478,6 +478,9 @@ fn an_agent_socket_of_the_home_directory_is_covered() -> TestResult {
         return Ok(());
     }
     let env = TestEnv::new()?;
+    // A socket with no rule would ask a question; without pentd it gets
+    // the refusal at once (RN-8).
+    env.block_pentd()?;
     let gnupg = env.home.join(".gnupg");
     std::fs::create_dir_all(&gnupg)?;
     let agent = gnupg.join("S.gpg-agent");

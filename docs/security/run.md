@@ -1,6 +1,6 @@
 # The rules in `pent run`
 
-Status: the branch `next`, steps 3.1 to 3.3 of `PLAN.md` (2026-11-23). This report
+Status: the branch `next`, steps 3.1 to 3.4 of `PLAN.md` (2026-11-23). This report
 lists the security properties of the rules in `pent run`: the key, the
 chain of deciders, the grants that the rules give to the static layers,
 and the events of a run. It gives the test of each property, and the
@@ -20,6 +20,10 @@ properties that later steps must add.
 - `crates/pent-proxy/src/lib.rs` (`DomainDecider`, `DomainVerdict`,
   `SharedState::decide_domain`), `proxy.rs` and `dns.rs`: the questions of
   the proxy (step 3.2) and of DNS (step 3.3).
+- `crates/pent-sandbox/src/config.rs` (`AccessDecider`),
+  `linux_watch.rs` (`ask_unix`, `ask_port`, `defer_job`) and
+  `linux_unixconn.rs` (`UnixPolicy::askable`): the questions of the
+  supervisor (step 3.4).
 
 ## The state of phase 3
 
@@ -30,9 +34,10 @@ the ports).
 
 Since step 3.2 the proxy asks: a CONNECT or SOCKS request for a name that
 its list does not hold goes through the chain of deciders, and it can wait
-for a question. Since step 3.3 a DNS query asks in the same way. The Unix
-sockets and the ports ask from step 3.4, and the files from phase 5. Until
-then, such an access with no rule and no flag gets a refusal of the base.
+for a question. Since step 3.3 a DNS query asks in the same way, and since
+step 3.4 a connection to a Unix socket or to a port of the host. The files
+ask from phase 5. Until then, a file access with no rule and no flag gets a
+refusal of the base.
 
 ## Threat model
 
@@ -79,6 +84,12 @@ cargo test -p pent --test pentd pent_denials_shows_the_refusals_of_a_real_run
 | RN-17 | The proxy sends one event for each connection, and the event takes the cause of the hook decision for the same name and decision: the answer or the deadline of the question. A later event with no hook decision takes the cause of the chain. At most 1024 hook decisions wait for their event. | `decide::tests::a_deadline_names_its_question`, `an_answer_decides_and_covers_the_rest_of_its_width`, `a_proxy_question_waits_for_a_deny` |
 | RN-18 | A DNS query for a name off the list of the proxy waits for the chain of deciders, at most 4 s (`DNS_DEADLINE`), because glibc waits 5 s. Nothing goes upstream before an "allow". A "deny" gives `REFUSED`, and the deadline gives `SERVFAIL` ("cannot answer now"); the question stays open. A refusal is never `NXDOMAIN`, so pent never says that a name that exists does not exist. | `dns::tests::a_name_off_the_allowlist_goes_upstream_only_after_an_allow`, `disallowed_name_gets_refused_and_is_not_forwarded_upstream`, `a_dns_question_waits_for_a_deny` |
 | RN-19 | A verdict that comes after the deadline of its access still reaches the chain: the session keeps each verdict (at most 4096), and the chain takes them before it decides. Thus the next try of the program gets the answer with no new question. | `decide::tests::a_late_answer_applies_to_the_next_access`, `a_late_dns_answer_applies_to_the_next_try` |
+| RN-20 | A `connect(2)` to a Unix socket off the list waits for the chain, at most 120 s (`FILE_DEADLINE`). After an "allow" the supervisor connects on the host and gives the socket to the child; after a "deny" or the deadline the child gets `EACCES`. The question names the canonical path and the program. A sensitive socket (Docker, `ssh-agent`) takes only an exact answer of the human (RN-7, QU-5). | `a_unix_socket_question_decides_the_connection` |
+| RN-21 | A TCP connection to a port of the host off the list waits for the chain in the same way. After an "allow" the supervisor connects on the host; after a "deny" or the deadline the child gets `ECONNREFUSED`. A server that the program runs itself needs no question. | `a_port_question_decides_the_connection`, `child_cannot_reach_a_host_loopback_service` |
+| RN-22 | A worker thread waits for each question, so one question does not stop the other calls of the program. At most 64 workers wait at one time; a question above this limit gets the refusal at once. | `a_question_does_not_stop_the_other_connections`, `a_slow_host_port_does_not_stop_other_connections` |
+| RN-23 | No question asks for a socket below the runtime directory of pent, for a path that does not exist, or for an abstract name. In its own network namespace the child gets no question for a resolver socket (`nscd`, `systemd-resolved`): such a socket reaches the network past the proxy, and glibc tries it on each lookup. | `linux_unixconn::tests::a_question_asks_only_for_an_existing_path_outside_pent` |
+| RN-24 | `--network blocked` refuses a Unix socket and a port off the lists with no question. | `network_blocked_asks_no_question_for_a_socket` |
+| RN-25 | The supervisor sends the event of each question also without `--trace`, so `pent denials` shows the refusal and names the answer. | `a_unix_socket_question_decides_the_connection` |
 
 ## The limits
 
@@ -112,6 +123,11 @@ cargo test -p pent --test pentd pent_denials_shows_the_refusals_of_a_real_run
   listing.
 - **A lost event.** When pentd is slow and the queue is full (RN-13), an
   event goes nowhere, and `pent denials` does not show that refusal.
+- **A send with an address.** Only `connect(2)` asks. A `sendto(2)` or
+  `sendmsg(2)` to a Unix socket off the list gets `EACCES` with no
+  question, also after an "allow" for a `connect(2)` to the same path.
+- **A test of a static refusal** keeps pentd away (`block_pentd` in the
+  tests), so the refusal comes at once (RN-8).
 - **The program of a network event.** The proxy does not know the process
   of a connection, so a network event names the key.
 
@@ -119,6 +135,5 @@ cargo test -p pent --test pentd pent_denials_shows_the_refusals_of_a_real_run
 
 | Step | Property |
 |---|---|
-| 3.4 | The Unix sockets and the ports ask through the chain of deciders, and a held-back rule applies through it. |
 | 4.2 | The workspace is a flag, so a deny rule inside it applies. |
 | 5.4 | The files of pent give `ENOENT` in each mode, also for a flag. |

@@ -322,6 +322,15 @@ impl TestEnv {
         Ok(out)
     }
 
+    /// Keep pentd from starting for the runs of this test. See
+    /// [`super::block_pentd`].
+    ///
+    /// # Errors
+    /// Returns an error if the directory or the file cannot be made.
+    pub fn block_pentd(&self) -> std::io::Result<()> {
+        super::block_pentd(&self.runtime)
+    }
+
     /// The rule file of `key`.
     pub fn rules_path(&self, key: &str) -> PathBuf {
         self.state_dir().join(format!("pent/rules/{key}.toml"))

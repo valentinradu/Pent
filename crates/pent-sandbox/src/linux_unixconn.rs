@@ -189,6 +189,12 @@ pub(crate) struct UnixPolicy {
     allowed: Vec<PathBuf>,
     /// Where the abstract names of the child live.
     abstract_names: AbstractNames,
+    /// The directories that no path may be below (the runtime directory of
+    /// pent). A question never asks for a path below them.
+    forbidden: Vec<PathBuf>,
+    /// The canonical sockets that a question never asks for (the resolver
+    /// sockets when the child has its own network namespace).
+    never_ask: Vec<PathBuf>,
 }
 
 impl UnixPolicy {
@@ -222,7 +228,36 @@ impl UnixPolicy {
         Self {
             allowed,
             abstract_names,
+            forbidden: forbidden.to_vec(),
+            never_ask: Vec::new(),
         }
+    }
+
+    /// Never ask a question for the sockets `paths`, in their canonical
+    /// form: such a connection gets the refusal at once. A path that does
+    /// not canonicalize needs no entry, because no question asks for it.
+    #[must_use]
+    pub(crate) fn with_never_ask(mut self, paths: &[&str]) -> Self {
+        self.never_ask = paths
+            .iter()
+            .filter_map(|p| std::fs::canonicalize(p).ok())
+            .collect();
+        self
+    }
+
+    /// The canonical path that a question may ask about, for an address
+    /// that [`UnixPolicy::decide`] refuses: a path that exists and is not
+    /// below a forbidden directory. Return `None` for an abstract name and
+    /// for every other path: the refusal then stays.
+    pub(crate) fn askable(&self, addr: &UnixAddr) -> Option<PathBuf> {
+        let UnixAddr::Path(path) = addr else {
+            return None;
+        };
+        let real = std::fs::canonicalize(path).ok()?;
+        let forbidden = self.forbidden.iter().any(|f| {
+            real.starts_with(f) || std::fs::canonicalize(f).is_ok_and(|f| real.starts_with(f))
+        });
+        (!forbidden && !self.never_ask.contains(&real)).then_some(real)
     }
 
     /// What the supervisor does with the address `addr`.
@@ -909,6 +944,38 @@ mod tests {
             pending.decide(&UnixAddr::Path(dir.join("missing.sock"))),
             UnixDecision::Refuse
         );
+        Ok(())
+    }
+
+    /// A question may ask only for a socket path that exists, that is not
+    /// below a forbidden directory (the runtime directory of pent), and
+    /// that is not a never-ask socket (a resolver socket). It asks with
+    /// the canonical path.
+    #[test]
+    fn a_question_asks_only_for_an_existing_path_outside_pent() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        let dir = std::fs::canonicalize(tmp.path())?;
+        let runtime = dir.join("pent");
+        std::fs::create_dir(&runtime)?;
+        let open = dir.join("open.sock");
+        let resolver = dir.join("resolver.sock");
+        let inside = runtime.join("pentd.sock");
+        let _listeners = [
+            UnixListener::bind(&open)?,
+            UnixListener::bind(&resolver)?,
+            UnixListener::bind(&inside)?,
+        ];
+        std::os::unix::fs::symlink(&open, dir.join("link.sock"))?;
+        let resolver_text = resolver.to_str().ok_or("the path is not UTF-8")?;
+        let policy = UnixPolicy::new(&[], AbstractNames::Private, std::slice::from_ref(&runtime))
+            .with_never_ask(&[resolver_text]);
+        let ask = |p: &Path| policy.askable(&UnixAddr::Path(p.to_path_buf()));
+        assert_eq!(ask(&open), Some(open.clone()));
+        assert_eq!(ask(&dir.join("link.sock")), Some(open.clone()));
+        assert_eq!(ask(&resolver), None);
+        assert_eq!(ask(&inside), None);
+        assert_eq!(ask(&dir.join("missing.sock")), None);
+        assert_eq!(policy.askable(&UnixAddr::Abstract("own".into())), None);
         Ok(())
     }
 

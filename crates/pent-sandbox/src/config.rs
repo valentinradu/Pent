@@ -137,6 +137,30 @@ pub struct SandboxConfig {
     /// and gives the connected socket to the child. The default opens no
     /// port.
     pub localhost: LocalhostPorts,
+
+    /// The decider of a connection to a Unix socket or to a port of the
+    /// host that the lists above do not hold. The supervisor asks it in a
+    /// worker thread, so one question does not stop the other calls.
+    /// Without it, such a connection gets the refusal at once.
+    pub decider: Option<std::sync::Arc<dyn AccessDecider>>,
+}
+
+/// Decides a connection that the lists of the sandbox do not hold: a Unix
+/// socket or a port on the loopback of the host.
+///
+/// `pent run` gives its chain of deciders, which can ask pentd. The
+/// supervisor calls it in a worker thread, and the call blocks until the
+/// decision. The decider keeps to `deadline`, and it gives
+/// [`pent_profile::Decision::Deny`] at the deadline.
+pub trait AccessDecider: Send + Sync + std::fmt::Debug {
+    /// Decide `request` of the program `program`, and wait at most
+    /// `deadline`.
+    fn decide(
+        &self,
+        program: &str,
+        request: pent_profile::Request,
+        deadline: std::time::Duration,
+    ) -> pent_profile::Decision;
 }
 
 impl SandboxConfig {
@@ -160,6 +184,7 @@ impl SandboxConfig {
             record_events: false,
             unix_sockets: Vec::new(),
             localhost: LocalhostPorts::default(),
+            decider: None,
         }
     }
 

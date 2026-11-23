@@ -1,6 +1,6 @@
 # Plan: the new pent
 
-**Cursor: step 3.4.** Steps with `[x]` are done. Work on the branch `next`,
+**Cursor: step 3.5.** Steps with `[x]` are done. Work on the branch `next`,
 one commit for each step, and move this cursor when a step is done.
 
 **The way of work.** One commit for each step. Then the user runs
@@ -195,12 +195,28 @@ not their structure.
     - The session keeps each verdict, also a late one, and the chain takes
       them, so the next try after a `SERVFAIL` gets the answer with no new
       question.
-- [ ] **3.4 Unix sockets and ports on localhost.** The supervisor holds the
+- [x] **3.4 Unix sockets and ports on localhost.** The supervisor holds the
   call and asks, in a worker thread (as `defer_connect` does), so one
   question does not stop the other calls. A refusal gives `EACCES` for a
   socket and `ECONNREFUSED` for a port. A sensitive socket or port goes
   only to the human.
-  - Files: `linux_unixconn.rs`, `linux_loopback.rs`.
+  - Files: `linux_unixconn.rs`, `linux_loopback.rs`; `AccessDecider` in
+    `pent-sandbox/src/config.rs`; `ask_unix`, `ask_port` and `defer_job`
+    in `linux_watch.rs`; `SandboxDecider` in `pent/src/commands/decide.rs`;
+    RN-20 to RN-25 in `docs/security/run.md`.
+  - Decisions (2026-11-23):
+    - `pent-sandbox` gets a blocking trait, `AccessDecider`. A worker
+      thread of the supervisor calls it, and `pent run` waits on its
+      runtime for the chain.
+    - `--network blocked` asks no question for a socket or a port; this
+      rule of step 3.5 comes now.
+    - A resolver socket (`nscd`) never asks in the network namespace of
+      the child: it reaches the network past the proxy, and glibc tries it
+      on each lookup.
+    - Only `connect(2)` asks; `sendto(2)` and `sendmsg(2)` keep the static
+      list.
+    - The tests of a static refusal keep pentd away (`block_pentd`) or use
+      `--network blocked`; the tests of `pentd.rs` cover the questions.
 - [ ] **3.5 The network modes.** The default asks. `--network blocked`
   refuses each access with no question. `--network unrestricted` stays.
 

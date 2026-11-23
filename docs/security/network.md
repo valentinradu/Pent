@@ -13,7 +13,10 @@ and the whole rules of `pent run`. A CONNECT or SOCKS request for another
 name waits for the chain of deciders, which can ask pentd (RN-15 to RN-17
 in [run.md](run.md)). Since step 3.3 a DNS query for another name waits
 for the chain too, nothing goes upstream before an "allow", and a refusal
-is `REFUSED`, not `NXDOMAIN` (RN-18 and RN-19).
+is `REFUSED`, not `NXDOMAIN` (RN-18 and RN-19). Since step 3.4 a port of
+the host off the list asks too (RN-21), and a resolver socket never asks in
+the network namespace of the child (RN-23). The end-to-end tests of this
+report keep pentd away, so each refusal comes at once.
 
 Each finding has a test. A test that passes proves a defense. A test that
 fails proves a vulnerability. The failing test keeps the secure assertion and

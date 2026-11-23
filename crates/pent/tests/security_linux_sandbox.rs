@@ -73,6 +73,10 @@ impl Harness {
         for d in [&h.config, &h.state, &h.home, &h.workspace, &h.outside] {
             std::fs::create_dir_all(d)?;
         }
+        // These tests prove static refusals. A socket or a port with no
+        // rule would ask a question; without pentd it gets the refusal at
+        // once (RN-8).
+        common::block_pentd(h.runtime.path())?;
         Ok(h)
     }
 

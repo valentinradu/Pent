@@ -14,6 +14,14 @@ then wrote the test that states the property.
 The host is NixOS, Linux 7.1, Landlock ABI 6, with unprivileged user
 namespaces and no root.
 
+Since step 3.4 of `PLAN.md`, a connection of `pent run` to a Unix socket
+or to a port of the host that no rule names asks a question in a worker
+thread of the supervisor (RN-20 to RN-25 in [run.md](run.md)). The
+refusals in this report are the refusals with no question: after a "deny",
+with `--network blocked`, or without pentd. The tests of this report use
+`--network blocked` or keep pentd away, so a refusal does not wait for a
+question.
+
 ## The test files
 
 | File | Area |

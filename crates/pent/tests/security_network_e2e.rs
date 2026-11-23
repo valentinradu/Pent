@@ -203,6 +203,12 @@ fn daemon_socket_is_masked(test: &str, daemon: &str, host_socket: &str) -> TestR
     };
 
     let env = TestEnv::new()?;
+
+    // A socket or a port with no rule would ask a question; without
+
+    // pentd it gets the refusal at once (RN-8).
+
+    env.block_pentd()?;
     // The directory of the positive control is outside every private
     // directory, and a rule names it.
     let allowed_dir = env.root.join("allowed");
@@ -309,6 +315,9 @@ fn a_rule_path_below_a_private_dir_keeps_its_siblings_hidden() -> TestResult {
     let allowed_dir = base.join("allowed");
     std::fs::create_dir_all(&allowed_dir)?;
     let env = TestEnv::new()?;
+    // A socket or a port with no rule would ask a question; without
+    // pentd it gets the refusal at once (RN-8).
+    env.block_pentd()?;
     install_socket_rules(&env, &allowed_dir)?;
     let allowed = Victim::bind(allowed_dir.join("allowed.sock"), ALLOWED_BANNER.as_bytes())?;
     let victim = Victim::bind(base.join("victim.sock"), VICTIM_SECRET.as_bytes())?;
@@ -393,6 +402,12 @@ fn child_cannot_reach_a_host_loopback_service() -> TestResult {
     });
 
     let env = TestEnv::new()?;
+
+    // A socket or a port with no rule would ask a question; without
+
+    // pentd it gets the refusal at once (RN-8).
+
+    env.block_pentd()?;
     env.install_rules(KEY, &[DOMAIN_RULE])?;
     // The positive control: the child starts its own server on its own
     // loopback and reaches it. Loopback works in the namespace of the
@@ -514,6 +529,12 @@ fn a_listed_localhost_port_reaches_the_host_and_no_other_port() -> TestResult {
     let script = localhost_probe_script(open, closed);
 
     let env = TestEnv::new()?;
+
+    // A socket or a port with no rule would ask a question; without
+
+    // pentd it gets the refusal at once (RN-8).
+
+    env.block_pentd()?;
     let port_rule = format!("localhost {open}");
     let cases: [(&str, Vec<&str>, Vec<String>); 3] = [
         ("no domains", vec![&port_rule], vec![]),
@@ -605,6 +626,9 @@ fn a_refused_localhost_port_is_recorded_with_trace() -> TestResult {
     }
     let (closed, _closed_rx) = host_server(b"VICTIM")?;
     let env = TestEnv::new()?;
+    // A socket or a port with no rule would ask a question; without
+    // pentd it gets the refusal at once (RN-8).
+    env.block_pentd()?;
     env.install_rules(KEY, &[DOMAIN_RULE])?;
     let script = format!(
         r#"
@@ -645,6 +669,9 @@ fn watch_reaches_and_records_a_localhost_port() -> TestResult {
     }
     let (open, _open_rx) = host_server(b"HOSTOPEN")?;
     let env = TestEnv::new()?;
+    // A socket or a port with no rule would ask a question; without
+    // pentd it gets the refusal at once (RN-8).
+    env.block_pentd()?;
     let script = localhost_probe_script(open, open);
     let out = env.pent(&[
         "watch",
@@ -714,6 +741,9 @@ fn watch_blocks_a_control_port() -> TestResult {
         }
     });
     let env = TestEnv::new()?;
+    // A socket or a port with no rule would ask a question; without
+    // pentd it gets the refusal at once (RN-8).
+    env.block_pentd()?;
     let script = r#"
 import socket
 h = socket.socket(); h.settimeout(3)
@@ -767,6 +797,9 @@ fn a_slow_host_port_does_not_stop_other_connections() -> TestResult {
     let slow = full_queue_listener()?;
     let slow_port = slow.port;
     let env = TestEnv::new()?;
+    // A socket or a port with no rule would ask a question; without
+    // pentd it gets the refusal at once (RN-8).
+    env.block_pentd()?;
     env.install_rules(
         KEY,
         &[
@@ -852,6 +885,9 @@ fn without_a_socket_rule_a_path_is_refused_but_the_unix_family_stays() -> TestRe
         return Ok(());
     }
     let env = TestEnv::new()?;
+    // A socket or a port with no rule would ask a question; without
+    // pentd it gets the refusal at once (RN-8).
+    env.block_pentd()?;
     env.install_rules(KEY, &[DOMAIN_RULE])?;
     // A victim socket of the host, outside each private directory, so the
     // refusal comes from the control of the address and not from a mount.
@@ -959,6 +995,9 @@ fn an_abstract_address_is_refused_without_a_network_namespace() -> TestResult {
         }
     });
     let env = TestEnv::new()?;
+    // A socket or a port with no rule would ask a question; without
+    // pentd it gets the refusal at once (RN-8).
+    env.block_pentd()?;
     env.install_rules(KEY, &[DOMAIN_RULE])?;
     // The positive control: a file that the base allows. It proves
     // that the child ran and that only the socket call failed.
@@ -1030,6 +1069,12 @@ fn child_cannot_reach_a_host_abstract_unix_socket() -> TestResult {
     });
 
     let env = TestEnv::new()?;
+
+    // A socket or a port with no rule would ask a question; without
+
+    // pentd it gets the refusal at once (RN-8).
+
+    env.block_pentd()?;
     // A rule names one socket. The child makes a socket of the Unix family
     // also without such a rule; see
     // `without_a_socket_rule_a_path_is_refused_but_the_unix_family_stays`.
@@ -1086,6 +1131,9 @@ fn child_has_no_raw_udp_egress() -> TestResult {
         return Ok(());
     }
     let env = TestEnv::new()?;
+    // A socket or a port with no rule would ask a question; without
+    // pentd it gets the refusal at once (RN-8).
+    env.block_pentd()?;
     env.install_rules(KEY, &[DOMAIN_RULE])?;
     // A direct UDP datagram to a public resolver must not leave the
     // namespace. The only route is the loopback proxy, which is TCP/DNS.
@@ -1128,6 +1176,9 @@ fn child_cannot_steal_the_proxy_port_with_reuseport() -> TestResult {
         return Ok(());
     }
     let env = TestEnv::new()?;
+    // A socket or a port with no rule would ask a question; without
+    // pentd it gets the refusal at once (RN-8).
+    env.block_pentd()?;
     env.install_rules(KEY, &[DOMAIN_RULE])?;
     // The child must not bind 127.0.0.1:3128 again, with SO_REUSEPORT or
     // otherwise, to steal the connections of other processes in the
@@ -1176,6 +1227,9 @@ fn child_sees_proxy_resolv_conf() -> TestResult {
         return Ok(());
     }
     let env = TestEnv::new()?;
+    // A socket or a port with no rule would ask a question; without
+    // pentd it gets the refusal at once (RN-8).
+    env.block_pentd()?;
     env.install_rules(KEY, &[DOMAIN_RULE])?;
     // The child's /etc/resolv.conf must name only the loopback proxy. A
     // fixed external resolver would let the child resolve names off-proxy.

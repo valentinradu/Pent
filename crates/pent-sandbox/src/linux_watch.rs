@@ -1127,6 +1127,8 @@ pub(crate) struct RecorderPlan {
     pub(crate) unix: crate::linux_unixconn::UnixControl,
     /// The control of a TCP connection to the loopback of the host.
     pub(crate) loopback: crate::linux_loopback::LoopbackControl,
+    /// The decider of a Unix socket or a port that the lists do not hold.
+    pub(crate) decider: Option<std::sync::Arc<dyn crate::AccessDecider>>,
 }
 
 /// Start the supervisor thread of the recorder.
@@ -1541,6 +1543,9 @@ struct Supervisor {
     events: Option<mpsc::Sender<WatchEvent>>,
     /// The number of worker threads that wait for a connection now.
     workers: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// The decider of a Unix socket or a port that the lists do not hold.
+    /// A worker thread asks it.
+    decider: Option<std::sync::Arc<dyn crate::AccessDecider>>,
 }
 
 impl Supervisor {
@@ -1592,6 +1597,7 @@ impl Supervisor {
             errors: 0,
             events: None,
             workers: std::sync::Arc::default(),
+            decider: plan.decider,
         }
     }
 
@@ -2155,10 +2161,132 @@ impl Supervisor {
                 // socket of its own, because the name belongs to the
                 // network namespace of the socket of the child.
                 UnixDecision::Child => Self::connect_on_child(&socket, &seen, flags),
-                UnixDecision::Refuse => Answer::Fail(libc::EACCES),
+                UnixDecision::Refuse => {
+                    if self.ask_unix(notif.id, tid, sockfd, socket.kind(), &target, flags) {
+                        // A worker thread asks, answers and sends the event.
+                        return;
+                    }
+                    Answer::Fail(libc::EACCES)
+                }
             };
         }
         self.record_unix_event(tid, &target, decision.outcome());
+    }
+
+    /// Ask the decider about a Unix socket that the list does not hold, in
+    /// a worker thread. After an "allow" the worker makes the connection
+    /// and gives the socket to the child; after a "deny" or the deadline
+    /// the child gets `EACCES`. The worker sends the event of the decision
+    /// also without `--trace`.
+    ///
+    /// Return false, and do nothing, when no decider is set, the path may
+    /// not be asked about (see [`crate::linux_unixconn::UnixPolicy::askable`]),
+    /// or no worker can start: the refusal then stays.
+    fn ask_unix(
+        &mut self,
+        id: u64,
+        tid: u32,
+        sockfd: RawFd,
+        kind: Option<libc::c_int>,
+        target: &UnixAddr,
+        flags: crate::linux_unixconn::FdFlags,
+    ) -> bool {
+        let Some(decider) = self.decider.clone() else {
+            return false;
+        };
+        let Some(path) = self.unix.policy().askable(target) else {
+            return false;
+        };
+        let Ok(rule_path) = pent_profile::RulePath::new(path.clone()) else {
+            return false;
+        };
+        let process = self.procs.get(tid);
+        let display = target.display();
+        self.defer_job(move |listener| {
+            let decision = decider.decide(
+                &process.name,
+                pent_profile::Request::UnixSocket(rule_path),
+                pent_profile::FILE_DEADLINE,
+            );
+            let (resp, outcome) = match decision {
+                pent_profile::Decision::Allow => {
+                    match crate::linux_unixconn::connect_for_child(
+                        tid,
+                        sockfd,
+                        kind,
+                        &path,
+                        flags,
+                        crate::linux_unixconn::CONNECT_LIMIT,
+                    ) {
+                        Ok(fd) => (
+                            give_resp(listener, id, &fd, sockfd, flags.cloexec, 0),
+                            Outcome::Allowed,
+                        ),
+                        Err(err) => (fail_resp(id, err), Outcome::Allowed),
+                    }
+                }
+                pent_profile::Decision::Deny => (fail_resp(id, libc::EACCES), Outcome::Denied),
+            };
+            let event = WatchEvent::UnixConnect {
+                target: display,
+                process,
+                outcome,
+            };
+            (resp, Some(event))
+        })
+    }
+
+    /// Let a worker thread run `job` and send the answer that it gives to
+    /// its notification, so that a question does not stop the other
+    /// processes of the sandbox. The worker sends the event of the job.
+    ///
+    /// Return false, and do nothing, when [`MAX_CONNECT_WORKERS`] threads
+    /// already wait or a copy of the listener fails.
+    fn defer_job<F>(&mut self, job: F) -> bool
+    where
+        F: FnOnce(&OwnedFd) -> (libc::seccomp_notif_resp, Option<WatchEvent>) + Send + 'static,
+    {
+        use std::sync::atomic::Ordering;
+
+        let Some(events) = self.events.clone() else {
+            return false;
+        };
+        if self.workers.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECT_WORKERS {
+            self.workers.fetch_sub(1, Ordering::SeqCst);
+            return false;
+        }
+        let Ok(listener) = self.listener.try_clone() else {
+            self.workers.fetch_sub(1, Ordering::SeqCst);
+            return false;
+        };
+        let workers = std::sync::Arc::clone(&self.workers);
+        let mut buf = vec![0u64; self.resp.len()];
+        let work = move || {
+            let (resp, event) = job(&listener);
+            if let Err(err) = send_resp(&listener, &mut buf, resp) {
+                tracing::warn!("seccomp recorder: NOTIF_SEND of a worker: {err}");
+            }
+            if let Some(event) = event {
+                // The caller can drop the receiver; the answer above
+                // matters, not the event.
+                let _ = events.send(event);
+            }
+            workers.fetch_sub(1, Ordering::SeqCst);
+        };
+        match std::thread::Builder::new()
+            .name("pent-ask".to_string())
+            .spawn(work)
+        {
+            Ok(_) => {
+                self.answer = Answer::Deferred;
+                true
+            }
+            Err(_) => {
+                // The closure and its copies are gone with the error.
+                self.workers.fetch_sub(1, Ordering::SeqCst);
+                false
+            }
+        }
     }
 
     /// Control a `connect()` on a socket of another family: a TCP
@@ -2187,7 +2315,11 @@ impl Supervisor {
             LoopbackControl::Shared => return,
             // No port opens and no event is wanted: the call stays in the
             // namespace of the child at no cost.
-            LoopbackControl::Private { ports, .. } if ports.is_empty() && !record => return,
+            LoopbackControl::Private { ports, .. }
+                if ports.is_empty() && !record && self.decider.is_none() =>
+            {
+                return
+            }
             LoopbackControl::Private { .. } => {}
         }
         let domain = sock.domain();
@@ -2232,10 +2364,14 @@ impl Supervisor {
         // listens on. Without an event, the supervisor needs no look at the
         // sockets of the child: the proxy port and the DNS port pay
         // nothing.
-        if policy != PortPolicy::Open && !record {
+        if policy != PortPolicy::Open && !record && self.decider.is_none() {
             return;
         }
         let decision = loopback::decide(policy, || loopback::child_listens(tid, dest));
+        if decision == LoopbackDecision::Refuse && self.ask_port(notif.id, tid, sockfd, dest) {
+            // A worker thread asks, answers and sends the event.
+            return;
+        }
         let event =
             decision
                 .outcome()
@@ -2290,6 +2426,69 @@ impl Supervisor {
             }
         }
         self.out.extend(event);
+    }
+
+    /// Ask the decider about a port of the host that the policy does not
+    /// open, in a worker thread. After an "allow" the worker connects on
+    /// the host and gives the socket to the child; after a "deny" or the
+    /// deadline the child gets `ECONNREFUSED`. The worker sends the event
+    /// of the decision also without `--trace`.
+    ///
+    /// Return false, and do nothing, when no decider is set or no worker
+    /// can start: the call then stays in the namespace of the child.
+    fn ask_port(&mut self, id: u64, tid: u32, sockfd: RawFd, dest: std::net::SocketAddr) -> bool {
+        let Some(decider) = self.decider.clone() else {
+            return false;
+        };
+        let Some(port) = std::num::NonZeroU16::new(dest.port()) else {
+            return false;
+        };
+        if !self.id_valid(id) {
+            return false;
+        }
+        let process = self.procs.get(tid);
+        let flags = crate::linux_unixconn::fd_flags(tid, sockfd);
+        self.defer_job(move |listener| {
+            let decision = decider.decide(
+                &process.name,
+                pent_profile::Request::Localhost(port),
+                pent_profile::FILE_DEADLINE,
+            );
+            let (resp, outcome) = match decision {
+                pent_profile::Decision::Allow => {
+                    let connected = crate::linux_loopback::start_on_host(dest).and_then(|conn| {
+                        crate::linux_loopback::finish_on_host(
+                            conn,
+                            flags,
+                            crate::linux_unixconn::CONNECT_LIMIT,
+                        )
+                    });
+                    match connected {
+                        Ok(conn) => {
+                            let error = if conn.in_progress {
+                                libc::EINPROGRESS
+                            } else {
+                                0
+                            };
+                            (
+                                give_resp(listener, id, &conn.fd, sockfd, flags.cloexec, error),
+                                Outcome::Allowed,
+                            )
+                        }
+                        Err(err) => (fail_resp(id, err), Outcome::Allowed),
+                    }
+                }
+                pent_profile::Decision::Deny => {
+                    (fail_resp(id, libc::ECONNREFUSED), Outcome::Denied)
+                }
+            };
+            let event = WatchEvent::LocalhostConnect {
+                port: port.get(),
+                process,
+                outcome,
+            };
+            (resp, Some(event))
+        })
     }
 
     /// Let a worker thread wait for the blocking connection `conn` and then

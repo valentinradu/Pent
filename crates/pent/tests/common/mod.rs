@@ -34,6 +34,23 @@ pub fn runtime_dir() -> std::io::Result<TempDir> {
     Ok(dir)
 }
 
+/// Keep pentd from starting in the runtime directory `runtime`: a regular
+/// file at the path of its socket makes each start fail (PD-5). A run then
+/// has no pentd, and each access that needs a question gets the refusal of
+/// the base at once (RN-8 in `docs/security/run.md`). A test of a static
+/// refusal uses it, so the refusal does not wait for the deadline of a
+/// question.
+///
+/// # Errors
+/// Returns an error if the directory or the file cannot be made.
+pub fn block_pentd(runtime: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = runtime.join("pent");
+    std::fs::create_dir_all(&dir)?;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    std::fs::write(dir.join("pentd.sock"), "not a socket")
+}
+
 /// Give `cmd` the runtime directory `dir`, and a short linger, so the
 /// pentd that `pent run` starts stops soon after the test.
 pub fn use_runtime<'a>(cmd: &'a mut Command, dir: &TempDir) -> &'a mut Command {

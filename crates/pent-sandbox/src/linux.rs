@@ -3154,6 +3154,15 @@ pub(crate) fn spawn_linux(
         abstract_names,
         runtime_mask.as_slice(),
     );
+    // A resolver socket reaches the network past the proxy, so the
+    // sandbox masks it in its own network namespace. A question for it
+    // would offer a way around the proxy, and glibc tries `nscd` on each
+    // lookup of a name, so such a connection gets the refusal at once.
+    let unix_policy = if net_flag == 0 {
+        unix_policy
+    } else {
+        unix_policy.with_never_ask(RESOLVER_SOCKETS)
+    };
     let unix = if enforce {
         crate::linux_unixconn::UnixControl::Enforce(unix_policy)
     } else {
@@ -3215,6 +3224,7 @@ pub(crate) fn spawn_linux(
                 judge,
                 unix,
                 loopback,
+                decider: config.decider.clone(),
             },
         )?)
     } else {
@@ -3275,7 +3285,13 @@ pub(crate) fn spawn_linux(
     // A recorder that only controls the Unix socket connections makes no
     // event. The caller gets no channel, so it starts no reader. The
     // supervisor then sends into a closed channel and ignores the error.
-    let events = if record { events } else { None };
+    // A decider makes an event for each question, also without
+    // `--trace`, so `pent denials` shows the refusals of the questions.
+    let events = if record || config.decider.is_some() {
+        events
+    } else {
+        None
+    };
 
     let mut child = spawn_result.map_err(SandboxError::SpawnFailed)?;
     // `spawn` returns after the `exec` of the child, so the child has sent

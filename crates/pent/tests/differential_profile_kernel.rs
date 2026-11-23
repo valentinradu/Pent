@@ -359,6 +359,9 @@ printf 'rc=%s\n' "$?"
     /// Run one row and return what the kernel did.
     fn kernel_verdict(case: &FsCase) -> Result<Run, BoxError> {
         let env = TestEnv::new()?;
+        // A socket with no rule would ask a question; without pentd it
+        // gets the refusal at once (RN-8).
+        env.block_pentd()?;
         // A path with `..` leaves the home directory; the parent must
         // exist before the run.
         std::fs::create_dir_all(&env.root)?;
@@ -537,6 +540,9 @@ printf 'rc=%s\n' "$?"
         let mut wrong = Vec::new();
         for (kind, access, want) in cases {
             let env = TestEnv::new()?;
+            // A socket with no rule would ask a question; without pentd it
+            // gets the refusal at once (RN-8).
+            env.block_pentd()?;
             let dir = env.home.join("tools");
             let tool = dir.join("tool");
             std::fs::create_dir_all(&dir)?;
@@ -580,6 +586,9 @@ printf 'rc=%s\n' "$?"
             return Ok(());
         }
         let env = TestEnv::new()?;
+        // A socket with no rule would ask a question; without pentd it
+        // gets the refusal at once (RN-8).
+        env.block_pentd()?;
         let dir = env.home.join("ro");
         install(&env, &[format!("read {}/**", path_text(&dir)?)])?;
         let file = dir.join("f.txt");
@@ -767,6 +776,9 @@ printf 'rc=%s\n' "$?"
             return Ok(());
         }
         let env = TestEnv::new()?;
+        // A socket with no rule would ask a question; without pentd it
+        // gets the refusal at once (RN-8).
+        env.block_pentd()?;
         let file = env.home.join("data/one.txt");
         std::fs::create_dir_all(env.home.join("data"))?;
         std::fs::write(&file, format!("{MARKER}\n"))?;
@@ -804,6 +816,9 @@ printf 'rc=%s\n' "$?"
             return Ok(());
         }
         let env = TestEnv::new()?;
+        // A socket with no rule would ask a question; without pentd it
+        // gets the refusal at once (RN-8).
+        env.block_pentd()?;
         let dir = env.home.join("data");
         let file = dir.join("one.txt");
         std::fs::create_dir_all(&dir)?;
@@ -841,6 +856,9 @@ printf 'rc=%s\n' "$?"
             return Ok(());
         }
         let env = TestEnv::new()?;
+        // A socket with no rule would ask a question; without pentd it
+        // gets the refusal at once (RN-8).
+        env.block_pentd()?;
         let dir = env.home.join("src");
         let secret = dir.join("secret/key.txt");
         std::fs::create_dir_all(dir.join("secret"))?;

@@ -20,7 +20,7 @@ use pent_sandbox::{
 use pent_settings::{ConfigLoader, ProfileStore, RuleStore};
 
 use crate::cli::{NetworkModeArg, RunArgs};
-use crate::commands::decide::{Decider, FlagLists, Grants, ProxyDecider};
+use crate::commands::decide::{Decider, FlagLists, Grants, ProxyDecider, SandboxDecider};
 use crate::commands::session::{
     drain, exit_like_child, forward_std, forward_tokio, is_broad_workspace, start_proxy,
     wait_child, ForwardStop, ProxyChannels, SessionCleanup, SignalRelay,
@@ -217,6 +217,15 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
     sandbox_cfg.record_events = args.trace;
     sandbox_cfg.unix_sockets = unix_socket_paths(&grants.unix_sockets, &args.unix_socket, &cwd);
     sandbox_cfg.localhost = LocalhostPorts::Listed(localhost_ports);
+    // A Unix socket or a port off the lists asks, except with
+    // `--network blocked`: that flag refuses each such access with no
+    // question.
+    if !blocks_localhost(decision) {
+        sandbox_cfg.decider = Some(std::sync::Arc::new(SandboxDecider {
+            decider: std::sync::Arc::clone(&decider),
+            runtime: tokio::runtime::Handle::current(),
+        }));
+    }
 
     if let Some(data_dir) = args.data_dir {
         sandbox_cfg = sandbox_cfg.with_data_dir(data_dir);

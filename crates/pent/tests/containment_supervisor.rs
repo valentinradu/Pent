@@ -156,9 +156,23 @@ fn install_socket_rules(env: &TestEnv, sockets: &[&Path]) -> TestResult {
 }
 
 /// Run a python script under `pent run` with the key `python3`.
+///
+/// These tests prove the static control of the supervisor: a socket with
+/// no rule gets `EACCES` at once. Since step 3.4 such a socket asks a
+/// question, except with `--network blocked`, the mode that a run with no
+/// domain rule had already. `pentd.rs` tests the questions.
 fn run(env: &TestEnv, script: &str) -> std::io::Result<Output> {
     env.pent(&[
-        "run", "--key", "python3", "--", "python3", "-I", "-c", script,
+        "run",
+        "--network",
+        "blocked",
+        "--key",
+        "python3",
+        "--",
+        "python3",
+        "-I",
+        "-c",
+        script,
     ])
 }
 

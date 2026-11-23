@@ -568,6 +568,12 @@ fn answer_a_proxy_question(
 /// The code of the open question for the domain `host`, as soon as pentd
 /// has it.
 fn question_code(rt: &Runtime, host: &str) -> Result<String, common::e2e::BoxError> {
+    question_for(rt, &format!("domain {host}"))
+}
+
+/// The code of the open question whose request has the text `request`
+/// (as `localhost 5432`), as soon as pentd has it.
+fn question_for(rt: &Runtime, request: &str) -> Result<String, common::e2e::BoxError> {
     let deadline = Instant::now() + WAIT;
     loop {
         let out = rt
@@ -576,14 +582,13 @@ fn question_code(rt: &Runtime, host: &str) -> Result<String, common::e2e::BoxErr
             .output()?;
         let found = stdout(&out).lines().find_map(|line| {
             let question: pent_profile::Question = serde_json::from_str(line).ok()?;
-            (question.ask.request.to_string() == format!("domain {host}"))
-                .then(|| question.id.to_string())
+            (question.ask.request.to_string() == request).then(|| question.id.to_string())
         });
         if let Some(code) = found {
             return Ok(code);
         }
         if Instant::now() >= deadline {
-            return Err(format!("no question for {host}").into());
+            return Err(format!("no question for {request}").into());
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -733,6 +738,256 @@ fn a_late_dns_answer_applies_to_the_next_try() -> TestResult {
         .stdout(Stdio::piped())
         .output()?;
     assert_eq!(stdout(&left), "", "a new question stayed open");
+    Ok(())
+}
+
+/// A server on the host that sends `HELLO` to each client, on a Unix
+/// socket at `path` or on a TCP port of the loopback.
+enum HostServer {
+    Unix(std::os::unix::net::UnixListener),
+    Tcp(std::net::TcpListener),
+}
+
+impl HostServer {
+    /// Serve each client in a thread, until the test ends.
+    fn serve(self) {
+        std::thread::spawn(move || loop {
+            let sent = match &self {
+                Self::Unix(l) => l.accept().and_then(|(mut c, _)| c.write_all(b"HELLO")),
+                Self::Tcp(l) => l.accept().and_then(|(mut c, _)| c.write_all(b"HELLO")),
+            };
+            if sent.is_err() {
+                return;
+            }
+        });
+    }
+}
+
+/// The program of the socket tests: it connects to `$1` (a path, or a port
+/// of 127.0.0.1) and prints what it gets, or the name of its error.
+const SOCKET_PROBE: &str = r#"
+import socket, sys
+target = sys.argv[1]
+try:
+    if target.isdigit():
+        s = socket.create_connection(("127.0.0.1", int(target)), timeout=200)
+    else:
+        s = socket.socket(socket.AF_UNIX)
+        s.connect(target)
+    print("GOT", s.recv(5).decode())
+except OSError as e:
+    print("ERR", type(e).__name__)
+"#;
+
+/// Run the probe for `target` with no rule, answer its question
+/// `request` with `verb`, and return the output and the code of the
+/// question.
+fn answer_a_socket_question(
+    rt: &Runtime,
+    env: &TestEnv,
+    target: &str,
+    request: &str,
+    verb: &str,
+) -> Result<(std::process::Output, String), common::e2e::BoxError> {
+    let run = env
+        .command(&[
+            "run",
+            "--key",
+            "probe",
+            "--",
+            "python3",
+            "-c",
+            SOCKET_PROBE,
+            target,
+        ])
+        .env("XDG_RUNTIME_DIR", rt.xdg())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let code = match question_for(rt, request) {
+        Ok(code) => code,
+        Err(e) => {
+            let mut run = run;
+            // The test fails anyway; the kill only cleans up.
+            let _ = run.kill();
+            let _ = run.wait();
+            return Err(e);
+        }
+    };
+    let answer = rt.pent(&[verb, &code]).output()?;
+    assert!(answer.status.success(), "{answer:?}");
+    Ok((run.wait_with_output()?, code))
+}
+
+/// A Unix socket off the list asks. An "allow" gives the connection that
+/// the supervisor makes on the host; a "deny" gives `EACCES`, and `pent
+/// denials` names the answer and the program.
+#[test]
+fn a_unix_socket_question_decides_the_connection() -> TestResult {
+    let test = "a_unix_socket_question_decides_the_connection";
+    if !have_tools(test, &["python3"]) || !sandbox_ready(test) {
+        return Ok(());
+    }
+    let rt = Runtime::new()?;
+    let _pentd = Reap(rt.pent(&["daemon"]).spawn()?);
+    assert!(rt.wait_for_socket());
+    let env = TestEnv::new()?;
+    let path = env.root.join("service.sock");
+    HostServer::Unix(std::os::unix::net::UnixListener::bind(&path)?).serve();
+    let target = path.to_str().ok_or("the path is not UTF-8")?;
+    let request = format!("unix-socket {target}");
+
+    let (out, _) = answer_a_socket_question(&rt, &env, target, &request, "allow")?;
+    assert!(stdout(&out).contains("GOT HELLO"), "{out:?}");
+
+    let (out, code) = answer_a_socket_question(&rt, &env, target, &request, "deny")?;
+    assert!(stdout(&out).contains("ERR PermissionError"), "{out:?}");
+    let denials = rt.pent(&["denials"]).stdout(Stdio::piped()).output()?;
+    let text = stdout(&denials);
+    assert!(
+        text.lines().any(|l| l.contains(&request)
+            && l.contains("by python3")
+            && l.ends_with(&format!("(the answer to question {code})"))),
+        "{text}"
+    );
+    Ok(())
+}
+
+/// A port of the host off the list asks. An "allow" connects on the
+/// host; a "deny" gives `ECONNREFUSED`.
+#[test]
+fn a_port_question_decides_the_connection() -> TestResult {
+    let test = "a_port_question_decides_the_connection";
+    if !have_tools(test, &["python3"]) || !sandbox_ready(test) {
+        return Ok(());
+    }
+    let rt = Runtime::new()?;
+    let _pentd = Reap(rt.pent(&["daemon"]).spawn()?);
+    assert!(rt.wait_for_socket());
+    let env = TestEnv::new()?;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port().to_string();
+    HostServer::Tcp(listener).serve();
+    let request = format!("localhost {port}");
+
+    let (out, _) = answer_a_socket_question(&rt, &env, &port, &request, "allow")?;
+    assert!(stdout(&out).contains("GOT HELLO"), "{out:?}");
+
+    let (out, _) = answer_a_socket_question(&rt, &env, &port, &request, "deny")?;
+    assert!(
+        stdout(&out).contains("ERR ConnectionRefusedError"),
+        "{out:?}"
+    );
+    Ok(())
+}
+
+/// `--network blocked` refuses a Unix socket and a port off the lists
+/// with no question.
+#[test]
+fn network_blocked_asks_no_question_for_a_socket() -> TestResult {
+    let test = "network_blocked_asks_no_question_for_a_socket";
+    if !have_tools(test, &["python3"]) || !sandbox_ready(test) {
+        return Ok(());
+    }
+    let rt = Runtime::new()?;
+    let _pentd = Reap(rt.pent(&["daemon"]).spawn()?);
+    assert!(rt.wait_for_socket());
+    let env = TestEnv::new()?;
+    let path = env.root.join("service.sock");
+    HostServer::Unix(std::os::unix::net::UnixListener::bind(&path)?).serve();
+    let target = path.to_str().ok_or("the path is not UTF-8")?;
+    let begin = Instant::now();
+    let out = env
+        .command(&[
+            "run",
+            "--network",
+            "blocked",
+            "--key",
+            "probe",
+            "--",
+            "python3",
+            "-c",
+            SOCKET_PROBE,
+            target,
+        ])
+        .env("XDG_RUNTIME_DIR", rt.xdg())
+        .output()?;
+    assert!(stdout(&out).contains("ERR PermissionError"), "{out:?}");
+    assert!(begin.elapsed() < Duration::from_secs(10), "the run waited");
+    let open = rt
+        .pent(&["questions", "--json"])
+        .stdout(Stdio::piped())
+        .output()?;
+    assert_eq!(stdout(&open), "", "a question opened");
+    Ok(())
+}
+
+/// A question does not stop the other calls: while one thread of the
+/// program waits for the question of a socket, another thread connects to
+/// a socket that a rule allows and finishes.
+#[test]
+fn a_question_does_not_stop_the_other_connections() -> TestResult {
+    let test = "a_question_does_not_stop_the_other_connections";
+    if !have_tools(test, &["python3"]) || !sandbox_ready(test) {
+        return Ok(());
+    }
+    let rt = Runtime::new()?;
+    let _pentd = Reap(rt.pent(&["daemon"]).spawn()?);
+    assert!(rt.wait_for_socket());
+    let env = TestEnv::new()?;
+    let asked = env.root.join("asked.sock");
+    let listed = env.root.join("listed.sock");
+    HostServer::Unix(std::os::unix::net::UnixListener::bind(&asked)?).serve();
+    HostServer::Unix(std::os::unix::net::UnixListener::bind(&listed)?).serve();
+    let asked = asked.to_str().ok_or("the path is not UTF-8")?;
+    let listed = listed.to_str().ok_or("the path is not UTF-8")?;
+    env.install_rules("probe", &[&format!("unix-socket {listed}")])?;
+    let marker = env.ws.join("second-done");
+    let script = r#"
+import socket, sys, threading, time
+def first():
+    try:
+        s = socket.socket(socket.AF_UNIX)
+        s.connect(sys.argv[1])
+    except OSError:
+        pass
+t = threading.Thread(target=first)
+t.start()
+time.sleep(0.5)
+s = socket.socket(socket.AF_UNIX)
+s.connect(sys.argv[2])
+if s.recv(5) == b"HELLO":
+    open("second-done", "w").close()
+t.join()
+"#;
+    let run = env
+        .command(&[
+            "run", "--key", "probe", "--", "python3", "-c", script, asked, listed,
+        ])
+        .env("XDG_RUNTIME_DIR", rt.xdg())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut run = Reap(run);
+    let code = question_for(&rt, &format!("unix-socket {asked}"))?;
+    // The second connection finishes while the question is open.
+    let deadline = Instant::now() + WAIT;
+    while !marker.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the second connection waited for the question"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let open = rt.pent(&["questions"]).stdout(Stdio::piped()).output()?;
+    assert!(
+        stdout(&open).contains(&code),
+        "the question is not open any more"
+    );
+    let answer = rt.pent(&["deny", &code]).output()?;
+    assert!(answer.status.success(), "{answer:?}");
+    let status = wait_exit(&mut run.0, WAIT)?;
+    assert!(status.is_some_and(|s| s.success()), "{status:?}");
     Ok(())
 }
 
