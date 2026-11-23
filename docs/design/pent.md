@@ -356,7 +356,9 @@ questions.
 
 - **`pent monitor`** is a terminal screen. It shows the questions grouped by
   root program and by width, with the keys allow, deny, width, scope and
-  details. A sensitive question shows its warning.
+  details. A sensitive question shows its warning. A second tab shows the
+  events of each session, with a filter by session and by kind, and a
+  third tab shows the saved rules of each key.
 - **The notification is a command hook.** pentd runs a command that the user
   sets when new questions come. It puts the number of open questions in
   `PENT_PENDING`. One notification covers a burst of questions.

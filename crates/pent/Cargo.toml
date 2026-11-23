@@ -23,6 +23,7 @@ tracing       = { workspace = true }
 tracing-subscriber = { workspace = true }
 thiserror     = { workspace = true }
 serde_json    = "1"
+ratatui       = "0.29"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -35,6 +36,7 @@ clap        = { workspace = true, features = ["string"] }
 tempfile    = { workspace = true }
 tokio       = { workspace = true, features = ["test-util"] }
 toml        = "0.8"
+vt100       = "0.15"
 
 [package.metadata.deb]
 name = "pent"
@@ -68,6 +70,7 @@ assets = [
     ["../../man/pent-allow.1",      "usr/share/man/man1/", "644"],
     ["../../man/pent-deny.1",       "usr/share/man/man1/", "644"],
     ["../../man/pent-questions.1",  "usr/share/man/man1/", "644"],
+    ["../../man/pent-monitor.1",    "usr/share/man/man1/", "644"],
     ["../../man/pent-denials.1",    "usr/share/man/man1/", "644"],
     ["../../man/pent-rules.1",      "usr/share/man/man1/", "644"],
     ["../../man/pent-rules-list.1", "usr/share/man/man1/", "644"],

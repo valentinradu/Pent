@@ -43,6 +43,9 @@ pub(crate) enum Command {
     Deny(AnswerArgs),
     /// List the open questions with their width menus
     Questions(QuestionsArgs),
+    /// Answer the questions, and see the events and the rules, on a
+    /// terminal screen. pentd must run
+    Monitor,
     /// Show the accesses that pent refused in a session, or in each session
     Denials(DenialsArgs),
     /// List, show or forget the rules

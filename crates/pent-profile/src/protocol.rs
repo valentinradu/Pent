@@ -34,6 +34,10 @@
 //!   [`Message::End`].
 //! - [`Forget`]: a client asks pentd to remove rules (`pent rules forget`).
 //!   pentd answers with [`Forgotten`].
+//! - [`SessionInfo`]: pentd tells each watcher the start and the end of a
+//!   session, so `pent monitor` can name the session of an event.
+//! - [`EventsDropped`]: a watcher fell behind, and pentd dropped events for
+//!   it. pentd never drops a question or a verdict.
 
 use std::fmt;
 use std::num::NonZeroU16;
@@ -500,6 +504,29 @@ pub struct Forget {
     pub target: Option<Target>,
 }
 
+/// A session, as pentd tells it to a watcher.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionInfo {
+    /// The code of the session.
+    pub id: SessionId,
+    /// The key of the session.
+    pub key: RuleKey,
+    /// The command line of the run. The program chose it, so it is
+    /// untrusted text.
+    pub command: Vec<String>,
+    /// True while the run lasts.
+    pub live: bool,
+}
+
+/// pentd dropped events for a watcher that fell behind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EventsDropped {
+    /// How many events the watcher did not get.
+    pub count: u64,
+}
+
 /// The result of a [`Forget`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -623,6 +650,10 @@ pub enum Message {
     Forget(Forget),
     /// See [`Forgotten`].
     Forgotten(Forgotten),
+    /// See [`SessionInfo`].
+    Session(SessionInfo),
+    /// See [`EventsDropped`].
+    EventsDropped(EventsDropped),
     /// The end of the reply to [`Message::Questions`] or
     /// [`Message::Denials`].
     End,
@@ -856,6 +887,13 @@ mod tests {
                 key: "cargo".parse().unwrap_or_else(|e| panic!("{e}")),
                 count: 2,
             }),
+            Message::Session(SessionInfo {
+                id: SessionId(4),
+                key: "cargo".parse().unwrap_or_else(|e| panic!("{e}")),
+                command: vec!["cargo".into(), "\u{1b}[2J".into()],
+                live: true,
+            }),
+            Message::EventsDropped(EventsDropped { count: 12 }),
             Message::End,
         ]
     }

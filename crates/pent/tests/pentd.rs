@@ -684,7 +684,24 @@ mod queue {
             Ok(())
         }
 
+        /// The next message, without the messages of the event stream of
+        /// a watcher (`Session`, `Event`, `EventsDropped`): these tests
+        /// check the questions and the verdicts, and the tests of the hub
+        /// check the stream.
         pub(super) fn recv(&mut self) -> Result<Message, common::e2e::BoxError> {
+            loop {
+                let message = self.recv_any()?;
+                if !matches!(
+                    message,
+                    Message::Session(_) | Message::Event(_) | Message::EventsDropped(_)
+                ) {
+                    return Ok(message);
+                }
+            }
+        }
+
+        /// The next message.
+        pub(super) fn recv_any(&mut self) -> Result<Message, common::e2e::BoxError> {
             let mut line = String::new();
             if self.read.read_line(&mut line)? == 0 {
                 return Err("pentd closed the connection".into());
@@ -1628,6 +1645,83 @@ created = 2026-11-22T12:00:01Z
         // `list` and `show` read the files and need no pentd.
         let (out, _) = ok(&pent(&rt, state.path(), &["rules", "list"])?)?;
         assert!(out.contains("2 rules"), "{out}");
+        Ok(())
+    }
+}
+
+// ── pent monitor ─────────────────────────────────────────────────────────────
+
+mod monitor {
+    use pent_profile::{Decision, FileKind, Message, PathWidth, RulePath, Target};
+
+    use super::common::e2e::Pty;
+    use super::queue::{pentd, read_ask, Client};
+    use super::*;
+
+    /// The size of the terminal of the monitor.
+    const SIZE: (u16, u16) = (110, 30);
+
+    #[test]
+    fn pent_monitor_answers_with_a_width_and_shows_the_new_rule() -> TestResult {
+        let rt = Runtime::new()?;
+        let state = tempfile::tempdir()?;
+        let _pentd = pentd(&rt, state.path(), &["daemon"])?;
+        assert!(rt.wait_for_socket());
+        let mut session = Client::session(&rt, "cargo")?;
+        let id = session.ask(read_ask("/home/u/reg/a", "/home/u/reg")?)?;
+
+        let mut cmd = rt.pent(&["monitor"]);
+        cmd.env("XDG_STATE_HOME", state.path())
+            .env("HOME", state.path())
+            .env("TERM", "xterm");
+        let mut screen = Pty::spawn(cmd, Some(SIZE))?;
+        screen.expect_screen(SIZE, "Questions (1)", WAIT)?;
+        screen.expect_screen(SIZE, &format!("  {id}  read /home/u/reg/a"), WAIT)?;
+        screen.expect_screen(SIZE, "(•) 0 read /home/u/reg/a", WAIT)?;
+        // The wider place of the menu, the scope `remember`, then allow.
+        screen.send("ls")?;
+        screen.expect_screen(SIZE, "(•) 1 read /home/u/reg/**", WAIT)?;
+        screen.expect_screen(SIZE, "scope   this run  [remember]", WAIT)?;
+        screen.send("a")?;
+        match session.recv()? {
+            Message::Verdict(v) => {
+                assert_eq!(v.id, id);
+                assert_eq!(v.decision, Decision::Allow);
+                assert_eq!(
+                    v.target,
+                    Target::File {
+                        kind: FileKind::Read,
+                        width: PathWidth::Subtree(RulePath::new("/home/u/reg")?),
+                    }
+                );
+            }
+            other => return Err(format!("{other:?}").into()),
+        }
+        screen.expect_screen(SIZE, "allow read /home/u/reg/** (remembered)", WAIT)?;
+        screen.expect_screen(SIZE, "Questions (0)", WAIT)?;
+        // The rules tab shows the new rule.
+        screen.send("\t\t")?;
+        screen.expect_screen(SIZE, "cargo            1 rule", WAIT)?;
+        screen.expect_screen(SIZE, "  1  allow  read /home/u/reg/**  human", WAIT)?;
+        screen.send("q")?;
+        let (status, text) = screen.wait(WAIT)?;
+        assert!(status.success(), "{status:?}\n{text}");
+        Ok(())
+    }
+
+    #[test]
+    fn pent_monitor_needs_a_terminal_and_a_running_pentd() -> TestResult {
+        let rt = Runtime::new()?;
+        let output = rt.pent(&["monitor"]).stderr(Stdio::piped()).output()?;
+        assert!(!output.status.success());
+        let err = String::from_utf8_lossy(&output.stderr);
+        assert!(err.contains("pent monitor needs a terminal"), "{err}");
+
+        let screen = Pty::spawn(rt.pent(&["monitor"]), Some((80, 24)))?;
+        let (status, text) = screen.wait(WAIT)?;
+        assert!(!status.success(), "{text}");
+        assert!(text.contains("pentd does not run"), "{text}");
+        assert!(!rt.socket().exists(), "pent monitor started pentd");
         Ok(())
     }
 }

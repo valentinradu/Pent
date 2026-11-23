@@ -32,8 +32,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use pent_profile::{
-    Answer, Forget, Forgotten, Hold, Message, QuestionId, RejectReason, Rejected, RuleKey, Scope,
-    SessionId, Verdict,
+    Answer, EventsDropped, Forget, Forgotten, Hold, Message, QuestionId, RejectReason, Rejected,
+    RuleKey, Scope, SessionId, SessionInfo, Verdict,
 };
 use pent_profile::{Class, Classifier};
 use pent_settings::RuleStore;
@@ -45,6 +45,18 @@ use super::random;
 
 /// How many messages wait for one connection before pentd closes it.
 pub(crate) const OUTBOX_LEN: usize = 256;
+
+/// How often pentd sends the new events to the watchers.
+pub(crate) const FLUSH_EVERY: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// The free places that an outbox keeps for the questions and the verdicts.
+/// pentd sends a batch of events only to an outbox with more free places,
+/// so the events never close a connection.
+const EVENT_RESERVE: usize = 64;
+
+/// The most events that wait for the next flush. Above it, pentd counts the
+/// events as dropped for each watcher.
+const MAX_PENDING: usize = 4096;
 
 /// One or more encoded lines, each with its `\n`, for one write.
 #[derive(Debug, Clone, Default)]
@@ -120,9 +132,40 @@ impl Outbox {
         }
     }
 
+    /// Send `batch` only when the outbox keeps more than `reserve` free
+    /// places. Returns false when pentd did not send it. A full outbox does
+    /// not close the connection here: the caller counts what it dropped.
+    fn send_spare(&self, batch: Batch, reserve: usize) -> bool {
+        if self.tx.capacity() <= reserve {
+            return false;
+        }
+        self.tx.try_send(batch).is_ok()
+    }
+
     /// Return true if `self` and `other` reach the same connection.
     fn same(&self, other: &Self) -> bool {
         self.tx.same_channel(&other.tx)
+    }
+}
+
+/// A connection that watches, and the events that it did not get.
+#[derive(Debug)]
+struct Watcher {
+    outbox: Outbox,
+    /// The events that pentd dropped for this watcher since its last batch
+    /// of events.
+    dropped: u64,
+}
+
+impl Watcher {
+    /// Send `batch`, as [`Outbox::send`].
+    fn send(&self, batch: Batch) -> bool {
+        self.outbox.send(batch)
+    }
+
+    /// Return true if this watcher is the connection of `outbox`.
+    fn same(&self, outbox: &Outbox) -> bool {
+        self.outbox.same(outbox)
     }
 }
 
@@ -148,7 +191,11 @@ struct State {
     queue: Queue,
     denials: Denials,
     sessions: HashMap<SessionId, Outbox>,
-    watchers: Vec<Outbox>,
+    watchers: Vec<Watcher>,
+    /// The events for the watchers since the last flush.
+    pending: Vec<pent_profile::Event>,
+    /// The events above [`MAX_PENDING`] since the last flush.
+    pending_lost: u64,
 }
 
 impl State {
@@ -224,6 +271,8 @@ impl Hub {
                 denials: Denials::default(),
                 sessions: HashMap::new(),
                 watchers: Vec::new(),
+                pending: Vec::new(),
+                pending_lost: 0,
             }),
             activity: watch::Sender::new(Activity::default()),
             rules,
@@ -308,7 +357,16 @@ impl Hub {
                     reject(outbox, None, RejectReason::NotPermitted);
                     return;
                 };
-                self.lock().denials.record(*id, event);
+                let mut state = self.lock();
+                if let Some(event) = state.denials.record(*id, event) {
+                    if state.watchers.is_empty() {
+                        // Nobody watches: the log of the session keeps it.
+                    } else if state.pending.len() < MAX_PENDING {
+                        state.pending.push(event);
+                    } else {
+                        state.pending_lost = state.pending_lost.saturating_add(1);
+                    }
+                }
             }
             Message::Questions => {
                 if matches!(role, Role::Session { .. }) {
@@ -356,12 +414,24 @@ impl Hub {
                 if state.watches(outbox) {
                     return;
                 }
+                // The other watchers get the waiting events first, so the new
+                // watcher gets them only in the recent events below.
+                flush(&mut state);
                 let mut batch = Batch::default();
+                for info in state.denials.sessions() {
+                    batch.push(&Message::Session(info));
+                }
                 for question in state.queue.open() {
                     batch.push(&Message::Question(question.clone()));
                 }
+                for event in state.denials.recent() {
+                    batch.push(&Message::Event(event));
+                }
                 if outbox.send(batch) {
-                    state.watchers.push(outbox.clone());
+                    state.watchers.push(Watcher {
+                        outbox: outbox.clone(),
+                        dropped: 0,
+                    });
                 }
             }
             other => tracing::debug!("pentd does not take {other:?} from a client"),
@@ -376,7 +446,7 @@ impl Hub {
             return;
         }
         *role = match hold {
-            Hold::Run { key, .. } => {
+            Hold::Run { key, command } => {
                 let mut state = self.lock();
                 // A code that no live session and no list of refusals has.
                 let id = SessionId(random::fresh(|v| {
@@ -384,7 +454,10 @@ impl Hub {
                     state.sessions.contains_key(&id) || state.denials.knows(id)
                 }));
                 state.sessions.insert(id, outbox.clone());
-                state.denials.start(id, key.clone());
+                state.denials.start(id, key.clone(), command);
+                if let Some(info) = state.denials.info(id) {
+                    broadcast(&mut state.watchers, &Batch::of(&Message::Session(info)));
+                }
                 Role::Session { id, key }
             }
             Hold::Daemon | Hold::Unit => Role::Holder,
@@ -578,7 +651,17 @@ impl Hub {
             let now = std::time::Instant::now();
             state.sessions.remove(&id);
             state.queue.end_session(id, now);
+            // The watchers get the last events of the run before its end.
+            flush(&mut state);
+            let info = state.denials.info(id);
             state.denials.end(id, now);
+            if let Some(info) = info {
+                let ended = Message::Session(SessionInfo {
+                    live: false,
+                    ..info
+                });
+                broadcast(&mut state.watchers, &Batch::of(&ended));
+            }
         }
         self.publish(&state);
     }
@@ -592,8 +675,44 @@ impl Hub {
         if dropped > 0 {
             tracing::debug!("pentd drops {dropped} old questions of ended sessions");
         }
-        state.watchers.retain(|w| !w.tx.is_closed());
+        state.watchers.retain(|w| !w.outbox.tx.is_closed());
         self.publish(&state);
+    }
+
+    /// Send the new events to the watchers. The server calls this every
+    /// [`FLUSH_EVERY`].
+    pub(crate) fn flush_events(&self) {
+        flush(&mut self.lock());
+    }
+}
+
+/// Send the waiting events to each watcher in one batch. A watcher whose
+/// outbox has no room above [`EVENT_RESERVE`] does not get the batch:
+/// pentd counts its events as dropped and sends the count with the next
+/// batch that fits, so a loss is never silent.
+fn flush(state: &mut State) {
+    let events = std::mem::take(&mut state.pending);
+    let lost = std::mem::take(&mut state.pending_lost);
+    let mut lines = Batch::default();
+    for event in events.iter().cloned() {
+        lines.push(&Message::Event(event));
+    }
+    let count = u64::try_from(events.len()).unwrap_or(u64::MAX);
+    for watcher in &mut state.watchers {
+        let missed = watcher.dropped.saturating_add(lost);
+        let mut batch = Batch::default();
+        if missed > 0 {
+            batch.push(&Message::EventsDropped(EventsDropped { count: missed }));
+        }
+        batch.0.push_str(&lines.0);
+        if batch.is_empty() {
+            continue;
+        }
+        if watcher.outbox.send_spare(batch, EVENT_RESERVE) {
+            watcher.dropped = 0;
+        } else {
+            watcher.dropped = missed.saturating_add(count);
+        }
     }
 }
 
@@ -642,7 +761,7 @@ fn send(outbox: &Outbox, message: &Message) {
 
 /// Send `batch` to each watcher, and forget each watcher that is gone or
 /// full.
-fn broadcast(watchers: &mut Vec<Outbox>, batch: &Batch) {
+fn broadcast(watchers: &mut Vec<Watcher>, batch: &Batch) {
     if batch.is_empty() {
         return;
     }
@@ -663,12 +782,143 @@ fn reject(outbox: &Outbox, id: Option<QuestionId>, reason: RejectReason) {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)] // a test fails on a value that it must not get
 mod tests {
     use std::num::NonZeroU16;
 
-    use pent_profile::{Decision, Source, Target};
+    use pent_profile::{DecidedBy, Decision, Event, Request, Source, Target, Timestamp};
 
     use super::*;
+
+    /// The messages of each batch that waits in `rx`.
+    fn drain(rx: &mut mpsc::Receiver<Batch>) -> Vec<Vec<Message>> {
+        let mut batches = Vec::new();
+        while let Ok(batch) = rx.try_recv() {
+            let text = String::from_utf8(batch.as_bytes().to_vec()).unwrap();
+            batches.push(
+                text.lines()
+                    .map(|l| Message::decode_line(l).unwrap())
+                    .collect(),
+            );
+        }
+        batches
+    }
+
+    fn event(time: i64) -> Message {
+        Message::Event(Event {
+            session: SessionId(0),
+            time: Timestamp(time),
+            program: "node".into(),
+            request: Request::Localhost(NonZeroU16::MIN),
+            decided_by: DecidedBy::Rule(Decision::Allow),
+        })
+    }
+
+    #[tokio::test]
+    async fn a_watcher_gets_the_sessions_and_the_events_in_batches_and_each_loss() {
+        let hub = Hub::new(None, None);
+        let (watcher, mut watched, _close) = Outbox::new();
+        hub.handle(&mut Role::Client, &watcher, Message::Watch)
+            .await;
+        assert!(drain(&mut watched).is_empty(), "nothing to dump yet");
+
+        let (session, _rx, _c) = Outbox::new();
+        let mut role = Role::Client;
+        let hold = Hold::Run {
+            key: "cargo".parse().unwrap(),
+            command: vec!["cargo".into()],
+        };
+        hub.handle(&mut role, &session, Message::Hold(hold)).await;
+        let Role::Session { id, .. } = role else {
+            panic!("no session");
+        };
+        let batches = drain(&mut watched);
+        assert!(
+            matches!(&batches[..], [b] if matches!(&b[..], [Message::Session(i)] if i.id == id && i.live))
+        );
+
+        // Three events wait for the flush, then come in one batch with the
+        // code of the session.
+        for t in 0..3 {
+            hub.handle(&mut role, &session, event(t)).await;
+        }
+        assert!(drain(&mut watched).is_empty());
+        hub.flush_events();
+        let batches = drain(&mut watched);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].len(), 3);
+        assert!(batches[0]
+            .iter()
+            .all(|m| matches!(m, Message::Event(e) if e.session == id)));
+
+        // The outbox has no room above the reserve: the events are dropped
+        // for this watcher, and the connection stays.
+        for _ in 0..(OUTBOX_LEN - EVENT_RESERVE) {
+            assert!(watcher.send(Batch::of(&Message::End)));
+        }
+        for t in 3..5 {
+            hub.handle(&mut role, &session, event(t)).await;
+        }
+        hub.flush_events();
+        assert_eq!(drain(&mut watched).len(), OUTBOX_LEN - EVENT_RESERVE);
+        assert!(hub.lock().watches(&watcher), "the watcher must stay");
+        // The next batch that fits names the loss first.
+        hub.handle(&mut role, &session, event(5)).await;
+        hub.flush_events();
+        let batches = drain(&mut watched);
+        assert!(matches!(
+            &batches[..],
+            [b] if matches!(&b[..], [Message::EventsDropped(d), Message::Event(e)] if d.count == 2 && e.time.0 == 5)
+        ));
+
+        // The end of the session reaches the watcher after its events.
+        hub.handle(&mut role, &session, event(6)).await;
+        hub.end(role, &session);
+        let batches = drain(&mut watched);
+        let all: Vec<&Message> = batches.iter().flatten().collect();
+        assert!(
+            matches!(&all[..], [Message::Event(e), Message::Session(i)] if e.time.0 == 6 && !i.live)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_watcher_gets_the_sessions_the_questions_and_the_recent_events() {
+        let hub = Hub::new(None, None);
+        let (session, _rx, _c) = Outbox::new();
+        let mut role = Role::Client;
+        let hold = Hold::Run {
+            key: "cargo".parse().unwrap(),
+            command: vec![],
+        };
+        hub.handle(&mut role, &session, Message::Hold(hold)).await;
+        let (first, mut first_rx, _c1) = Outbox::new();
+        hub.handle(&mut Role::Client, &first, Message::Watch).await;
+        drain(&mut first_rx);
+        hub.handle(&mut role, &session, event(1)).await;
+        // A second watcher before the flush: the first one gets the event
+        // in a flush, the second one in its dump, and neither gets it two
+        // times.
+        let (second, mut second_rx, _c2) = Outbox::new();
+        hub.handle(&mut Role::Client, &second, Message::Watch).await;
+        hub.flush_events();
+        let count = |rx: &mut mpsc::Receiver<Batch>| {
+            drain(rx)
+                .iter()
+                .flatten()
+                .filter(|m| matches!(m, Message::Event(_)))
+                .count()
+        };
+        assert_eq!(count(&mut first_rx), 1);
+        let dump = drain(&mut second_rx);
+        assert!(matches!(dump[0][0], Message::Session(_)), "{dump:?}");
+        assert_eq!(
+            dump.iter()
+                .flatten()
+                .filter(|m| matches!(m, Message::Event(_)))
+                .count(),
+            1
+        );
+    }
 
     fn verdict(id: u64) -> (SessionId, Verdict) {
         (

@@ -342,7 +342,7 @@ impl TestEnv {
     /// # Errors
     /// Returns an error if the terminal or the process cannot start.
     pub fn spawn_pty(&self, args: &[&str]) -> Result<Pty, BoxError> {
-        Pty::spawn(self.raw_command(args))
+        Pty::spawn(self.raw_command(args), None)
     }
 }
 
@@ -555,18 +555,33 @@ pub struct Pty {
 }
 
 impl Pty {
-    fn spawn(mut cmd: Command) -> Result<Self, BoxError> {
+    /// Start `cmd` on a new pseudo-terminal, with `size` (columns, rows)
+    /// as its window size, or with no size.
+    ///
+    /// # Errors
+    /// Returns an error if the terminal or the process cannot start.
+    pub fn spawn(mut cmd: Command, size: Option<(u16, u16)>) -> Result<Self, BoxError> {
         let mut master: libc::c_int = -1;
         let mut slave: libc::c_int = -1;
-        // SAFETY: the pointers point to valid c_int values. The name, the
-        // termios and the window size are optional (null).
+        let mut winsize = size.map(|(cols, rows)| libc::winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        });
+        let winsize_ptr = winsize
+            .as_mut()
+            .map_or(std::ptr::null_mut(), std::ptr::from_mut);
+        // SAFETY: the pointers point to valid c_int values, and the window
+        // size is a valid `winsize` or null. The name and the termios are
+        // optional (null).
         let rc = unsafe {
             libc::openpty(
                 &mut master,
                 &mut slave,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                std::ptr::null_mut(),
+                winsize_ptr,
             )
         };
         if rc != 0 {
@@ -626,6 +641,38 @@ impl Pty {
         strip_ansi(&String::from_utf8_lossy(&bytes))
     }
 
+    /// The screen of a terminal of `cols` x `rows` after all output until
+    /// now, as a terminal shows it: one row on each line. A full-screen
+    /// program writes only the cells that change, so its text is in the
+    /// screen, not in the raw output.
+    pub fn screen(&self, cols: u16, rows: u16) -> String {
+        let bytes = self.output.lock().map(|o| o.clone()).unwrap_or_default();
+        let mut parser = vt100::Parser::new(rows, cols, 0);
+        parser.process(&bytes);
+        parser.screen().contents()
+    }
+
+    /// Wait until the screen of `cols` x `rows` shows `needle`.
+    ///
+    /// # Errors
+    /// Returns an error with the screen after `timeout`.
+    pub fn expect_screen(&self, size: (u16, u16), needle: &str, timeout: Duration) -> TestResult {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let screen = self.screen(size.0, size.1);
+            if screen.contains(needle) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "the screen did not show {needle:?} after {timeout:?}\n--- screen ---\n{screen}"
+                )
+                .into());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// Wait until the output after the last match has `needle`.
     ///
     /// # Errors
@@ -649,6 +696,16 @@ impl Pty {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// Type `keys` as they are, with no Enter.
+    ///
+    /// # Errors
+    /// Returns an error if the write fails.
+    pub fn send(&mut self, keys: &str) -> TestResult {
+        self.master.write_all(keys.as_bytes())?;
+        self.master.flush()?;
+        Ok(())
     }
 
     /// Type `line` and Enter.

@@ -47,10 +47,11 @@ pub use guard::{
 pub use localhost::{control_port, is_localhost_name, is_loopback, CONTROL_PORTS};
 pub use name::{ProfileName, ProfileNameError};
 pub use protocol::{
-    Answer, Ask, BadCode, Deadline, DeadlineTooLong, DecidedBy, Denial, Event, Forget, Forgotten,
-    Hold, MenuIndex, Message, ProtocolError, Question, QuestionId, RejectReason, Rejected, Request,
-    Scope, SessionId, Timestamp, Verdict, CODE_ALPHABET, CODE_LEN, CODE_SPACE, DNS_DEADLINE,
-    FILE_DEADLINE, MAX_DEADLINE, MAX_LINE_LEN, PROTOCOL_VERSION, PROXY_DEADLINE,
+    Answer, Ask, BadCode, Deadline, DeadlineTooLong, DecidedBy, Denial, Event, EventsDropped,
+    Forget, Forgotten, Hold, MenuIndex, Message, ProtocolError, Question, QuestionId, RejectReason,
+    Rejected, Request, Scope, SessionId, SessionInfo, Timestamp, Verdict, CODE_ALPHABET, CODE_LEN,
+    CODE_SPACE, DNS_DEADLINE, FILE_DEADLINE, MAX_DEADLINE, MAX_LINE_LEN, PROTOCOL_VERSION,
+    PROXY_DEADLINE,
 };
 pub use render::{
     render_draft, render_draft_with, render_header, render_profile, render_terminal, safe,

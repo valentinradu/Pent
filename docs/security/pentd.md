@@ -1,9 +1,10 @@
 # pentd
 
-Status: the branch `next`, steps 2.1 to 2.4 of `PLAN.md` (2026-11-22).
+Status: the branch `next`, steps 2.1 to 2.5 of `PLAN.md` (2026-11-23).
 This report lists the security properties of the daemon, its socket, its
-lock, its queue, its notification hook and the clients of the CLI, the test
-of each property, and the properties that later steps must add.
+lock, its queue, its notification hook, the clients of the CLI, the event
+stream and `pent monitor`, the test of each property, and the properties
+that later steps must add.
 
 pentd has the queue of questions, and it writes the rules. `pent run`
 holds pentd for the whole run and starts it when no pentd runs, but it asks
@@ -16,6 +17,8 @@ no question yet (phase 3). A failure of pentd does not stop a run.
   (`notify.rs`), the refusals of each session (`denials.rs`), the session of
   `pent run` (`client.rs`), the request of a command of the CLI (`call.rs`)
   and the line reader (`mod.rs`).
+- `crates/pent/src/monitor/`: `pent monitor` (the model, the view and the
+  loop).
 - `crates/pent/src/commands/answer.rs` (`pent allow`, `pent deny`,
   `pent questions`, `pent denials`) and `crates/pent/src/commands/rules.rs`
   (`pent rules list`, `show`, `forget`).
@@ -42,9 +45,12 @@ pentd will decide what each sandboxed program can do. Thus:
   itself.
 - A session must not put a refusal in the list of another session, and it
   must not read the questions or the refusals of other runs.
-- The clients of the CLI print paths, names and command lines that the
-  program chose. That text must not reach the terminal as a control
-  sequence.
+- The clients of the CLI and `pent monitor` print paths, names and command
+  lines that the program chose. That text must not reach the terminal as a
+  control sequence.
+- A flood of events must not close the connection of a monitor, make pentd
+  grow without a limit, or hide a refusal. A lost event must not be
+  silent.
 
 ## How to run the tests
 
@@ -52,6 +58,7 @@ pentd will decide what each sandboxed program can do. Thus:
 cargo test -p pent --test pentd
 cargo test -p pent daemon::
 cargo test -p pent commands::
+cargo test -p pent monitor::
 cargo test -p pent-settings runtime
 ```
 
@@ -122,6 +129,31 @@ soon after the last hold.
 | CC-6 | No client of the CLI starts pentd. Without pentd, `pent allow`, `deny`, `questions`, `denials` and `rules forget` stop with an error, and no socket appears. `pent rules list` and `show` read the files and need no pentd. | `each_client_fails_when_no_pentd_runs_and_starts_none` |
 | CC-7 | Each text that the program chose (a path, a name, the program) goes through `safe` before it reaches the terminal, so a control character shows as an escape. `pent questions --json` gives JSON, which escapes each control character. | `answer::tests::a_question_shows_its_menu_and_escapes_the_program`, `a_denial_names_what_refused_it`, `rules::tests::a_rule_shows_its_number_target_source_and_date` |
 
+## The event stream
+
+| ID | Property | Test |
+|---|---|---|
+| ES-1 | pentd keeps the last 256 events of each session, in a list apart from the refusals, so a flood of allowed accesses cannot push a refusal out of `pent denials`. The limits of CC-2 hold for both lists. | `denials::tests::the_recent_events_keep_each_kind_and_the_refusals_survive_a_flood` |
+| ES-2 | `watch` gives the sessions, the open questions and the recent events in one batch. pentd first sends the waiting events to the other watchers, so a new watcher gets each event one time. | `hub::tests::a_new_watcher_gets_the_sessions_the_questions_and_the_recent_events` |
+| ES-3 | New events go to each watcher every 200 ms, in one batch. pentd sends the batch only to an outbox with more than 64 free places, so the events never close a connection and leave room for the questions and the verdicts, which pentd never drops. A watcher that gets no batch keeps a count, and its next batch starts with `events_dropped`. | `hub::tests::a_watcher_gets_the_sessions_and_the_events_in_batches_and_each_loss` |
+| ES-4 | Each watcher gets the start and the end of each session (`session`, with its code, key and command). The end comes after the last events of the run. | `hub::tests::a_watcher_gets_the_sessions_and_the_events_in_batches_and_each_loss` |
+| ES-5 | At most 4096 events wait between two flushes; pentd counts the others as dropped for each watcher. | No test. |
+
+## pent monitor
+
+| ID | Property | Test |
+|---|---|---|
+| MO-1 | `pent monitor` needs a terminal, and it never starts pentd: without pentd it stops with an error, and no socket appears. | `pent_monitor_needs_a_terminal_and_a_running_pentd` |
+| MO-2 | An answer of the monitor is an answer of the human with the selected place in the menu and the selected scope (`this run` by default). pentd checks it as each answer (QU-3, QU-16). A sensitive question has only its exact target in its menu. | `model::tests::an_answer_names_the_selected_width_and_scope`, `a_sensitive_question_keeps_its_exact_target`, `pent_monitor_answers_with_a_width_and_shows_the_new_rule` |
+| MO-3 | Each text that a program chose (a path, a name, a command line, the program) goes through `safe` before it reaches the screen. The log of pent is off in the monitor, so no log line breaks the screen. | `view::tests::the_questions_show_by_key_with_the_menu_of_the_selected_one`, `the_events_tab_names_each_loss_and_escapes_the_program` |
+| MO-4 | The monitor shows each loss of events (ES-3), and a sensitive question shows its warning in the list and in the details. | `view::tests::the_events_tab_names_each_loss_and_escapes_the_program`, `a_sensitive_question_shows_its_warning_in_the_details` |
+| MO-5 | The rules tab reads the rule files, as `pent rules show`, when it opens and after each answer with `remember`. A file that pent cannot read shows its error, and the other keys stay. The tab does not change a rule. | `model::tests::the_rules_tab_loads_the_rules_when_it_opens_and_after_a_kept_answer`, `tests::the_rules_of_each_key_load_and_a_bad_file_keeps_its_error`, `pent_monitor_answers_with_a_width_and_shows_the_new_rule` |
+| MO-6 | A terminal of any size, also 1 x 1, does not make the monitor panic. | `view::tests::a_small_terminal_does_not_panic` |
+
+The end-to-end test of the monitor runs it on a pseudo-terminal and reads
+the screen with the `vt100` crate (a dev-dependency): `ratatui` writes only
+the cells that change, so the raw output does not hold whole phrases.
+
 ## The limits
 
 - **The same user.** A process of the same user outside the sandbox can
@@ -137,6 +169,8 @@ soon after the last hold.
   the rules before it queues a question: `pent run` asks only when no rule
   answers. A rule that the user adds by hand during a run does not resolve
   a question that is open already.
+- **The events tab of the monitor** shows the last events that fit on the
+  screen, from at most 2000 that the monitor keeps. It has no scroll.
 - **The refusals are in memory.** A stop or a restart of pentd loses
   them. `pent run` sends no event yet (phase 3), so today only a test
   fills the list.

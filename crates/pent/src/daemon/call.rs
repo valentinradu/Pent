@@ -86,7 +86,7 @@ impl Call {
 
 /// Connect to `socket`. A missing socket and a refused connection mean
 /// that no pentd runs.
-async fn connect(socket: &Path) -> Result<UnixStream, DaemonError> {
+pub(crate) async fn connect(socket: &Path) -> Result<UnixStream, DaemonError> {
     UnixStream::connect(socket).await.map_err(|source| {
         if matches!(
             source.kind(),

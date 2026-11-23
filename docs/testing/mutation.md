@@ -87,6 +87,14 @@ makes one mutation by hand. The test must fail on the mutant. No
 | 2.4 | pentd keeps the menu of the `Ask`. | `pentd_computes_the_class_and_the_menu_and_ignores_those_of_the_session` |
 | 2.4 | An access in the pent class gets a question. | `pentd_computes_the_class_and_the_menu_and_ignores_those_of_the_session` |
 | 2.4 | A fresh code ignores the codes that are taken. | `random::tests::a_taken_number_is_never_given` |
+| 2.5 | A batch of events ignores the reserve of the outbox. | `hub::tests::a_watcher_gets_the_sessions_and_the_events_in_batches_and_each_loss` |
+| 2.5 | A loss of events is silent. | `hub::tests::a_watcher_gets_the_sessions_and_the_events_in_batches_and_each_loss` |
+| 2.5 | A new watcher does not flush the other watchers first. | `hub::tests::a_new_watcher_gets_the_sessions_the_questions_and_the_recent_events` |
+| 2.5 | The end of a session comes before its last events. | `hub::tests::a_watcher_gets_the_sessions_and_the_events_in_batches_and_each_loss` |
+| 2.5 | A refusal goes only to the recent events. | `denials::tests::the_recent_events_keep_each_kind_and_the_refusals_survive_a_flood` |
+| 2.5 | The monitor answers with the first place of the menu. | `model::tests::an_answer_names_the_selected_width_and_scope`, `pent_monitor_answers_with_a_width_and_shows_the_new_rule` |
+| 2.5 | The monitor does not escape the command line of a session. | `view::tests::the_questions_show_by_key_with_the_menu_of_the_selected_one` |
+| 2.5 | The rules tab does not load the rules when it opens. | `model::tests::the_rules_tab_loads_the_rules_when_it_opens_and_after_a_kept_answer`, `pent_monitor_answers_with_a_width_and_shows_the_new_rule` |
 
 The first form of `pent_run_starts_pentd_and_holds_it_for_the_run` passed on
 the mutant: the client started a new pentd each time that it lost one. The

@@ -332,6 +332,8 @@ async fn accept_loop(
     let own_uid = pent_settings::current_uid();
     let mut idle_since = (!holds_itself).then(tokio::time::Instant::now);
     let mut expire = tokio::time::interval(EXPIRE_EVERY);
+    let mut flush = tokio::time::interval(super::hub::FLUSH_EVERY);
+    flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         let stop_at = idle_since.map(|t| t + linger);
@@ -357,6 +359,7 @@ async fn accept_loop(
                 };
             }
             _ = expire.tick() => hub.expire(),
+            _ = flush.tick() => hub.flush_events(),
             () = sleep_until(stop_at) => {
                 tracing::info!(
                     "pentd stops: no hold and no open question for {} ms",

@@ -161,13 +161,7 @@ pub(crate) async fn denials(args: &DenialsArgs) -> Result<(), CliError> {
 /// The text of one refusal, on one line.
 fn denial_text(denial: &Denial) -> String {
     let event = &denial.event;
-    let why = match event.decided_by {
-        DecidedBy::Flag(_) => "a flag of pent run".to_string(),
-        DecidedBy::Rule(_) => "a rule".to_string(),
-        DecidedBy::Answer { question, .. } => format!("the answer to question {question}"),
-        DecidedBy::Deadline { question } => format!("the deadline of question {question}"),
-        DecidedBy::Hidden => "a file of pent (ENOENT)".to_string(),
-    };
+    let why = why_text(event.decided_by);
     format!(
         "  {}  {}  by {}  ({why})",
         time_text(event.time),
@@ -176,9 +170,21 @@ fn denial_text(denial: &Denial) -> String {
     )
 }
 
+/// What decided an access, as text: `a rule`, `the deadline of question
+/// k3m9tx`.
+pub(crate) fn why_text(decided_by: DecidedBy) -> String {
+    match decided_by {
+        DecidedBy::Flag(_) => "a flag of pent run".to_string(),
+        DecidedBy::Rule(_) => "a rule".to_string(),
+        DecidedBy::Answer { question, .. } => format!("the answer to question {question}"),
+        DecidedBy::Deadline { question } => format!("the deadline of question {question}"),
+        DecidedBy::Hidden => "a file of pent (ENOENT)".to_string(),
+    }
+}
+
 /// The text of a time, in UTC, or the milliseconds when the time is out of
 /// the range of a date.
-fn time_text(time: Timestamp) -> String {
+pub(crate) fn time_text(time: Timestamp) -> String {
     time.to_system_time()
         .and_then(format_date)
         .unwrap_or_else(|| format!("{} ms", time.0))

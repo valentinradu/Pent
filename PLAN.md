@@ -6,9 +6,9 @@ one commit for each step, and move this cursor when a step is done.
 **The way of work.** One commit for each step. Then the user runs
 `/code-review origin/main..HEAD`, and each finding gets a fix in one more
 commit. Push only when the user approves that push. Each new test gets a
-mutation check by hand (`docs/testing/mutation.md`). When the protocol
-changes, run the fuzz target `protocol_line` again and write the number in
-the documents.
+mutation check by hand (`docs/testing/mutation.md`). Run a fuzz target
+only when the user asks. When the protocol or a parser changes, mark the
+fuzz record as stale in the documents and say so.
 
 This plan builds the design in `docs/design/pent.md`. Each step names its
 goal, the main files, and the condition for "done". A step is done only
@@ -108,10 +108,31 @@ ready for users.
   details, and the warning of a sensitive question.
   - Done: tests of the model of the screen; a manual check on a real
     terminal.
-  - Open point from step 2.4: pentd does not tell a session its number,
-    so `pent run` cannot print it, and `pent denials SESSION` needs a
-    number that the user sees only next to a refusal. Decide here (or in
-    step 6.1) the reply to `Hold::Run` that carries the number.
+  - Files: `pent/src/monitor/` (model, view, loop); the event stream in
+    `daemon/hub.rs` and `daemon/denials.rs`; the messages `Session` and
+    `EventsDropped`; ES-1 to ES-5 and MO-1 to MO-6 in
+    `docs/security/pentd.md`.
+  - Decisions (2026-11-23):
+    - The screen uses `ratatui` with `crossterm`. The tests draw the model
+      on the test backend of `ratatui`.
+    - The layout: a list of the questions, grouped by root program, and
+      below it the details of the selected question with its width menu
+      and its scope. Tab switches to a tab of events, with a filter by
+      session and by kind.
+    - The events: pentd keeps the last 256 events of each session, next
+      to the refusals. `Watch` sends them after the open questions. New
+      events go to each watcher in one batch every 200 ms. A watcher that
+      falls behind loses events, and pentd sends `EventsDropped { count }`,
+      so a loss is never silent. pentd never drops a question or a
+      verdict. Until phase 3, only the tests send events.
+    - pentd tells the watchers each start and end of a session (its code,
+      key and command), so the monitor can name the session of an event.
+    - pentd still does not tell a session its own code: step 6.1 decides
+      that with `agent.sock`.
+    - A third tab shows the saved rules of each key, as
+      `pent rules show`. The monitor reads the rule files itself, again
+      when the tab opens and after each answer with `remember`. The tab
+      only shows the rules; it does not forget one.
 
 ## Phase 3: questions for the network, sockets and ports
 

@@ -5,6 +5,7 @@ mod cli;
 mod commands;
 mod daemon;
 mod error;
+mod monitor;
 mod ui;
 
 use clap::Parser;
@@ -14,9 +15,14 @@ use error::CliError;
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
-    // The child owns the terminal in `run` and `watch`.
-    let run_mode = matches!(cli.command, Command::Run(_) | Command::Watch(_));
-    setup_tracing(cli.verbose, run_mode);
+    // The child owns the terminal in `run` and `watch`, and the screen owns
+    // it in `monitor`.
+    let quiet = match cli.command {
+        Command::Run(_) | Command::Watch(_) => Quiet::Warnings,
+        Command::Monitor => Quiet::All,
+        _ => Quiet::No,
+    };
+    setup_tracing(cli.verbose, quiet);
 
     pent_sandbox::cleanup_stale_overlays();
 
@@ -43,18 +49,31 @@ async fn dispatch(cli: Cli) -> Result<(), CliError> {
         }
         Command::Deny(args) => commands::answer::answer(&args, pent_profile::Decision::Deny).await,
         Command::Questions(args) => commands::answer::questions(&args).await,
+        Command::Monitor => monitor::monitor().await,
         Command::Denials(args) => commands::answer::denials(&args).await,
         Command::Rules(args) => commands::rules::rules(&args).await,
     }
 }
 
-fn setup_tracing(verbose: u8, run_mode: bool) {
-    // In run mode the sandboxed process owns the terminal; suppress pent's own
-    // log output unless the user explicitly requested verbosity or PENT_LOG.
-    let default_level = if run_mode && verbose == 0 {
-        "warn"
-    } else {
-        "info"
+/// How much of the log of pent a command shows by default.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Quiet {
+    /// The log from `info` up.
+    No,
+    /// Only the warnings and the errors: the sandboxed process owns the
+    /// terminal.
+    Warnings,
+    /// Nothing: a line of log would break the screen of `pent monitor`.
+    All,
+}
+
+fn setup_tracing(verbose: u8, quiet: Quiet) {
+    // Suppress pent's own log output unless the user explicitly requested
+    // verbosity or PENT_LOG.
+    let default_level = match (quiet, verbose) {
+        (Quiet::Warnings, 0) => "warn",
+        (Quiet::All, 0) => "off",
+        _ => "info",
     };
     let level = match verbose {
         0 => default_level,

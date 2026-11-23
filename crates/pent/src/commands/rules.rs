@@ -48,7 +48,7 @@ fn list(store: &RuleStore) -> Result<(), CliError> {
 }
 
 /// `1 rule` or `N rules`.
-fn count_text(count: usize) -> String {
+pub(crate) fn count_text(count: usize) -> String {
     if count == 1 {
         "1 rule".to_string()
     } else {
@@ -70,7 +70,7 @@ fn show(store: &RuleStore, key: &RuleKey) -> Result<(), CliError> {
 }
 
 /// The text of one rule: `  1  allow  read /x/**  human  2026-11-22T12:00:00Z`.
-fn rule_text(number: usize, rule: &Rule) -> String {
+pub(crate) fn rule_text(number: usize, rule: &Rule) -> String {
     format!(
         "{number:>3}  {:<5}  {}  {}  {}",
         rule.decision.name(),
