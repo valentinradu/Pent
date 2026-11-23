@@ -50,7 +50,15 @@ pub(crate) struct Decider {
     classes: Option<Classes>,
     /// The hold on pentd, or `None` when the run has no key.
     session: Option<Session>,
+    /// The recent decisions of the hooks, oldest first, at most
+    /// [`MAX_HOOKED`]. The event of a hook comes later from the static
+    /// layer (the proxy), and it takes its cause from here: an answer or a
+    /// deadline has a question that the chain alone cannot know again.
+    hooked: Mutex<std::collections::VecDeque<(Request, DecidedBy)>>,
 }
+
+/// The most hook decisions that wait for their event.
+const MAX_HOOKED: usize = 1024;
 
 impl Decider {
     /// A chain with the flags `flags` and the rules `rules`.
@@ -70,6 +78,7 @@ impl Decider {
             }),
             classes,
             session,
+            hooked: Mutex::new(std::collections::VecDeque::new()),
         }
     }
 
@@ -133,10 +142,10 @@ impl Decider {
             })
     }
 
-    /// Decide `request` of `program`: with the chain when it knows the
-    /// answer, else with a question to pentd that waits at most `deadline`.
-    /// Send the event of the decision to pentd.
-    #[cfg_attr(not(test), allow(dead_code))] // the hooks ask from step 3.2 of PLAN.md.
+    /// Decide `request` of `program` for a hook: with the chain when it
+    /// knows the answer, else with a question to pentd that waits at most
+    /// `deadline`. The hook sends no event itself: its static layer sends
+    /// one, and [`Decider::report_watch`] gives it this cause.
     pub(crate) async fn decide(
         &self,
         program: &str,
@@ -147,8 +156,29 @@ impl Decider {
             Some(known) => known,
             None => self.ask(program, &request, deadline).await,
         };
-        self.report(program, request, decided_by);
+        let mut hooked = self
+            .hooked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if hooked.len() >= MAX_HOOKED {
+            hooked.pop_front();
+        }
+        hooked.push_back((request, decided_by));
         decided_by
+    }
+
+    /// Take the oldest hook decision of `request` with the decision
+    /// `decision`.
+    fn take_hooked(&self, request: &Request, decision: Decision) -> Option<DecidedBy> {
+        let mut hooked = self
+            .hooked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let refusal = decision == Decision::Deny;
+        let place = hooked
+            .iter()
+            .position(|(r, d)| r == request && d.is_refusal() == refusal)?;
+        hooked.remove(place).map(|(_, decided_by)| decided_by)
     }
 
     /// Ask pentd, and keep the verdict for the rest of the run.
@@ -206,7 +236,7 @@ impl Decider {
 
     /// Send the event of a decision to pentd. pentd puts the number of the
     /// session in it.
-    pub(crate) fn report(&self, program: &str, request: Request, decided_by: DecidedBy) {
+    fn report(&self, program: &str, request: Request, decided_by: DecidedBy) {
         let Some(session) = &self.session else {
             return;
         };
@@ -220,14 +250,17 @@ impl Decider {
     }
 
     /// Send the event of an access that a static layer decided: the proxy,
-    /// the supervisor or Landlock. An access that the program cannot name as
+    /// the supervisor or Landlock. The cause is the hook decision of the
+    /// same request and decision, when one waits, else the chain. An access that the program cannot name as
     /// a request (an IP address, an abstract socket) gives no event.
     pub(crate) fn report_watch(&self, event: &WatchEvent) {
         let Some((program, request, decision)) = request_of(event, self.key()) else {
             tracing::debug!("no event for {event:?}: it is not a request");
             return;
         };
-        let decided_by = self.static_cause(&request, decision);
+        let decided_by = self
+            .take_hooked(&request, decision)
+            .unwrap_or_else(|| self.static_cause(&request, decision));
         self.report(&program, request, decided_by);
     }
 
@@ -244,6 +277,38 @@ impl Decider {
     /// known.
     fn class(&self, request: &Request) -> Option<Class> {
         self.classes.as_ref().map(|c| c.decide(request).0)
+    }
+}
+
+/// The chain of deciders as the decider of the proxy. The proxy does not
+/// know the process of a connection, so a question names the key as the
+/// program.
+pub(crate) struct ProxyDecider(pub std::sync::Arc<Decider>);
+
+impl std::fmt::Debug for ProxyDecider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("ProxyDecider").field(self.0.key()).finish()
+    }
+}
+
+impl pent_proxy::DomainDecider for ProxyDecider {
+    fn decide<'a>(
+        &'a self,
+        name: &'a pent_profile::DomainName,
+        deadline: Duration,
+    ) -> pent_proxy::DecisionFuture<'a> {
+        Box::pin(async move {
+            let key = self.0.key().to_string();
+            let decided_by = self
+                .0
+                .decide(&key, Request::Domain(name.clone()), deadline)
+                .await;
+            if decided_by.is_refusal() {
+                Decision::Deny
+            } else {
+                Decision::Allow
+            }
+        })
     }
 }
 
@@ -1053,6 +1118,15 @@ mod tests {
             )
             .await;
         assert_eq!(second, answer);
+        // The hook sends no event: the proxy sends one for each
+        // connection, and it takes the cause of the hook.
+        let dns = |name: &str| WatchEvent::Dns {
+            name: name.to_string(),
+            qtype: "A".to_string(),
+            outcome: Outcome::Allowed,
+        };
+        chain.report_watch(&dns("api.example.com"));
+        chain.report_watch(&dns("cdn.example.com"));
         chain.flush().await;
         drop(chain);
         let mut asks = 0;
@@ -1085,19 +1159,38 @@ mod tests {
     #[tokio::test]
     async fn a_deadline_names_its_question() {
         let (ours, theirs) = UnixStream::pair().unwrap();
-        let (_seen, _task) = fake_pentd(theirs, None);
+        let (mut seen, _task) = fake_pentd(theirs, None);
         let session = Session::over_stream(ours);
         let chain = Decider::new(set(vec![]), set(vec![]), classes(), Some(session));
+        let deadline = DecidedBy::Deadline {
+            question: pent_profile::QuestionId(10),
+        };
         assert_eq!(
             chain
                 .decide("curl", domain("slow.org"), Duration::from_millis(300))
                 .await,
-            DecidedBy::Deadline {
-                question: pent_profile::QuestionId(10)
-            }
+            deadline
         );
         // No answer came, so the next access asks again.
         assert_eq!(chain.known(&domain("slow.org")), None);
+        // The refusal of the proxy names the question. A second refusal
+        // with no hook decision names the base.
+        let refused = WatchEvent::Dns {
+            name: "slow.org".to_string(),
+            qtype: "A".to_string(),
+            outcome: Outcome::Denied,
+        };
+        chain.report_watch(&refused);
+        chain.report_watch(&refused);
+        chain.flush().await;
+        drop(chain);
+        let mut causes = Vec::new();
+        while let Some(message) = seen.recv().await {
+            if let Message::Event(e) = message {
+                causes.push(e.decided_by);
+            }
+        }
+        assert_eq!(causes, vec![deadline, DecidedBy::Base(Decision::Deny)]);
     }
 
     #[tokio::test]

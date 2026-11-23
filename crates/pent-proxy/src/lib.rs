@@ -93,6 +93,24 @@ use std::sync::Arc;
 /// Result type for proxy operations.
 pub type Result<T> = std::result::Result<T, ProxyError>;
 
+/// The future of a decision of a [`DomainDecider`].
+pub type DecisionFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = pent_profile::Decision> + Send + 'a>>;
+
+/// Decides a connection to a domain that the allowlist does not hold.
+///
+/// `pent run` gives its chain of deciders, which can ask pentd. The proxy
+/// waits for the decision, and the decider keeps to `deadline`: at the
+/// deadline it gives [`pent_profile::Decision::Deny`].
+pub trait DomainDecider: Send + Sync + std::fmt::Debug {
+    /// Decide a connection to `name`, and wait at most `deadline`.
+    fn decide<'a>(
+        &'a self,
+        name: &'a pent_profile::DomainName,
+        deadline: std::time::Duration,
+    ) -> DecisionFuture<'a>;
+}
+
 /// A structured event emitted by the proxy during trace mode.
 ///
 /// Replaces the previous stringly-typed `"access:..."` prefix convention,
@@ -455,6 +473,10 @@ pub struct SharedState {
     /// Optional channel for structured watch events.
     event_tx: Option<tokio::sync::mpsc::UnboundedSender<pent_profile::WatchEvent>>,
 
+    /// The decider of a domain that the allowlist does not hold, in enforce
+    /// mode. Without it, the allowlist alone decides.
+    decider: Option<Arc<dyn DomainDecider>>,
+
     /// The number of trace events and watch events that the proxy could not
     /// send, because the receiver was closed.
     dropped_events: AtomicU64,
@@ -516,6 +538,7 @@ impl SharedState {
             violation_tx,
             policy: ProxyPolicy::Enforce,
             event_tx: None,
+            decider: None,
             dropped_events: AtomicU64::new(0),
             connections_accepted: Arc::new(AtomicU64::new(0)),
         }
@@ -537,6 +560,31 @@ impl SharedState {
     ) -> Self {
         self.event_tx = event_tx;
         self
+    }
+
+    /// Set the decider of a domain that the allowlist does not hold.
+    #[must_use]
+    pub fn with_decider(mut self, decider: Option<Arc<dyn DomainDecider>>) -> Self {
+        self.decider = decider;
+        self
+    }
+
+    /// Decide whether the policy permits a connection to `domain`, a
+    /// normalized name. In observe mode it permits each domain. In enforce
+    /// mode, the allowlist permits it, else the decider decides, within
+    /// [`pent_profile::PROXY_DEADLINE`]. Without a decider, the domain must
+    /// be on the allowlist.
+    pub async fn permits_connection(&self, domain: &str) -> bool {
+        if self.is_permitted(domain) {
+            return true;
+        }
+        let Some(decider) = &self.decider else {
+            return false;
+        };
+        let Ok(name) = domain.parse::<pent_profile::DomainName>() else {
+            return false;
+        };
+        decider.decide(&name, pent_profile::PROXY_DEADLINE).await == pent_profile::Decision::Allow
     }
 
     /// The policy of the proxy.

@@ -8,6 +8,12 @@ The threat model: the sandboxed program is hostile. It wants to send data to,
 or get commands from, a host that the profile does not allow. It also wants to
 reach services on the host or on the local network.
 
+Since step 3.2 of `PLAN.md`, the allowlist of the proxy holds the flags
+and the whole rules of `pent run`. A CONNECT or SOCKS request for another
+name waits for the chain of deciders, which can ask pentd (RN-15 to RN-17
+in [run.md](run.md)). The DNS server still answers only the names of the
+allowlist until step 3.3.
+
 Each finding has a test. A test that passes proves a defense. A test that
 fails proves a vulnerability. The failing test keeps the secure assertion and
 has the mark `#[ignore = "OPEN VULN NET-<n>: ..."]`.

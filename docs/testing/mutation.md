@@ -125,6 +125,10 @@ makes one mutation by hand. The test must fail on the mutant. No
 | 3.1 | A rule path with a trailing `*` goes into Landlock. | `decide::tests::a_static_grant_holds_each_kind_that_the_sandbox_gives` |
 | 3.1 | A wide answer names a sensitive access. | `decide::tests::a_sensitive_access_names_its_exact_answer` |
 | 3.1 | The queue of events has no limit. | `client::tests::the_queue_of_events_has_a_limit` |
+| 3.2 | The proxy does not ask the decider. | `proxy::tests::a_name_off_the_allowlist_waits_for_the_decider` |
+| 3.2 | A SNI name equal to the request asks again. | `proxy::tests::a_sni_name_asks_only_when_it_differs_from_the_request` |
+| 3.2 | The event of the proxy ignores the hook decision. | `decide::tests::a_deadline_names_its_question` |
+| 3.2 | `pent run` gives the proxy no decider. | `a_proxy_question_waits_for_a_deny` |
 
 The first form of `pent_run_starts_pentd_and_holds_it_for_the_run` passed on
 the mutant: the client started a new pentd each time that it lost one. The

@@ -1,6 +1,6 @@
 # Plan: the new pent
 
-**Cursor: step 3.2.** Steps with `[x]` are done. Work on the branch `next`,
+**Cursor: step 3.3.** Steps with `[x]` are done. Work on the branch `next`,
 one commit for each step, and move this cursor when a step is done.
 
 **The way of work.** One commit for each step. Then the user runs
@@ -163,9 +163,21 @@ not their structure.
       trip `pent watch` → `pent trust` → `pent run` goes.
     - `--key NAME` replaces `--profile NAME`. A flag wins over a rule,
       because the user gives it for this run.
-- [ ] **3.2 The proxy.** A CONNECT or a SOCKS request for a name with no rule
+- [x] **3.2 The proxy.** A CONNECT or a SOCKS request for a name with no rule
   waits for an answer (20 s).
-  - Files: `pent-proxy/src/proxy.rs`, `server.rs`.
+  - Files: `pent-proxy/src/proxy.rs`, `server.rs`; the trait
+    `DomainDecider` in `pent-proxy/src/lib.rs`; `ProxyDecider` and the
+    hook decisions in `pent/src/commands/decide.rs`; RN-15 to RN-17 in
+    `docs/security/run.md`.
+  - Decisions (2026-11-23):
+    - The list of the proxy (the flags and the whole rules) stays the fast
+      path. Another name goes through the chain of deciders, also a TLS
+      SNI or `Host` name that differs from the request.
+    - The proxy keeps its own event for each connection. The event takes
+      the cause of the hook decision, so `pent denials` names the
+      question.
+    - The tests that need a refusal with no wait use a deny rule; the
+      tests of `pentd.rs` cover the question.
 - [ ] **3.3 DNS.** A query for a name with no rule waits for an answer.
   Nothing goes upstream before an "allow". `SERVFAIL` at about 4 s,
   `REFUSED` after a "deny". `NXDOMAIN` only for a name that does not exist.

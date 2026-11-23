@@ -1,6 +1,6 @@
 # The rules in `pent run`
 
-Status: the branch `next`, step 3.1 of `PLAN.md` (2026-11-23). This report
+Status: the branch `next`, steps 3.1 and 3.2 of `PLAN.md` (2026-11-23). This report
 lists the security properties of the rules in `pent run`: the key, the
 chain of deciders, the grants that the rules give to the static layers,
 and the events of a run. It gives the test of each property, and the
@@ -17,17 +17,22 @@ properties that later steps must add.
 - `crates/pent-profile/src/class.rs`, `Classifier::subtree_holds_guard`.
 - `crates/pent/src/daemon/client.rs`: the events, the flush and the number
   of a question at its deadline.
+- `crates/pent-proxy/src/lib.rs` (`DomainDecider`,
+  `SharedState::permits_connection`) and `proxy.rs`: the question of the
+  proxy (step 3.2).
 
-## The state of step 3.1
+## The state of phase 3
 
 `pent run` reads the rules of its key, and it no longer reads a profile or
-the trust store. The hooks do not ask yet: the proxy asks from step 3.2,
-DNS from step 3.3, the Unix sockets and the ports from step 3.4, and the
-files from phase 5. Until then, the rules go into the static layers at the
-start (Landlock, the list of the proxy, the list of the sockets and the
-list of the ports), and an access that no rule and no flag gives gets a
-refusal of the base. The chain of deciders and the questions exist, with
-their tests, but no hook calls them yet.
+the trust store. The rules go into the static layers at the start
+(Landlock, the list of the proxy, the list of the sockets and the list of
+the ports).
+
+Since step 3.2 the proxy asks: a CONNECT or SOCKS request for a name that
+its list does not hold goes through the chain of deciders, and it can wait
+for a question. DNS asks from step 3.3, the Unix sockets and the ports from
+step 3.4, and the files from phase 5. Until then, such an access with no
+rule and no flag gets a refusal of the base.
 
 ## Threat model
 
@@ -69,6 +74,9 @@ cargo test -p pent --test pentd pent_denials_shows_the_refusals_of_a_real_run
 | RN-12 | A real run sends its events to pentd, and they leave before `pent run` exits. `pent denials` shows each refusal with its cause. | `pent_denials_shows_the_refusals_of_a_real_run` |
 | RN-13 | At most 4096 events wait in the queue of a session. A later event goes nowhere, so a pentd that reads slowly cannot make `pent run` use memory without a limit. No decision depends on an event. | `client::tests::the_queue_of_events_has_a_limit` |
 | RN-14 | The trace log of `pent run --trace` has the name of the key, so a key with `+`, `@` or `~` (`g++`) gets its log. | `store::tests::trace_log_is_private_and_does_not_follow_links` |
+| RN-15 | A CONNECT or SOCKS request for a name off the list of the proxy waits for the chain of deciders, at most 20 s (`PROXY_DEADLINE`). An "allow" lets the connection go through; a "deny" or the deadline refuses it. A name of the list connects with no question, and `pent watch` (observe mode) never asks. | `proxy::tests::a_name_off_the_allowlist_waits_for_the_decider`, `the_allowlist_and_observe_mode_do_not_ask`, `a_proxy_question_waits_for_a_deny`, `a_proxy_question_waits_for_an_allow` |
+| RN-16 | A TLS SNI or HTTP `Host` name that differs from the name of the request goes through the chain too, so an answer for one name does not let a connection carry another (domain fronting). A name equal to the request does not ask again. | `proxy::tests::a_sni_name_asks_only_when_it_differs_from_the_request` |
+| RN-17 | The proxy sends one event for each connection, and the event takes the cause of the hook decision for the same name and decision: the answer or the deadline of the question. A later event with no hook decision takes the cause of the chain. At most 1024 hook decisions wait for their event. | `decide::tests::a_deadline_names_its_question`, `an_answer_decides_and_covers_the_rest_of_its_width`, `a_proxy_question_waits_for_a_deny` |
 
 ## The limits
 
@@ -83,8 +91,17 @@ cargo test -p pent --test pentd pent_denials_shows_the_refusals_of_a_real_run
   that pentd writes during the run (an answer with the scope "remember")
   applies to the questions of this run at once, but it goes into the
   static layers only at the next run.
-- **A held-back rule.** Until the hooks ask, a rule that pent holds back
-  has no effect: the access gets a refusal of the base.
+- **A held-back rule.** A domain rule that pent holds back applies
+  through the chain at the proxy (step 3.2). A held-back file rule has no
+  effect until phase 5: the access gets a refusal of the base.
+- **DNS before step 3.3.** The DNS server answers only the names of the
+  list. A client that resolves a name itself, before it connects, gets no
+  address for a name with no rule, so it never reaches the question of the
+  proxy. A client that names the host to the proxy (`HTTPS_PROXY`) asks.
+- **A SNI name is matched to the event of its request.** When the SNI name
+  differs from the name of the request, the event of the connection names
+  the request, and the hook decision of the SNI name can wait unused. The
+  limit of 1024 drops the oldest one.
 - **A listing.** The defaults of the sandbox give the traversal of `/`,
   and Landlock gives the right to list each directory below a traversal
   grant. So the program can list the names in a sensitive directory (for
@@ -100,6 +117,6 @@ cargo test -p pent --test pentd pent_denials_shows_the_refusals_of_a_real_run
 
 | Step | Property |
 |---|---|
-| 3.2, 3.3, 3.4 | Each hook asks through the chain of deciders, and a held-back rule applies through it. |
+| 3.3, 3.4 | DNS, the Unix sockets and the ports ask through the chain of deciders, and a held-back rule applies through it. |
 | 4.2 | The workspace is a flag, so a deny rule inside it applies. |
 | 5.4 | The files of pent give `ENOENT` in each mode, also for a flag. |

@@ -178,6 +178,7 @@ pub(crate) async fn watch(args: WatchArgs, cwd: PathBuf) -> Result<(), CliError>
                     trace: None,
                     events: Some(net_tx),
                 },
+                None,
             )
             .await?,
         )

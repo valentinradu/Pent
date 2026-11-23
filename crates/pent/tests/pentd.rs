@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-use common::e2e::{have_tools, sandbox_ready, stderr, stdout, TestEnv, TestResult};
+use common::e2e::{have_tools, internet, sandbox_ready, stderr, stdout, TestEnv, TestResult};
 use common::PENT;
 
 /// The linger time of each pentd in these tests.
@@ -502,6 +502,131 @@ fn pent_denials_shows_the_refusals_of_a_real_run() -> TestResult {
     let bad = line("bad.example").ok_or_else(|| format!("no refusal of bad.example: {text}"))?;
     assert!(bad.ends_with("(a rule)"), "{bad}");
     assert!(line("good.example").is_none(), "{text}");
+    Ok(())
+}
+
+/// A run with the proxy and no rule for a name: the program waits, `pent
+/// questions` shows the question, and the answer decides the connection.
+/// Returns the output of the run and the code of the question.
+fn answer_a_proxy_question(
+    rt: &Runtime,
+    env: &TestEnv,
+    url: &str,
+    verb: &str,
+) -> Result<(std::process::Output, String), common::e2e::BoxError> {
+    let host = url
+        .trim_start_matches("https://")
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    let run = env
+        .command(&[
+            "run",
+            "--network",
+            "proxy",
+            "--key",
+            "fetch",
+            "--",
+            "curl",
+            "-sS",
+            "-o",
+            "/dev/null",
+            "-w",
+            "CODE=%{http_code}\n",
+            url,
+        ])
+        .env("XDG_RUNTIME_DIR", rt.xdg())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let code = match question_code(rt, &host) {
+        Ok(code) => code,
+        Err(e) => {
+            let mut run = run;
+            // The test fails anyway; the kill only cleans up.
+            let _ = run.kill();
+            let _ = run.wait();
+            return Err(e);
+        }
+    };
+    let answer = rt.pent(&[verb, &code]).output()?;
+    assert!(answer.status.success(), "{answer:?}");
+    // The run ends at the deadline of the proxy at the latest.
+    Ok((run.wait_with_output()?, code))
+}
+
+/// The code of the open question for the domain `host`, as soon as pentd
+/// has it.
+fn question_code(rt: &Runtime, host: &str) -> Result<String, common::e2e::BoxError> {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let out = rt
+            .pent(&["questions", "--json"])
+            .stdout(Stdio::piped())
+            .output()?;
+        let found = stdout(&out).lines().find_map(|line| {
+            let question: pent_profile::Question = serde_json::from_str(line).ok()?;
+            (question.ask.request.to_string() == format!("domain {host}"))
+                .then(|| question.id.to_string())
+        });
+        if let Some(code) = found {
+            return Ok(code);
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("no question for {host}").into());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// A real question through the proxy: a "deny" refuses the connection at
+/// once, long before the deadline of 20 s, and `pent denials` names the
+/// answer. The test needs no network: the refused name never resolves.
+#[test]
+fn a_proxy_question_waits_for_a_deny() -> TestResult {
+    let test = "a_proxy_question_waits_for_a_deny";
+    if !have_tools(test, &["curl"]) || !sandbox_ready(test) {
+        return Ok(());
+    }
+    let rt = Runtime::new()?;
+    let _pentd = Reap(rt.pent(&["daemon"]).spawn()?);
+    assert!(rt.wait_for_socket());
+    let env = TestEnv::new()?;
+    let begin = Instant::now();
+    let (out, code) = answer_a_proxy_question(&rt, &env, "https://asked.example/", "deny")?;
+    let took = begin.elapsed();
+    assert!(
+        took < pent_profile::PROXY_DEADLINE,
+        "the run waited for the deadline: {took:?}"
+    );
+    assert!(stdout(&out).contains("CODE=000"), "{out:?}");
+    let denials = rt.pent(&["denials"]).stdout(Stdio::piped()).output()?;
+    let text = stdout(&denials);
+    assert!(
+        text.lines().any(|l| l.contains("domain asked.example")
+            && l.ends_with(&format!("(the answer to question {code})"))),
+        "{text}"
+    );
+    Ok(())
+}
+
+/// A real question through the proxy: an "allow" lets the connection go
+/// through, and the program gets its page.
+#[test]
+fn a_proxy_question_waits_for_an_allow() -> TestResult {
+    let test = "a_proxy_question_waits_for_an_allow";
+    if !have_tools(test, &["curl"]) || !sandbox_ready(test) || !internet(test) {
+        return Ok(());
+    }
+    let rt = Runtime::new()?;
+    let _pentd = Reap(rt.pent(&["daemon"]).spawn()?);
+    assert!(rt.wait_for_socket());
+    let env = TestEnv::new()?;
+    let (out, _code) = answer_a_proxy_question(&rt, &env, "https://example.com/", "allow")?;
+    assert!(stdout(&out).contains("CODE=200"), "{out:?}");
+    // An answer with the scope "run" writes no rule.
+    assert!(!env.rules_path("fetch").exists());
     Ok(())
 }
 

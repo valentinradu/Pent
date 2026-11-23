@@ -103,6 +103,10 @@ pub struct ProxyConfig {
     /// each connection, allowed or denied). `pent watch` uses it to record
     /// the network access, and `pent run` to record denials.
     pub event_tx: Option<tokio::sync::mpsc::UnboundedSender<pent_profile::WatchEvent>>,
+
+    /// The decider of a connection to a domain that the allowlist does not
+    /// hold, in enforce mode (`pent run`). Default: none.
+    pub decider: Option<Arc<dyn crate::DomainDecider>>,
 }
 
 /// The policy of the proxy.
@@ -132,6 +136,7 @@ impl Default for ProxyConfig {
             violation_tx: None,
             policy: ProxyPolicy::Enforce,
             event_tx: None,
+            decider: None,
             dns_ttl: std::time::Duration::from_secs(300),
             dns_min_ttl: std::time::Duration::from_secs(30),
             tcp_connect_timeout: std::time::Duration::from_secs(30),
@@ -458,7 +463,8 @@ impl ProxyServer {
                 config.violation_tx.clone(),
             )?
             .with_policy(config.policy)
-            .with_event_tx(config.event_tx.clone()),
+            .with_event_tx(config.event_tx.clone())
+            .with_decider(config.decider.clone()),
         );
         Ok(Self { config, state })
     }

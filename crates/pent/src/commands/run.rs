@@ -20,7 +20,7 @@ use pent_sandbox::{
 use pent_settings::{ConfigLoader, ProfileStore, RuleStore};
 
 use crate::cli::{NetworkModeArg, RunArgs};
-use crate::commands::decide::{Decider, FlagLists, Grants};
+use crate::commands::decide::{Decider, FlagLists, Grants, ProxyDecider};
 use crate::commands::session::{
     drain, exit_like_child, forward_std, forward_tokio, is_broad_workspace, start_proxy,
     wait_child, ForwardStop, ProxyChannels, SessionCleanup, SignalRelay,
@@ -111,7 +111,13 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
         crate::daemon::classes::Classes::new(&home, &crate::daemon::server::pent_dirs())
     });
     let grants = Grants::of(&rules, classes.as_ref(), Path::is_dir);
-    let decider = make_decider(&args, &cwd, classes, rules, hold_pentd(&key, &args.command));
+    let decider = std::sync::Arc::new(make_decider(
+        &args,
+        &cwd,
+        classes,
+        rules,
+        hold_pentd(&key, &args.command),
+    ));
     for (target, why) in &grants.held_back {
         ui::warn(format!(
             "this run does not apply the rule \"{}\": {}",
@@ -182,6 +188,9 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
                 localhost_ports.clone(),
                 ProxyPolicy::Enforce,
                 channels,
+                Some(std::sync::Arc::new(ProxyDecider(std::sync::Arc::clone(
+                    &decider,
+                )))),
             )
             .await?,
         )

@@ -152,7 +152,11 @@ mod linux {
     /// `agent`, and return the flags for each run.
     fn install_agent_rules(env: &TestEnv, agent: &str) -> Result<Vec<String>, BoxError> {
         let access = agent_access(&env.home, agent)?;
-        let targets: Vec<&str> = access.targets.iter().map(String::as_str).collect();
+        let mut targets: Vec<&str> = access.targets.iter().map(String::as_str).collect();
+        // A name with no rule asks a question (step 3.2). The network tests
+        // refuse this name with a rule, so they do not wait for the
+        // deadline.
+        targets.push("deny domain blocked-domain.invalid");
         env.install_rules(agent, &targets)?;
         Ok(access.flags)
     }
@@ -722,7 +726,9 @@ mod linux {
             return Ok(());
         }
         let env = TestEnv::new()?;
-        env.install_rules("net", &["domain example.com"])?;
+        // A name with no rule asks a question (step 3.2); the deny rule
+        // refuses example.org at once.
+        env.install_rules("net", &["domain example.com", "deny domain example.org"])?;
         let run = |args: &[String]| {
             let mut all = vec!["run", "--key", "net", "--"];
             all.extend(args.iter().map(String::as_str));
@@ -776,7 +782,12 @@ mod linux {
             return Ok(());
         }
         let env = TestEnv::new()?;
-        env.install_rules("tr", &["domain allowed.example"])?;
+        // A name with no rule asks a question (step 3.2); a deny rule
+        // refuses it at once.
+        env.install_rules(
+            "tr",
+            &["domain allowed.example", "deny domain denied.example"],
+        )?;
         let outside = env.root.join("outside.txt");
         fs::write(&outside, "secret\n")?;
         let script = format!(

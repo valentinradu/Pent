@@ -604,7 +604,10 @@ impl TcpProxy {
                     .map_err(|e| {
                         ProxyError::Internal(format!("failed to read client data: {e}"))
                     })?;
-            match self.check_requested_host(protocol, &target, kind, &initial) {
+            match self
+                .check_requested_host(protocol, &target, kind, &initial)
+                .await
+            {
                 Ok(peeked) => record.peeked = peeked,
                 Err(e) => {
                     if let ProxyError::DomainBlocked { domain } = &e {
@@ -750,7 +753,7 @@ impl TcpProxy {
                         return Err(e.into());
                     }
                 };
-                if !self.state.is_permitted(&name) {
+                if !self.state.permits_connection(&name).await {
                     self.state.report_violation(format!(
                         "network: {protocol} connection to \"{name}\" port {port} blocked: \
                          the domain is not in the allowlist"
@@ -863,14 +866,15 @@ impl TcpProxy {
 
     /// Check the host name in the TLS SNI or the HTTP `Host` header.
     ///
-    /// If the client data contains a host name, the name must be on the
-    /// allowlist. If it contains no name (for example with ECH, or for a
-    /// protocol that the proxy cannot read), the checks before the connect
-    /// are the only checks. In observe mode, the name does not block the
-    /// connection.
+    /// If the client data contains a host name, the policy must permit it:
+    /// the allowlist, else the decider. A name equal to the domain of the
+    /// request has its decision already, so it does not ask again. If the
+    /// data contains no name (for example with ECH, or for a protocol that
+    /// the proxy cannot read), the checks before the connect are the only
+    /// checks. In observe mode, the name does not block the connection.
     ///
     /// Returns the normalized host name, if the data contains a valid name.
-    fn check_requested_host(
+    async fn check_requested_host(
         &self,
         protocol: Protocol,
         target: &Target,
@@ -885,9 +889,17 @@ impl TcpProxy {
             Inspect::Tls => "TLS SNI",
             Inspect::Http => "HTTP Host header",
         };
-        let allowed = match self.state.policy() {
-            ProxyPolicy::Observe => true,
-            ProxyPolicy::Enforce => name.as_ref().is_some_and(|n| self.state.is_allowed(n)),
+        let decided = match (&name, target) {
+            (Some(n), Target::Domain { host, .. }) => {
+                normalize_hostname(host).ok().as_ref() == Some(n)
+            }
+            _ => false,
+        };
+        let allowed = match (&name, self.state.policy()) {
+            (_, ProxyPolicy::Observe) => true,
+            _ if decided => true,
+            (Some(n), ProxyPolicy::Enforce) => self.state.permits_connection(n).await,
+            (None, ProxyPolicy::Enforce) => false,
         };
         if allowed {
             return Ok(name);
@@ -1796,6 +1808,155 @@ mod tests {
         let state = Arc::new(SharedState::new(vec![]));
         let proxy = TcpProxy::new(config, state).unwrap();
         assert_eq!(proxy.connection_count(), 0);
+    }
+
+    // ========================================================================
+    // The decider of a domain that the allowlist does not hold
+    // ========================================================================
+
+    /// A decider that gives one decision and keeps each name and deadline
+    /// that it got.
+    #[derive(Debug)]
+    struct FixedDecider {
+        decision: pent_profile::Decision,
+        asked: std::sync::Mutex<Vec<(String, Duration)>>,
+    }
+
+    impl FixedDecider {
+        fn new(decision: pent_profile::Decision) -> Arc<Self> {
+            Arc::new(Self {
+                decision,
+                asked: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn asked(&self) -> Vec<(String, Duration)> {
+            self.asked.lock().unwrap().clone()
+        }
+    }
+
+    impl crate::DomainDecider for FixedDecider {
+        fn decide<'a>(
+            &'a self,
+            name: &'a pent_profile::DomainName,
+            deadline: Duration,
+        ) -> crate::DecisionFuture<'a> {
+            self.asked
+                .lock()
+                .unwrap()
+                .push((name.to_string(), deadline));
+            Box::pin(std::future::ready(self.decision))
+        }
+    }
+
+    fn decided_proxy(
+        allowlist: &[&str],
+        decider: &Arc<FixedDecider>,
+        policy: ProxyPolicy,
+    ) -> TcpProxy {
+        let decider: Arc<dyn crate::DomainDecider> = Arc::clone(decider) as _;
+        let state = crate::SharedState::new(allowlist.iter().map(|s| (*s).to_string()).collect())
+            .with_policy(policy)
+            .with_decider(Some(decider));
+        TcpProxy::new(TcpProxyConfig::default(), Arc::new(state)).unwrap()
+    }
+
+    fn domain_target(host: &str) -> Target {
+        Target::Domain {
+            host: host.to_string(),
+            port: 443,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_name_off_the_allowlist_waits_for_the_decider() {
+        use pent_profile::Decision;
+        // `.invalid` never resolves, so a name that the policy permits
+        // ends with a DNS error, and a refused name with `DomainBlocked`.
+        let target = domain_target("new.invalid");
+        let deny = FixedDecider::new(Decision::Deny);
+        let proxy = decided_proxy(&[], &deny, ProxyPolicy::Enforce);
+        let mut record = ConnectRecord::new(&proxy.state, Protocol::Socks5, &target);
+        let result = proxy
+            .check_target(Protocol::Socks5, &target, &mut record)
+            .await;
+        record.discard();
+        assert!(
+            matches!(result, Err(ProxyError::DomainBlocked { .. })),
+            "{result:?}"
+        );
+        assert_eq!(
+            deny.asked(),
+            vec![("new.invalid".to_string(), pent_profile::PROXY_DEADLINE)]
+        );
+
+        let allow = FixedDecider::new(Decision::Allow);
+        let proxy = decided_proxy(&[], &allow, ProxyPolicy::Enforce);
+        let mut record = ConnectRecord::new(&proxy.state, Protocol::Socks5, &target);
+        let result = proxy
+            .check_target(Protocol::Socks5, &target, &mut record)
+            .await;
+        record.discard();
+        assert!(
+            matches!(result, Err(ProxyError::DnsResolution { .. })),
+            "{result:?}"
+        );
+        assert_eq!(allow.asked().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_allowlist_and_observe_mode_do_not_ask() {
+        use pent_profile::Decision;
+        let target = domain_target("listed.invalid");
+        for (allowlist, policy) in [
+            (&["listed.invalid"][..], ProxyPolicy::Enforce),
+            (&[][..], ProxyPolicy::Observe),
+        ] {
+            let decider = FixedDecider::new(Decision::Deny);
+            let proxy = decided_proxy(allowlist, &decider, policy);
+            let mut record = ConnectRecord::new(&proxy.state, Protocol::Socks5, &target);
+            let result = proxy
+                .check_target(Protocol::Socks5, &target, &mut record)
+                .await;
+            record.discard();
+            assert!(
+                matches!(result, Err(ProxyError::DnsResolution { .. })),
+                "{result:?}"
+            );
+            assert!(decider.asked().is_empty(), "{policy:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sni_name_asks_only_when_it_differs_from_the_request() {
+        use crate::inspect::tests::client_hello;
+        use pent_profile::Decision;
+        let decider = FixedDecider::new(Decision::Deny);
+        let proxy = decided_proxy(&[], &decider, ProxyPolicy::Enforce);
+        let target = domain_target("a.example");
+        let same = client_hello(Some("a.example"));
+        assert!(proxy
+            .check_requested_host(Protocol::Socks5, &target, Inspect::Tls, &same)
+            .await
+            .is_ok());
+        assert!(decider.asked().is_empty());
+        let other = client_hello(Some("b.example"));
+        assert!(proxy
+            .check_requested_host(Protocol::Socks5, &target, Inspect::Tls, &other)
+            .await
+            .is_err());
+        assert_eq!(decider.asked().len(), 1);
+        assert_eq!(
+            decider.asked().first().map(|a| a.0.as_str()),
+            Some("b.example")
+        );
+
+        let allow = FixedDecider::new(Decision::Allow);
+        let proxy = decided_proxy(&[], &allow, ProxyPolicy::Enforce);
+        assert!(proxy
+            .check_requested_host(Protocol::Socks5, &target, Inspect::Tls, &other)
+            .await
+            .is_ok());
     }
 
     // ========================================================================
@@ -3479,8 +3640,8 @@ mod tests {
         handle.abort();
     }
 
-    #[test]
-    fn test_check_requested_host_sni() {
+    #[tokio::test]
+    async fn test_check_requested_host_sni() {
         use crate::inspect::tests::client_hello;
         let (state, mut rx) = traced_state(&["allowed.com", "cdn.allowed.com"]);
         let proxy = TcpProxy::new(TcpProxyConfig::default(), state).unwrap();
@@ -3489,18 +3650,21 @@ mod tests {
         let ok = client_hello(Some("cdn.allowed.com"));
         assert!(proxy
             .check_requested_host(Protocol::Socks5, &target, Inspect::Tls, &ok)
+            .await
             .is_ok());
 
         // No SNI (for example ECH): only the IP-cache check applies.
         let none = client_hello(None);
         assert!(proxy
             .check_requested_host(Protocol::Socks5, &target, Inspect::Tls, &none)
+            .await
             .is_ok());
 
         // Domain fronting: an allowed IP with a SNI that is not allowed.
         let fronted = client_hello(Some("evil.example"));
         assert!(proxy
             .check_requested_host(Protocol::Socks5, &target, Inspect::Tls, &fronted)
+            .await
             .is_err());
         let messages = drain(&mut rx);
         assert!(
@@ -3512,8 +3676,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_check_requested_host_http() {
+    #[tokio::test]
+    async fn test_check_requested_host_http() {
         let (state, _rx) = traced_state(&["allowed.com"]);
         let proxy = TcpProxy::new(TcpProxyConfig::default(), state).unwrap();
         let target = Target::Ip("93.184.216.34:80".parse().unwrap());
@@ -3521,9 +3685,11 @@ mod tests {
         let bad = b"GET / HTTP/1.1\r\nHost: evil.com\r\n\r\n";
         assert!(proxy
             .check_requested_host(Protocol::HttpConnect, &target, Inspect::Http, ok)
+            .await
             .is_ok());
         assert!(proxy
             .check_requested_host(Protocol::HttpConnect, &target, Inspect::Http, bad)
+            .await
             .is_err());
     }
 
@@ -4182,8 +4348,8 @@ mod tests {
         handle.abort();
     }
 
-    #[test]
-    fn test_sni_names_ip_connection() {
+    #[tokio::test]
+    async fn test_sni_names_ip_connection() {
         use crate::inspect::tests::client_hello;
         let target = Target::Ip("93.184.216.34:443".parse().unwrap());
         let hello = client_hello(Some("Evil.Example"));
@@ -4193,6 +4359,7 @@ mod tests {
         let proxy = TcpProxy::new(TcpProxyConfig::default(), Arc::clone(&state)).unwrap();
         let peeked = proxy
             .check_requested_host(Protocol::Socks5, &target, Inspect::Tls, &hello)
+            .await
             .unwrap();
         assert_eq!(peeked.as_deref(), Some("evil.example"));
         let mut record = ConnectRecord::new(&state, Protocol::Socks5, &target);
@@ -4211,6 +4378,7 @@ mod tests {
         let proxy = TcpProxy::new(TcpProxyConfig::default(), state).unwrap();
         assert!(proxy
             .check_requested_host(Protocol::Socks5, &target, Inspect::Tls, &hello)
+            .await
             .is_err());
     }
 

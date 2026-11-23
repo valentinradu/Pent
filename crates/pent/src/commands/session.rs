@@ -63,7 +63,9 @@ pub(crate) struct ProxyChannels {
     pub events: Option<UnboundedSender<pent_profile::WatchEvent>>,
 }
 
-/// Start the proxy with `domains` and `policy`.
+/// Start the proxy with `domains` and `policy`. `decider` decides a domain
+/// off the list in enforce mode (`pent run`); without it, the list alone
+/// decides.
 ///
 /// The proxy has no host listener. The child unshares its network
 /// namespace and makes the listeners there (127.0.0.1:3128 for SOCKS5 and
@@ -80,6 +82,7 @@ pub(crate) async fn start_proxy(
     localhost_ports: Vec<std::num::NonZeroU16>,
     policy: ProxyPolicy,
     channels: ProxyChannels,
+    decider: Option<std::sync::Arc<dyn pent_proxy::DomainDecider>>,
 ) -> Result<ProxySession, CliError> {
     let mut config = ProxyConfig::try_from(settings).map_err(|e| CliError::Other(e.to_string()))?;
     config.domain_allowlist = domains;
@@ -87,6 +90,7 @@ pub(crate) async fn start_proxy(
     config.policy = policy;
     config.violation_tx = channels.trace;
     config.event_tx = channels.events;
+    config.decider = decider;
     let server = ProxyServer::new(config)?;
 
     let (handle, proxy_addr, dns_port) = (

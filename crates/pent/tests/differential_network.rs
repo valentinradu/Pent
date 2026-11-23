@@ -48,9 +48,17 @@ printf 'CODE=%s\n' "$code"
     const KEY: &str = "p";
 
     /// Write one domain rule for each domain of `domains` in the rule file
-    /// of the key `p`.
-    fn install_domain_rules(env: &TestEnv, domains: &[&str]) -> TestResult {
-        let targets: Vec<String> = domains.iter().map(|d| format!("domain {d}")).collect();
+    /// of the key `p`. When no rule covers the name `host`, add a deny rule
+    /// for it: since step 3.2 a name with no rule asks a question, and the
+    /// table holds the decisions of the rules. `pentd.rs` tests the
+    /// question.
+    fn install_domain_rules(env: &TestEnv, domains: &[&str], host: &str) -> TestResult {
+        let mut targets: Vec<String> = domains.iter().map(|d| format!("domain {d}")).collect();
+        let list: Vec<String> = domains.iter().map(|d| (*d).to_string()).collect();
+        let covered = pent_proxy::DomainFilter::new(&list).is_allowed(host);
+        if !covered && host.parse::<std::net::IpAddr>().is_err() {
+            targets.push(format!("deny domain {host}"));
+        }
         let targets: Vec<&str> = targets.iter().map(String::as_str).collect();
         env.install_rules(KEY, &targets)
     }
@@ -81,7 +89,7 @@ printf 'CODE=%s\n' "$code"
     /// The verdict of the two layers for one row.
     fn layers(case: &NetCase) -> Result<(Verdict, Option<Verdict>, String), BoxError> {
         let env = TestEnv::new()?;
-        install_domain_rules(&env, case.domains)?;
+        install_domain_rules(&env, case.domains, case.host)?;
         let out = env.pent(&[
             "run",
             "--key",
@@ -207,7 +215,9 @@ printf 'CODE=%s\n' "$code"
             return Ok(());
         }
         let env = TestEnv::new()?;
-        install_domain_rules(&env, &["www.iana.org", "10-0-0-1.sslip.io"])?;
+        // `example.com` gets a deny rule, so its refusal does not wait for
+        // a question.
+        install_domain_rules(&env, &["www.iana.org", "10-0-0-1.sslip.io"], "example.com")?;
         let out = env.pent(&[
             "run",
             "--key",
