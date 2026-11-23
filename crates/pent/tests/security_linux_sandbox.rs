@@ -838,3 +838,258 @@ fn wait_for(path: &Path) {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
 }
+
+// ============================================================================
+// The base (step 4.1)
+// ============================================================================
+
+/// LS-4: `/dev/shm` is an empty private tmpfs. The child does not see the
+/// shared memory of the host, it can write its own, and its files do not
+/// reach the host.
+#[test]
+fn test_dev_shm_is_private() -> TestResult {
+    if skip_without_sandbox() {
+        return Ok(());
+    }
+    if !Path::new("/dev/shm").is_dir() {
+        eprintln!("skip: this host has no /dev/shm");
+        return Ok(());
+    }
+    let h = Harness::new("sh")?;
+    let pid = std::process::id();
+    let victim = PathBuf::from(format!("/dev/shm/pent-victim-{pid}"));
+    let made = PathBuf::from(format!("/dev/shm/pent-child-{pid}"));
+    std::fs::write(&victim, "HOST_SHM_DATA")?;
+    let script = h.script(
+        "probe.sh",
+        &format!(
+            "echo PENT_CHILD_RAN\ncat '{v}'\necho TAMPERED > '{v}'\n\
+             echo CHILD > '{m}' && cat '{m}' && echo SHM_WRITE_OK\n",
+            v = victim.display(),
+            m = made.display()
+        ),
+    )?;
+    let out = h.run(&["sh", script.to_str().unwrap()])?;
+    let after = std::fs::read_to_string(&victim).unwrap_or_default();
+    let leaked = made.exists();
+    let _ = std::fs::remove_file(&victim);
+    let _ = std::fs::remove_file(&made);
+    let text = combined(&out);
+    assert_child_ran(&text);
+    assert!(
+        text.contains("SHM_WRITE_OK"),
+        "LS-4: the child cannot write in /dev/shm:\n{text}"
+    );
+    assert!(
+        !text.contains("HOST_SHM_DATA"),
+        "LS-4: the child read a host file in /dev/shm:\n{text}"
+    );
+    assert_eq!(
+        after, "HOST_SHM_DATA",
+        "LS-4: the child changed a host file"
+    );
+    assert!(
+        !leaked,
+        "LS-4: a file of the child reached /dev/shm of the host"
+    );
+    Ok(())
+}
+
+/// The Python `multiprocessing` module works: it needs a POSIX semaphore
+/// in `/dev/shm` and the CPU files below `/sys`.
+#[test]
+fn test_python_multiprocessing_works() -> TestResult {
+    if skip_without_sandbox() {
+        return Ok(());
+    }
+    let Some(py) = python3() else {
+        eprintln!("skip: no python3");
+        return Ok(());
+    };
+    let h = Harness::new("python3")?;
+    let probe = h.script(
+        "mp.py",
+        "import multiprocessing as mp, os\n\
+         def sq(x):\n    return x * x\n\
+         if __name__ == '__main__':\n\
+         \x20   print('PENT_CHILD_RAN')\n\
+         \x20   lock = mp.Lock()\n\
+         \x20   with mp.Pool(2) as pool:\n\
+         \x20       print('POOL', pool.map(sq, [1, 2, 3]))\n\
+         \x20   print('CPUS', os.cpu_count())\n",
+    )?;
+    let out = h.run(&[py.to_str().unwrap(), "-I", probe.to_str().unwrap()])?;
+    let text = combined(&out);
+    assert_child_ran(&text);
+    assert!(
+        text.contains("POOL [1, 4, 9]"),
+        "multiprocessing fails in the sandbox:\n{text}"
+    );
+    assert!(
+        !text.contains("CPUS None"),
+        "the child cannot count the CPUs:\n{text}"
+    );
+    Ok(())
+}
+
+/// LS-5: the child sees a random machine identifier, a new one in each run,
+/// and it cannot change it. The stage of the file is gone.
+#[test]
+fn test_machine_id_is_random_for_each_run() -> TestResult {
+    if skip_without_sandbox() {
+        return Ok(());
+    }
+    let Ok(host) = std::fs::read_to_string("/etc/machine-id") else {
+        eprintln!("skip: this host has no /etc/machine-id");
+        return Ok(());
+    };
+    let h = Harness::new("sh")?;
+    let script = h.script(
+        "probe.sh",
+        "echo PENT_CHILD_RAN\nprintf 'ID %s\\n' \"$(cat /etc/machine-id)\"\n\
+         echo 0123 > /etc/machine-id 2>/dev/null && echo ID_WRITE_OK\n\
+         ls -a /tmp /run /dev/shm | grep -q pent-machine-id && echo STAGE_LEFT\n",
+    )?;
+    let id_of = |out: &Output| -> Option<String> {
+        combined(out)
+            .lines()
+            .find_map(|l| l.strip_prefix("ID ").map(str::to_owned))
+    };
+    let first = h.run(&["sh", script.to_str().unwrap()])?;
+    let second = h.run(&["sh", script.to_str().unwrap()])?;
+    let text = combined(&first);
+    assert_child_ran(&text);
+    let (a, b) = (id_of(&first), id_of(&second));
+    assert!(
+        a.is_some() && b.is_some(),
+        "the child could not read /etc/machine-id:\n{text}"
+    );
+    let (a, b) = (a.unwrap_or_default(), b.unwrap_or_default());
+    assert_ne!(
+        a,
+        host.trim(),
+        "LS-5: the child read the machine-id of the host"
+    );
+    assert_ne!(a, b, "LS-5: two runs share one machine-id");
+    assert!(
+        a.len() == 32 && a.bytes().all(|c| c.is_ascii_hexdigit()),
+        "the machine-id of the child has a bad form: {a:?}"
+    );
+    assert!(
+        !text.contains("ID_WRITE_OK"),
+        "the child changed its machine-id"
+    );
+    assert!(
+        !text.contains("STAGE_LEFT"),
+        "the stage of the machine-id stays:\n{text}"
+    );
+    Ok(())
+}
+
+/// The child reads the CPU files and the limits of its cgroup, and not the
+/// list of the processes in the cgroup.
+#[test]
+fn test_cpu_and_cgroup_limits_are_readable() -> TestResult {
+    if skip_without_sandbox() {
+        return Ok(());
+    }
+    let h = Harness::new("sh")?;
+    let cgroup = std::fs::read_to_string("/proc/self/cgroup")
+        .ok()
+        .and_then(|t| {
+            t.lines()
+                .find_map(|l| l.strip_prefix("0::").map(str::to_owned))
+        })
+        .map(|p| PathBuf::from(format!("/sys/fs/cgroup{p}")))
+        .filter(|d| d.join("cgroup.procs").is_file());
+    let mut body =
+        String::from("echo PENT_CHILD_RAN\ncat /sys/devices/system/cpu/online && echo CPU_OK\n");
+    let limit = cgroup
+        .as_ref()
+        .map(|d| d.join("memory.max"))
+        .or_else(|| cgroup.as_ref().map(|d| d.join("cpu.max")))
+        .filter(|f| f.is_file());
+    if let Some(dir) = &cgroup {
+        body.push_str(&format!(
+            "cat '{}' >/dev/null 2>&1 && echo PROCS_OPEN\n",
+            dir.join("cgroup.procs").display()
+        ));
+    }
+    if let Some(file) = &limit {
+        body.push_str(&format!(
+            "cat '{}' >/dev/null && echo LIMIT_OK\n",
+            file.display()
+        ));
+    }
+    let script = h.script("probe.sh", &body)?;
+    let out = h.run(&["sh", script.to_str().unwrap()])?;
+    let text = combined(&out);
+    assert_child_ran(&text);
+    assert!(
+        text.contains("CPU_OK"),
+        "the child cannot read the CPU files:\n{text}"
+    );
+    if limit.is_some() {
+        assert!(
+            text.contains("LIMIT_OK"),
+            "the child cannot read its cgroup limit:\n{text}"
+        );
+    } else {
+        eprintln!("note: no cgroup v2 limit file on this host");
+    }
+    assert!(
+        !text.contains("PROCS_OPEN"),
+        "the child reads cgroup.procs:\n{text}"
+    );
+    Ok(())
+}
+
+/// LS-6: a directory of `PATH` outside the system paths is not in the base.
+/// The child cannot run or read a program there with no rule.
+#[test]
+fn test_a_path_dir_outside_the_system_paths_is_not_in_the_base() -> TestResult {
+    if skip_without_sandbox() {
+        return Ok(());
+    }
+    let h = Harness::new("sh")?;
+    let bin = h.outside.join("bin");
+    std::fs::create_dir_all(&bin)?;
+    let tool = bin.join("pent-own-tool");
+    std::fs::write(&tool, "#!/bin/sh\necho OWN_TOOL_RAN\n")?;
+    std::fs::set_permissions(&tool, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
+    let script = h.script(
+        "probe.sh",
+        &format!(
+            "echo PENT_CHILD_RAN\npent-own-tool\ncat '{}' | grep -q OWN && echo TOOL_READ\n",
+            tool.display()
+        ),
+    )?;
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = h
+        .command(&[
+            PENT,
+            "run",
+            "--key",
+            h.key,
+            "--",
+            "sh",
+            script.to_str().unwrap(),
+        ])
+        .env("PATH", path)
+        .output()?;
+    let text = combined(&out);
+    assert_child_ran(&text);
+    assert!(
+        !text.contains("OWN_TOOL_RAN"),
+        "LS-6: the child ran a program of a PATH directory outside the base:\n{text}"
+    );
+    assert!(
+        !text.contains("TOOL_READ"),
+        "LS-6: the child read a file of a PATH directory outside the base:\n{text}"
+    );
+    Ok(())
+}

@@ -20,6 +20,9 @@ message when the sandbox or `python3` is not available.
 | LS-1 | High | The child connects to a path Unix socket outside its profile. | Fixed | `test_unix_socket_connect_outside_the_rules` |
 | LS-2 | Low | The child reads and changes host files under `/tmp`. | Fixed | `test_tmp_not_shared_with_host` |
 | LS-3 | Medium | The child reads the command line of a host process. | Fixed on a host; absent in a container, with a warning | `test_proc_cmdline_of_host_process_denied` |
+| LS-4 | Low | The child reads and changes the shared memory of the host in `/dev/shm`, when a rule gives `/dev/shm`. | Fixed (step 4.1) | `test_dev_shm_is_private` |
+| LS-5 | Low | The child reads `/etc/machine-id`, a fixed identifier of the machine. | Fixed (step 4.1) | `test_machine_id_is_random_for_each_run` |
+| LS-6 | Medium | The child reads and runs the programs of each directory of `PATH`, also `~/.local/bin`, `~/.cargo/bin` and a directory below `/tmp`. | Fixed (step 4.1) | `test_a_path_dir_outside_the_system_paths_is_not_in_the_base` |
 
 ### LS-1 — Path Unix socket connect bypasses the file allowlist
 
@@ -129,8 +132,8 @@ host program wrote through it later. `/tmp` also held the sockets of LS-1: a
 socket of a terminal multiplexer there makes the host server run a command
 outside the sandbox.
 
-**The fix.** The child gets an empty tmpfs over `/tmp`, `/var/tmp` and `/run`
-in its mount namespace, as bubblewrap does. `/var/run` is a symbolic link to
+**The fix.** The child gets an empty tmpfs over `/tmp`, `/var/tmp`,
+`/dev/shm` (LS-4) and `/run` in its mount namespace, as bubblewrap does. `/var/run` is a symbolic link to
 `/run` on most systems, and the tmpfs on `/run` covers it.
 
 Pent binds back only what the session needs:
@@ -138,7 +141,8 @@ Pent binds back only what the session needs:
 - the workspace, the `data_dir` and the `cwd` (a scratch workspace under
   `/tmp` keeps working);
 - every configured path (read, read-write, execute, traversal, mounts);
-- every directory of `PATH`;
+- each directory of `PATH` whose canonical target is inside a system path
+  (LS-6);
 - the system paths: `/run/current-system`, `/run/booted-system`,
   `/run/wrappers/bin` and the graphics drivers of NixOS;
 - the mount points of the overlay, and the write targets of the watch guard.
@@ -157,8 +161,8 @@ an empty directory inside the tmpfs, so that a program that reads them still
 finds a place to write. A `TMPDIR` outside the covered directories stays as
 it is.
 
-Each tmpfs is `nosuid` and `nodev`. `/tmp` and `/var/tmp` keep the mode
-`1777`; `/run` keeps `0755`. No tmpfs has a `size=` option, so each takes the
+Each tmpfs is `nosuid` and `nodev`. `/tmp`, `/var/tmp` and `/dev/shm` keep
+the mode `1777`; `/run` keeps `0755`. No tmpfs has a `size=` option, so each takes the
 kernel default of half of the memory, the same limit that a distribution
 gives `/tmp`. A build writes large temporary files, and a smaller limit
 breaks it.
@@ -360,6 +364,88 @@ two properties above calls `private_proc_ready` (in
 `SKIP (container)` with the reason, also with `PENT_REQUIRE_ALL_TESTS=1`,
 and the same tests run and pass outside a container.
 
+## The base (step 4.1)
+
+The base is what each run gets with no rule and no question (section 4 of
+`docs/design/pent.md`). Step 4.1 adds three items and removes one.
+
+### LS-4 — `/dev/shm` of the host
+
+**The attack.** Landlock gave no right on `/dev/shm`, so a program that
+needs shared memory or a POSIX semaphore (Python `multiprocessing`) failed.
+A rule or a flag for `/dev/shm` gave the shared memory of the host: the
+segments of other programs of the user, and a place to plant a file that a
+host program opens later.
+
+**The fix.** `/dev/shm` is a private directory (`PRIVATE_DIRS`): an empty
+tmpfs, `nosuid`, `nodev`, mode `1777`. Landlock gives it read-write
+(`TEMP_PATHS`). `HIDDEN_ROOTS` in `pent-settings` names it too, because the
+two lists must agree.
+
+**The evidence.** `test_dev_shm_is_private` (a host file stays hidden and
+unchanged, the child writes its own file, and the file does not reach the
+host), `test_python_multiprocessing_works`, and the unit tests
+`test_private_dirs_cover_tmp_and_run` and `test_dev_paths_are_minimal`.
+
+### LS-5 — `/etc/machine-id`
+
+**The attack.** `/etc` is in the base for read. `machine-id` is a fixed
+identifier of the machine: a program can send it out and link each run on
+this machine.
+
+**The fix.** The child sees a random identifier for each run, in the format
+of systemd (32 lowercase hexadecimal digits, version 4). A D-Bus client or a
+library of systemd keeps working. The parent takes 16 bytes from
+`getrandom(2)`. The child mounts a small tmpfs on a stage inside its private
+`/tmp`, writes the file, binds it read-only over the canonical path of
+`/etc/machine-id`, then detaches the tmpfs and removes the stage. The bind
+keeps the file alive. When the child cannot write a random identifier (no
+private tmpfs, or no random bytes), it binds `/dev/null` over the file, so
+the mask never goes away in silence.
+
+**The evidence.** `test_machine_id_is_random_for_each_run` (the identifier
+differs from the host and between two runs, the write fails, and no stage
+stays), `a_machine_id_has_the_form_of_systemd` and
+`two_plans_give_two_machine_ids`.
+
+### LS-6 — the directories of `PATH`
+
+**The attack.** Pent gave read and execute to each directory of `PATH`.
+`~/.local/bin`, `~/.cargo/bin` and `~/.npm-global/bin` hold the programs
+of the user, and the child read and ran them with no rule. A directory of
+`PATH` below `/tmp` came back into the private tmpfs.
+
+**The fix.** `base_path_dirs` keeps a directory of `PATH` only when its
+canonical target is inside a system path (`SYSTEM_PATHS`: `/usr/bin`,
+`/usr/sbin`, `/bin`, `/sbin`, `/usr/lib`, `/usr/share`, `/etc`,
+`/nix/store`, `/run/current-system`, `/run/wrappers/bin`). A link such as
+`~/.nix-profile/bin` reaches `/nix/store` and stays. `/usr/local/bin`
+does not stay. The summary of `pent watch` uses the same list.
+
+The directory of the command itself still gets read and execute
+(`binary_grant_dirs`), so `pent run claude` starts with no rule. Phase 5
+removes this grant, when the exec of a file asks.
+
+**The evidence.** `test_a_path_dir_outside_the_system_paths_is_not_in_the_base`,
+`a_path_directory_below_a_private_directory_stays_hidden` and
+`the_base_holds_a_path_dir_only_inside_a_system_path`.
+
+### The CPU files and the limits of the cgroup
+
+A runtime sizes its thread pool from `/sys/devices/system/cpu` and from the
+limits of its cgroup. The base gives read on `/sys/devices/system/cpu`, and
+on the limit files (`CGROUP_LIMIT_FILES`: `cpu.max`, `memory.max`,
+`pids.max`, ...) of the own cgroup and of each parent. Go and the JVM walk
+up the tree and take the smallest limit. The lists of processes
+(`cgroup.procs`, `cgroup.threads`) stay closed: they name the processes of
+the host in the same cgroup. Only the unified hierarchy (cgroup v2) gets
+the files. A path in `/proc/self/cgroup` with a `.` or a `..` component
+gives no file.
+
+**The evidence.** `test_cpu_and_cgroup_limits_are_readable`,
+`the_unified_cgroup_comes_from_the_line_of_cgroup_v2` and
+`the_limit_files_come_from_the_cgroup_and_its_parents`.
+
 ## The mounts of the watch guard
 
 Watch mode does not sandbox the program; it records what the program does
@@ -408,6 +494,11 @@ Each test below passes. It guards a defense that works.
 | The exit code and the signal of the command reach the caller. | `test_exit_status_passes_through_the_namespace`, `test_signal_status_passes_through_the_namespace` |
 | The child cannot make a new mount namespace or unmount a mask. | `test_cannot_unshare_or_umount` |
 | `ioctl(TIOCSTI)` fails with EPERM (no keystroke injection). | `test_tiocsti_blocked` |
+| `/dev/shm` is an empty private tmpfs that the child can write. | `test_dev_shm_is_private` |
+| Python `multiprocessing` works. | `test_python_multiprocessing_works` |
+| The child sees a random `machine-id` for each run, read-only. | `test_machine_id_is_random_for_each_run` |
+| The child reads the CPU files and the limits of its cgroup, not `cgroup.procs`. | `test_cpu_and_cgroup_limits_are_readable` |
+| A directory of `PATH` outside the system paths is not in the base. | `test_a_path_dir_outside_the_system_paths_is_not_in_the_base` |
 
 ## The next step
 

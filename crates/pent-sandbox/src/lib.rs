@@ -79,8 +79,8 @@ use thiserror::Error;
 ///
 /// The list has the default paths of [`system_default_paths`], the paths that
 /// the platform backend always allows (on Linux: `/nix/store`, `/proc`, the
-/// device nodes, ...), the directories in `path_env` (a `PATH` value) and
-/// their canonical targets. The summary of watch mode omits accesses below
+/// device nodes, ...), the directories in `path_env` (a `PATH` value) that
+/// are inside a system path, and their canonical targets. The summary of watch mode omits accesses below
 /// these paths, because a profile does not need a rule for them.
 #[must_use]
 pub fn implicit_allowed_paths(path_env: &str) -> Vec<std::path::PathBuf> {
@@ -92,12 +92,9 @@ pub fn implicit_allowed_paths(path_env: &str) -> Vec<std::path::PathBuf> {
         .map(|(path, _glob)| path)
         .collect();
     #[cfg(target_os = "linux")]
-    paths.extend(linux::implicit_paths());
-    for dir in resolve_path_dirs_from(path_env) {
-        if let Ok(real) = std::fs::canonicalize(&dir) {
-            paths.push(real);
-        }
-        paths.push(dir);
+    {
+        paths.extend(linux::implicit_paths());
+        paths.extend(linux::base_path_dirs(path_env));
     }
     paths.sort();
     paths.dedup();
@@ -268,17 +265,11 @@ pub fn spawn_sandboxed(
     #[cfg(target_os = "linux")]
     {
         let child_path = config.env.get("PATH").map_or("", |s| s.as_str());
-        let mut path_dirs = resolve_path_dirs_from(child_path);
-        // Landlock checks the inode that a symbolic link resolves to. Add the
-        // canonical target of each PATH directory too (for example
-        // /run/current-system/sw/bin -> /nix/store/...-system-path/bin).
-        for dir in path_dirs.clone() {
-            if let Ok(real) = std::fs::canonicalize(&dir) {
-                if !path_dirs.contains(&real) {
-                    path_dirs.push(real);
-                }
-            }
-        }
+        // Only a directory of PATH inside a system path is in the base, with
+        // its canonical target: Landlock checks the inode that a symbolic
+        // link resolves to (for example /run/current-system/sw/bin ->
+        // /nix/store/...-system-path/bin).
+        let mut path_dirs = linux::base_path_dirs(child_path);
         // Add canonical binary parent dirs to path_dirs so they receive
         // syslib_access (ReadFile | ReadDir | Execute) — execve requires ReadFile.
         for p in binary_real_parents {

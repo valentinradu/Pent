@@ -1,6 +1,6 @@
 # Plan: the new pent
 
-**Cursor: step 4.1.** Steps with `[x]` are done. Work on the branch `next`,
+**Cursor: step 4.2.** Steps with `[x]` are done. Work on the branch `next`,
 one commit for each step, and move this cursor when a step is done.
 
 **The way of work.** One commit for each step. Then the user runs
@@ -228,13 +228,25 @@ not their structure.
 
 ## Phase 4: the base and the flags
 
-- [ ] **4.1 The base.** Add a private `/dev/shm`, read access to
+- [x] **4.1 The base.** Add a private `/dev/shm`, read access to
   `/sys/devices/system/cpu` and to the limits of the own cgroup, and a mask
   over `/etc/machine-id`. A directory of `PATH` outside the system paths is
   no longer in the base.
-  - Files: `pent-sandbox/src/linux.rs`, `config.rs`.
+  - Files: `pent-sandbox/src/linux.rs` (`PRIVATE_DIRS`, `TEMP_PATHS`,
+    `SYSTEM_PATHS`, `SYS_READ_PATHS`, `cgroup_limit_files`,
+    `MachineIdMask`, `base_path_dirs`), `lib.rs`; `HIDDEN_ROOTS` in
+    `pent-settings/src/runtime.rs`; LS-4 to LS-6 in
+    `docs/security/linux-sandbox.md`.
   - Done: tests for each item; Python `multiprocessing` works in the
     sandbox.
+  - Decisions (2026-11-23):
+    - The mask over `/etc/machine-id` is a random identifier for each run,
+      read-only, in the format of systemd, so D-Bus clients keep working.
+    - The cgroup gives only its limit files (`CGROUP_LIMIT_FILES`), of the
+      own cgroup and of each parent, and only for cgroup v2.
+      `cgroup.procs` stays closed.
+    - The directory of the command itself (`binary_grant_dirs`) stays in
+      the base until phase 5 makes exec ask.
 - [ ] **4.2 The flags.** `--workspace` / `-w [DIR]` gives read-write access
   to the directory for one run. Without it, the workspace is not in the
   base. `--read`, `--write`, `--execute`, `--allow`, `--unix-socket` and

@@ -288,8 +288,8 @@ Each test below passes. It guards a property that holds.
 | `<workspace>/.pent` is readable and read-only. | `the_dot_pent_directory_of_the_workspace_is_read_only` |
 | The rules cover the full process tree, three levels deep. | `the_rules_cover_the_full_process_tree` |
 | Pent ignores `SIGINT`, and the command of the process group sees it. | `pent_ignores_sigint_and_lets_the_command_see_it` |
-| `/tmp` and `/var/tmp` keep the mode 1777, `/run` keeps 0755. | `the_private_directories_keep_their_modes` |
-| A directory of `PATH` below `/tmp` comes back, and its sibling stays hidden. | `a_path_directory_below_a_private_directory_comes_back` |
+| `/tmp`, `/var/tmp` and `/dev/shm` keep the mode 1777, `/run` keeps 0755. | `the_private_directories_keep_their_modes` |
+| A directory of `PATH` below `/tmp` does not come back, and its sibling stays hidden (LS-6 in `linux-sandbox.md`). | `a_path_directory_below_a_private_directory_stays_hidden` |
 | `pent run --unix-socket PATH` works for a socket that the mask list covers. | `a_named_agent_socket_still_works_behind_the_mask` |
 
 ## The next step

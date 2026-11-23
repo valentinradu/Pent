@@ -147,6 +147,20 @@ makes one mutation by hand. The test must fail on the mutant. No
 | 3.5 (review) | A TLS SNI name waits for a question. | `proxy::tests::a_sni_name_never_waits_for_a_question` |
 | 3.5 (review) | An old hook decision names a later event. | `decide::tests::an_old_hook_decision_names_no_later_event` |
 | 3.5 (review) | A denied domain gets the hint `--allow`. | `linux::trace_logs_filesystem_and_network_denials` |
+| 4.1 | `/dev/shm` is not a private directory. | `test_dev_shm_is_private` |
+| 4.1 | Landlock gives no right on `/dev/shm`. | `test_python_multiprocessing_works` |
+| 4.1 | The base gives no right on `/sys/devices/system/cpu`. | `test_cpu_and_cgroup_limits_are_readable` |
+| 4.1 | The base gives no limit file of the cgroup. | `test_cpu_and_cgroup_limits_are_readable` |
+| 4.1 | `cgroup.procs` is a limit file. | `test_cpu_and_cgroup_limits_are_readable` |
+| 4.1 | The child gets no mask over `/etc/machine-id`. | `test_machine_id_is_random_for_each_run` |
+| 4.1 | The machine identifier is the same in each run. | `test_machine_id_is_random_for_each_run` |
+| 4.1 | The stage of the machine identifier stays. | `test_machine_id_is_random_for_each_run` |
+| 4.1 | Each directory of `PATH` is in the base. | `test_a_path_dir_outside_the_system_paths_is_not_in_the_base`, `a_path_directory_below_a_private_directory_stays_hidden` |
+
+One mutant of step 4.1 survives, and it is equivalent: a bind of the
+machine identifier with no read-only remount. Landlock gives `/etc` no
+write right, and the file has the mode `0444`, so the write of the child
+fails on both forms. The read-only remount is a second layer.
 
 The check of the notification after a question (`notif_id_valid` in the
 workers of `ask_unix` and `ask_port`) has no test: it needs a task that

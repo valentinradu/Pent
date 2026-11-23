@@ -19,9 +19,10 @@
 //! - `Blocked`: new network namespace with no interfaces.
 //! - `Unrestricted`: no network namespace.
 //!
-//! The private mount namespace gives the child its own `/tmp`, `/var/tmp`
-//! and `/run`, hides the Unix sockets that Landlock cannot control, and
-//! makes `<workspace>/.pent` read-only.
+//! The private mount namespace gives the child its own `/tmp`, `/var/tmp`,
+//! `/dev/shm` and `/run`, hides the Unix sockets that Landlock cannot
+//! control, puts a random identifier over `/etc/machine-id`, and makes
+//! `<workspace>/.pent` read-only.
 //!
 //! The PID namespace holds a private `proc` mount, so the child sees only
 //! the processes of the sandbox, and no background process of the sandbox
@@ -49,13 +50,13 @@
 //!   +-- Allow workspace (rw)
 //!   +-- Allow data_dir (rw)
 //!   +-- Allow mounts (per config)
-//!   +-- Allow PATH dirs (read+exec)
+//!   +-- Allow PATH dirs inside a system path (read+exec)
 //!   +-- Allow execute paths (exec, no read)
 //!   +-- Allow read paths (read only)
-//!   +-- Allow system libs and /nix/store (read+exec)
-//!   +-- Allow /tmp, /var/tmp (rw)
+//!   +-- Allow system programs, libs and /nix/store (read+exec)
+//!   +-- Allow /tmp, /var/tmp, /dev/shm (rw)
 //!   +-- Allow /dev/null, /dev/tty, /dev/pts, ... (rw); /dev/urandom, ... (ro)
-//!   +-- Allow /proc (ro)
+//!   +-- Allow /proc, /sys/devices/system/cpu, the cgroup limits (ro)
 //! ```
 //!
 //! # `pre_exec` and async-signal safety
@@ -72,12 +73,13 @@
 //!
 //! # Private temporary and runtime directories
 //!
-//! `/tmp`, `/var/tmp` and `/run` of the host hold the temporary files and the
-//! control sockets of the programs of the user. The child gets an empty
-//! tmpfs over each of them (see [`PRIVATE_DIRS`]), and pent binds back only
-//! the paths that the session needs: the workspace, the data directory, the
-//! working directory, each configured path, each directory of `PATH`, and
-//! the system paths of [`PRIVATE_KEEP`]. See [`plan_private_dirs`].
+//! `/tmp`, `/var/tmp`, `/dev/shm` and `/run` of the host hold the temporary
+//! files, the shared memory and the control sockets of the programs of the
+//! user. The child gets an empty tmpfs over each of them (see
+//! [`PRIVATE_DIRS`]), and pent binds back only the paths that the session
+//! needs: the workspace, the data directory, the working directory, each
+//! configured path, each directory of `PATH` inside a system path, and the
+//! system paths of [`PRIVATE_KEEP`]. See [`plan_private_dirs`].
 //!
 //! # Limits
 //!
@@ -101,12 +103,21 @@ use std::sync::atomic::{AtomicI32, Ordering};
 /// Minimum required Landlock ABI version.
 pub const MIN_LANDLOCK_ABI: u32 = crate::linux_landlock::MIN_ABI;
 
-/// System paths to allow read and execute access (libraries, config, etc.).
+/// System paths to allow read and execute access (programs, libraries,
+/// config, etc.).
 ///
 /// On NixOS, all binaries and libraries live in the immutable, world-readable
-/// `/nix/store`. `/run/current-system` points into it. A missing path is
-/// skipped.
+/// `/nix/store`. `/run/current-system` points into it. The setuid wrappers of
+/// `/run/wrappers/bin` have no power: the child runs with `NO_NEW_PRIVS`. A
+/// missing path is skipped.
+///
+/// A directory of `PATH` is in the base only when its canonical target is
+/// inside one of these paths (see [`base_path_dirs`]).
 const SYSTEM_PATHS: &[&str] = &[
+    "/usr/bin",
+    "/usr/sbin",
+    "/bin",
+    "/sbin",
     "/usr/lib",
     "/usr/lib64",
     "/lib",
@@ -115,13 +126,16 @@ const SYSTEM_PATHS: &[&str] = &[
     "/etc",
     "/nix/store",
     "/run/current-system",
+    "/run/wrappers/bin",
 ];
 
-/// Temp paths to allow read/write access.
-const TEMP_PATHS: &[&str] = &["/tmp", "/var/tmp"];
+/// Temp paths to allow read/write access. Each one is an empty private tmpfs
+/// (see [`PRIVATE_DIRS`]).
+const TEMP_PATHS: &[&str] = &["/tmp", "/var/tmp", "/dev/shm"];
 
-/// Device nodes with read/write access. `/dev/shm` and `/dev/mqueue` are not
-/// in the list: add them to the configuration if a tool needs them.
+/// Device nodes with read/write access. `/dev/shm` is a temp path (see
+/// [`TEMP_PATHS`]). `/dev/mqueue` is not in the list: add it to the
+/// configuration if a tool needs it.
 pub(crate) const DEV_RW_PATHS: &[&str] = &[
     "/dev/null",
     "/dev/zero",
@@ -140,6 +154,36 @@ pub(crate) const DEV_READ_PATHS: &[&str] = &["/dev/random", "/dev/urandom"];
 
 /// Proc paths to allow read access.
 const PROC_PATHS: &[&str] = &["/proc"];
+
+/// Sysfs paths to allow read access. A runtime sizes its thread pool from
+/// the CPU files (`online`, `possible`, `cpu<N>/topology`). The limits of the
+/// own cgroup come from [`cgroup_limit_files`].
+const SYS_READ_PATHS: &[&str] = &["/sys/devices/system/cpu"];
+
+/// The mount point of the unified cgroup hierarchy (cgroup v2).
+const CGROUP_ROOT: &str = "/sys/fs/cgroup";
+
+/// The files of a cgroup that hold its limits. A runtime reads them from
+/// the own cgroup and from each parent (Go, the JVM, .NET), and takes the
+/// smallest limit. `cgroup.procs` and the other lists of processes are not
+/// here: they name the processes of the host in the same cgroup.
+const CGROUP_LIMIT_FILES: &[&str] = &[
+    "cgroup.controllers",
+    "cpu.max",
+    "cpu.weight",
+    "cpuset.cpus.effective",
+    "cpuset.mems.effective",
+    "memory.high",
+    "memory.low",
+    "memory.max",
+    "memory.min",
+    "memory.swap.max",
+    "pids.max",
+];
+
+/// The file that holds the fixed identifier of the machine. The child sees
+/// a random identifier for each run in its place (see [`MachineIdMask`]).
+const MACHINE_ID_PATH: &str = "/etc/machine-id";
 
 // The sockets that the child hides are data in one place, in
 // `pent_profile::class`: `ESCAPE_SOCKETS` (unless the configuration names
@@ -165,9 +209,10 @@ struct PrivateDir {
 /// namespace of the child.
 ///
 /// `/tmp` and `/var/tmp` hold the temporary files of the programs of the
-/// user; `/run` holds their control sockets. The child must see neither.
-/// Each tmpfs is `nosuid` and `nodev`. `/tmp` and `/var/tmp` keep the mode
-/// `1777` of a temporary directory; `/run` keeps `0755`.
+/// user; `/dev/shm` holds their shared memory and their POSIX semaphores;
+/// `/run` holds their control sockets. The child must see none of them.
+/// Each tmpfs is `nosuid` and `nodev`. `/tmp`, `/var/tmp` and `/dev/shm`
+/// keep the mode `1777` of a temporary directory; `/run` keeps `0755`.
 ///
 /// A path that is a symbolic link is skipped: `/var/run` points to `/run` on
 /// most systems, and the tmpfs on `/run` covers it.
@@ -178,6 +223,10 @@ const PRIVATE_DIRS: &[PrivateDir] = &[
     },
     PrivateDir {
         path: "/var/tmp",
+        data: c"mode=1777",
+    },
+    PrivateDir {
+        path: "/dev/shm",
         data: c"mode=1777",
     },
     PrivateDir {
@@ -231,6 +280,7 @@ pub fn compute_accessible_set(config: &SandboxConfig, path_dirs: &[PathBuf]) -> 
     {
         accessible.insert(PathBuf::from(p));
     }
+    accessible.extend(base_read_files());
     for path_dir in path_dirs {
         accessible.insert(path_dir.clone());
     }
@@ -973,6 +1023,9 @@ fn add_ruleset_rules(
     for p in DEV_READ_PATHS.iter().chain(PROC_PATHS) {
         ruleset.add_rule(Path::new(p), access::READ);
     }
+    for p in base_read_files() {
+        ruleset.add_rule(&p, access::READ);
+    }
     // The `resolv.conf` of the proxy. On a host with `systemd-resolved`,
     // `/etc/resolv.conf` is a symbolic link into `/run`, and the target is
     // inside the private tmpfs of `/run`. No rule above covers that path,
@@ -986,17 +1039,110 @@ fn add_ruleset_rules(
 
 /// Return the paths that the Landlock backend always allows, in addition to
 /// the configuration: the system paths, the temporary paths, the device
-/// nodes and `/proc`.
+/// nodes, `/proc`, the CPU files and the limits of the own cgroup.
 #[must_use]
 pub(crate) fn implicit_paths() -> Vec<PathBuf> {
-    SYSTEM_PATHS
+    let mut paths: Vec<PathBuf> = SYSTEM_PATHS
         .iter()
         .chain(TEMP_PATHS)
         .chain(DEV_RW_PATHS)
         .chain(DEV_READ_PATHS)
         .chain(PROC_PATHS)
         .map(PathBuf::from)
-        .collect()
+        .collect();
+    paths.extend(base_read_files());
+    paths
+}
+
+/// Return the paths below `/sys` that the base gives for read: the CPU
+/// files and the limit files of the own cgroup.
+fn base_read_files() -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = SYS_READ_PATHS.iter().map(PathBuf::from).collect();
+    paths.extend(cgroup_limit_files());
+    paths
+}
+
+/// Return the path of the own cgroup in the unified hierarchy, relative to
+/// its root, from `proc_cgroup` (the text of `/proc/self/cgroup`).
+///
+/// Only the line of cgroup v2 (`0::/path`) counts. A path that is not
+/// absolute, or that has a `.` or a `..` component, gives `None`.
+fn unified_cgroup(proc_cgroup: &str) -> Option<PathBuf> {
+    use std::path::Component;
+    let path = Path::new(proc_cgroup.lines().find_map(|l| l.strip_prefix("0::"))?);
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|c| !matches!(c, Component::RootDir | Component::Normal(_)))
+    {
+        return None;
+    }
+    path.strip_prefix("/").ok().map(Path::to_path_buf)
+}
+
+/// Return each file of [`CGROUP_LIMIT_FILES`] that exists in the cgroup
+/// `cgroup` below `root`, or in a parent of it up to `root`.
+fn cgroup_limit_files_in(root: &Path, cgroup: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for dir in cgroup.ancestors() {
+        for name in CGROUP_LIMIT_FILES {
+            let file = root.join(dir).join(name);
+            if file.is_file() {
+                files.push(file);
+            }
+        }
+    }
+    files
+}
+
+/// Return the limit files of the own cgroup and of its parents.
+///
+/// The child stays in the cgroup of pent, so the parent reads its own
+/// `/proc/self/cgroup`. A host without the unified hierarchy at
+/// [`CGROUP_ROOT`] (cgroup v1) gives no file.
+fn cgroup_limit_files() -> Vec<PathBuf> {
+    let root = Path::new(CGROUP_ROOT);
+    if !root.join("cgroup.controllers").is_file() {
+        return Vec::new();
+    }
+    let Ok(text) = std::fs::read_to_string("/proc/self/cgroup") else {
+        return Vec::new();
+    };
+    unified_cgroup(&text).map_or_else(Vec::new, |cgroup| cgroup_limit_files_in(root, &cgroup))
+}
+
+/// Return the directories of `path_env` (a `PATH` value) that the base
+/// holds, each with its canonical target.
+///
+/// A directory is in the base only when its canonical target is inside a
+/// system path of [`SYSTEM_PATHS`]. A link such as `~/.nix-profile/bin`
+/// reaches `/nix/store` and stays. A directory such as `~/.local/bin`,
+/// `~/.cargo/bin` or `/usr/local/bin` is not in the base: an access there
+/// needs a rule or a flag.
+pub(crate) fn base_path_dirs(path_env: &str) -> Vec<PathBuf> {
+    let roots: Vec<PathBuf> = SYSTEM_PATHS
+        .iter()
+        .map(PathBuf::from)
+        .flat_map(|p| {
+            let real = std::fs::canonicalize(&p).ok();
+            std::iter::once(p).chain(real)
+        })
+        .collect();
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for dir in crate::env::resolve_path_dirs_from(path_env) {
+        let Ok(real) = std::fs::canonicalize(&dir) else {
+            continue;
+        };
+        if !roots.iter().any(|root| real.starts_with(root)) {
+            continue;
+        }
+        for path in [dir, real] {
+            if !dirs.contains(&path) {
+                dirs.push(path);
+            }
+        }
+    }
+    dirs
 }
 
 /// Build the Landlock ruleset for `config` (test helper).
@@ -1693,6 +1839,161 @@ struct PrivateBind {
     forced_mode: Option<ForcedMode>,
 }
 
+/// The length of a machine identifier: 32 hexadecimal digits and a newline.
+const MACHINE_ID_LEN: usize = 33;
+
+/// The mask over `/etc/machine-id`.
+///
+/// The child sees a random identifier for each run, read-only. A program
+/// that needs a machine identifier (a D-Bus client, a library of systemd)
+/// keeps working, and the identifier neither names the machine nor links
+/// two runs.
+///
+/// The child writes the file in a small tmpfs on `stage`, binds the file
+/// over `target`, and then detaches the tmpfs and removes `stage`. The bind
+/// keeps the file, and no path of the child shows the stage.
+#[derive(Debug)]
+struct MachineIdMask {
+    /// The file that the mask covers: the canonical path of
+    /// `/etc/machine-id`.
+    target: CString,
+    /// The mount point of the stage, inside a private tmpfs of the child.
+    stage: CString,
+    /// The file in the stage.
+    file: CString,
+    /// The identifier and its newline.
+    content: [u8; MACHINE_ID_LEN],
+}
+
+/// Return the text of a machine identifier from 16 random bytes.
+///
+/// The text has the form of the systemd format: 32 lowercase hexadecimal
+/// digits, a newline, and the bits of a version 4 UUID, as
+/// `systemd-machine-id-setup` makes them.
+fn machine_id_text(mut bytes: [u8; 16]) -> [u8; MACHINE_ID_LEN] {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    if let Some(b) = bytes.get_mut(6) {
+        *b = (*b & 0x0f) | 0x40;
+    }
+    if let Some(b) = bytes.get_mut(8) {
+        *b = (*b & 0x3f) | 0x80;
+    }
+    // A nibble is below 16, so the lookup never misses.
+    let hex = |nibble: u8| HEX.get(usize::from(nibble)).copied().unwrap_or(b'0');
+    let mut text = [b'\n'; MACHINE_ID_LEN];
+    let (pairs, _newline) = text.as_chunks_mut::<2>();
+    for ([high, low], byte) in pairs.iter_mut().zip(bytes) {
+        *high = hex(byte >> 4);
+        *low = hex(byte & 0x0f);
+    }
+    text
+}
+
+/// Return 16 bytes from the random source of the kernel, or `None` when
+/// `getrandom(2)` fails.
+fn random_bytes() -> Option<[u8; 16]> {
+    let mut bytes = [0u8; 16];
+    // SAFETY: getrandom(2) writes at most `bytes.len()` bytes into the
+    // buffer. A request of 16 bytes is never short after the pool is ready,
+    // and the length check below catches a short read anyway.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let ret = unsafe { libc::getrandom(bytes.as_mut_ptr().cast(), bytes.len(), 0) };
+    (usize::try_from(ret).ok() == Some(bytes.len())).then_some(bytes)
+}
+
+/// Plan the mask over `/etc/machine-id`.
+///
+/// `None` when the host has no such file, or when a private tmpfs hides it
+/// already. `Some(Err(path))` when the child cannot write a random
+/// identifier (no private tmpfs for the stage, or no random bytes): the
+/// child then hides the file with an empty one, so the protection never
+/// goes in silence.
+fn plan_machine_id(private: &PrivatePlan) -> Option<Result<MachineIdMask, PathBuf>> {
+    let real = std::fs::canonicalize(MACHINE_ID_PATH).ok()?;
+    if !real.is_file() || private.hides(&real) {
+        return None;
+    }
+    let Some(target) = to_cstring(&real) else {
+        return Some(Err(real));
+    };
+    let stage_dir = private
+        .covered
+        .first()
+        .map(|root| root.join(".pent-machine-id"));
+    let (Some(stage_dir), Some(bytes)) = (stage_dir, random_bytes()) else {
+        return Some(Err(real));
+    };
+    let (Some(stage), Some(file)) = (
+        to_cstring(&stage_dir),
+        to_cstring(&stage_dir.join("machine-id")),
+    ) else {
+        return Some(Err(real));
+    };
+    Some(Ok(MachineIdMask {
+        target,
+        stage,
+        file,
+        content: machine_id_text(bytes),
+    }))
+}
+
+impl MachineIdMask {
+    /// Write the identifier and bind it over the target. Async-signal-safe.
+    ///
+    /// # Errors
+    /// Returns the OS error of the stage, of the file or of a mount.
+    fn apply(&self) -> std::io::Result<()> {
+        mkdir_if_missing(&self.stage, 0o700)?;
+        // SAFETY: mount(2) with NUL-terminated strings that the parent
+        // prepared.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let ret = unsafe {
+            libc::mount(
+                c"tmpfs".as_ptr(),
+                self.stage.as_ptr(),
+                c"tmpfs".as_ptr(),
+                libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+                c"size=4k,mode=0700".as_ptr().cast(),
+            )
+        };
+        if ret != 0 {
+            return Err(last_err(b"pent: cannot make the stage of the machine-id\n"));
+        }
+        // SAFETY: open(2) with a NUL-terminated string that the parent
+        // prepared. The file is new in the empty tmpfs of the stage.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let fd = unsafe {
+            libc::open(
+                self.file.as_ptr(),
+                libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY | libc::O_CLOEXEC,
+                0o444,
+            )
+        };
+        if fd < 0 {
+            return Err(last_err(b"pent: cannot make the machine-id of the run\n"));
+        }
+        let written = write_all_fd(fd, &self.content);
+        // SAFETY: `fd` is the descriptor that this function opened.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe { libc::close(fd) };
+        written?;
+        bind_readonly(&self.file, &self.target, 0)?;
+        // The bind holds the file, so the stage can go. A stage that stays
+        // shows only an empty directory, thus a failure is not fatal.
+        // SAFETY: umount2(2) and rmdir(2) with a NUL-terminated string that
+        // the parent prepared.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let gone = unsafe {
+            libc::umount2(self.stage.as_ptr(), libc::MNT_DETACH) == 0
+                && libc::rmdir(self.stage.as_ptr()) == 0
+        };
+        if !gone {
+            write_stderr_static(b"pent: cannot remove the stage of the machine-id\n");
+        }
+        Ok(())
+    }
+}
+
 /// The private mounts that the child makes before Landlock applies.
 #[derive(Debug, Default)]
 struct MountPlan {
@@ -1714,6 +2015,8 @@ struct MountPlan {
     mask_dirs: Vec<CString>,
     /// Socket files to hide with a bind mount of `/dev/null`.
     mask_files: Vec<CString>,
+    /// The random identifier over `/etc/machine-id`.
+    machine_id: Option<MachineIdMask>,
     /// Directories that the watch guard hides with an empty, read-only
     /// tmpfs.
     guard_dirs: Vec<CString>,
@@ -1829,7 +2132,7 @@ fn mount_point_parents(target: &Path, root: &Path) -> Vec<CString> {
 /// Each directory of [`PRIVATE_DIRS`] gets an empty tmpfs. Pent binds back
 /// only the paths that the session needs: the workspace, the data directory,
 /// the working directory, each configured path and mount, each directory of
-/// `PATH`, the system paths, and `extra` (the overlay mount points and the
+/// `PATH` inside a system path, the system paths, and `extra` (the overlay mount points and the
 /// write targets of the watch guard).
 ///
 /// Pent binds the path that the configuration names, not a parent of it: a
@@ -2526,6 +2829,10 @@ impl MountPlan {
             }
         }
 
+        if let Some(mask) = &self.machine_id {
+            mask.apply()?;
+        }
+
         // The watch guard. The read-only bind mounts above come first, so a
         // mask can be on a path below a read-only directory.
         for dir in &self.guard_dirs {
@@ -3131,6 +3438,11 @@ pub(crate) fn spawn_linux(
         mounts
             .mask_files
             .extend(mask_files.iter().filter_map(|p| to_cstring(p)));
+        match plan_machine_id(&private) {
+            Some(Ok(mask)) => mounts.machine_id = Some(mask),
+            Some(Err(path)) => mounts.mask_files.extend(to_cstring(&path)),
+            None => {}
+        }
     }
 
     // The recorder. The supervisor thread starts before `spawn`: the child
@@ -5245,12 +5557,13 @@ mod tests {
         assert!(!DEV_RW_PATHS.contains(&"/dev"));
         assert!(!DEV_READ_PATHS.contains(&"/dev"));
         for p in ["/dev/shm", "/dev/mqueue"] {
-            assert!(
-                !DEV_RW_PATHS.contains(&p),
-                "{p} must not be writable by default"
-            );
+            assert!(!DEV_RW_PATHS.contains(&p), "{p} must not be a device path");
             assert!(!DEV_READ_PATHS.contains(&p));
         }
+        // `/dev/shm` is writable only as a private tmpfs.
+        assert!(TEMP_PATHS.contains(&"/dev/shm"));
+        assert!(PRIVATE_DIRS.iter().any(|d| d.path == "/dev/shm"));
+        assert!(!TEMP_PATHS.contains(&"/dev/mqueue"));
         for p in ["/dev/null", "/dev/tty", "/dev/pts", "/dev/ptmx"] {
             assert!(DEV_RW_PATHS.contains(&p), "{p} must be writable");
         }
@@ -5258,6 +5571,113 @@ mod tests {
         let set = compute_accessible_set(&make_test_config(), &[]);
         assert!(!set.contains(Path::new("/dev")));
         assert!(set.contains(Path::new("/dev/null")));
+    }
+
+    #[test]
+    fn a_machine_id_has_the_form_of_systemd() {
+        let text = machine_id_text([0xff; 16]);
+        let (hex, newline) = text.split_at(32);
+        assert_eq!(newline, b"\n");
+        assert!(hex
+            .iter()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b)));
+        // The version nibble is 4 and the variant bits are `10`.
+        assert_eq!(hex.get(12), Some(&b'4'));
+        assert_eq!(hex.get(16), Some(&b'b'));
+        assert_eq!(
+            machine_id_text([0; 16]).get(..32),
+            Some(b"00000000000040008000000000000000".as_slice())
+        );
+        assert_eq!(
+            machine_id_text([0x12, 0x34, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xab]).get(..32),
+            Some(b"123400000000400080000000000000ab".as_slice())
+        );
+    }
+
+    #[test]
+    fn two_plans_give_two_machine_ids() {
+        let plan = plan_private_dirs(&make_test_config(), &[], &[], 4242);
+        let (Some(Ok(a)), Some(Ok(b))) = (plan_machine_id(&plan), plan_machine_id(&plan)) else {
+            eprintln!("skip: this host has no {MACHINE_ID_PATH} or no private tmpfs");
+            return;
+        };
+        assert_ne!(a.content, b.content);
+        assert_eq!(a.target, b.target);
+        // The stage is inside a private tmpfs, never on the host.
+        let stage = PathBuf::from(a.stage.to_string_lossy().into_owned());
+        assert!(
+            plan.hides(&stage),
+            "the stage {} is on the host",
+            stage.display()
+        );
+    }
+
+    #[test]
+    fn the_unified_cgroup_comes_from_the_line_of_cgroup_v2() {
+        let text = "12:cpu,cpuacct:/old\n0::/user.slice/app.scope\n";
+        assert_eq!(
+            unified_cgroup(text),
+            Some(PathBuf::from("user.slice/app.scope"))
+        );
+        assert_eq!(unified_cgroup("0::/\n"), Some(PathBuf::new()));
+        assert_eq!(unified_cgroup("12:cpu:/old\n"), None);
+        assert_eq!(unified_cgroup("0::relative\n"), None);
+        assert_eq!(unified_cgroup("0::/a/../../etc\n"), None);
+        assert_eq!(unified_cgroup("0::/a/./b\n"), Some(PathBuf::from("a/b")));
+    }
+
+    #[test]
+    fn the_limit_files_come_from_the_cgroup_and_its_parents() -> TestResult {
+        let root = tempfile::tempdir()?;
+        let leaf = root.path().join("a/b");
+        std::fs::create_dir_all(&leaf)?;
+        for (dir, name) in [
+            (root.path().to_path_buf(), "cgroup.controllers"),
+            (root.path().join("a"), "memory.max"),
+            (leaf.clone(), "cpu.max"),
+            (leaf.clone(), "cgroup.procs"),
+            (leaf.clone(), "memory.stat"),
+        ] {
+            std::fs::write(dir.join(name), "max\n")?;
+        }
+        let mut files = cgroup_limit_files_in(root.path(), Path::new("a/b"));
+        files.sort();
+        let mut want = vec![
+            root.path().join("cgroup.controllers"),
+            root.path().join("a/memory.max"),
+            leaf.join("cpu.max"),
+        ];
+        want.sort();
+        assert_eq!(files, want);
+        Ok(())
+    }
+
+    #[test]
+    fn the_base_holds_a_path_dir_only_inside_a_system_path() -> TestResult {
+        let Some(system) = SYSTEM_PATHS.iter().map(Path::new).find(|p| p.is_dir()) else {
+            eprintln!("skip: this host has no system path");
+            return Ok(());
+        };
+        let temp = tempfile::tempdir()?;
+        let own = temp.path().join("bin");
+        std::fs::create_dir(&own)?;
+        let link = temp.path().join("profile-bin");
+        std::os::unix::fs::symlink(system, &link)?;
+        let path_env = format!("{}:{}", own.display(), link.display());
+        let dirs = base_path_dirs(&path_env);
+        assert!(
+            !dirs.contains(&own),
+            "{own:?} is not a system path: {dirs:?}"
+        );
+        assert!(
+            dirs.contains(&link),
+            "the link reaches {system:?}: {dirs:?}"
+        );
+        assert!(dirs.contains(&std::fs::canonicalize(system)?));
+        let implicit = crate::implicit_allowed_paths(&path_env);
+        assert!(!implicit.contains(&own));
+        assert!(implicit.contains(&link));
+        Ok(())
     }
 
     #[test]
@@ -5291,6 +5711,12 @@ mod tests {
             plan.covered.contains(&PathBuf::from("/run")),
             "/run must get a private tmpfs"
         );
+        if Path::new("/dev/shm").is_dir() {
+            assert!(
+                plan.covered.contains(&PathBuf::from("/dev/shm")),
+                "/dev/shm must get a private tmpfs"
+            );
+        }
         // `/var/run` points to `/run` on this host, so it needs no own mount.
         assert_eq!(plan.covered.len(), plan.mounts.len());
     }

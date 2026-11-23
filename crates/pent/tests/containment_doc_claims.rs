@@ -246,7 +246,8 @@ fn pent_ignores_sigint_and_lets_the_command_see_it() -> TestResult {
 
 // ── linux-sandbox.md (LS-2): the modes of the private directories ──────────
 
-/// "`/tmp` and `/var/tmp` keep the mode `1777`; `/run` keeps `0755`."
+/// "`/tmp`, `/var/tmp` and `/dev/shm` keep the mode `1777`; `/run` keeps
+/// `0755`."
 /// (`docs/security/linux-sandbox.md`, LS-2)
 #[test]
 fn the_private_directories_keep_their_modes() -> TestResult {
@@ -262,10 +263,15 @@ fn the_private_directories_keep_their_modes() -> TestResult {
         "--",
         "sh",
         "-c",
-        &format!("echo {RAN}; stat -c '%n %a' /tmp /var/tmp /run"),
+        &format!("echo {RAN}; stat -c '%n %a' /tmp /var/tmp /dev/shm /run"),
     ])?;
     let all = assert_ran(&out);
-    for (dir, mode) in [("/tmp", "1777"), ("/var/tmp", "1777"), ("/run", "755")] {
+    for (dir, mode) in [
+        ("/tmp", "1777"),
+        ("/var/tmp", "1777"),
+        ("/dev/shm", "1777"),
+        ("/run", "755"),
+    ] {
         assert!(
             all.contains(&format!("{dir} {mode}")),
             "the mode of {dir} is not {mode}:\n{all}"
@@ -274,12 +280,13 @@ fn the_private_directories_keep_their_modes() -> TestResult {
     Ok(())
 }
 
-/// "Pent binds back only what the session needs: ... every directory of
-/// `PATH` ..." (README) A tool in a `PATH` directory below `/tmp` still
-/// runs.
+/// "A directory of `PATH` is in the base only when its canonical target is
+/// inside a system path." (`docs/security/linux-sandbox.md`, LS-6) A tool
+/// in a `PATH` directory below `/tmp` does not come back, and neither does
+/// its sibling.
 #[test]
-fn a_path_directory_below_a_private_directory_comes_back() -> TestResult {
-    let test = "a_path_directory_below_a_private_directory_comes_back";
+fn a_path_directory_below_a_private_directory_stays_hidden() -> TestResult {
+    let test = "a_path_directory_below_a_private_directory_stays_hidden";
     if !ready(test) {
         return Ok(());
     }
@@ -319,12 +326,12 @@ fn a_path_directory_below_a_private_directory_comes_back() -> TestResult {
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&sibling);
     assert!(
-        all.contains("PENT_TOOL_RAN"),
-        "a tool in a PATH directory below /tmp did not run:\n{all}"
+        !all.contains("PENT_TOOL_RAN"),
+        "a tool in a PATH directory below /tmp ran with no rule:\n{all}"
     );
     assert!(
         !all.contains("PENT_SIBLING_SECRET"),
-        "the bind of the PATH directory brought its sibling back:\n{all}"
+        "the sibling of the PATH directory came back:\n{all}"
     );
     Ok(())
 }

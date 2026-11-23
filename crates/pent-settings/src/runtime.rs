@@ -18,7 +18,7 @@ use thiserror::Error;
 /// The directories that the sandbox covers with a private tmpfs. They are
 /// the paths of `PRIVATE_DIRS` in `pent-sandbox`, and a test there checks
 /// that the two lists agree.
-pub const HIDDEN_ROOTS: &[&str] = &["/tmp", "/var/tmp", "/run", "/var/run"];
+pub const HIDDEN_ROOTS: &[&str] = &["/tmp", "/var/tmp", "/dev/shm", "/run", "/var/run"];
 
 /// The file name of the socket of pentd.
 const PENTD_SOCKET: &str = "pentd.sock";
