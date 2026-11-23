@@ -108,9 +108,9 @@ commit.
 | Step | Crate | Target | What it reads | Inputs |
 |------|-------|--------|---------------|-------:|
 | 1.2 | `pent-profile` | `rule_file` | The text of a rule file. A file that `RuleSet::from_toml` accepts must give the same rules after `to_toml` and after `update_toml` with no change. With the first rule removed or with a rule added, the file must hold the same rules with the same count of each rule, in any order. | 2,014,385 |
-| 1.4, 2.2, 2.4 | `pent-profile` | `protocol_line` | One line of the protocol of `pentd.sock`, with the messages, the reasons and the codes of step 2.4 (stale: not yet run with the messages of step 2.5). A line that `Message::decode_line` accepts must encode to one line that decodes to the same message. | 11,700,590 |
+| 1.4, 2.2, 2.4, 2.5 | `pent-profile` | `protocol_line` | One line of the protocol of `pentd.sock`, with the messages, the reasons and the codes of step 2.5. A line that `Message::decode_line` accepts must encode to one line that decodes to the same message. | 10,132,170 |
 
-Each run of 2026-11-22 took 151 seconds on a NixOS machine with Linux
+Each run took 151 seconds (`protocol_line` on 2026-11-23, the others on 2026-11-22) on a NixOS machine with Linux
 7.3.3, with no finding. An earlier run of `rule_file` found that an update
 can change the order of equal rules. The order has no effect on a
 decision, so the property of the target now compares the rules in any
