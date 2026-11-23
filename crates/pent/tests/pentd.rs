@@ -1978,6 +1978,7 @@ fn a_runtime_directory_that_appears_after_the_start_stays_hidden() -> TestResult
             &script,
         ])
         .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()?,
     );
     // A pentd that starts after the sandbox, as another `pent run` starts
@@ -1998,7 +1999,16 @@ fn a_runtime_directory_that_appears_after_the_start_stays_hidden() -> TestResult
     if let Some(mut out) = child.0.stdout.take() {
         out.read_to_string(&mut text)?;
     }
+    let mut err = String::new();
+    if let Some(mut stream) = child.0.stderr.take() {
+        stream.read_to_string(&mut err)?;
+    }
     assert!(status.success(), "{status:?}: {text}");
+    // `.pentsh` is not a valid key, and pent says so.
+    assert!(
+        err.contains("pent runs this program without pentd"),
+        "{err}"
+    );
     // The positive control: the profile brought the directory back.
     assert!(text.contains("PENT_VISIBLE"), "{text}");
     assert!(env.runtime.join("pent/pentd.lock").exists(), "no pentd ran");

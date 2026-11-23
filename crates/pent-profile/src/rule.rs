@@ -37,7 +37,7 @@ pub enum RuleError {
     #[error("the key {0:?} has more than 64 characters")]
     KeyTooLong(String),
     /// The key has a character that is not permitted.
-    #[error("the key {0:?} can contain only letters, digits, '.', '_' and '-', and it cannot start with '.'")]
+    #[error("the key {0:?} can contain only letters, digits and '.', '_', '-', '+', '@', '~', and it cannot start with '.'")]
     InvalidKey(String),
     /// The command has no file name, so pent cannot make a key.
     #[error("cannot make a key from the command {0:?}; use --key")]
@@ -64,8 +64,10 @@ pub enum RuleError {
 /// The key of a set of rules: the file name of the root program, for example
 /// `claude` for `pent run -- ~/.local/bin/claude`.
 ///
-/// A key has 1 to 64 characters from `[A-Za-z0-9._-]`, and it does not start
-/// with `.`. Thus a key is always a safe file name.
+/// A key has 1 to 64 characters from `[A-Za-z0-9._+@~-]`, and it does not
+/// start with `.`. Thus a key is always a safe file name, and the names of
+/// the well-known programs fit, for example `g++`, `clang++` and
+/// `x86_64-linux-gnu-gcc`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct RuleKey(String);
@@ -118,8 +120,9 @@ impl FromStr for RuleKey {
             return Err(RuleError::KeyTooLong(s.to_string()));
         }
         let valid = !s.starts_with('.')
-            && s.chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+            && s.chars().all(|c| {
+                c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+' | '@' | '~')
+            });
         if !valid {
             return Err(RuleError::InvalidKey(s.to_string()));
         }
@@ -666,6 +669,26 @@ mod tests {
             "claude"
         );
         assert_eq!(RuleKey::from_command("cargo")?.as_str(), "cargo");
+        for name in [
+            "g++",
+            "c++",
+            "clang++",
+            "x86_64-linux-gnu-gcc",
+            "node@20",
+            "vim~",
+            "python3.12",
+        ] {
+            assert_eq!(
+                RuleKey::from_command(&format!("/usr/bin/{name}"))?.as_str(),
+                name
+            );
+        }
+        for bad in ["a b", "a:b", "a$b", "a*b", "née", "a\\b", "a\nb"] {
+            assert!(
+                matches!(bad.parse::<RuleKey>(), Err(RuleError::InvalidKey(_))),
+                "{bad:?}"
+            );
+        }
         assert!(matches!(
             RuleKey::from_command("/"),
             Err(RuleError::NoBasename(_))

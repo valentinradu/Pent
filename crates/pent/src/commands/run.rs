@@ -40,9 +40,19 @@ enum RunEvent {
 /// not stop the run. The design asks the same: without pentd, the rules
 /// still apply (`docs/design/pent.md`, section 2).
 fn hold_pentd(command: &[String]) -> Option<crate::daemon::client::Session> {
-    let key = command
+    let key = match command
         .first()
-        .and_then(|c| pent_profile::RuleKey::from_command(c).ok())?;
+        .map(|c| pent_profile::RuleKey::from_command(c))
+    {
+        Some(Ok(key)) => key,
+        Some(Err(e)) => {
+            // Until phase 3 nothing asks, but the user must know that this
+            // program can keep no rule.
+            ui::warn(format!("{e}; pent runs this program without pentd"));
+            return None;
+        }
+        None => return None,
+    };
     let hold = pent_profile::Hold::Run {
         key,
         command: command.to_vec(),

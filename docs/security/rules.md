@@ -59,7 +59,7 @@ cargo +nightly fuzz run rule_file -- -max_total_time=150 -rss_limit_mb=4096
 | RU-5 | The domain forms follow the proxy. `*.base` is one more label, `**.base` is any depth, and neither covers `base`. A wildcard compares whole labels: `*.npmjs.org` does not cover `evilnpmjs.org`. | `domain_widths_follow_the_proxy`, `a_domain_width_parses_the_form_of_the_proxy` |
 | RU-6 | A wildcard cannot cover a public suffix (`*.com`, `*.co.uk`, `*.github.io`), also in a file that a user edits. | `a_wildcard_cannot_cover_a_public_suffix`, `rule_file::tests::bad_values_are_errors` |
 | RU-7 | A socket rule and a port rule match exactly, and a file rule never answers a socket access. | `sockets_and_ports_match_exactly` |
-| RU-8 | A key has 1 to 64 characters from `[A-Za-z0-9._-]` and does not start with `.`, so a key is always a safe file name in the rule directory. | `a_key_comes_from_the_file_name_of_the_command` |
+| RU-8 | A key has 1 to 64 characters from `[A-Za-z0-9._+@~-]` and does not start with `.`, so a key is always a safe file name in the rule directory, and the well-known names fit (`g++`, `clang++`, `x86_64-linux-gnu-gcc`). A space, a `/`, a `:`, a shell character and a non-ASCII letter are refused. `pent run` warns when the name of the program is not a valid key, and it runs the program without pentd. | `a_key_comes_from_the_file_name_of_the_command`, `a_runtime_directory_that_appears_after_the_start_stays_hidden` (the warning) |
 
 ## The classes and the width menu
 
