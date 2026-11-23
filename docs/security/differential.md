@@ -25,7 +25,7 @@ code.
 
 | File | Table | Compares |
 |---|---|---|
-| `crates/pent/tests/differential_profile_kernel.rs` | `FS_CASES` (39 rows) | the profile against the kernel |
+| `crates/pent/tests/differential_profile_kernel.rs` | `FS_CASES` (39 rows) | the rules against the kernel (the profile until step 3.1) |
 | `crates/pent/tests/differential_watch_round_trip.rs` | `WATCH_CASES` (9 rows) | the summary against the kernel |
 | `crates/pent/tests/differential_guard.rs` | `GUARD_CASES` (25 rows) | `classify` against the kernel |
 | `crates/pent/tests/differential_network.rs` | `NET_CASES` (7 rows) | the DNS answer, the proxy and the profile |
@@ -122,15 +122,22 @@ test `diff_1_a_test_of_a_hidden_path_is_a_recorded_denial` uses the test
 of the shell (`[ -e ]`), so it does not depend on the `cat` of the
 machine.
 
+**Since step 3.1.** `pent run` writes no denied log, and `pent trust
+--review` does not read the refusals of a run. The refusal goes to the
+trace log of the run and to pentd, and `pent denials` shows it. The two
+tests check both, with a pentd in the foreground.
+
 ### DIFF-2 — a profile entry that names a symbolic link gives access to nothing
 
 **Severity:** Medium. **Wrong description:** the kernel. **Fixed** in
 `3a754ae`.
 
 **Test:** `differential_profile_kernel.rs`,
-`diff_2_a_profile_entry_that_names_a_symbolic_link`. Rows
+`diff_2_a_rule_that_names_a_symbolic_link` (named
+`diff_2_a_profile_entry_that_names_a_symbolic_link` until step 3.1). Rows
 `symlink-the-named-link` and `symlink-the-target-by-its-own-name`. The
-test runs now.
+test runs now. Since step 3.1 the entry is an exact rule on the path of the
+link, and the two rows still pass.
 
 The profile holds `read = ["~/link.txt"]`, and `~/link.txt` is a symbolic
 link to `~/real.txt`. The program reads neither file. The link stays
@@ -188,7 +195,10 @@ word "read".
 
 **Test:** `differential_profile_kernel.rs`,
 `diff_4_a_read_rule_also_gives_execute`. Rows `read-rule-does-not-run`,
-`execute-rule-run` and `read-write-rule-run`. The test runs now.
+`execute-rule-run` and `read-write-rule-run`. The test runs now. Since step
+3.1 the test runs its own six cases on `~/tools` with the rule kinds
+`read`, `exec` and `write` (a `read_write` entry is a `write` rule), and
+the rows of the table hold the same verdicts.
 
 The profile has three lists: `read`, `read_write` and `execute`. The
 profile holds `read = ["~/bin"]`, and the program runs `~/bin/tool`. The
@@ -318,7 +328,9 @@ The proxy refused a destination that is not public, also for a domain of
 the allowlist. It answered HTTP 400 and recorded nothing. The trace log
 of `pent run --trace` had no line, and
 `~/.local/state/pent/denied/<name>.jsonl` had no item. An address written
-as a number got the same treatment.
+as a number got the same treatment. Since step 3.1, `pent run` writes no
+denied log: the test reads the trace log, and it checks the message
+`see them: pent denials`.
 
 A domain outside the allowlist does reach both files. The test uses that as
 its positive control.
@@ -355,7 +367,9 @@ fix it answered 400.
 These results are solid. Each one comes from a real run of the `pent`
 binary, three times, alone, on Linux.
 
-**The profile against the kernel (39 of 39 rows).**
+**The rules against the kernel (39 of 39 rows).** Until step 3.1 the
+table ran with a profile. The table still holds profile text, and the test
+writes each entry as a rule of the same kind (`read`, `write`, `exec`).
 
 - A rule on one file gives the file and no sibling.
 - A rule on one directory gives each child, at any depth, and no other
@@ -365,9 +379,13 @@ binary, three times, alone, on Linux.
 - A path with a space, a quotation mark, a newline or a name that is not
   ASCII works, and the sibling of each one stays closed. The TOML escape
   of a newline survives the whole flow.
-- A relative entry resolves against the workspace. The same name in the
-  home directory stays closed.
-- A `~` entry gives the whole home directory and nothing above it.
+- A rule path is always absolute. The test writes a relative entry as a
+  path below the workspace, and the same name in the home directory stays
+  closed.
+- A subtree rule on the whole home directory does not apply, because it
+  covers the files of pent and the credentials (RN-5 in
+  [run.md](run.md)). The two rows of `~` expect a refusal and the warning,
+  and the run fails when the warning comes on another row.
 - A directory that does not exist when the run starts works: the program
   makes it and writes in it, and the files stay on the host.
 - A `read_write` rule gives read and write. A `read_write` rule on a
@@ -381,7 +399,8 @@ binary, three times, alone, on Linux.
 
 **The summary against the kernel (9 of 9 rows).**
 
-The round trip holds for each row: watch, trust, run, and no denial. The
+Until step 3.1 the round trip held for each row: watch, trust, run, and no
+denial. `pent run` reads no draft now, so the run part is gone. The
 draft has each rule that the program needs, and no rule that the program
 never needed. The rows cover one read, a create and an edit in one
 directory, a write with an atomic rename, a delete, four reads that become
@@ -419,10 +438,10 @@ are stable:
 
 | Test | Times |
 |---|---|
-| `the_profile_and_the_kernel_agree` (39 rows) | 3.1 s, 3.2 s, 3.1 s |
+| `the_rules_and_the_kernel_agree` (39 rows; `the_profile_and_the_kernel_agree` then) | 3.1 s, 3.2 s, 3.1 s |
 | `the_draft_has_each_rule_that_the_program_needs` | 0.8 s, 0.4 s, 0.4 s |
 | `the_draft_has_no_rule_that_the_program_never_needed` | 0.4 s, 0.4 s, 0.4 s |
-| `a_run_with_the_draft_makes_no_denial` | 1.4 s, 1.2 s, 1.1 s |
+| `a_run_with_the_draft_makes_no_denial` (removed in step 3.1) | 1.4 s, 1.2 s, 1.1 s |
 | `classify_and_the_kernel_agree` (25 rows) | 0.8 s, 0.8 s, 0.8 s |
 | `the_three_layers_of_the_network_agree` (7 rows) | 1.0 s, 1.0 s, 1.0 s |
 

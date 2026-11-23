@@ -17,7 +17,7 @@ message when the sandbox or `python3` is not available.
 
 | ID | Severity | Attack | State | Test |
 |----|----------|--------|-------|------|
-| LS-1 | High | The child connects to a path Unix socket outside its profile. | Fixed | `test_unix_socket_connect_outside_profile` |
+| LS-1 | High | The child connects to a path Unix socket outside its profile. | Fixed | `test_unix_socket_connect_outside_the_rules` |
 | LS-2 | Low | The child reads and changes host files under `/tmp`. | Fixed | `test_tmp_not_shared_with_host` |
 | LS-3 | Medium | The child reads the command line of a host process. | Fixed on a host; absent in a container, with a warning | `test_proc_cmdline_of_host_process_denied` |
 
@@ -102,7 +102,7 @@ supervisor, which has no name, so an answer reaches nobody.
 `HOME_AGENT_SOCKETS` keep their place: they also hide the socket from a
 program that only lists a directory.
 
-**The evidence.** `test_unix_socket_connect_outside_profile` (no
+**The evidence.** `test_unix_socket_connect_outside_the_rules` (no
 `#[ignore]` any more), and in `crates/pent-sandbox/src/linux_watch.rs`:
 `unix_connect_to_a_socket_on_the_list_works`,
 `unix_connect_outside_the_list_gets_eacces`,
@@ -116,7 +116,7 @@ program that only lists a directory.
 `an_abstract_address_works_in_a_private_network_namespace` and
 `an_abstract_address_is_refused_without_a_network_namespace`. The
 containment report adds `a_second_thread_cannot_change_the_address_family`
-and `sendto_cannot_reach_a_socket_outside_the_profile`.
+and `sendto_cannot_reach_a_socket_outside_the_rules`.
 
 ### LS-2 — `/tmp` is read-write and shared with the host
 
@@ -392,10 +392,10 @@ Each test below passes. It guards a defense that works.
 
 | Defense | Test |
 |---------|------|
-| A read of a file outside the profile is denied. | `test_read_outside_profile_denied` |
-| A write of a file outside the profile is denied. | `test_write_outside_profile_denied` |
+| A read of a file outside the profile is denied. | `test_read_outside_the_rules_denied` |
+| A write of a file outside the profile is denied. | `test_write_outside_the_rules_denied` |
 | A connect to an abstract Unix socket of a host process fails. | `test_abstract_unix_socket_blocked` |
-| A connect to a path Unix socket outside the profile fails. | `test_unix_socket_connect_outside_profile` |
+| A connect to a path Unix socket outside the profile fails. | `test_unix_socket_connect_outside_the_rules` |
 | The user runtime directory `/run/user/<uid>` is an empty directory. | `test_runtime_dir_masked` |
 | A host file under `/tmp` is not visible. | `test_tmp_not_shared_with_host` |
 | A host socket in `/tmp` is not reachable. | `test_tmp_unix_socket_unreachable` |

@@ -70,18 +70,16 @@ fn expect_failure(out: &Output) {
     );
 }
 
-/// Invoke `pent run --profile pent-test [extra_args] -- [cmd_args]` in
+/// Invoke `pent run --key pent-test [extra_args] -- [cmd_args]` in
 /// `workspace`.
 ///
-/// The profile is empty and trusted, in temporary XDG directories. `HOME`
-/// stays the real home directory, so that the tests can place files outside
-/// the sandbox defaults.
+/// The key has no rule file, in temporary XDG directories. `HOME` stays the
+/// real home directory, so that the tests can place files outside the
+/// sandbox defaults.
 #[allow(clippy::panic)] // infrastructure helper: setup failure is a hard test setup error
 fn sandboxed_run(workspace: &Path, extra_args: &[String], cmd_args: &[&str]) -> Output {
     let xdg = Xdg::new().unwrap_or_else(|e| panic!("cannot make the XDG directories: {e}"));
-    xdg.install_profile(TEST_PROFILE, "")
-        .unwrap_or_else(|e| panic!("cannot install the test profile: {e}"));
-    let mut args: Vec<String> = vec!["run".into(), "--profile".into(), TEST_PROFILE.into()];
+    let mut args: Vec<String> = vec!["run".into(), "--key".into(), TEST_PROFILE.into()];
     args.extend_from_slice(extra_args);
     args.push("--".into());
     for a in cmd_args {
@@ -298,7 +296,7 @@ mod no_hang {
     /// Spawn `pent` with `args` in `dir`; kill it if it has not exited after
     /// `timeout_secs`.  Returns `(finished_before_deadline, stderr_text)`.
     ///
-    /// `home` must be a temp dir from [`profile_home`] — it is set as `$HOME`
+    /// `home` must be a temp dir from [`rules_home`] — it is set as `$HOME`
     /// so the real `~/.config/pent` is invisible to pent.
     /// `XDG_CONFIG_HOME`, `XDG_STATE_HOME` and `XDG_DATA_HOME` are also
     /// cleared so they cannot override the isolated home.
@@ -348,25 +346,18 @@ mod no_hang {
         (exited, stderr)
     }
 
-    /// Make a temp `$HOME` with the trusted profile `name` (content `toml`).
-    #[allow(clippy::unwrap_used, clippy::panic)] // infrastructure helper: setup failures are hard test setup errors
-    fn profile_home(name: &str, toml: &str) -> TempDir {
-        let home = TempDir::new().unwrap();
-        let drafts = home.path().join(".local/state/pent/drafts");
-        fs::create_dir_all(&drafts).unwrap();
-        fs::write(drafts.join(format!("{name}.toml")), toml).unwrap();
-        let status = Command::new(PENT)
-            .args(["trust", name, "--yes"])
-            .env("HOME", home.path())
-            .env_remove("XDG_CONFIG_HOME")
-            .env_remove("XDG_STATE_HOME")
-            .env_remove("XDG_DATA_HOME")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .unwrap_or_else(|e| panic!("pent trust {name}: {e}"));
-        assert!(status.success(), "pent trust {name} --yes failed");
+    /// Make a temp `$HOME` with the rule file of `key`. The rule file has
+    /// the allow rules `targets` (see [`common::rule_file_text`]). With no
+    /// target, the home has no rule file.
+    #[allow(clippy::panic)] // infrastructure helper: setup failures are hard test setup errors
+    fn rules_home(key: &str, targets: &[&str]) -> TempDir {
+        let home = TempDir::new().unwrap_or_else(|e| panic!("cannot make the home: {e}"));
+        if !targets.is_empty() {
+            let text = common::rule_file_text(targets)
+                .unwrap_or_else(|e| panic!("the targets are not valid: {e}"));
+            common::write_rule_file(&home.path().join(".local/state"), key, &text)
+                .unwrap_or_else(|e| panic!("cannot write the rule file of {key}: {e}"));
+        }
         home
     }
 
@@ -391,11 +382,11 @@ mod no_hang {
     #[test]
     fn system_true_exits_quickly() -> TestResult {
         let dir = TempDir::new()?;
-        let home = profile_home(TEST_PROFILE, "");
+        let home = rules_home(TEST_PROFILE, &[]);
         let (ok, stderr) = pent_timeout(
             dir.path(),
             home.path(),
-            &["run", "--profile", TEST_PROFILE, "--", "true"],
+            &["run", "--key", TEST_PROFILE, "--", "true"],
             2,
         );
         assert!(ok, "pent run -- true timed out (2s)\nstderr:\n{stderr}");
@@ -406,13 +397,13 @@ mod no_hang {
     #[test]
     fn system_true_blocked_network_exits_quickly() -> TestResult {
         let dir = TempDir::new()?;
-        let home = profile_home(TEST_PROFILE, "");
+        let home = rules_home(TEST_PROFILE, &[]);
         let (ok, stderr) = pent_timeout(
             dir.path(),
             home.path(),
             &[
                 "run",
-                "--profile",
+                "--key",
                 TEST_PROFILE,
                 "--network",
                 "blocked",
@@ -436,11 +427,11 @@ mod no_hang {
             return Ok(());
         }
         let dir = TempDir::new()?;
-        let home = profile_home(TEST_PROFILE, "");
+        let home = rules_home(TEST_PROFILE, &[]);
         let (ok, stderr) = pent_timeout(
             dir.path(),
             home.path(),
-            &["run", "--profile", TEST_PROFILE, "--", "curl", "--version"],
+            &["run", "--key", TEST_PROFILE, "--", "curl", "--version"],
             2,
         );
         assert!(
@@ -469,11 +460,11 @@ mod no_hang {
         };
         let bin_s = bin.to_str().unwrap();
         let dir = TempDir::new().unwrap();
-        let home = profile_home(TEST_PROFILE, "");
+        let home = rules_home(TEST_PROFILE, &[]);
         let (ok, stderr) = pent_timeout(
             dir.path(),
             home.path(),
-            &["run", "--profile", TEST_PROFILE, "--", bin_s, "--version"],
+            &["run", "--key", TEST_PROFILE, "--", bin_s, "--version"],
             5,
         );
         assert!(
@@ -487,9 +478,9 @@ mod no_hang {
         assert_version_exits_quickly("claude");
     }
 
-    // ── with a profile: the profile has domains → ProxyOnly ─────────────────
+    // ── with rules: a domain rule → ProxyOnly ─────────────────────────────────
     //
-    // The profile lives only in the isolated `home`.
+    // The rule file lives only in the isolated `home`.
 
     #[allow(clippy::unwrap_used)] // infrastructure helper: to_str()/TempDir failures are hard errors
     fn assert_proxy_mode_exits_quickly(name: &str) {
@@ -500,15 +491,12 @@ mod no_hang {
         let bin_s = bin.to_str().unwrap();
 
         let dir = TempDir::new().unwrap();
-        let home = profile_home(
-            TEST_PROFILE,
-            "[network]\ndomains = [\"api.anthropic.com\"]\n",
-        );
+        let home = rules_home(TEST_PROFILE, &["domain api.anthropic.com"]);
 
         let (ok, stderr) = pent_timeout(
             dir.path(),
             home.path(),
-            &["run", "--profile", TEST_PROFILE, "--", bin_s, "--version"],
+            &["run", "--key", TEST_PROFILE, "--", bin_s, "--version"],
             5, // the proxy setup takes much less than 1s; allow 5s total
         );
         assert!(
@@ -529,12 +517,12 @@ mod no_hang {
     // Isolation model:
     //   HOME            = real test-process HOME  (so ~/.npm-global, ~/.local/share/claude
     //                     etc. are reachable by the sandboxed binary)
-    //   XDG_CONFIG_HOME = fresh TempDir with the {agent} profile installed
+    //   XDG_STATE_HOME  = unset: the rule file of {agent} is in the temp HOME
     //   cwd             = fresh empty TempDir
     //
-    // Each test installs and trusts the {agent} profile (common::agent_profile)
-    // in a temp HOME before it spawns pent, so the agent's paths and network
-    // rules are active.
+    // Each test writes the rules of {agent} (the paths and the domains of
+    // common::agent_profile) in a temp HOME before it spawns pent, so the
+    // agent's paths and network rules are active.
     //
     // Test flow:
     //   1. Wait up to 8s for PTY output that looks like a started TUI:
@@ -579,7 +567,7 @@ mod no_hang {
         let child = common::use_runtime(&mut Command::new(PENT), &runtime)
             .args(args)
             .current_dir(dir)
-            // Use the agent_home so the {agent} profile is visible.
+            // Use the agent_home so the rule file of {agent} is visible.
             .env("HOME", agent_home)
             .env_remove("XDG_CONFIG_HOME")
             .env_remove("XDG_STATE_HOME")
@@ -594,10 +582,87 @@ mod no_hang {
         (master, child, runtime)
     }
 
-    /// Install the trusted `{agent}` profile into a fresh temp HOME.
-    /// Returns the TempDir (keep alive) — its path is used as HOME.
-    fn setup_agent_config(agent: &str) -> TempDir {
-        profile_home(agent, &common::agent_profile(agent))
+    /// The paths of `common::agent_profile` that name one file. Each other
+    /// path is a directory.
+    const AGENT_FILES: &[&str] = &[
+        "~/.bashrc",
+        "~/.bash_profile",
+        "~/.profile",
+        "~/.npmrc",
+        "~/.ssh/known_hosts",
+        "~/.ssh/config",
+        "~/.ssh/config.d",
+        "~/.gitconfig",
+        "~/.claude.json",
+        "~/.claude.lock",
+    ];
+
+    /// The directories of `common::agent_profile` that hold a location of
+    /// the guard list. A subtree rule cannot give them (pent holds such a
+    /// rule back), thus they go to the run as flags.
+    const AGENT_FLAG_DIRS: &[&str] = &["~/.local/bin", "~/.config/git"];
+
+    /// The string list `key` in the table `table` of `toml_text`.
+    fn string_list(toml_text: &str, table: &str, key: &str) -> Result<Vec<String>, String> {
+        let doc: toml::Value = toml::from_str(toml_text).map_err(|e| e.to_string())?;
+        let Some(list) = doc.get(table).and_then(|t| t.get(key)) else {
+            return Ok(Vec::new());
+        };
+        list.as_array()
+            .ok_or_else(|| format!("{table}.{key} is not a list"))?
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| format!("{table}.{key} has a non-string value"))
+            })
+            .collect()
+    }
+
+    /// Write the rules of `agent` into a fresh temp HOME: the paths and the
+    /// domains of `common::agent_profile`, with `~` replaced by the home. A
+    /// file gets an exact rule, a directory a subtree rule, and a directory
+    /// of `AGENT_FLAG_DIRS` a flag.
+    ///
+    /// Returns the TempDir (keep alive) — its path is used as HOME — and
+    /// the flags for the run.
+    #[allow(clippy::panic)] // infrastructure helper: setup failures are hard test setup errors
+    fn setup_agent_config(agent: &str) -> (TempDir, Vec<String>) {
+        let home = TempDir::new().unwrap_or_else(|e| panic!("cannot make the home: {e}"));
+        let profile = common::agent_profile(agent);
+        let list = |table: &str, key: &str| {
+            string_list(&profile, table, key).unwrap_or_else(|e| panic!("agent_profile: {e}"))
+        };
+        let mut targets = Vec::new();
+        let mut flags = Vec::new();
+        for (key, kind, flag) in [
+            ("read", "read", "--read"),
+            ("read_write", "write", "--write"),
+            ("execute", "exec", "--execute"),
+        ] {
+            for value in list("filesystem", key) {
+                let rel = value
+                    .strip_prefix("~/")
+                    .unwrap_or_else(|| panic!("the path {value:?} is not in the home"));
+                let path = home.path().join(rel).display().to_string();
+                if AGENT_FILES.contains(&value.as_str()) {
+                    targets.push(format!("{kind} {path}"));
+                } else if AGENT_FLAG_DIRS.contains(&value.as_str()) {
+                    flags.extend([flag.to_string(), path]);
+                } else {
+                    targets.push(format!("{kind} {path}/**"));
+                }
+            }
+        }
+        for domain in list("network", "domains") {
+            targets.push(format!("domain {domain}"));
+        }
+        let targets: Vec<&str> = targets.iter().map(String::as_str).collect();
+        let text = common::rule_file_text(&targets)
+            .unwrap_or_else(|e| panic!("the targets are not valid: {e}"));
+        common::write_rule_file(&home.path().join(".local/state"), agent, &text)
+            .unwrap_or_else(|e| panic!("cannot write the rule file of {agent}: {e}"));
+        (home, flags)
     }
 
     /// Poll `master_fd` (non-blocking) for up to `timeout`.  Returns what arrived.
@@ -704,7 +769,7 @@ mod no_hang {
         text.lines().filter(|l| !l.trim().is_empty()).count() >= 2
     }
 
-    /// Core PTY TUI-start test: install the `{agent}` profile into a temp HOME,
+    /// Core PTY TUI-start test: write the rules of `{agent}` into a temp HOME,
     /// spawn `pent run --network unrestricted -- <binary>` with a PTY, and
     /// confirm the TUI renders (≥ 2 non-empty lines after ANSI strip, no crash
     /// markers).  Then kill pent.  This test is purely about sandbox access —
@@ -718,22 +783,13 @@ mod no_hang {
         let bin_s = bin.to_str().unwrap();
 
         let dir = TempDir::new().unwrap();
-        // Install the agent profile; keep TempDir alive so the config persists.
-        let agent_home = setup_agent_config(agent);
+        // Write the rules; keep TempDir alive so the rule file persists.
+        let (agent_home, flags) = setup_agent_config(agent);
+        let mut args = vec!["run", "--key", agent, "--network", "unrestricted"];
+        args.extend(flags.iter().map(String::as_str));
+        args.extend(["--", bin_s]);
 
-        let (master, mut child, _runtime) = spawn_with_pty(
-            dir.path(),
-            agent_home.path(),
-            &[
-                "run",
-                "--profile",
-                agent,
-                "--network",
-                "unrestricted",
-                "--",
-                bin_s,
-            ],
-        );
+        let (master, mut child, _runtime) = spawn_with_pty(dir.path(), agent_home.path(), &args);
 
         // Step 1: wait for the TUI to render.
         //

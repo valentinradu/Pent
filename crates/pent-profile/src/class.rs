@@ -174,16 +174,7 @@ impl Classifier {
         if self.is_pent(path) {
             return Class::Pent;
         }
-        // The guard accesses that can make this access sensitive. A list
-        // shows the names in a credential directory (the entries of a
-        // password store name the sites). A write can create or replace a
-        // credential. An exec reads the file.
-        let checks: &[GuardAccess] = match kind {
-            FileKind::List | FileKind::Read => &[GuardAccess::Read],
-            FileKind::Write => &[GuardAccess::Read, GuardAccess::Write],
-            FileKind::Exec => &[GuardAccess::Read, GuardAccess::ExecName],
-        };
-        checks
+        guard_checks(kind)
             .iter()
             .find_map(|access| self.guard.iter().find(|r| r.matches(path, *access)))
             .map_or(Class::Normal, |rule| match rule.class {
@@ -282,11 +273,45 @@ impl Classifier {
     fn subtree_allowed(&self, dir: &Path) -> bool {
         dir.components().count() > 2
             && !self.home.starts_with(dir)
-            && !self
-                .guard
-                .iter()
-                .filter_map(|rule| guard_location(&rule.target))
-                .any(|location| location.starts_with(dir))
+            && !self.subtree_holds_guard(dir)
+    }
+
+    /// Return true if a subtree on `dir` covers a location of the guard
+    /// list: a credential, a file that runs code later, or a directory of
+    /// pent. A rule on such a subtree would give a sensitive path through a
+    /// wider rule.
+    #[must_use]
+    pub fn subtree_holds_guard(&self, dir: &Path) -> bool {
+        self.guard
+            .iter()
+            .filter_map(|rule| guard_location(&rule.target))
+            .any(|location| location.starts_with(dir))
+    }
+
+    /// Return true if a subtree rule of the kind `kind` on `dir` covers a
+    /// location of the guard list that makes an access of this kind
+    /// sensitive, as [`Classifier::classify`] decides one access. Thus a
+    /// read rule may cover a directory where the guard stops only a write.
+    #[must_use]
+    pub fn subtree_holds_guard_for(&self, dir: &Path, kind: FileKind) -> bool {
+        let checks = guard_checks(kind);
+        self.guard
+            .iter()
+            .filter(|rule| checks.contains(&rule.access))
+            .filter_map(|rule| guard_location(&rule.target))
+            .any(|location| location.starts_with(dir))
+    }
+}
+
+/// The guard accesses that can make a file access of the kind `kind`
+/// sensitive. A list shows the names in a credential directory (the entries
+/// of a password store name the sites). A write can create or replace a
+/// credential. An exec reads the file.
+const fn guard_checks(kind: FileKind) -> &'static [GuardAccess] {
+    match kind {
+        FileKind::List | FileKind::Read => &[GuardAccess::Read],
+        FileKind::Write => &[GuardAccess::Read, GuardAccess::Write],
+        FileKind::Exec => &[GuardAccess::Read, GuardAccess::ExecName],
     }
 }
 

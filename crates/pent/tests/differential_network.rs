@@ -1,13 +1,13 @@
 //! D. The three layers of the network.
 //!
 //! A name has three verdicts: the answer of the DNS server, the decision
-//! of the proxy, and the rule in the profile. The three must agree.
+//! of the proxy, and the domain rules of the key. The three must agree.
 //!
 //! The table [`differential::NET_CASES`] holds one row for each shape: a
-//! name that the profile allows, a name that it does not allow, a name
-//! below a wildcard, the domain of the wildcard itself, an address written
-//! as a number, and a name that the profile allows but that resolves to a
-//! loopback or to a private address.
+//! name that a rule allows, a name that no rule allows, a name below a
+//! wildcard, the domain of the wildcard itself, an address written as a
+//! number, and a name that a rule allows but that resolves to a loopback or
+//! to a private address.
 //!
 //! Every row that asserts a refusal has a row that asserts a connection in
 //! the same table, and each probe prints `PENT_CHILD_RAN` first.
@@ -44,10 +44,15 @@ printf 'CURL=%s\n' "$?"
 printf 'CODE=%s\n' "$code"
 "#;
 
-    /// The profile text of a row.
-    fn profile(case: &NetCase) -> String {
-        let list: Vec<String> = case.domains.iter().map(|d| format!("{d:?}")).collect();
-        format!("[network]\ndomains = [{}]\n", list.join(", "))
+    /// The key of each run of this file.
+    const KEY: &str = "p";
+
+    /// Write one domain rule for each domain of `domains` in the rule file
+    /// of the key `p`.
+    fn install_domain_rules(env: &TestEnv, domains: &[&str]) -> TestResult {
+        let targets: Vec<String> = domains.iter().map(|d| format!("domain {d}")).collect();
+        let targets: Vec<&str> = targets.iter().map(String::as_str).collect();
+        env.install_rules(KEY, &targets)
     }
 
     /// The HTTP code that the proxy answered, from either shape of the
@@ -76,11 +81,11 @@ printf 'CODE=%s\n' "$code"
     /// The verdict of the two layers for one row.
     fn layers(case: &NetCase) -> Result<(Verdict, Option<Verdict>, String), BoxError> {
         let env = TestEnv::new()?;
-        env.install_profile("p", &profile(case))?;
+        install_domain_rules(&env, case.domains)?;
         let out = env.pent(&[
             "run",
-            "--profile",
-            "p",
+            "--key",
+            KEY,
             "--trace",
             "--",
             "sh",
@@ -126,8 +131,8 @@ printf 'CODE=%s\n' "$code"
         have_tools(test, &["sh", "curl", "getent"]) && sandbox_ready(test) && internet(test)
     }
 
-    /// The DNS answer, the decision of the proxy and the rule of the
-    /// profile agree for each row of the table.
+    /// The DNS answer, the decision of the proxy and the domain rules agree
+    /// for each row of the table.
     #[test]
     fn the_three_layers_of_the_network_agree() -> TestResult {
         let test = "net_three_layers";
@@ -158,7 +163,7 @@ printf 'CODE=%s\n' "$code"
             };
             if dns != case.dns {
                 wrong.push(format!(
-                    "  {}: the profile says the DNS layer must {}, it does {}\n{text}",
+                    "  {}: the rules say the DNS layer must {}, it does {}\n{text}",
                     case.id,
                     case.dns.word(),
                     dns.word()
@@ -166,7 +171,7 @@ printf 'CODE=%s\n' "$code"
             }
             if connect != case.connect {
                 wrong.push(format!(
-                    "  {}: the profile says the proxy must {}, it does {}\n{text}",
+                    "  {}: the rules say the proxy must {}, it does {}\n{text}",
                     case.id,
                     case.connect.word(),
                     connect.word()
@@ -191,7 +196,7 @@ printf 'CODE=%s\n' "$code"
     /// refuses.
     ///
     /// A domain that the allowlist does not hold reaches the trace log and
-    /// the list of the denied accesses. Before the fix a destination that
+    /// the count of the denied accesses. Before the fix a destination that
     /// is not public reached neither, because a client sends an `http://`
     /// URL as a plain proxy request and the proxy answered 400 before any
     /// check of the destination.
@@ -202,14 +207,11 @@ printf 'CODE=%s\n' "$code"
             return Ok(());
         }
         let env = TestEnv::new()?;
-        env.install_profile(
-            "p",
-            "[network]\ndomains = [\"www.iana.org\", \"10-0-0-1.sslip.io\"]\n",
-        )?;
+        install_domain_rules(&env, &["www.iana.org", "10-0-0-1.sslip.io"])?;
         let out = env.pent(&[
             "run",
-            "--profile",
-            "p",
+            "--key",
+            KEY,
             "--trace",
             "--",
             "sh",
@@ -221,7 +223,7 @@ printf 'CODE=%s\n' "$code"
         ])?;
         let text = format!("{}{}", stdout(&out), stderr(&out));
         assert!(text.contains(RAN), "the child did not run:\n{text}");
-        let log = std::fs::read_to_string(env.denied_log("p")).unwrap_or_default();
+        let log = std::fs::read_to_string(env.trace_log(KEY)).unwrap_or_default();
         // The positive control: a domain outside the allowlist is in the
         // log, so an empty log means "not recorded", not "no recorder".
         assert!(
@@ -233,8 +235,13 @@ printf 'CODE=%s\n' "$code"
             log.contains("10-0-0-1.sslip.io"),
             "the proxy refused the connection to an allowed name that \
              resolves to a private address, and recorded nothing. The user \
-             sees no denial and `pent trust p --review` shows nothing.\n\
+             sees no denial and `pent denials` shows nothing.\n\
              {text}\nlog: {log}"
+        );
+        // The refusals are denials of the run.
+        assert!(
+            text.contains("accesses denied; see them: pent denials"),
+            "pent must count each refusal of the proxy as a denial:\n{text}"
         );
         Ok(())
     }

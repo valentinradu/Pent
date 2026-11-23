@@ -453,6 +453,11 @@ pub enum DecidedBy {
     },
     /// The access was in the pent class: the program got `ENOENT`.
     Hidden,
+    /// The fixed rules decided with no question: the base, the guard, or
+    /// the refusal of a destination that is not public. A refusal of an
+    /// access that no question covers yet is here too. This is layer 1 of
+    /// the chain of deciders.
+    Base(Decision),
 }
 
 impl DecidedBy {
@@ -460,9 +465,10 @@ impl DecidedBy {
     #[must_use]
     pub const fn is_refusal(self) -> bool {
         match self {
-            Self::Flag(decision) | Self::Rule(decision) | Self::Answer { decision, .. } => {
-                matches!(decision, Decision::Deny)
-            }
+            Self::Flag(decision)
+            | Self::Rule(decision)
+            | Self::Base(decision)
+            | Self::Answer { decision, .. } => matches!(decision, Decision::Deny),
             Self::Deadline { .. } | Self::Hidden => true,
         }
     }
@@ -843,6 +849,7 @@ mod tests {
             ),
             event(8, domain("x.org"), DecidedBy::Rule(Decision::Allow)),
             event(9, domain("y.org"), DecidedBy::Flag(Decision::Allow)),
+            event(10, domain("z.org"), DecidedBy::Base(Decision::Deny)),
             Message::Verdict(Verdict {
                 id: QuestionId(7),
                 decision: Decision::Allow,

@@ -99,15 +99,11 @@ impl Env {
             .join(format!("{name}.toml"))
     }
 
-    /// Write `toml` as the draft of `name` and trust it.
-    fn install_profile(&self, name: &str, toml: &str) -> TestResult {
-        let path = self.draft_path(name);
-        if let Some(dir) = path.parent() {
-            fs::create_dir_all(dir)?;
-        }
-        fs::write(path, toml)?;
-        let out = self.pent(&["trust", name, "--yes"])?;
-        assert!(out.status.success(), "trust failed: {}", stderr(&out));
+    /// Write the allow rules `targets` as the rule file of `key`. See
+    /// `common::rule_file_text` for the form of a target.
+    fn install_rules(&self, key: &str, targets: &[&str]) -> TestResult {
+        let text = common::rule_file_text(targets).map_err(|e| e.to_string())?;
+        common::write_rule_file(&self.state, key, &text)?;
         Ok(())
     }
 }
@@ -163,7 +159,6 @@ fn a_profile_can_name_a_unix_socket() -> TestResult {
 #[test]
 fn run_accepts_the_unix_socket_flag() -> TestResult {
     let env = Env::new()?;
-    env.install_profile("true", "[filesystem]\nread = []\n")?;
     let socket = env.home.join("agent.sock");
     let socket = socket.to_string_lossy().into_owned();
     let out = env.pent(&[
@@ -188,17 +183,17 @@ fn run_accepts_the_unix_socket_flag() -> TestResult {
     Ok(())
 }
 
-/// A socket path of the profile reaches the run too.
+/// A unix-socket rule of the key reaches the run too, and the run applies
+/// it.
 #[test]
-fn run_accepts_a_socket_rule_of_the_profile() -> TestResult {
+fn run_accepts_a_socket_rule_of_the_key() -> TestResult {
     let env = Env::new()?;
-    env.install_profile(
-        "true",
-        "[filesystem]\nunix_sockets = [\"~/.gnupg/S.gpg-agent\"]\n",
-    )?;
+    let socket = env.home.join(".gnupg/S.gpg-agent");
+    env.install_rules("true", &[&format!("unix-socket {}", socket.display())])?;
     let out = env.pent(&["run", "--", "true"])?;
     let err = stderr(&out);
-    assert!(!err.contains("invalid profile"), "{err}");
+    assert!(!err.contains("invalid"), "{err}");
+    assert!(!err.contains("does not apply the rule"), "{err}");
     assert!(!err.contains("panicked"), "{err}");
     if !out.status.success() {
         assert!(

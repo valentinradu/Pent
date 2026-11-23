@@ -41,6 +41,70 @@ pub fn use_runtime<'a>(cmd: &'a mut Command, dir: &TempDir) -> &'a mut Command {
         .env("PENTD_LINGER_MS", "200")
 }
 
+/// The text of a rule file with one allow rule for each target of
+/// `targets`. A target has the text form of `pent rules show`:
+/// `read /a/**` (a subtree), `write /a/b` (an exact path), `exec /a/**`,
+/// `list /a`, `domain *.example.com`, `unix-socket /run/x.sock` or
+/// `localhost 5432`. A target that starts with `deny ` gives a deny rule.
+///
+/// # Errors
+/// Returns an error for a target that has no kind or no value.
+pub fn rule_file_text(
+    targets: &[&str],
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    use std::fmt::Write as _;
+    let mut text = String::from("version = 1\n");
+    for target in targets {
+        let (decision, target) = match target.strip_prefix("deny ") {
+            Some(rest) => ("deny", rest),
+            None => ("allow", *target),
+        };
+        let (kind, value) = target
+            .split_once(' ')
+            .ok_or_else(|| format!("the target {target:?} has no value"))?;
+        text.push_str("\n[[rule]]\n");
+        writeln!(text, "kind = \"{kind}\"")?;
+        match kind {
+            "list" | "read" | "write" | "exec" => match value.strip_suffix("/**") {
+                Some(base) => {
+                    let base = if base.is_empty() { "/" } else { base };
+                    writeln!(text, "width = \"subtree\"\npath = {base:?}")?;
+                }
+                None => writeln!(text, "width = \"exact\"\npath = {value:?}")?,
+            },
+            "domain" => writeln!(text, "domain = {value:?}")?,
+            "unix-socket" => writeln!(text, "path = {value:?}")?,
+            "localhost" => writeln!(text, "port = {value}")?,
+            other => return Err(format!("unknown kind {other:?}").into()),
+        }
+        writeln!(
+            text,
+            "decision = \"{decision}\"\nsource = \"human\"\ncreated = 2026-11-22T12:00:00Z"
+        )?;
+    }
+    Ok(text)
+}
+
+/// Write `text` as the rule file of `key` in the state directory `state`
+/// (the value of `XDG_STATE_HOME`), with the mode `0600`.
+///
+/// # Errors
+/// Returns an error if a directory or the file cannot be written.
+pub fn write_rule_file(state: &std::path::Path, key: &str, text: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    let dir = state.join("pent/rules");
+    std::fs::create_dir_all(&dir)?;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(dir.join(format!("{key}.toml")))?;
+    file.write_all(text.as_bytes())
+}
+
 /// Temporary XDG directories for one test.
 ///
 /// Pent finds its config (profiles, trust store, `pent.toml`) and its state
@@ -100,6 +164,21 @@ impl Xdg {
             std::fs::create_dir_all(dir)?;
         }
         std::fs::write(path, toml)
+    }
+
+    /// Write the allow rules `targets` as the rule file of `key`. See
+    /// [`rule_file_text`] for the form of a target.
+    ///
+    /// # Errors
+    /// Returns an error if a target is not valid or the file cannot be
+    /// written.
+    pub fn install_rules(
+        &self,
+        key: &str,
+        targets: &[&str],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        write_rule_file(&self.state, key, &rule_file_text(targets)?)?;
+        Ok(())
     }
 
     /// Write `toml` as the draft of `name` and trust it with

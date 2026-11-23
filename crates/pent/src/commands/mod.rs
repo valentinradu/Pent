@@ -1,6 +1,7 @@
 pub mod answer;
 pub mod check;
 pub mod config;
+pub mod decide;
 pub mod review_flow;
 pub mod rules;
 pub mod run;

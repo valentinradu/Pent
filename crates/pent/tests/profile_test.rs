@@ -1,6 +1,6 @@
-//! Integration tests for the recorded profiles: `pent run` without a trusted
-//! profile, `pent trust`, `pent untrust`, `pent profile`, `pent watch` and
-//! the global settings.
+//! Integration tests for the key and the rule file of `pent run`, and for
+//! the recorded profiles: `pent trust`, `pent untrust`, `pent profile`,
+//! `pent watch` and the global settings.
 //!
 //! Each test sets `XDG_CONFIG_HOME` and `XDG_STATE_HOME` to temporary
 //! directories, thus no test reads or changes the real files of the user.
@@ -69,41 +69,50 @@ const DRAFT: &str =
                      \n[network]\ndomains = []\n";
 
 // ============================================================================
-// A. pent run without a trusted profile
+// A. pent run: the key and the rule file
 // ============================================================================
 
+/// Write `text` as the rule file of `key` in the state directory of `xdg`.
+fn write_rules(xdg: &Xdg, key: &str, text: &str) -> std::io::Result<std::path::PathBuf> {
+    common::write_rule_file(&xdg.state, key, text)?;
+    Ok(xdg.state.join("pent/rules").join(format!("{key}.toml")))
+}
+
+/// A rule file that is not valid stops the run before the program starts.
+/// The message names the file.
 #[test]
-fn test_run_without_profile_names_pent_watch() -> TestResult {
+fn test_run_with_a_bad_rule_file_names_the_file() -> TestResult {
     let xdg = Xdg::new()?;
-    let out = pent(&xdg, &["run", "--", "claude", "--resume"])?;
+    let path = write_rules(
+        &xdg,
+        "claude",
+        "version = 1\n[[rule]]\nkind = \"nothing\"\n",
+    )?;
+    let out = pent(&xdg, &["run", "--", "claude"])?;
     expect_failure(&out);
     let err = stderr(&out);
-    assert!(
-        err.contains(
-            "✗ no trusted profile for \"claude\"\n  record one: pent watch -- claude --resume"
-        ),
-        "{err}"
-    );
+    assert!(err.contains(&path.display().to_string()), "{err}");
     Ok(())
 }
 
+/// `--key` sets the key: the run reads the rule file of that key, and it
+/// does not warn about a generic command.
 #[test]
-fn test_run_with_profile_flag_names_it_in_the_hint() -> TestResult {
+fn test_run_with_key_flag_has_no_generic_warning() -> TestResult {
     let xdg = Xdg::new()?;
+    // A bad rule file stops the run before the sandbox starts. The message
+    // shows which file the run reads.
+    let path = write_rules(&xdg, "train", "not toml [\n")?;
     let out = pent(
         &xdg,
-        &["run", "--profile", "train", "--", "python3", "train.py"],
+        &["run", "--key", "train", "--", "python3", "train.py"],
     )?;
     expect_failure(&out);
     let err = stderr(&out);
-    assert!(err.contains("no trusted profile for \"train\""), "{err}");
-    assert!(
-        err.contains("record one: pent watch --profile train -- python3 train.py"),
-        "{err}"
-    );
+    assert!(err.contains(&path.display().to_string()), "{err}");
     assert!(
         !err.contains("generic"),
-        "--profile suppresses the warning: {err}"
+        "--key suppresses the warning: {err}"
     );
     Ok(())
 }
@@ -111,70 +120,36 @@ fn test_run_with_profile_flag_names_it_in_the_hint() -> TestResult {
 #[test]
 fn test_run_generic_command_warns() -> TestResult {
     let xdg = Xdg::new()?;
+    // The warning comes before the sandbox starts, thus the test does not
+    // check the status of the run: it depends on the sandbox of the host.
     let out = pent(&xdg, &["run", "--", "bash", "-c", "true"])?;
-    expect_failure(&out);
     let err = stderr(&out);
     assert!(
-        err.contains("\"bash\" comes from a generic command"),
+        err.contains("the key \"bash\" comes from a generic command"),
         "{err}"
     );
-    assert!(err.contains("--profile NAME"), "{err}");
-    Ok(())
-}
-
-#[test]
-fn test_run_invalid_profile_name_fails() -> TestResult {
-    let xdg = Xdg::new()?;
-    let out = pent(&xdg, &["run", "--profile", "../x", "--", "true"])?;
-    expect_failure(&out);
-    assert!(stderr(&out).contains("profile name"), "{}", stderr(&out));
-    Ok(())
-}
-
-#[test]
-fn test_run_with_draft_only_names_pent_trust() -> TestResult {
-    let xdg = Xdg::new()?;
-    xdg.write_draft("claude", DRAFT)?;
-    let out = pent(&xdg, &["run", "--", "claude"])?;
-    expect_failure(&out);
-    let err = stderr(&out);
-    assert!(err.contains("the draft is not trusted"), "{err}");
     assert!(
-        err.contains("review and trust it: pent trust claude"),
+        err.contains("Give each program its own key with --key NAME"),
         "{err}"
     );
-    assert!(!err.contains("pent watch"), "{err}");
     Ok(())
 }
 
 #[test]
-fn test_run_after_edit_says_changed() -> TestResult {
+fn test_run_invalid_key_fails() -> TestResult {
     let xdg = Xdg::new()?;
-    xdg.install_profile("claude", DRAFT)?;
-    fs::write(
-        xdg.profile_path("claude"),
-        "[network]\ndomains = [\"evil.example\"]\n",
-    )?;
-    let out = pent(&xdg, &["run", "--", "claude"])?;
+    let out = pent(&xdg, &["run", "--key", "../x", "--", "true"])?;
     expect_failure(&out);
-    let err = stderr(&out);
     assert!(
-        err.contains("the profile \"claude\" changed after you trusted it"),
-        "{err}"
+        stderr(&out).contains("give a key with --key NAME"),
+        "{}",
+        stderr(&out)
     );
-    assert!(err.contains("pent trust claude"), "{err}");
-    Ok(())
-}
-
-#[test]
-fn test_run_after_untrust_says_not_trusted() -> TestResult {
-    let xdg = Xdg::new()?;
-    xdg.install_profile("claude", DRAFT)?;
-    expect_success(&pent(&xdg, &["untrust", "claude"])?);
-    let out = pent(&xdg, &["run", "--", "claude"])?;
+    // A command whose file name is not a valid key needs --key too.
+    let out = pent(&xdg, &["run", "--", "/tmp/a b"])?;
     expect_failure(&out);
     assert!(
-        stderr(&out).contains("the profile \"claude\" is not trusted"),
+        stderr(&out).contains("give a key with --key NAME"),
         "{}",
         stderr(&out)
     );
@@ -354,16 +329,11 @@ fn test_profile_list_show_rm() -> TestResult {
     let out = pent(&xdg, &["profile", "rm", "claude"])?;
     expect_success(&out);
     assert!(!xdg.profile_path("claude").exists());
-    let out = pent(&xdg, &["run", "--", "claude"])?;
-    assert!(
-        stderr(&out).contains("no trusted profile for \"claude\""),
-        "{}",
-        stderr(&out)
-    );
     // The trust entry is gone too: the same content is not trusted.
     fs::write(xdg.profile_path("claude"), DRAFT)?;
-    let out = pent(&xdg, &["run", "--", "claude"])?;
-    assert!(stderr(&out).contains("is not trusted"), "{}", stderr(&out));
+    let out = pent(&xdg, &["profile", "list"])?;
+    expect_success(&out);
+    assert!(stdout(&out).contains("not trusted"), "{}", stdout(&out));
     Ok(())
 }
 
@@ -490,7 +460,6 @@ fn test_config_init_show_and_old_keys() -> TestResult {
     }
 
     // `pent run` reads the global settings too.
-    xdg.install_profile("claude", DRAFT)?;
     let out = pent(&xdg, &["run", "--", "claude"])?;
     expect_failure(&out);
     assert!(
@@ -510,6 +479,7 @@ fn test_removed_commands_fail() -> TestResult {
         &["config", "trust", "--yes"][..],
         &["config", "untrust"][..],
         &["run", "--no-config", "--", "true"][..],
+        &["run", "--profile", "claude", "--", "true"][..],
     ] {
         let out = pent(&xdg, args)?;
         expect_failure(&out);

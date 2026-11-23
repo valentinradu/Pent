@@ -29,6 +29,7 @@ mod linux {
     use std::collections::BTreeSet;
     use std::fs;
     use std::os::unix::process::ExitStatusExt as _;
+    use std::path::Path;
     use std::process::Stdio;
     use std::time::Duration;
 
@@ -82,32 +83,107 @@ mod linux {
             .collect())
     }
 
-    // ── the agent profiles ───────────────────────────────────────────────────
+    // ── the rules of the agents ──────────────────────────────────────────────
 
-    /// The profile of an agent keeps the workspace read-write and denies a
+    /// The paths of `agent_profile` that name one file. Each other path is
+    /// a directory.
+    const AGENT_FILES: &[&str] = &[
+        "~/.bashrc",
+        "~/.bash_profile",
+        "~/.profile",
+        "~/.npmrc",
+        "~/.ssh/known_hosts",
+        "~/.ssh/config",
+        "~/.ssh/config.d",
+        "~/.gitconfig",
+        "~/.claude.json",
+        "~/.claude.lock",
+    ];
+
+    /// The directories of `agent_profile` that hold a location of the
+    /// guard list. A subtree rule cannot give them (pent holds such a rule
+    /// back), thus they go to the run as flags.
+    const AGENT_FLAG_DIRS: &[&str] = &["~/.local/bin", "~/.config/git"];
+
+    /// The access of an agent: the rules for its rule file, and the flags
+    /// for each run.
+    struct AgentAccess {
+        targets: Vec<String>,
+        flags: Vec<String>,
+    }
+
+    /// The access of the agent `agent`: the paths and the domains of
+    /// `agent_profile`, with `~` replaced by `home`. A file gets an exact
+    /// rule, a directory gets a subtree rule, and a directory of
+    /// `AGENT_FLAG_DIRS` gets a flag.
+    fn agent_access(home: &Path, agent: &str) -> Result<AgentAccess, BoxError> {
+        let profile = agent_profile(agent);
+        let mut access = AgentAccess {
+            targets: Vec::new(),
+            flags: Vec::new(),
+        };
+        for (table, list, kind, flag) in [
+            ("filesystem", "read", "read", "--read"),
+            ("filesystem", "read_write", "write", "--write"),
+            ("filesystem", "execute", "exec", "--execute"),
+        ] {
+            for value in rules(&profile, table, list)? {
+                let rel = value
+                    .strip_prefix("~/")
+                    .ok_or_else(|| format!("the path {value:?} is not in the home directory"))?;
+                let path = home.join(rel);
+                let path = path.to_str().ok_or("the path is not UTF-8")?;
+                if AGENT_FILES.contains(&value.as_str()) {
+                    access.targets.push(format!("{kind} {path}"));
+                } else if AGENT_FLAG_DIRS.contains(&value.as_str()) {
+                    access.flags.extend([flag.to_string(), path.to_string()]);
+                } else {
+                    access.targets.push(format!("{kind} {path}/**"));
+                }
+            }
+        }
+        for domain in rules(&profile, "network", "domains")? {
+            access.targets.push(format!("domain {domain}"));
+        }
+        Ok(access)
+    }
+
+    /// Write the rules of the agent `agent` as the rule file of the key
+    /// `agent`, and return the flags for each run.
+    fn install_agent_rules(env: &TestEnv, agent: &str) -> Result<Vec<String>, BoxError> {
+        let access = agent_access(&env.home, agent)?;
+        let targets: Vec<&str> = access.targets.iter().map(String::as_str).collect();
+        env.install_rules(agent, &targets)?;
+        Ok(access.flags)
+    }
+
+    /// Assert that the run applied each rule of its key.
+    #[track_caller]
+    fn assert_all_rules_apply(what: &str, err: &str) {
+        assert!(
+            !err.contains("this run does not apply the rule"),
+            "{what}: a rule does not apply:\n{err}"
+        );
+    }
+
+    /// The rules of an agent keep the workspace read-write and deny a
     /// write outside the workspace.
     fn agent_filesystem(agent: &str) -> TestResult {
         if !ready(agent, &["sh"]) {
             return Ok(());
         }
         let env = TestEnv::new()?;
-        env.install_profile(agent, &agent_profile(agent))?;
+        let flags = install_agent_rules(&env, agent)?;
         let run = |script: &str| {
-            env.pent(&[
-                "run",
-                "--profile",
-                agent,
-                "--network",
-                "unrestricted",
-                "--",
-                "sh",
-                "-c",
-                script,
-            ])
+            let mut args = vec!["run", "--key", agent, "--network", "unrestricted"];
+            args.extend(flags.iter().map(String::as_str));
+            args.extend(["--", "sh", "-c", script]);
+            env.pent(&args)
         };
 
         let out = run("echo ok > sentinel.txt")?;
         assert!(out.status.success(), "{agent}: {}", stderr(&out));
+        assert_all_rules_apply(agent, &stderr(&out));
         assert_eq!(fs::read_to_string(env.ws.join("sentinel.txt"))?, "ok\n");
 
         let out = run("cat sentinel.txt")?;
@@ -139,19 +215,17 @@ mod linux {
         agent_filesystem("gemini")
     }
 
-    /// The profile of an agent allows its API domain and denies other
-    /// domains.
+    /// The rules of an agent allow its API domain and deny other domains.
     fn agent_network(agent: &str, allowed: &str) -> TestResult {
         if !ready(agent, &["curl"]) || !internet(agent) {
             return Ok(());
         }
         let env = TestEnv::new()?;
-        env.install_profile(agent, &agent_profile(agent))?;
+        let flags = install_agent_rules(&env, agent)?;
         let curl = |url: &str| {
-            env.pent(&[
-                "run",
-                "--profile",
-                agent,
+            let mut args = vec!["run", "--key", agent];
+            args.extend(flags.iter().map(String::as_str));
+            args.extend([
                 "--",
                 "curl",
                 "-sS",
@@ -162,12 +236,14 @@ mod linux {
                 "--max-time",
                 "20",
                 url,
-            ])
+            ]);
+            env.pent(&args)
         };
 
         // Any HTTP answer (also 404) proves that the proxy forwarded the
         // connection.
         let out = curl(&format!("https://{allowed}"))?;
+        assert_all_rules_apply(agent, &stderr(&out));
         let code = stdout(&out);
         assert!(
             code.len() == 3 && code != "000",
@@ -196,79 +272,63 @@ mod linux {
         agent_network("gemini", "generativelanguage.googleapis.com")
     }
 
-    // ── pent run without a trusted profile ───────────────────────────────────
+    // ── pent run and its rule file ───────────────────────────────────────────
 
-    /// `pent run` does not start the program without a trusted profile. The
-    /// message tells the next step: record, trust, or trust again.
+    /// Without a rule file, `pent run` runs the program with only the base:
+    /// the workspace is read-write, and the home directory stays hidden.
+    /// An allow rule in the rule file gives its path. A rule file that is
+    /// not valid stops the run before the program starts, and the message
+    /// names the file.
     #[test]
-    fn run_needs_a_trusted_profile() -> TestResult {
-        if !ready("run_needs_a_trusted_profile", &["sh"]) {
+    fn run_without_rules_has_only_the_base() -> TestResult {
+        if !ready("run_without_rules_has_only_the_base", &["sh", "cat"]) {
             return Ok(());
         }
         let env = TestEnv::new()?;
+        let foorc = env.write_home(".foorc", "foo\n")?;
+        let foorc = foorc.to_str().ok_or("the path is not UTF-8")?;
         let marker = env.ws.join("ran");
-        let script = "touch ran";
-        let run = || env.pent(&["run", "--profile", "m", "--", "sh", "-c", script]);
+        let script = format!("touch ran; cat '{foorc}' 2>/dev/null || echo HIDDEN");
+        let run = || env.pent(&["run", "--key", "m", "--", "sh", "-c", &script]);
 
-        let out = run()?;
-        assert!(!out.status.success());
-        let err = stderr(&out);
-        assert!(
-            err.contains("✗ no trusted profile for \"m\"\n  record one: pent watch --profile m -- sh -c 'touch ran'"),
-            "{err}"
-        );
-        assert!(!marker.exists(), "the program must not start");
-
-        env.pent_ok(&["watch", "--yes", "--profile", "m", "--", "sh", "-c", "true"])?;
-        let out = run()?;
-        assert!(!out.status.success());
-        let err = stderr(&out);
-        assert!(err.contains("the draft is not trusted"), "{err}");
-        assert!(err.contains("review and trust it: pent trust m"), "{err}");
-        assert!(!marker.exists(), "the program must not start");
-
-        env.pent_ok(&["trust", "m", "--yes"])?;
         let out = run()?;
         assert!(out.status.success(), "{}", stderr(&out));
-        assert!(marker.exists());
+        assert_eq!(stdout(&out), "HIDDEN\n", "{}", stderr(&out));
+        assert!(marker.exists(), "the workspace is not writable");
         fs::remove_file(&marker)?;
 
-        let profile = env.profile_path("m");
-        let mut text = fs::read_to_string(&profile)?;
-        text.push_str("\n[network]\ndomains = [\"evil.example\"]\n");
-        fs::write(&profile, text)?;
+        env.install_rules("m", &[&format!("read {foorc}")])?;
+        let out = run()?;
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert_eq!(stdout(&out), "foo\n", "{}", stderr(&out));
+        assert_all_rules_apply("m", &stderr(&out));
+        fs::remove_file(&marker)?;
+
+        let rules_path = env.rules_path("m");
+        fs::write(&rules_path, "version = 1\n[[rule]]\nkind = \"nothing\"\n")?;
         let out = run()?;
         assert!(!out.status.success());
         let err = stderr(&out);
-        assert!(
-            err.contains("the profile \"m\" changed after you trusted it"),
-            "{err}"
-        );
-        assert!(err.contains("pent trust m"), "{err}");
+        assert!(err.contains(&rules_path.display().to_string()), "{err}");
         assert!(!marker.exists(), "the program must not start");
         Ok(())
     }
 
-    // ── watch → trust → run ──────────────────────────────────────────────────
+    // ── watch, and the rules of a run ────────────────────────────────────────
 
     /// The watched program reads a file, edits one config file, edits two
     /// files in one directory and makes files in its cache. The draft has
-    /// one rule for each, and the trusted profile allows exactly these
-    /// accesses: other paths in the home directory stay hidden, and writes
-    /// to them never reach the real home directory.
+    /// one rule for each.
     #[test]
-    fn watch_trust_run_gives_exactly_the_recorded_accesses() -> TestResult {
-        if !ready("watch_trust_run", &["sh"]) {
+    fn watch_records_one_rule_for_each_access() -> TestResult {
+        if !ready("watch_records_one_rule_for_each_access", &["sh"]) {
             return Ok(());
         }
         let env = TestEnv::new()?;
         env.write_home(".foorc", "foo\n")?;
         env.write_home(".config/app/settings.toml", "a = 1\n")?;
-        env.write_home(".config/app/other.toml", "other\n")?;
         env.write_home(".local/share/data/x", "x\n")?;
         env.write_home(".local/share/data/y", "y\n")?;
-        env.write_home(".local/share/other/file", "other\n")?;
-        env.write_home(".secret", "secret\n")?;
         fs::create_dir_all(env.home_path(".cache"))?;
 
         let out = env.pent_ok(&[
@@ -301,13 +361,42 @@ mod linux {
         );
         assert!(draft.contains("# cache"), "{draft}");
         assert!(draft.contains("# config file"), "{draft}");
+        Ok(())
+    }
 
-        env.pent_ok(&["trust", "t", "--yes"])?;
-        assert!(env.profile_path("t").exists());
+    /// The rules of a key allow exactly their accesses: other paths in the
+    /// home directory stay hidden, and writes to them never reach the real
+    /// home directory.
+    #[test]
+    fn run_rules_give_exactly_their_accesses() -> TestResult {
+        if !ready("run_rules_give_exactly_their_accesses", &["sh"]) {
+            return Ok(());
+        }
+        let env = TestEnv::new()?;
+        let foorc = env.write_home(".foorc", "foo\n")?;
+        let settings = env.write_home(".config/app/settings.toml", "a = 1\n")?;
+        env.write_home(".config/app/other.toml", "other\n")?;
+        env.write_home(".local/share/data/x", "x\n")?;
+        env.write_home(".local/share/data/y", "y\n")?;
+        env.write_home(".local/share/other/file", "other\n")?;
+        env.write_home(".secret", "secret\n")?;
+        env.write_home(".cache/tool/sub/c1", "c\n")?;
+        let utf8 = |p: &Path| -> Result<String, BoxError> {
+            Ok(p.to_str().ok_or("the path is not UTF-8")?.to_string())
+        };
+        env.install_rules(
+            "t",
+            &[
+                &format!("read {}", utf8(&foorc)?),
+                &format!("write {}", utf8(&settings)?),
+                &format!("write {}/**", utf8(&env.home_path(".local/share/data"))?),
+                &format!("write {}/**", utf8(&env.home_path(".cache/tool"))?),
+            ],
+        )?;
 
         let out = env.pent(&[
             "run",
-            "--profile",
+            "--key",
             "t",
             "--",
             "sh",
@@ -344,12 +433,10 @@ mod linux {
             "stderr: {}",
             stderr(&out)
         );
+        assert_all_rules_apply("t", &stderr(&out));
 
         // The allowed writes reach the real home directory.
-        assert_eq!(
-            fs::read_to_string(env.home_path(".config/app/settings.toml"))?,
-            "a = 1\nb = 2\nc = 3\n"
-        );
+        assert_eq!(fs::read_to_string(&settings)?, "a = 1\nc = 3\n");
         assert_eq!(
             fs::read_to_string(env.home_path(".local/share/data/x"))?,
             "x3\n"
@@ -358,7 +445,7 @@ mod linux {
         assert!(env.home_path(".cache/tool/c2").exists());
         // The other paths do not change. A write to them can work in the
         // overlay of the home directory, but pent discards it.
-        assert_eq!(fs::read_to_string(env.home_path(".foorc"))?, "foo\n");
+        assert_eq!(fs::read_to_string(&foorc)?, "foo\n");
         assert_eq!(
             fs::read_to_string(env.home_path(".config/app/other.toml"))?,
             "other\n"
@@ -539,10 +626,6 @@ mod linux {
             "{profile}"
         );
         assert!(!profile.contains("bashrc"), "{profile}");
-
-        // The trusted profile works at once.
-        let out = env.pent(&["run", "--profile", "r", "--", "cat", "/dev/null"])?;
-        assert!(out.status.success(), "{}", stderr(&out));
         Ok(())
     }
 
@@ -602,27 +685,24 @@ mod linux {
 
     // ── network ──────────────────────────────────────────────────────────────
 
-    /// Watch records the domain. The trusted profile allows it and denies
-    /// other domains, also at the DNS level. A direct connection past the
-    /// proxy fails. `pent trust --review` adds a denied domain.
+    /// The curl command that fetches `url`, with no output.
+    fn curl_args(extra: &[&str]) -> Vec<String> {
+        ["curl", "-sS", "-o", "/dev/null", "--max-time", "20"]
+            .iter()
+            .chain(extra)
+            .map(|s| (*s).to_string())
+            .collect()
+    }
+
+    /// Watch records the domain in the draft.
     #[test]
-    fn network_watch_trust_run_review() -> TestResult {
-        if !ready("network_flow", &["curl", "sh"]) || !internet("network_flow") {
+    fn network_watch_records_the_domain() -> TestResult {
+        if !ready("network_watch", &["curl"]) || !internet("network_watch") {
             return Ok(());
         }
         let env = TestEnv::new()?;
-        let curl = ["curl", "-sS", "-o", "/dev/null", "--max-time", "20"];
-        let with = |extra: &[&str]| -> Vec<String> {
-            curl.iter().chain(extra).map(|s| (*s).to_string()).collect()
-        };
-        let run = |args: &[String]| {
-            let mut all = vec!["run", "--profile", "net", "--"];
-            all.extend(args.iter().map(String::as_str));
-            env.pent(&all)
-        };
-
         let mut watch = vec!["watch", "--yes", "--profile", "net", "--"];
-        let args = with(&["https://example.com"]);
+        let args = curl_args(&["https://example.com"]);
         watch.extend(args.iter().map(String::as_str));
         env.pent_ok(&watch)?;
         let draft = fs::read_to_string(env.draft_path("net"))?;
@@ -631,27 +711,43 @@ mod linux {
             set(&["example.com"]),
             "{draft}"
         );
-        env.pent_ok(&["trust", "net", "--yes"])?;
+        Ok(())
+    }
 
-        let out = run(&with(&["https://example.com"]))?;
+    /// A domain rule allows its domain and the run denies other domains,
+    /// also at the DNS level. A direct connection past the proxy fails.
+    #[test]
+    fn network_rules_allow_the_domain_and_deny_others() -> TestResult {
+        if !ready("network_rules", &["curl", "sh"]) || !internet("network_rules") {
+            return Ok(());
+        }
+        let env = TestEnv::new()?;
+        env.install_rules("net", &["domain example.com"])?;
+        let run = |args: &[String]| {
+            let mut all = vec!["run", "--key", "net", "--"];
+            all.extend(args.iter().map(String::as_str));
+            env.pent(&all)
+        };
+
+        let out = run(&curl_args(&["https://example.com"]))?;
         assert!(out.status.success(), "allowed: {}", stderr(&out));
 
-        let out = run(&with(&["https://example.org"]))?;
+        let out = run(&curl_args(&["https://example.org"]))?;
         assert!(!out.status.success(), "example.org must be denied");
         assert!(
-            stderr(&out).contains("1 access denied; review it: pent trust net --review"),
+            stderr(&out).contains("1 access denied; see it: pent denials"),
             "{}",
             stderr(&out)
         );
 
-        let out = run(&with(&["--noproxy", "*", "https://example.com"]))?;
+        let out = run(&curl_args(&["--noproxy", "*", "https://example.com"]))?;
         assert!(
             !out.status.success(),
             "a direct connection must fail: {}",
             stderr(&out)
         );
 
-        if have_tools("network_flow (getent)", &["getent"]) {
+        if have_tools("network_rules (getent)", &["getent"]) {
             let out = run(&[
                 "sh".to_string(),
                 "-c".to_string(),
@@ -666,32 +762,13 @@ mod linux {
                 stderr(&out)
             );
         }
-
-        let denied = fs::read_to_string(env.denied_log("net"))?;
-        assert!(denied.contains("\"example.org\""), "{denied}");
-
-        let out = env.pent_ok(&["trust", "net", "--review", "--yes"])?;
-        assert!(stderr(&out).contains("example.org"), "{}", stderr(&out));
-        let profile = fs::read_to_string(env.profile_path("net"))?;
-        assert_eq!(
-            rules(&profile, "network", "domains")?,
-            set(&["example.com", "example.org"]),
-            "{profile}"
-        );
-        assert!(
-            !env.denied_log("net").exists(),
-            "the review must consume the denied log"
-        );
-
-        let out = run(&with(&["https://example.org"]))?;
-        assert!(out.status.success(), "after review: {}", stderr(&out));
         Ok(())
     }
 
     // ── --trace ──────────────────────────────────────────────────────────────
 
     /// `--trace` writes a denied filesystem access and a denied domain to
-    /// `$XDG_STATE_HOME/pent/trace/<profile>.log`, each with a fix hint. The proxy denies the domain
+    /// `$XDG_STATE_HOME/pent/trace/<key>.log`, each with a fix hint. The proxy denies the domain
     /// before any connection, so this test needs no internet.
     #[test]
     fn trace_logs_filesystem_and_network_denials() -> TestResult {
@@ -699,23 +776,14 @@ mod linux {
             return Ok(());
         }
         let env = TestEnv::new()?;
-        env.install_profile("tr", "[network]\ndomains = [\"allowed.example\"]\n")?;
+        env.install_rules("tr", &["domain allowed.example"])?;
         let outside = env.root.join("outside.txt");
         fs::write(&outside, "secret\n")?;
         let script = format!(
             "cat '{}'; curl -sS -o /dev/null --max-time 10 https://denied.example; true",
             outside.display()
         );
-        let out = env.pent(&[
-            "run",
-            "--profile",
-            "tr",
-            "--trace",
-            "--",
-            "sh",
-            "-c",
-            &script,
-        ])?;
+        let out = env.pent(&["run", "--key", "tr", "--trace", "--", "sh", "-c", &script])?;
         assert!(out.status.success(), "{}", stderr(&out));
         assert!(!stdout(&out).contains("secret"), "the read was not denied");
 
@@ -741,11 +809,7 @@ mod linux {
             "{log}"
         );
         assert!(log.contains("--allow denied.example"), "{log}");
-
-        // The denials are in the list for `pent trust --review` too.
-        let denied = fs::read_to_string(env.denied_log("tr"))?;
-        assert!(denied.contains("outside.txt"), "{denied}");
-        assert!(denied.contains("denied.example"), "{denied}");
+        assert!(!log.contains("pent trust"), "{log}");
         Ok(())
     }
 
@@ -760,16 +824,14 @@ mod linux {
             return Ok(());
         }
         let env = TestEnv::new()?;
-        env.write_home(".config/app/settings.toml", "a = 1\n")?;
-        env.install_profile(
-            "sig",
-            "[filesystem]\nread_write = [\"~/.config/app/settings.toml\"]\n",
-        )?;
+        let settings = env.write_home(".config/app/settings.toml", "a = 1\n")?;
+        let settings = settings.to_str().ok_or("the path is not UTF-8")?;
+        env.install_rules("sig", &[&format!("write {settings}")])?;
         // A unique argument: the test finds the sleep process by it.
         let nap = format!("300.{}", std::process::id());
         let script = format!("touch started; exec sleep {nap}");
         let mut child = env
-            .command(&["run", "--profile", "sig", "--", "sh", "-c", &script])
+            .command(&["run", "--key", "sig", "--", "sh", "-c", &script])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()?;
@@ -860,32 +922,15 @@ mod linux {
         let out = env.pent_ok(&["profile", "show", "pm"])?;
         assert!(stdout(&out).contains("\"~/.foorc\""), "{}", stdout(&out));
         assert!(stderr(&out).contains("(trusted)"), "{}", stderr(&out));
-        let foorc = env.home_path(".foorc");
-        let foorc = foorc.to_str().ok_or("the path is not UTF-8")?;
-        let out = env.pent_ok(&["run", "--profile", "pm", "--", "cat", foorc])?;
-        assert_eq!(stdout(&out), "foo\n");
 
         env.pent_ok(&["untrust", "pm"])?;
         assert_eq!(profile_list(&env)?, vec!["pm not trusted"]);
-        let out = env.pent(&["run", "--profile", "pm", "--", "cat", foorc])?;
-        assert!(!out.status.success());
-        assert!(
-            stderr(&out).contains("the profile \"pm\" is not trusted"),
-            "{}",
-            stderr(&out)
-        );
 
         env.pent_ok(&["profile", "rm", "pm"])?;
         assert_eq!(profile_list(&env)?, Vec::<String>::new());
         assert!(!env.profile_path("pm").exists());
         assert!(!env.draft_path("pm").exists());
         assert!(!env.state_dir().join("pent/watch/pm").exists());
-        let out = env.pent(&["run", "--profile", "pm", "--", "cat", foorc])?;
-        assert!(
-            stderr(&out).contains("no trusted profile for \"pm\""),
-            "{}",
-            stderr(&out)
-        );
         Ok(())
     }
 }

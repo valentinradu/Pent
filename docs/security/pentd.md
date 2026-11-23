@@ -81,9 +81,9 @@ soon after the last hold.
 | PD-7 | `pent daemon` in the foreground and the systemd unit hold themselves. pentd keeps a socket from systemd (`LISTEN_FDS`) and does not remove it. When pentd stops, it removes the path only when the socket there is still its own (the same device and inode), so it never removes a socket that another process put there. pentd sets `FD_CLOEXEC` on the socket from systemd, so no child of pentd (the notification hook) gets the listening socket. pentd does not change its environment: the runtime has more than one thread, and a change of the environment then is not safe. A child sees `LISTEN_PID` with the PID of pentd, so it ignores the variables. | `a_foreground_pentd_has_a_private_socket_and_stops_on_a_signal`, `a_socket_from_systemd_is_served_and_kept`, `pentd_does_not_remove_a_socket_that_another_process_put_at_its_path` |
 | PD-8 | The reader of pentd stops at 64 KiB without a newline, and pentd closes a connection with a line that is too long or not valid. | `a_long_line_or_a_bad_line_closes_the_connection`, `daemon::tests::the_reader_stops_a_line_with_no_newline_at_the_limit` |
 | PD-9 | `pent run` starts pentd when no pentd runs, and it holds the same pentd for the whole run. The session connects in the background, so the program starts at once; a question before the connection waits inside its deadline. The started pentd has no terminal and its own process group, so a Ctrl-C of the run does not stop it. When that pentd stops before a connection works, the client stops at once, so the run does not wait 3 s for a pentd that cannot start. | `pent_run_starts_pentd_and_holds_it_for_the_run`, `pent_run_does_not_wait_for_a_pentd_that_cannot_start` |
-| PD-10 | The sandboxed program cannot see the socket of pentd or its directory, also when a profile names a parent of the runtime directory (for example `/run/user/<uid>`) and the sandbox binds it back: the child covers the runtime directory of pent with an empty tmpfs, always, also in `pent watch`. The supervisor of Unix sockets never takes a path inside the runtime directory from a profile, so no profile can give the program `pentd.sock` through a connection on the host. | `the_program_cannot_see_the_socket_of_pentd`, `a_profile_that_names_a_parent_does_not_bring_back_the_socket_of_pentd`, `pent_watch_also_hides_the_socket_of_pentd_under_a_bound_parent`, `linux_unixconn::tests::the_policy_never_takes_a_socket_in_the_files_of_pent`, and for `/run/user/<uid>` `security_linux_sandbox::test_runtime_dir_masked` |
+| PD-10 | The sandboxed program cannot see the socket of pentd or its directory, also when a flag or a profile names a parent of the runtime directory (for example `/run/user/<uid>`) and the sandbox binds it back: the child covers the runtime directory of pent with an empty tmpfs, always, also in `pent watch`. The supervisor of Unix sockets never takes a path inside the runtime directory from a profile, so no profile can give the program `pentd.sock` through a connection on the host. | `the_program_cannot_see_the_socket_of_pentd`, `a_flag_that_names_a_parent_does_not_bring_back_the_socket_of_pentd`, `pent_watch_also_hides_the_socket_of_pentd_under_a_bound_parent`, `linux_unixconn::tests::the_policy_never_takes_a_socket_in_the_files_of_pent`, and for `/run/user/<uid>` `security_linux_sandbox::test_runtime_dir_masked` |
 | PD-11 | After a failed `accept(2)`, for example at the limit of file descriptors, pentd pauses 100 ms, so the loop does not spin. | `pentd_does_not_spin_at_the_limit_of_file_descriptors` |
-| PD-12 | `pent run` makes the runtime directory before the sandbox computes its masks, so the mask of PD-10 covers it also when no pentd runs yet. A pentd that starts after the sandbox then puts its socket under the mask. A directory that `RuntimeDir::ensure` refuses gets no mask, but pentd refuses it too, so no socket appears there. The error names `chmod 700` for a directory of the user with a wider mode. | `a_runtime_directory_that_appears_after_the_start_stays_hidden`, `runtime::tests::ensure_makes_a_private_directory_and_refuses_an_open_one` |
+| PD-12 | The sandbox makes the runtime directory before it computes its masks, in `pent run` and in `pent watch`, so the mask of PD-10 covers it also when no pentd runs yet. A pentd that starts after the sandbox then puts its socket under the mask. A directory that `RuntimeDir::ensure` refuses gets no mask, but pentd refuses it too, so no socket appears there. The error names `chmod 700` for a directory of the user with a wider mode. | `a_runtime_directory_that_appears_after_the_start_stays_hidden`, `runtime::tests::ensure_makes_a_private_directory_and_refuses_an_open_one` |
 
 ## The queue
 
@@ -175,8 +175,8 @@ the cells that change, so the raw output does not hold whole phrases.
 - **The events tab of the monitor** shows the last events that fit on the
   screen, from at most 2000 that the monitor keeps. It has no scroll.
 - **The refusals are in memory.** A stop or a restart of pentd loses
-  them. `pent run` sends no event yet (phase 3), so today only a test
-  fills the list.
+  them. `pent run` sends its events since step 3.1 (RN-12 in
+  [run.md](run.md)); a run without pentd sends none.
 - **A session with no refusal** does not show in `pent denials`, and the
   code of a session shows only next to its refusals and in
   `pent questions`. `pent run` does not print its code: pentd does not tell
@@ -188,6 +188,6 @@ the cells that change, so the raw output does not hold whole phrases.
 
 ## The properties that later steps add
 
-| Step | Property |
-|---|---|
-| 3.1 | The pent class includes the runtime directory, so the program gets `ENOENT` for it, also when it guesses the path. |
+Step 3.1 put the runtime directory in the pent class of `pent run`
+(RN-6 in [run.md](run.md)). No later step adds a property to this report
+now; [run.md](run.md) lists the properties of the questions of phase 3.

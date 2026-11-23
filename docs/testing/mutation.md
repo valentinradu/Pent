@@ -63,7 +63,7 @@ makes one mutation by hand. The test must fail on the mutant. No
 | 2.3 | A connection counts only after its first message. | `a_new_connection_keeps_pentd_alive_before_its_first_message` |
 | 2.3 | A second `Watch` adds the connection again. | `a_watcher_that_answers_gets_one_verdict_and_a_second_watch_changes_nothing` |
 | 2.3 | A run has no limit of open questions. | `one_session_has_at_most_the_limit_of_open_questions` |
-| 2.3 | The sandbox does not mask the runtime directory of pent. | `a_profile_that_names_a_parent_does_not_bring_back_the_socket_of_pentd` |
+| 2.3 | The sandbox does not mask the runtime directory of pent. | `a_flag_that_names_a_parent_does_not_bring_back_the_socket_of_pentd` (named `a_profile_...` until step 3.1) |
 | 2.4 | pentd keeps the number of the session that the event names. | `denials::tests::only_a_refusal_is_kept_with_the_number_of_its_session`, `pent_denials_shows_the_refusals_of_each_session` |
 | 2.4 | pentd keeps an allow as a refusal. | `denials::tests::only_a_refusal_is_kept_with_the_number_of_its_session`, `pent_denials_shows_the_refusals_of_each_session` |
 | 2.4 | A client that is not a session may send an event. | `only_a_session_sends_events_and_a_session_cannot_read_or_forget` |
@@ -107,6 +107,19 @@ makes one mutation by hand. The test must fail on the mutant. No
 | 2.5 | pentd knows only one form of the home directory. | `classes::tests::each_name_of_a_credential_is_sensitive`, `a_normal_file_gets_the_shortest_menu_of_each_name_of_the_home` |
 | 2.5 | A merged connection keeps the old start of the idle time. | `server::tests::a_merged_connection_starts_the_idle_time_again` |
 | 2.5 | `forget` keeps a rule file with no rules. | `store::tests::rules::forget_keeps_the_other_rules_and_removes_an_empty_file` |
+| 3.1 | An allow rule with a deny rule inside it counts as whole. | `rule::tests::a_deny_inside_an_allow_takes_the_allow_out_of_the_whole_allows`, `a_deny_inside_a_domain_or_on_a_socket_makes_a_hole` |
+| 3.1 | The hole check uses the whole set, so a third rule hides the hole. | `rule::tests::a_deny_inside_an_allow_takes_the_allow_out_of_the_whole_allows` |
+| 3.1 | An exact rule on a directory goes into Landlock. | `decide::tests::the_grants_hold_back_what_a_static_layer_cannot_hold` |
+| 3.1 | A subtree over a location of the guard list goes into Landlock. | `decide::tests::the_grants_hold_back_what_a_static_layer_cannot_hold` |
+| 3.1 | The subtree check ignores the kind of the rule. | `decide::tests::the_grants_hold_back_what_a_static_layer_cannot_hold` |
+| 3.1 | A wide allow allows a sensitive access. | `decide::tests::only_an_exact_rule_allows_a_sensitive_access` |
+| 3.1 | The rules come before the flags. | `decide::tests::the_chain_asks_the_pent_class_then_the_flags_then_the_rules` |
+| 3.1 | The chain does not keep an answer for the run. | `decide::tests::an_answer_decides_and_covers_the_rest_of_its_width` |
+| 3.1 | An event names a rule as its cause also when a static layer gave the other decision. | `decide::tests::a_static_event_names_its_cause` |
+| 3.1 | The client does not report the number of a question. | `decide::tests::a_deadline_names_its_question`, `client::tests::a_deadline_names_the_number_of_its_question` |
+| 3.1 | `pent run` sends no event. | `pent_denials_shows_the_refusals_of_a_real_run` |
+| 3.1 | The flush of a session waits for nothing. | `decide::tests::an_answer_decides_and_covers_the_rest_of_its_width`, `a_static_event_names_its_cause` |
+| 3.1 | An address at the proxy becomes a domain in an event. | `decide::tests::a_static_event_names_its_cause` |
 
 The first form of `pent_run_starts_pentd_and_holds_it_for_the_run` passed on
 the mutant: the client started a new pentd each time that it lost one. The
@@ -123,12 +136,18 @@ collection window left a signal, and one burst gave two runs.
 hook now counts the questions with a `watch` channel. The first form of
 `a_runtime_directory_that_appears_after_the_start_stays_hidden` passed on
 its mutant: the background session of `pent run` made the directory before
-the sandbox computed its masks. The test now runs a program whose file name
-is not a valid key, so `pent run` holds no pentd. A mutation by hand also
+the sandbox computed its masks. The test then ran a program whose file name
+was not a valid key, so `pent run` held no pentd. Since step 3.1 such a name
+stops the run, so the test runs `pent watch`, which holds no pentd. A mutation by hand also
 leaves a restored file with an older time than the last build, so the next
 `cargo test` can run the mutant: touch each restored file. A check of the pent
 directories in `subtree_allowed` survived its mutant: the guard list holds
-those directories already, so the check went.
+those directories already, so the check went. In step 3.1, the removal of the call
+`decider.flush()` in `run.rs` survived
+`pent_denials_shows_the_refusals_of_a_real_run`: the final drain of the run
+gives the task of the session time to send the events. The mutant of the
+flush itself (it waits for nothing) dies in the unit tests, which drop the
+session right after the flush.
 
 ## How to repeat the run
 

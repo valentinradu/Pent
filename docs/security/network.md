@@ -26,8 +26,8 @@ Test files:
 |----|----------|----------|-------|------|
 | NET-1 | Critical | The Tailscale daemon socket is not masked; its `ts-dial` call gives full network egress past the proxy. | Fixed | `tailscale_localapi_socket_is_masked` |
 | NET-2 | High | The system D-Bus socket is reachable; it resolves names and reaches network services past the proxy. | Fixed | `system_dbus_socket_is_masked` |
-| NET-3 | High | One profile path below a private directory restores the whole subtree above it, so the sibling sockets of the host come back. | Fixed by `dedaf2e` | `a_profile_path_below_a_private_dir_keeps_its_siblings_hidden` |
-| NET-4 | Medium | Pent refuses each address of the Unix family, so a program cannot use its own abstract socket. | Fixed by `bfac3e0` | `child_cannot_reach_a_host_abstract_unix_socket`, `the_default_profile_refuses_a_path_but_keeps_the_unix_family` |
+| NET-3 | High | One profile path below a private directory restores the whole subtree above it, so the sibling sockets of the host come back. | Fixed by `dedaf2e` | `a_rule_path_below_a_private_dir_keeps_its_siblings_hidden` |
+| NET-4 | Medium | Pent refuses each address of the Unix family, so a program cannot use its own abstract socket. | Fixed by `bfac3e0` | `child_cannot_reach_a_host_abstract_unix_socket`, `without_a_socket_rule_a_path_is_refused_but_the_unix_family_stays` |
 | NET-5 | Medium | On a host where `/etc/resolv.conf` is a symbolic link into `/run`, the child reads no resolver at all, so no name resolves in the sandbox. | Fixed | `child_sees_proxy_resolv_conf`, `test_proxy_only_passes_the_listeners`, `test_resolv_bind_makes_the_chain_inside_the_tmpfs` |
 
 ### NET-1 — the Tailscale daemon socket gives full egress (Critical)
@@ -116,7 +116,7 @@ resolver and an egress path.
 names itself, without the traversal paths. The plan binds the named path
 (a file over a file, a directory over a directory) and makes the
 directories above it inside the private tmpfs with `mount_point_parents`.
-The test `a_profile_path_below_a_private_dir_keeps_its_siblings_hidden`
+The test `a_rule_path_below_a_private_dir_keeps_its_siblings_hidden`
 in `crates/pent/tests/security_network_e2e.rs` has no `#[ignore]` any
 more. The connect control of LS-1 already refused the sibling socket, so
 the test also lists the parent directory: with the bug the listing holds
@@ -196,7 +196,7 @@ and the filter permits the family again:
 Each decision makes the same event as the connect path, so watch mode
 proposes the socket and `pent run --trace` reports the denial. The tests
 are `child_cannot_reach_a_host_abstract_unix_socket`,
-`the_default_profile_refuses_a_path_but_keeps_the_unix_family` and
+`without_a_socket_rule_a_path_is_refused_but_the_unix_family_stays` and
 `an_abstract_address_is_refused_without_a_network_namespace` in
 `crates/pent/tests/security_network_e2e.rs`, and the unit tests of
 `crates/pent-sandbox/src/linux_watch.rs` and
@@ -346,10 +346,10 @@ End to end (`crates/pent/tests/security_network_e2e.rs`):
   (`an_abstract_address_is_refused_without_a_network_namespace`)
 - The default profile keeps the Unix family and refuses each path that
   it does not name, with `connect` and with a datagram `sendto`.
-  (`the_default_profile_refuses_a_path_but_keeps_the_unix_family`)
+  (`without_a_socket_rule_a_path_is_refused_but_the_unix_family_stays`)
 - A profile path below a private directory does not bring the siblings
   of the host back.
-  (`a_profile_path_below_a_private_dir_keeps_its_siblings_hidden`)
+  (`a_rule_path_below_a_private_dir_keeps_its_siblings_hidden`)
 - The child has no raw UDP egress out of the namespace.
   (`child_has_no_raw_udp_egress`)
 - The child cannot bind the proxy port again, with `SO_REUSEPORT` or not, to

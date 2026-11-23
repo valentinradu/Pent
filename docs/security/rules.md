@@ -5,9 +5,8 @@ This report lists the security properties of the rule model, of the classes
 and the width menu, and of the rule files, the test of each property, and
 the properties that later steps must add.
 
-`pent run` does not read the rules yet. On `next`, `pent run` still uses the
-profiles and the trust store of version 0.2.x (see
-[watch-and-profiles.md](watch-and-profiles.md)). Step 3.1 changes this.
+`pent run` reads the rules of its key since step 3.1. [run.md](run.md) has
+the properties of the rules in `pent run`.
 
 ## Scope
 
@@ -59,7 +58,7 @@ cargo +nightly fuzz run rule_file -- -max_total_time=150 -rss_limit_mb=4096
 | RU-5 | The domain forms follow the proxy. `*.base` is one more label, `**.base` is any depth, and neither covers `base`. A wildcard compares whole labels: `*.npmjs.org` does not cover `evilnpmjs.org`. | `domain_widths_follow_the_proxy`, `a_domain_width_parses_the_form_of_the_proxy` |
 | RU-6 | A wildcard cannot cover a public suffix (`*.com`, `*.co.uk`, `*.github.io`), also in a file that a user edits. | `a_wildcard_cannot_cover_a_public_suffix`, `rule_file::tests::bad_values_are_errors` |
 | RU-7 | A socket rule and a port rule match exactly, and a file rule never answers a socket access. | `sockets_and_ports_match_exactly` |
-| RU-8 | A key has 1 to 64 characters from `[A-Za-z0-9._+@~-]` and does not start with `.`, so a key is always a safe file name in the rule directory, and the well-known names fit (`g++`, `clang++`, `x86_64-linux-gnu-gcc`). A space, a `/`, a `:`, a shell character and a non-ASCII letter are refused. `pent run` warns when the name of the program is not a valid key, and it runs the program without pentd. | `a_key_comes_from_the_file_name_of_the_command`, `a_runtime_directory_that_appears_after_the_start_stays_hidden` (the warning) |
+| RU-8 | A key has 1 to 64 characters from `[A-Za-z0-9._+@~-]` and does not start with `.`, so a key is always a safe file name in the rule directory, and the well-known names fit (`g++`, `clang++`, `x86_64-linux-gnu-gcc`). A space, a `/`, a `:`, a shell character and a non-ASCII letter are refused. When the name of the program is not a valid key, `pent run` stops and names `--key NAME` (RN-1 in [run.md](run.md)). | `a_key_comes_from_the_file_name_of_the_command`, `run::tests::a_key_comes_from_the_flag_or_the_command` |
 
 ## The classes and the width menu
 
@@ -105,8 +104,7 @@ cargo +nightly fuzz run rule_file -- -max_total_time=150 -rss_limit_mb=4096
 
 | Step | Property |
 |---|---|
-| 3.1, 5.4 | A sensitive access is answered only by an exact rule, never by a wider rule that contains it. |
+| 5.4 | A sensitive access is answered only by an exact rule also in the FUSE server (RN-5 and RN-7 in [run.md](run.md) hold it for the static layers and the chain). |
 | 5.4 | The program gets `ENOENT` for each path of the pent class (CL-1). |
 | 2.5, 7.2 | `pent monitor` and the judge take the targets of an answer only from the width menu. |
 | 2.2 | pentd is the only writer of the rules. A late answer becomes a rule for the next run. |
-| 3.1 | `pent run` decides each access from the rules of its key before it asks. |

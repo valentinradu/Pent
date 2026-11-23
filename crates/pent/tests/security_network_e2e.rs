@@ -1,10 +1,9 @@
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)] // integration test: a setup failure should abort the test loudly
 //! End-to-end network security tests for the real `pent` binary on Linux.
 //!
-//! Each test installs a trusted profile in its own `HOME` and XDG
-//! directories, starts a victim server on the host, and runs a hostile
-//! command under `pent run`. The command tries to reach a service that the
-//! profile does not allow. A test that passes proves containment; a test
+//! Each test writes a rule file in its own `HOME` and XDG directories,
+//! starts a victim server on the host, and runs a hostile command under
+//! `pent run`. The command tries to reach a service that no rule allows. A test that passes proves containment; a test
 //! with `#[ignore = "OPEN VULN NET-<n>"]` keeps a failing assertion that
 //! proves a bypass.
 //!
@@ -43,22 +42,16 @@ fn ready(test: &str) -> bool {
     have_tools(test, &["python3"]) && sandbox_ready(test)
 }
 
-/// A profile that allows only one harmless domain, so `pent run` chooses
+/// A rule that allows only one harmless domain, so `pent run` chooses
 /// proxy mode (the network namespace isolates the child).
-const PROFILE: &str = "[network]\ndomains = [\"allowed.pent-test.invalid\"]\n";
+const DOMAIN_RULE: &str = "domain allowed.pent-test.invalid";
 
-/// Run `pent run` with the profile `probe` and the python script `script`.
+/// The key of each run of this file.
+const KEY: &str = "probe";
+
+/// Run `pent run` with the key `probe` and the python script `script`.
 fn run_sandboxed(env: &TestEnv, script: &str) -> std::io::Result<std::process::Output> {
-    env.pent(&[
-        "run",
-        "--profile",
-        "probe",
-        "--",
-        "python3",
-        "-I",
-        "-c",
-        script,
-    ])
+    env.pent(&["run", "--key", KEY, "--", "python3", "-I", "-c", script])
 }
 
 /// The output of pent and of the child, as one text.
@@ -134,6 +127,16 @@ fn private_dir() -> Option<PathBuf> {
     })
 }
 
+/// Write the rules of the key `probe` for the positive control: write
+/// access to `allowed_dir`, the socket `allowed.sock` in it, and the
+/// domain rule. The supervisor makes each permitted connection itself, so
+/// a socket that no rule names is not reachable at all.
+fn install_socket_rules(env: &TestEnv, allowed_dir: &Path) -> TestResult {
+    let write = format!("write {}/**", allowed_dir.display());
+    let socket = format!("unix-socket {}", allowed_dir.join("allowed.sock").display());
+    env.install_rules(KEY, &[&write, &socket, DOMAIN_RULE])
+}
+
 /// The python script that connects to each `(label, path)` pair and prints
 /// one line for each one: `<LABEL> REACHED <bytes>` or `<LABEL> BLOCKED`.
 fn unix_probe_script(targets: &[(&str, String)]) -> String {
@@ -174,7 +177,7 @@ const SYSTEM_BUS: &str = "/run/dbus/system_bus_socket";
 /// The banner of the victim socket. It must never reach the child.
 const VICTIM_SECRET: &str = "PENT_VICTIM_SECRET";
 
-/// The banner of the socket that the profile allows.
+/// The banner of the socket that a rule allows.
 const ALLOWED_BANNER: &str = "PENT_ALLOWED_BANNER";
 
 /// Prove that the child cannot reach a daemon socket of the host below a
@@ -185,7 +188,7 @@ const ALLOWED_BANNER: &str = "PENT_ALLOWED_BANNER";
 /// socket in it). When the host has the real socket too, the child probes
 /// that one as well.
 ///
-/// The positive control is a second socket in a directory that the profile
+/// The positive control is a second socket in a directory that a rule
 /// names. The child must reach that one in the same run.
 fn daemon_socket_is_masked(test: &str, daemon: &str, host_socket: &str) -> TestResult {
     if !ready(test) {
@@ -201,23 +204,13 @@ fn daemon_socket_is_masked(test: &str, daemon: &str, host_socket: &str) -> TestR
 
     let env = TestEnv::new()?;
     // The directory of the positive control is outside every private
-    // directory, and the profile names it.
+    // directory, and a rule names it.
     let allowed_dir = env.root.join("allowed");
     std::fs::create_dir_all(&allowed_dir)?;
-    env.install_profile(
-        "probe",
-        &format!(
-            // The profile names the socket of the positive control. Since
-            // the supervisor makes each permitted connection itself, a
-            // socket that no rule names is not reachable at all.
-            "[filesystem]\nread_write = [{:?}]\nunix_sockets = [{:?}]\n\n{PROFILE}",
-            allowed_dir.display().to_string(),
-            allowed_dir.join("allowed.sock").display().to_string()
-        ),
-    )?;
+    install_socket_rules(&env, &allowed_dir)?;
 
     // The victim: a socket of a daemon of the host, in the private
-    // directory. The profile does not name it.
+    // directory. No rule names it.
     let daemon_dir = private.join(format!("pent-{daemon}-{}", std::process::id()));
     std::fs::create_dir_all(&daemon_dir)?;
     let victim = Victim::bind(
@@ -235,11 +228,11 @@ fn daemon_socket_is_masked(test: &str, daemon: &str, host_socket: &str) -> TestR
     let text = out_text(&out);
     let _ = std::fs::remove_dir_all(&daemon_dir);
 
-    // The positive control: the child ran, and a Unix socket that the
-    // profile names works for it.
+    // The positive control: the child ran, and a Unix socket that a rule
+    // names works for it.
     assert!(
         text.contains(&format!("ALLOWED REACHED b'{ALLOWED_BANNER}'")),
-        "the child did not reach the socket that the profile allows, so \
+        "the child did not reach the socket that a rule allows, so \
          this run proves no denial:\n{text}"
     );
     assert_eq!(allowed.reached(), 1, "the allowed socket got no client");
@@ -289,17 +282,17 @@ fn system_dbus_socket_is_masked() -> TestResult {
     daemon_socket_is_masked("system_dbus_socket_is_masked", "dbus", SYSTEM_BUS)
 }
 
-/// NET-3. A profile path below a private directory gives the child that
-/// path, not the whole subtree above it.
+/// NET-3. A rule path below a private directory gives the child that path,
+/// not the whole subtree above it.
 ///
-/// `plan_private_dirs` binds the path that the profile names and makes the
+/// `plan_private_dirs` binds the path that a rule names and makes the
 /// directories above it inside the private tmpfs. The traversal paths of a
 /// rule are not in the bind-back list, so a rule for a directory below the
 /// runtime directory of the user does not restore the whole runtime
 /// directory with its daemon sockets. See `docs/security/network.md`.
 #[test]
-fn a_profile_path_below_a_private_dir_keeps_its_siblings_hidden() -> TestResult {
-    let test = "a_profile_path_below_a_private_dir_keeps_its_siblings_hidden";
+fn a_rule_path_below_a_private_dir_keeps_its_siblings_hidden() -> TestResult {
+    let test = "a_rule_path_below_a_private_dir_keeps_its_siblings_hidden";
     if !ready(test) {
         return Ok(());
     }
@@ -310,23 +303,13 @@ fn a_profile_path_below_a_private_dir_keeps_its_siblings_hidden() -> TestResult 
         );
         return Ok(());
     };
-    // Both sockets are below the same directory of the host. The profile
-    // names the directory of the first one only.
+    // Both sockets are below the same directory of the host. The rules
+    // name the directory of the first one only.
     let base = private.join(format!("pent-net3-{}", std::process::id()));
     let allowed_dir = base.join("allowed");
     std::fs::create_dir_all(&allowed_dir)?;
     let env = TestEnv::new()?;
-    env.install_profile(
-        "probe",
-        &format!(
-            // The profile names the socket of the positive control. Since
-            // the supervisor makes each permitted connection itself, a
-            // socket that no rule names is not reachable at all.
-            "[filesystem]\nread_write = [{:?}]\nunix_sockets = [{:?}]\n\n{PROFILE}",
-            allowed_dir.display().to_string(),
-            allowed_dir.join("allowed.sock").display().to_string()
-        ),
-    )?;
+    install_socket_rules(&env, &allowed_dir)?;
     let allowed = Victim::bind(allowed_dir.join("allowed.sock"), ALLOWED_BANNER.as_bytes())?;
     let victim = Victim::bind(base.join("victim.sock"), VICTIM_SECRET.as_bytes())?;
     // A file of the host next to the named directory. The child must not
@@ -357,16 +340,16 @@ fn a_profile_path_below_a_private_dir_keeps_its_siblings_hidden() -> TestResult 
 
     assert!(
         text.contains(&format!("ALLOWED REACHED b'{ALLOWED_BANNER}'")),
-        "the child did not reach the socket that the profile allows:\n{text}"
+        "the child did not reach the socket that a rule allows:\n{text}"
     );
     assert!(
         text.contains("VICTIM BLOCKED"),
-        "NET-3: the profile names one directory below {}, and the child \
+        "NET-3: a rule names one directory below {}, and the child \
          reached a sibling of it:\n{text}",
         base.display()
     );
     assert_eq!(victim.reached(), 0, "the sibling socket got a client");
-    // The directory that the profile names is the only entry that the bind
+    // The directory that the rule names is the only entry that the bind
     // brings back. A listing with `victim.sock` or `victim.txt` in it means
     // that pent bound the parent of the named path.
     let listing = text
@@ -410,7 +393,7 @@ fn child_cannot_reach_a_host_loopback_service() -> TestResult {
     });
 
     let env = TestEnv::new()?;
-    env.install_profile("probe", PROFILE)?;
+    env.install_rules(KEY, &[DOMAIN_RULE])?;
     // The positive control: the child starts its own server on its own
     // loopback and reaches it. Loopback works in the namespace of the
     // child; only the loopback of the host is out of reach.
@@ -515,11 +498,11 @@ except OSError as e:
     )
 }
 
-/// A port of the profile (or of `--localhost`) on the loopback of the host
-/// is reachable from the namespace of the child, with a blocking and with a
-/// non-blocking socket. Another port of the host stays out of reach, and a
-/// server of the child itself still works. The rule holds with the proxy
-/// (a profile with domains) and without it (a profile with no domains).
+/// A port of a localhost rule (or of `--localhost`) on the loopback of the
+/// host is reachable from the namespace of the child, with a blocking and
+/// with a non-blocking socket. Another port of the host stays out of reach,
+/// and a server of the child itself still works. This holds with the proxy
+/// (a domain rule) and without it (no domain rule).
 #[test]
 fn a_listed_localhost_port_reaches_the_host_and_no_other_port() -> TestResult {
     let test = "a_listed_localhost_port_reaches_the_host_and_no_other_port";
@@ -531,26 +514,19 @@ fn a_listed_localhost_port_reaches_the_host_and_no_other_port() -> TestResult {
     let script = localhost_probe_script(open, closed);
 
     let env = TestEnv::new()?;
-    let cases: [(&str, String, Vec<String>); 3] = [
-        (
-            "no domains",
-            format!("[network]\nlocalhost = [{open}]\n"),
-            vec![],
-        ),
-        (
-            "with domains",
-            format!("{PROFILE}localhost = [{open}]\n"),
-            vec![],
-        ),
+    let port_rule = format!("localhost {open}");
+    let cases: [(&str, Vec<&str>, Vec<String>); 3] = [
+        ("no domains", vec![&port_rule], vec![]),
+        ("with domains", vec![DOMAIN_RULE, &port_rule], vec![]),
         (
             "the flag",
-            PROFILE.to_string(),
+            vec![DOMAIN_RULE],
             vec!["--localhost".to_string(), open.to_string()],
         ),
     ];
-    for (case, profile, flags) in cases {
-        env.install_profile("probe", &profile)?;
-        let mut args: Vec<&str> = vec!["run", "--profile", "probe"];
+    for (case, rules, flags) in cases {
+        env.install_rules(KEY, &rules)?;
+        let mut args: Vec<&str> = vec!["run", "--key", KEY];
         args.extend(flags.iter().map(String::as_str));
         args.extend(["--", "python3", "-I", "-c", &script]);
         let out = env.pent(&args)?;
@@ -575,7 +551,7 @@ fn a_listed_localhost_port_reaches_the_host_and_no_other_port() -> TestResult {
         );
         assert!(
             text.contains("CLOSED BLOCKED"),
-            "{case}: the child reached a port that the profile does not list:\n{text}"
+            "{case}: the child reached a port that no rule lists:\n{text}"
         );
         assert!(
             text.contains(&format!("port {open}")),
@@ -592,14 +568,14 @@ fn a_listed_localhost_port_reaches_the_host_and_no_other_port() -> TestResult {
         "the victim accepted a connection from the child"
     );
 
-    // An explicit `--network blocked` closes the ports of the profile too.
-    env.install_profile("probe", &format!("[network]\nlocalhost = [{open}]\n"))?;
+    // An explicit `--network blocked` closes the ports of the rules too.
+    env.install_rules(KEY, &[&port_rule])?;
     let out = env.pent(&[
         "run",
         "--network",
         "blocked",
-        "--profile",
-        "probe",
+        "--key",
+        KEY,
         "--",
         "python3",
         "-I",
@@ -609,7 +585,7 @@ fn a_listed_localhost_port_reaches_the_host_and_no_other_port() -> TestResult {
     let text = out_text(&out);
     assert!(text.contains("OPEN BLOCKED"), "{text}");
     assert!(
-        text.contains("the localhost ports of the profile have no effect"),
+        text.contains("the localhost rules have no effect"),
         "{text}"
     );
     assert!(
@@ -619,8 +595,8 @@ fn a_listed_localhost_port_reaches_the_host_and_no_other_port() -> TestResult {
     Ok(())
 }
 
-/// `pent run --trace` records a refused port of the loopback, so that
-/// `pent trust --review` can propose it, and the trace log names the flag.
+/// `pent run --trace` counts a refused port of the loopback as a denial,
+/// and the trace log names the flag.
 #[test]
 fn a_refused_localhost_port_is_recorded_with_trace() -> TestResult {
     let test = "a_refused_localhost_port_is_recorded_with_trace";
@@ -629,7 +605,7 @@ fn a_refused_localhost_port_is_recorded_with_trace() -> TestResult {
     }
     let (closed, _closed_rx) = host_server(b"VICTIM")?;
     let env = TestEnv::new()?;
-    env.install_profile("probe", PROFILE)?;
+    env.install_rules(KEY, &[DOMAIN_RULE])?;
     let script = format!(
         r#"
 import socket
@@ -641,24 +617,15 @@ except OSError as e:
 "#
     );
     let out = env.pent(&[
-        "run",
-        "--trace",
-        "--profile",
-        "probe",
-        "--",
-        "python3",
-        "-I",
-        "-c",
-        &script,
+        "run", "--trace", "--key", KEY, "--", "python3", "-I", "-c", &script,
     ])?;
     let text = out_text(&out);
     assert!(text.contains("CLOSED BLOCKED"), "{text}");
-    let denied = std::fs::read_to_string(env.denied_log("probe")).unwrap_or_default();
     assert!(
-        denied.contains("\"localhost_connect\"") && denied.contains(&format!("\"port\":{closed}")),
-        "the denied log must hold the port:\n{denied}\n{text}"
+        text.contains("1 access denied; see it: pent denials"),
+        "pent must count the refused port as a denial:\n{text}"
     );
-    let trace = std::fs::read_to_string(env.trace_log("probe")).unwrap_or_default();
+    let trace = std::fs::read_to_string(env.trace_log(KEY)).unwrap_or_default();
     assert!(
         trace.contains(&format!("--localhost {closed}")),
         "the trace log must name the flag:\n{trace}"
@@ -800,9 +767,13 @@ fn a_slow_host_port_does_not_stop_other_connections() -> TestResult {
     let slow = full_queue_listener()?;
     let slow_port = slow.port;
     let env = TestEnv::new()?;
-    env.install_profile(
-        "probe",
-        &format!("{PROFILE}localhost = [{open}, {slow_port}]\n"),
+    env.install_rules(
+        KEY,
+        &[
+            DOMAIN_RULE,
+            &format!("localhost {open}"),
+            &format!("localhost {slow_port}"),
+        ],
     )?;
     let script = format!(
         r#"
@@ -822,16 +793,7 @@ print("OPEN AFTER %.2f" % (time.monotonic() - start), data)
 t.join()
 "#
     );
-    let out = env.pent(&[
-        "run",
-        "--profile",
-        "probe",
-        "--",
-        "python3",
-        "-I",
-        "-c",
-        &script,
-    ])?;
+    let out = env.pent(&["run", "--key", KEY, "--", "python3", "-I", "-c", &script])?;
     let text = out_text(&out);
     let after: f64 = text
         .lines()
@@ -879,18 +841,18 @@ fn full_queue_listener() -> std::io::Result<FullQueue> {
     })
 }
 
-/// NET-4. With no socket in the profile the child still makes a socket of
-/// the Unix family, for its own use. The control of the address refuses
-/// each path that the profile does not name, with `connect` and with a
-/// datagram `sendto`, which needs no connection.
+/// NET-4. With no socket rule the child still makes a socket of the Unix
+/// family, for its own use. The control of the address refuses each path
+/// that no rule names, with `connect` and with a datagram `sendto`, which
+/// needs no connection.
 #[test]
-fn the_default_profile_refuses_a_path_but_keeps_the_unix_family() -> TestResult {
-    let test = "the_default_profile_refuses_a_path_but_keeps_the_unix_family";
+fn without_a_socket_rule_a_path_is_refused_but_the_unix_family_stays() -> TestResult {
+    let test = "without_a_socket_rule_a_path_is_refused_but_the_unix_family_stays";
     if !ready(test) {
         return Ok(());
     }
     let env = TestEnv::new()?;
-    env.install_profile("probe", PROFILE)?;
+    env.install_rules(KEY, &[DOMAIN_RULE])?;
     // A victim socket of the host, outside each private directory, so the
     // refusal comes from the control of the address and not from a mount.
     let victim_path = env.root.join("victim.sock");
@@ -954,14 +916,14 @@ except OSError as e:
         text.contains("ABSTRACT b'OWN'"),
         "the child must reach its own abstract socket:\n{text}"
     );
-    // The denials: a path that the profile does not name.
+    // The denials: a path that no rule names.
     assert!(
         text.contains("CONNECT BLOCKED"),
-        "a connect to a path outside the profile must fail:\n{text}"
+        "a connect to a path that no rule names must fail:\n{text}"
     );
     assert!(
         text.contains("SENDTO BLOCKED"),
-        "a sendto to a path outside the profile must fail:\n{text}"
+        "a sendto to a path that no rule names must fail:\n{text}"
     );
     assert_eq!(victim.reached(), 0, "the victim socket got a client");
     let mut buf = [0u8; 8];
@@ -997,8 +959,8 @@ fn an_abstract_address_is_refused_without_a_network_namespace() -> TestResult {
         }
     });
     let env = TestEnv::new()?;
-    env.install_profile("probe", PROFILE)?;
-    // The positive control: a file that the profile allows. It proves
+    env.install_rules(KEY, &[DOMAIN_RULE])?;
+    // The positive control: a file that the base allows. It proves
     // that the child ran and that only the socket call failed.
     let script = format!(
         r#"
@@ -1013,8 +975,8 @@ except OSError as e:
     );
     let out = env.pent(&[
         "run",
-        "--profile",
-        "probe",
+        "--key",
+        KEY,
         "--network",
         "unrestricted",
         "--",
@@ -1068,18 +1030,13 @@ fn child_cannot_reach_a_host_abstract_unix_socket() -> TestResult {
     });
 
     let env = TestEnv::new()?;
-    // The profile names one socket, so the child can make a socket of the
-    // Unix family. With no name in the profile, pent refuses the family
-    // itself; `the_default_profile_refuses_the_unix_family` states that.
+    // A rule names one socket. The child makes a socket of the Unix family
+    // also without such a rule; see
+    // `without_a_socket_rule_a_path_is_refused_but_the_unix_family_stays`.
     let named = env.root.join("allowed").join("unused.sock");
     std::fs::create_dir_all(env.root.join("allowed"))?;
-    env.install_profile(
-        "probe",
-        &format!(
-            "[filesystem]\nunix_sockets = [{:?}]\n\n{PROFILE}",
-            named.display().to_string()
-        ),
-    )?;
+    let socket_rule = format!("unix-socket {}", named.display());
+    env.install_rules(KEY, &[&socket_rule, DOMAIN_RULE])?;
     // The positive control: the child binds its own abstract socket and
     // reaches it. Abstract sockets work for the child; only the names of
     // the host are out of reach.
@@ -1129,7 +1086,7 @@ fn child_has_no_raw_udp_egress() -> TestResult {
         return Ok(());
     }
     let env = TestEnv::new()?;
-    env.install_profile("probe", PROFILE)?;
+    env.install_rules(KEY, &[DOMAIN_RULE])?;
     // A direct UDP datagram to a public resolver must not leave the
     // namespace. The only route is the loopback proxy, which is TCP/DNS.
     // The positive control: a datagram on the loopback of the child
@@ -1171,7 +1128,7 @@ fn child_cannot_steal_the_proxy_port_with_reuseport() -> TestResult {
         return Ok(());
     }
     let env = TestEnv::new()?;
-    env.install_profile("probe", PROFILE)?;
+    env.install_rules(KEY, &[DOMAIN_RULE])?;
     // The child must not bind 127.0.0.1:3128 again, with SO_REUSEPORT or
     // otherwise, to steal the connections of other processes in the
     // sandbox. The positive control: it binds a free port, so the refusal
@@ -1219,7 +1176,7 @@ fn child_sees_proxy_resolv_conf() -> TestResult {
         return Ok(());
     }
     let env = TestEnv::new()?;
-    env.install_profile("probe", PROFILE)?;
+    env.install_rules(KEY, &[DOMAIN_RULE])?;
     // The child's /etc/resolv.conf must name only the loopback proxy. A
     // fixed external resolver would let the child resolve names off-proxy.
     let script = r#"

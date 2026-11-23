@@ -616,6 +616,85 @@ impl RuleSet {
             })
             .map(|(_, decision)| decision)
     }
+
+    /// Return the allow rules that hold on their whole width: no deny rule
+    /// of the set refuses an access inside the width.
+    ///
+    /// A static layer (Landlock, the list of the proxy) cannot make a hole
+    /// in a grant. Thus a caller that gives the rules to such a layer gives
+    /// only these rules, and the other allow rules wait for a question.
+    #[must_use]
+    pub fn whole_allows(&self) -> Vec<&Rule> {
+        self.rules
+            .iter()
+            .filter(|rule| rule.decision == Decision::Allow && !self.has_hole(rule))
+            .collect()
+    }
+
+    /// Return true if a deny rule of the set wins over `allow` at a point
+    /// inside the width of `allow`.
+    ///
+    /// The check takes one deny rule at a time, with `allow` alone: another
+    /// allow rule can win at one point and not below it. The rank of a rule
+    /// is the same at each point of its width. Thus a deny rule that wins
+    /// somewhere inside the width wins at the top point of the overlap: the
+    /// exact path, or the deeper of the two bases. For a domain wildcard,
+    /// one name below the base stands for each name.
+    fn has_hole(&self, allow: &Rule) -> bool {
+        self.rules
+            .iter()
+            .filter(|rule| rule.decision == Decision::Deny)
+            .any(|deny| {
+                let pair = Self {
+                    key: self.key.clone(),
+                    rules: vec![allow.clone(), deny.clone()],
+                };
+                let wins_at = |access: &Access<'_>| {
+                    allow.matches(access).is_some() && pair.decide(access) == Some(Decision::Deny)
+                };
+                match (&allow.target, &deny.target) {
+                    (Target::File { width: wa, .. }, Target::File { width: wd, .. }) => {
+                        let (PathWidth::Exact(a) | PathWidth::Subtree(a)) = wa;
+                        let (PathWidth::Exact(d) | PathWidth::Subtree(d)) = wd;
+                        // The deeper of the two paths is the top of the overlap.
+                        let point = if d.as_path().starts_with(a.as_path()) {
+                            d
+                        } else {
+                            a
+                        };
+                        [
+                            FileKind::List,
+                            FileKind::Read,
+                            FileKind::Write,
+                            FileKind::Exec,
+                        ]
+                        .into_iter()
+                        .any(|kind| wins_at(&Access::File { kind, path: point }))
+                    }
+                    (Target::Domain(wa), Target::Domain(wd)) => domain_points(wa)
+                        .iter()
+                        .chain(domain_points(wd).iter())
+                        .any(|name| wins_at(&Access::Domain(name))),
+                    (Target::UnixSocket(a), Target::UnixSocket(_)) => {
+                        wins_at(&Access::UnixSocket(a))
+                    }
+                    (Target::Localhost(a), Target::Localhost(_)) => wins_at(&Access::Localhost(*a)),
+                    _ => false,
+                }
+            })
+    }
+}
+
+/// The names that stand for the width: the name itself, or one name of one
+/// more label below the base of a wildcard. A name that is not valid gives
+/// no point.
+fn domain_points(width: &DomainWidth) -> Vec<DomainName> {
+    match width {
+        DomainWidth::Exact(name) => vec![name.clone()],
+        DomainWidth::OneLabel(base) | DomainWidth::AnyDepth(base) => {
+            format!("pent-point.{base}").parse().into_iter().collect()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1002,6 +1081,96 @@ mod tests {
             Decision::Allow,
         )])?;
         assert_eq!(file_rules.decide(&Access::UnixSocket(&sock)), None);
+        Ok(())
+    }
+
+    #[test]
+    fn a_deny_inside_an_allow_takes_the_allow_out_of_the_whole_allows() -> TestResult {
+        let home = path("/home/u")?;
+        let ssh = path("/home/u/.ssh")?;
+        let key = path("/home/u/.ssh/id")?;
+        let wide = file(
+            FileKind::Read,
+            PathWidth::Subtree(home.clone()),
+            Decision::Allow,
+        );
+        let hole = file(
+            FileKind::Read,
+            PathWidth::Subtree(ssh.clone()),
+            Decision::Deny,
+        );
+        // An exact allow at the top of the hole does not close the hole
+        // below it.
+        let top = file(
+            FileKind::Read,
+            PathWidth::Exact(ssh.clone()),
+            Decision::Allow,
+        );
+        let rules = set(vec![wide.clone(), hole, top.clone()])?;
+        assert_eq!(rules.whole_allows(), vec![&top]);
+        assert_eq!(rules.decide(&read(&key)), Some(Decision::Deny));
+
+        // A deny of a write leaves a read grant whole, and a deny of a read
+        // makes a hole in a write grant.
+        let no_write = file(
+            FileKind::Write,
+            PathWidth::Subtree(ssh.clone()),
+            Decision::Deny,
+        );
+        assert_eq!(
+            set(vec![wide.clone(), no_write])?.whole_allows(),
+            vec![&wide]
+        );
+        let write = file(FileKind::Write, PathWidth::Subtree(home), Decision::Allow);
+        let no_read = file(FileKind::Read, PathWidth::Exact(key), Decision::Deny);
+        assert!(set(vec![write, no_read])?.whole_allows().is_empty());
+
+        // A wider deny loses to a deeper allow, so the allow stays whole.
+        let deep = file(FileKind::Read, PathWidth::Subtree(ssh), Decision::Allow);
+        let wide_deny = file(
+            FileKind::Read,
+            PathWidth::Subtree(path("/home")?),
+            Decision::Deny,
+        );
+        assert_eq!(
+            set(vec![deep.clone(), wide_deny])?.whole_allows(),
+            vec![&deep]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_deny_inside_a_domain_or_on_a_socket_makes_a_hole() -> TestResult {
+        let domain =
+            |w: &str, d| -> Result<Rule, RuleError> { Ok(rule(Target::Domain(w.parse()?), d)) };
+        let any = domain("**.example.com", Decision::Allow)?;
+        let one = domain("*.example.com", Decision::Allow)?;
+        let api = domain("api.example.com", Decision::Allow)?;
+        let deeper = domain("*.cdn.example.com", Decision::Deny)?;
+        // The deny covers names two labels below the base: only `**` reaches
+        // them.
+        let rules = set(vec![any, one.clone(), api.clone(), deeper])?;
+        assert_eq!(rules.whole_allows(), vec![&one, &api]);
+        let no_api = domain("api.example.com", Decision::Deny)?;
+        assert!(set(vec![api, no_api])?.whole_allows().is_empty());
+        let other = domain("other.org", Decision::Allow)?;
+        let no_one = domain("*.example.com", Decision::Deny)?;
+        assert_eq!(
+            set(vec![other.clone(), no_one])?.whole_allows(),
+            vec![&other]
+        );
+
+        let sock = path("/run/x.sock")?;
+        let allow = rule(Target::UnixSocket(sock.clone()), Decision::Allow);
+        let deny = rule(Target::UnixSocket(sock), Decision::Deny);
+        assert!(set(vec![allow.clone(), deny])?.whole_allows().is_empty());
+        let port = |n| NonZeroU16::new(n).ok_or(RuleError::EmptyKey);
+        let open = rule(Target::Localhost(port(5432)?), Decision::Allow);
+        let closed = rule(Target::Localhost(port(6379)?), Decision::Deny);
+        assert_eq!(
+            set(vec![allow.clone(), open.clone(), closed])?.whole_allows(),
+            vec![&allow, &open]
+        );
         Ok(())
     }
 

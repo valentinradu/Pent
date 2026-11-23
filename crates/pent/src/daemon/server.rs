@@ -384,12 +384,18 @@ fn classifier() -> Option<super::classes::Classes> {
         tracing::warn!("pentd does not know the home directory; it refuses each question");
         return None;
     };
+    Some(super::classes::Classes::new(&home, &pent_dirs()))
+}
+
+/// The directories of pent that the XDG variables can move: the runtime
+/// directory, and the config and state directories.
+pub(crate) fn pent_dirs() -> Vec<std::path::PathBuf> {
     let mut pent_dirs = vec![RuntimeDir::from_env().path().to_path_buf()];
     if let Some(dirs) = pent_settings::PentDirs::from_env() {
         pent_dirs.push(dirs.config);
         pent_dirs.push(dirs.state);
     }
-    Some(super::classes::Classes::new(&home, &pent_dirs))
+    pent_dirs
 }
 
 /// The start of the idle time after a change of `activity`, or `None` when

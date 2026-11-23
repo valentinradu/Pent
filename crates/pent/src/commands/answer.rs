@@ -179,6 +179,7 @@ pub(crate) fn why_text(decided_by: DecidedBy) -> String {
         DecidedBy::Answer { question, .. } => format!("the answer to question {question}"),
         DecidedBy::Deadline { question } => format!("the deadline of question {question}"),
         DecidedBy::Hidden => "a file of pent (ENOENT)".to_string(),
+        DecidedBy::Base(_) => "the base".to_string(),
     }
 }
 

@@ -1,7 +1,7 @@
 //! Security tests for the Linux filesystem and process sandbox of
 //! `pent run`.
 //!
-//! Each test runs the real `pent` binary with a trusted profile in an
+//! Each test runs the real `pent` binary with no rule file in an
 //! isolated `HOME`, `XDG_CONFIG_HOME` and `XDG_STATE_HOME` under
 //! `CARGO_TARGET_TMPDIR` (not `/tmp`, because the child gets its own empty
 //! `/tmp`; a test of `/tmp` makes its victim there on purpose). A test
@@ -41,18 +41,21 @@ struct Harness {
     home: PathBuf,
     /// The workspace (the cwd of the child); always read-write.
     workspace: PathBuf,
-    /// A host directory that no profile names, for victim resources.
+    /// A host directory that no rule names, for victim resources.
     outside: PathBuf,
     /// The value of `XDG_RUNTIME_DIR` (see `common::runtime_dir`).
     runtime: tempfile::TempDir,
+    /// The key of each run (`pent run --key`). It has no rule file, so a
+    /// run gets only the base and the workspace.
+    key: &'static str,
 }
 
 static SEQ: AtomicU32 = AtomicU32::new(0);
 
 impl Harness {
-    /// Make the directories and install a trusted profile `name` with the
-    /// content `profile_toml`.
-    fn new(name: &str, profile_toml: &str) -> std::io::Result<Self> {
+    /// Make the directories. Each run uses the key `key`, which has no
+    /// rule file.
+    fn new(key: &'static str) -> std::io::Result<Self> {
         let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
         let base = root.join(format!("sec-{}-{n}", std::process::id()));
@@ -65,19 +68,10 @@ impl Harness {
             outside: base.join("outside"),
             base,
             runtime: common::runtime_dir()?,
+            key,
         };
         for d in [&h.config, &h.state, &h.home, &h.workspace, &h.outside] {
             std::fs::create_dir_all(d)?;
-        }
-        let draft = h.state.join("pent/drafts").join(format!("{name}.toml"));
-        std::fs::create_dir_all(draft.parent().unwrap())?;
-        std::fs::write(&draft, profile_toml)?;
-        let out = h.command(&[PENT, "trust", name, "--yes"]).output()?;
-        if !out.status.success() {
-            return Err(std::io::Error::other(format!(
-                "pent trust {name} failed: {}",
-                String::from_utf8_lossy(&out.stderr)
-            )));
         }
         Ok(h)
     }
@@ -104,9 +98,9 @@ impl Harness {
         Ok(path)
     }
 
-    /// Run `pent run -- <argv>` and return the output.
+    /// Run `pent run --key <key> -- <argv>` and return the output.
     fn run(&self, argv: &[&str]) -> std::io::Result<Output> {
-        let mut full = vec![PENT, "run", "--"];
+        let mut full = vec![PENT, "run", "--key", self.key, "--"];
         full.extend_from_slice(argv);
         self.command(&full).output()
     }
@@ -204,21 +198,17 @@ fn python3() -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
-/// A minimal profile that allows nothing beyond the sandbox defaults.
-const EMPTY_PROFILE: &str = "[filesystem]\nread = []\nread_write = []\nexecute = []\n\n\
-                             [network]\ndomains = []\n";
-
 // ============================================================================
 // Verified defenses — these tests pass; they guard the sandbox.
 // ============================================================================
 
-/// The child cannot read a file outside its profile.
+/// The child cannot read a file that no rule allows.
 #[test]
-fn test_read_outside_profile_denied() -> TestResult {
+fn test_read_outside_the_rules_denied() -> TestResult {
     if skip_without_sandbox() {
         return Ok(());
     }
-    let h = Harness::new("sh", EMPTY_PROFILE)?;
+    let h = Harness::new("sh")?;
     let secret = h.outside.join("secret");
     std::fs::write(&secret, "SECRETDATA")?;
     let script = h.script(
@@ -230,18 +220,18 @@ fn test_read_outside_profile_denied() -> TestResult {
     let text = combined(&out);
     assert!(
         !text.contains("SECRETDATA"),
-        "the child read a file outside its profile:\n{text}"
+        "the child read a file that no rule allows:\n{text}"
     );
     Ok(())
 }
 
-/// The child cannot write a file outside its profile.
+/// The child cannot write a file that no rule allows.
 #[test]
-fn test_write_outside_profile_denied() -> TestResult {
+fn test_write_outside_the_rules_denied() -> TestResult {
     if skip_without_sandbox() {
         return Ok(());
     }
-    let h = Harness::new("sh", EMPTY_PROFILE)?;
+    let h = Harness::new("sh")?;
     let target = h.outside.join("written");
     let script = h.script(
         "probe.sh",
@@ -254,7 +244,7 @@ fn test_write_outside_profile_denied() -> TestResult {
     assert_child_ran(&combined(&out));
     assert!(
         !target.exists(),
-        "the child wrote a file outside its profile: {}",
+        "the child wrote a file that no rule allows: {}",
         target.display()
     );
     Ok(())
@@ -271,7 +261,7 @@ fn test_abstract_unix_socket_blocked() -> TestResult {
         eprintln!("skip: no python3");
         return Ok(());
     };
-    let h = Harness::new("python3", EMPTY_PROFILE)?;
+    let h = Harness::new("python3")?;
     // The abstract name carries the base so that parallel tests do not clash.
     let name = format!("pent-victim-{}", std::process::id());
     let listener_src = format!(
@@ -322,7 +312,7 @@ fn test_runtime_dir_masked() -> TestResult {
         eprintln!("skip: no python3");
         return Ok(());
     };
-    let h = Harness::new("python3", EMPTY_PROFILE)?;
+    let h = Harness::new("python3")?;
     let runtime = PathBuf::from(format!("/run/user/{}", unsafe { libc::getuid() }));
     if !runtime.is_dir() {
         eprintln!("skip: no {} on this host", runtime.display());
@@ -358,7 +348,7 @@ fn test_signal_to_host_process_denied() -> TestResult {
         eprintln!("skip: no python3");
         return Ok(());
     };
-    let h = Harness::new("python3", EMPTY_PROFILE)?;
+    let h = Harness::new("python3")?;
     let (mut victim, pid) = spawn_victim(&py, &h)?;
     let probe = h.script(
         "c.py",
@@ -392,7 +382,7 @@ fn test_proc_environ_of_host_process_denied() -> TestResult {
         eprintln!("skip: no python3");
         return Ok(());
     };
-    let h = Harness::new("python3", EMPTY_PROFILE)?;
+    let h = Harness::new("python3")?;
     let (mut victim, pid) = spawn_victim(&py, &h)?;
     let probe = h.script(
         "c.py",
@@ -423,7 +413,7 @@ fn test_cannot_unshare_or_umount() -> TestResult {
         eprintln!("skip: no python3");
         return Ok(());
     };
-    let h = Harness::new("python3", EMPTY_PROFILE)?;
+    let h = Harness::new("python3")?;
     let runtime = format!("/run/user/{}", unsafe { libc::getuid() });
     let probe = h.script(
         "c.py",
@@ -459,7 +449,7 @@ fn test_tiocsti_blocked() -> TestResult {
         eprintln!("skip: no python3");
         return Ok(());
     };
-    let h = Harness::new("python3", EMPTY_PROFILE)?;
+    let h = Harness::new("python3")?;
     // fd -1: without the filter the kernel returns EBADF (9); the filter
     // returns EPERM (1) before the fd check.
     let probe = h.script(
@@ -488,7 +478,7 @@ fn test_tmp_not_shared_with_host() -> TestResult {
     if skip_without_sandbox() {
         return Ok(());
     }
-    let h = Harness::new("sh", EMPTY_PROFILE)?;
+    let h = Harness::new("sh")?;
     // A host file under /tmp, outside the workspace, owned by this test.
     let victim = std::env::temp_dir().join(format!("pent-victim-{}", std::process::id()));
     std::fs::write(&victim, "HOST_TMP_DATA")?;
@@ -528,7 +518,7 @@ fn test_tmp_unix_socket_unreachable() -> TestResult {
         eprintln!("skip: no python3");
         return Ok(());
     };
-    let h = Harness::new("python3", EMPTY_PROFILE)?;
+    let h = Harness::new("python3")?;
     let sock = std::env::temp_dir().join(format!("pent-victim-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&sock);
     let listener = UnixListener::bind(&sock)?;
@@ -575,7 +565,7 @@ fn test_run_not_shared_with_host() -> TestResult {
         eprintln!("skip: no python3");
         return Ok(());
     };
-    let h = Harness::new("python3", EMPTY_PROFILE)?;
+    let h = Harness::new("python3")?;
     // The entries of /run that pent binds back. Everything else of the host
     // must be absent.
     let kept = [
@@ -613,7 +603,7 @@ fn test_workspace_under_tmp_still_works() -> TestResult {
     if skip_without_sandbox() {
         return Ok(());
     }
-    let h = Harness::new("sh", EMPTY_PROFILE)?;
+    let h = Harness::new("sh")?;
     let ws = std::env::temp_dir().join(format!("pent-ws-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&ws);
     std::fs::create_dir_all(&ws)?;
@@ -656,7 +646,7 @@ fn test_proc_cmdline_of_host_process_denied() -> TestResult {
         eprintln!("skip: no python3");
         return Ok(());
     };
-    let h = Harness::new("python3", EMPTY_PROFILE)?;
+    let h = Harness::new("python3")?;
     let (mut victim, pid) = spawn_victim(&py, &h)?;
     let probe = h.script(
         "c.py",
@@ -684,7 +674,7 @@ fn test_background_process_does_not_outlive_pent() -> TestResult {
     if skip_without_sandbox() {
         return Ok(());
     }
-    let h = Harness::new("sh", EMPTY_PROFILE)?;
+    let h = Harness::new("sh")?;
     let marker = h.workspace.join("alive");
     // The background process writes the marker every 200 ms for 30 s.
     let script = h.script(
@@ -719,7 +709,7 @@ fn test_exit_status_passes_through_the_namespace() -> TestResult {
     if skip_without_sandbox() {
         return Ok(());
     }
-    let h = Harness::new("sh", EMPTY_PROFILE)?;
+    let h = Harness::new("sh")?;
     // The exit status is the positive control: only the child can give 42.
     let script = h.script("probe.sh", "exit 42\n")?;
     let out = h.run(&["sh", script.to_str().unwrap()])?;
@@ -740,7 +730,7 @@ fn test_signal_status_passes_through_the_namespace() -> TestResult {
         return Ok(());
     }
     use std::os::unix::process::ExitStatusExt as _;
-    let h = Harness::new("sh", EMPTY_PROFILE)?;
+    let h = Harness::new("sh")?;
     // The signal status is the positive control: only the child can die
     // from the signal that it sends to itself.
     let script = h.script("probe.sh", "kill -TERM $$\nsleep 5\n")?;
@@ -755,14 +745,14 @@ fn test_signal_status_passes_through_the_namespace() -> TestResult {
     Ok(())
 }
 
-/// LS-1: the child must not connect to a path Unix socket outside its
-/// profile. Landlock does not control `connect(2)` on a path socket, and
+/// LS-1: the child must not connect to a path Unix socket that no rule
+/// allows. Landlock does not control `connect(2)` on a path socket, and
 /// the kernel needs no file right to walk through a directory. The
 /// supervisor now controls each connection: it makes a permitted
-/// connection itself, and the profile here names no socket, so the filter
-/// refuses the family `AF_UNIX` already in the BPF program.
+/// connection itself, and no rule here names a socket, so it refuses
+/// each path.
 #[test]
-fn test_unix_socket_connect_outside_profile() -> TestResult {
+fn test_unix_socket_connect_outside_the_rules() -> TestResult {
     if skip_without_sandbox() {
         return Ok(());
     }
@@ -770,8 +760,8 @@ fn test_unix_socket_connect_outside_profile() -> TestResult {
         eprintln!("skip: no python3");
         return Ok(());
     };
-    let h = Harness::new("python3", EMPTY_PROFILE)?;
-    // The victim socket is in `outside/`: not in the profile, not under /tmp.
+    let h = Harness::new("python3")?;
+    // The victim socket is in `outside/`: no rule names it, not under /tmp.
     let sock = h.outside.join("victim.sock");
     let _ = std::fs::remove_file(&sock);
     let listener = UnixListener::bind(&sock)?;
@@ -800,7 +790,7 @@ fn test_unix_socket_connect_outside_profile() -> TestResult {
     let text = combined(&out);
     assert!(
         !text.contains("VICTIM_SECRET"),
-        "LS-1: the child connected to a Unix socket outside its profile:\n{text}"
+        "LS-1: the child connected to a Unix socket that no rule allows:\n{text}"
     );
     Ok(())
 }

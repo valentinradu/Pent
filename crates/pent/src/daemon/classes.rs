@@ -12,7 +12,7 @@
 
 use std::path::{Path, PathBuf};
 
-use pent_profile::{exact_target, Class, Classifier, Request, RulePath, Target};
+use pent_profile::{exact_target, Class, Classifier, FileKind, Request, RulePath, Target};
 
 /// The classes of the user, in each form of the home directory.
 #[derive(Debug, Clone)]
@@ -64,6 +64,19 @@ impl Classes {
     }
 }
 
+impl Classes {
+    /// Return true if a subtree rule of the kind `kind` on `dir`, or on
+    /// `dir` with its links resolved, covers a location of the guard list
+    /// that makes such an access sensitive, in one form of the home
+    /// directory.
+    pub(crate) fn subtree_holds_guard(&self, dir: &Path, kind: FileKind) -> bool {
+        let real = resolve(dir);
+        self.views.iter().any(|view| {
+            view.subtree_holds_guard_for(dir, kind) || view.subtree_holds_guard_for(&real, kind)
+        })
+    }
+}
+
 /// How strict a class is: the pent class, then a sensitive class, then the
 /// normal class.
 fn strictness(class: &Class) -> u8 {
@@ -108,7 +121,7 @@ fn resolved_request(request: &Request) -> Option<Request> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)] // a test fails on a value that it must not get
 mod tests {
-    use pent_profile::{FileKind, PathWidth, Sensitive};
+    use pent_profile::{PathWidth, Sensitive};
 
     use super::*;
 

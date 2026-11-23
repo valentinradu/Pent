@@ -1,6 +1,6 @@
 # Plan: the new pent
 
-**Cursor: step 3.1.** Steps with `[x]` are done. Work on the branch `next`,
+**Cursor: step 3.2.** Steps with `[x]` are done. Work on the branch `next`,
 one commit for each step, and move this cursor when a step is done.
 
 **The way of work.** One commit for each step. Then the user runs
@@ -139,12 +139,30 @@ ready for users.
 The supervisor and the proxy exist, so this phase changes their decisions,
 not their structure.
 
-- [ ] **3.1 The rules in `pent run`.** `pent run` reads the rules of its key
+- [x] **3.1 The rules in `pent run`.** `pent run` reads the rules of its key
   at the start and asks pentd for each access that no rule answers. It no
   longer reads profiles, and it no longer needs a trusted profile to start.
   - `pent run` sends an `Event` for each decision, so `pent denials`
     shows the refusals of a real run. Add an end-to-end test with a real
     `pent run` (step 2.4 tests the list only with a fake session).
+  - Files: `pent/src/commands/decide.rs` (the chain, the flags, the
+    grants), `run.rs`; `RuleSet::whole_allows`;
+    `Classifier::subtree_holds_guard`; the events and the flush in
+    `daemon/client.rs`; `docs/security/run.md` (RN-1 to RN-12).
+  - Decisions (2026-11-23):
+    - A refusal with no rule and no question has the cause
+      `DecidedBy::Base` (layer 1 of the chain). The fuzz record of
+      `protocol_line` is stale.
+    - Until each hook asks, the rules go into the static layers at the
+      start, and they fail closed: an allow rule with a deny rule inside
+      its width, an exact rule on a directory, a rule on a file of pent and
+      a subtree over a sensitive path stay out, with a warning.
+    - Step 3.1 builds the chain of deciders and its tests. Steps 3.2 to
+      3.4 connect each hook to it.
+    - The tests of `pent run` use rule files (`install_rules`). The round
+      trip `pent watch` → `pent trust` → `pent run` goes.
+    - `--key NAME` replaces `--profile NAME`. A flag wins over a rule,
+      because the user gives it for this run.
 - [ ] **3.2 The proxy.** A CONNECT or a SOCKS request for a name with no rule
   waits for an answer (20 s).
   - Files: `pent-proxy/src/proxy.rs`, `server.rs`.

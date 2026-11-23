@@ -69,7 +69,6 @@ fn the_filter_blocks_tiocsti_and_tioclinux() -> TestResult {
         return Ok(());
     }
     let env = TestEnv::new()?;
-    env.install_profile("python3", "[filesystem]\nread = []\n")?;
     // The descriptor -1 is the control: without the filter the kernel
     // gives EBADF (9); the filter gives EPERM (1) before that check.
     let script = format!(
@@ -83,14 +82,7 @@ fn the_filter_blocks_tiocsti_and_tioclinux() -> TestResult {
          \x20   print(tag, r, ctypes.get_errno())\n"
     );
     let out = env.pent(&[
-        "run",
-        "--profile",
-        "python3",
-        "--",
-        "python3",
-        "-I",
-        "-c",
-        &script,
+        "run", "--key", "python3", "--", "python3", "-I", "-c", &script,
     ])?;
     let all = assert_ran(&out);
     // The positive control: an ioctl that the filter does not trap still
@@ -122,14 +114,13 @@ fn the_dot_pent_directory_of_the_workspace_is_read_only() -> TestResult {
     let env = TestEnv::new()?;
     std::fs::create_dir_all(env.ws.join(".pent"))?;
     std::fs::write(env.ws.join(".pent/keep"), "PENT_DOT_PENT_DATA")?;
-    env.install_profile("sh", "[filesystem]\nread = []\n")?;
     let script = format!(
         "echo {RAN}; cat .pent/keep; echo; \
          echo EVIL > .pent/new 2>&1; echo NEW rc=$?; \
          echo EVIL > .pent/keep 2>&1; echo OVER rc=$?; \
          echo OK > plain.txt; echo PLAIN rc=$?"
     );
-    let out = env.pent(&["run", "--profile", "sh", "--", "sh", "-c", &script])?;
+    let out = env.pent(&["run", "--key", "sh", "--", "sh", "-c", &script])?;
     let all = assert_ran(&out);
     // The positive control: the workspace itself is read-write.
     assert!(
@@ -154,11 +145,11 @@ fn the_dot_pent_directory_of_the_workspace_is_read_only() -> TestResult {
 
 // ── README: the process tree ───────────────────────────────────────────────
 
-/// "A profile covers the full process tree: when `claude` starts `git`,
-/// `git` gets the rules of the `claude` profile." (README)
+/// The rules of a run cover the full process tree: when `claude` starts
+/// `git`, `git` gets the rules of `claude`.
 #[test]
-fn the_profile_covers_the_full_process_tree() -> TestResult {
-    let test = "the_profile_covers_the_full_process_tree";
+fn the_rules_cover_the_full_process_tree() -> TestResult {
+    let test = "the_rules_cover_the_full_process_tree";
     if !ready(test) {
         return Ok(());
     }
@@ -166,7 +157,6 @@ fn the_profile_covers_the_full_process_tree() -> TestResult {
     let secret = env.root.join("outside-secret");
     std::fs::write(&secret, "PENT_OUTSIDE_SECRET")?;
     std::fs::write(env.ws.join("allowed.txt"), "PENT_ALLOWED_DATA")?;
-    env.install_profile("sh", "[filesystem]\nread = []\n")?;
     // Three levels deep, and the last level is a different program.
     let deep = env.ws.join("deep.py");
     std::fs::write(
@@ -185,7 +175,7 @@ fn the_profile_covers_the_full_process_tree() -> TestResult {
         format!("cat allowed.txt\npython3 -I '{d}'\n", d = deep.display()),
     )?;
     let script = format!("echo {RAN}; sh -c \"sh '{i}'\"", i = inner.display());
-    let out = env.pent(&["run", "--profile", "sh", "--", "sh", "-c", &script])?;
+    let out = env.pent(&["run", "--key", "sh", "--", "sh", "-c", &script])?;
     let all = assert_ran(&out);
     assert!(
         all.contains("PENT_ALLOWED_DATA"),
@@ -193,7 +183,7 @@ fn the_profile_covers_the_full_process_tree() -> TestResult {
     );
     assert!(
         !all.contains("PENT_OUTSIDE_SECRET"),
-        "a process below the command read a file outside the profile:\n{all}"
+        "a process below the command read a file outside the rules:\n{all}"
     );
     assert!(
         all.contains(&format!("DEEP ERR {}", libc::EACCES)),
@@ -215,7 +205,6 @@ fn pent_ignores_sigint_and_lets_the_command_see_it() -> TestResult {
         return Ok(());
     }
     let env = TestEnv::new()?;
-    env.install_profile("sh", "[filesystem]\nread = []\n")?;
     let ready_file = env.ws.join("ready");
     let got = env.ws.join("got");
     let script = format!(
@@ -226,7 +215,7 @@ fn pent_ignores_sigint_and_lets_the_command_see_it() -> TestResult {
         r = ready_file.display()
     );
     let child = env
-        .command(&["run", "--profile", "sh", "--", "sh", "-c", &script])
+        .command(&["run", "--key", "sh", "--", "sh", "-c", &script])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
@@ -266,10 +255,9 @@ fn the_private_directories_keep_their_modes() -> TestResult {
         return Ok(());
     }
     let env = TestEnv::new()?;
-    env.install_profile("sh", "[filesystem]\nread = []\n")?;
     let out = env.pent(&[
         "run",
-        "--profile",
+        "--key",
         "sh",
         "--",
         "sh",
@@ -307,7 +295,6 @@ fn a_path_directory_below_a_private_directory_comes_back() -> TestResult {
     let _ = std::fs::remove_dir_all(&sibling);
     std::fs::create_dir_all(&sibling)?;
     std::fs::write(sibling.join("secret"), "PENT_SIBLING_SECRET")?;
-    env.install_profile("sh", "[filesystem]\nread = []\n")?;
     let path = format!(
         "{}:{}",
         dir.display(),
@@ -316,7 +303,7 @@ fn a_path_directory_below_a_private_directory_comes_back() -> TestResult {
     let out = env
         .command(&[
             "run",
-            "--profile",
+            "--key",
             "sh",
             "--",
             "sh",
@@ -355,7 +342,6 @@ fn a_named_agent_socket_still_works_behind_the_mask() -> TestResult {
     }
     let env = TestEnv::new()?;
     let agent = agent_socket(&env)?;
-    env.install_profile("python3", "[filesystem]\nread = []\n")?;
     let script = format!(
         "import socket\n\
          print('{RAN}')\n\
@@ -368,7 +354,7 @@ fn a_named_agent_socket_still_works_behind_the_mask() -> TestResult {
     );
     let out = env.pent(&[
         "run",
-        "--profile",
+        "--key",
         "python3",
         "--unix-socket",
         agent.to_str().ok_or("the socket path is not UTF-8")?,
@@ -389,8 +375,8 @@ fn a_named_agent_socket_still_works_behind_the_mask() -> TestResult {
 /// "If your configuration names one of these paths, Pent does not hide
 /// it." (README, about the sockets that pent covers with `/dev/null`)
 ///
-/// A path rule keeps the claim, and so does a name in
-/// `filesystem.unix_sockets` or `pent run --unix-socket PATH`:
+/// A path rule keeps the claim, and so does a `unix-socket` rule or
+/// `pent run --unix-socket PATH`:
 /// `configured_paths` in `crates/pent-sandbox/src/linux.rs` holds the
 /// Unix socket list, so pent does not bind `/dev/null` over the socket.
 /// A program that reads the kind of the file before it connects then
@@ -404,36 +390,26 @@ fn a_socket_that_the_configuration_names_is_not_hidden() -> TestResult {
     // A path rule: the claim holds.
     let env = TestEnv::new()?;
     let agent = agent_socket(&env)?;
-    env.install_profile(
-        "python3",
-        &format!("[filesystem]\nread = [{:?}]\n", agent.display().to_string()),
-    )?;
+    env.install_rules("python3", &[&format!("read {}", agent.display())])?;
     let all = assert_ran(&kind_of(&env, &agent, &[])?);
     assert!(
         all.contains("KIND True"),
         "a path rule did not stop the mask, so the test proves nothing:\n{all}"
     );
 
-    // A name in `unix_sockets`: the claim must hold too.
+    // A unix-socket rule: the claim must hold too.
     let env = TestEnv::new()?;
     let agent = agent_socket(&env)?;
-    env.install_profile(
-        "python3",
-        &format!(
-            "[filesystem]\nunix_sockets = [{:?}]\n",
-            agent.display().to_string()
-        ),
-    )?;
+    env.install_rules("python3", &[&format!("unix-socket {}", agent.display())])?;
     let all = assert_ran(&kind_of(&env, &agent, &[])?);
     assert!(
         all.contains("KIND True"),
-        "pent covered a socket that `unix_sockets` names:\n{all}"
+        "pent covered a socket that a unix-socket rule names:\n{all}"
     );
 
     // The flag of one run: the claim must hold too.
     let env = TestEnv::new()?;
     let agent = agent_socket(&env)?;
-    env.install_profile("python3", "[filesystem]\nread = []\n")?;
     let flag = agent.to_str().ok_or("the socket path is not UTF-8")?;
     let all = assert_ran(&kind_of(&env, &agent, &["--unix-socket", flag])?);
     assert!(
@@ -471,7 +447,7 @@ fn kind_of(env: &TestEnv, path: &Path, extra: &[&str]) -> std::io::Result<Output
          print('KIND', stat.S_IFMT(os.stat({p:?}).st_mode) == stat.S_IFSOCK)\n",
         p = path.display().to_string()
     );
-    let mut args = vec!["run", "--profile", "python3"];
+    let mut args = vec!["run", "--key", "python3"];
     args.extend_from_slice(extra);
     args.extend_from_slice(&["--", "python3", "-I", "-c", &script]);
     env.pent(&args)

@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-use common::e2e::{sandbox_ready, TestEnv, TestResult};
+use common::e2e::{have_tools, sandbox_ready, stderr, stdout, TestEnv, TestResult};
 use common::PENT;
 
 /// The linger time of each pentd in these tests.
@@ -386,8 +386,7 @@ fn pent_run_starts_pentd_and_holds_it_for_the_run() -> TestResult {
     }
     let rt = Runtime::new()?;
     let env = TestEnv::new()?;
-    env.install_profile("sh", "")?;
-    let mut run = env.command(&["run", "--profile", "sh", "--", "sh", "-c", "sleep 2"]);
+    let mut run = env.command(&["run", "--", "sh", "-c", "sleep 2"]);
     run.env("XDG_RUNTIME_DIR", rt.xdg())
         .env("PENTD_LINGER_MS", LINGER_MS)
         .stdout(Stdio::null())
@@ -434,14 +433,13 @@ fn the_program_cannot_see_the_socket_of_pentd() -> TestResult {
     let _pentd = Reap(rt.pent(&["daemon"]).spawn()?);
     assert!(rt.wait_for_socket());
     let env = TestEnv::new()?;
-    env.install_profile("sh", "")?;
     let script = format!(
         "if [ -e '{sock}' ] || [ -e '{dir}' ]; then echo SEEN; else echo HIDDEN; fi",
         sock = rt.socket().display(),
         dir = rt.pent_dir().display()
     );
     let out = env
-        .command(&["run", "--profile", "sh", "--", "sh", "-c", &script])
+        .command(&["run", "--", "sh", "-c", &script])
         .env("XDG_RUNTIME_DIR", rt.xdg())
         .env("PENTD_LINGER_MS", LINGER_MS)
         .output()?;
@@ -450,6 +448,60 @@ fn the_program_cannot_see_the_socket_of_pentd() -> TestResult {
     assert!(text.contains("HIDDEN"), "{text}");
     // The socket is there for the host, so the check means something.
     assert!(rt.socket().exists());
+    Ok(())
+}
+
+/// A real `pent run` sends an event for each decision, and `pent denials`
+/// shows each refusal with its cause: a rule, or the base when no rule
+/// covers the access.
+#[test]
+fn pent_denials_shows_the_refusals_of_a_real_run() -> TestResult {
+    let test = "pent_denials_shows_the_refusals_of_a_real_run";
+    if !have_tools(test, &["sh", "getent"]) || !sandbox_ready(test) {
+        return Ok(());
+    }
+    let rt = Runtime::new()?;
+    // A pentd in the foreground keeps the refusals after the run ends.
+    let _pentd = Reap(rt.pent(&["daemon"]).spawn()?);
+    assert!(rt.wait_for_socket());
+    let env = TestEnv::new()?;
+    env.install_rules("sh", &["deny domain bad.example"])?;
+    // `--allow` starts the proxy. The two names are refused, so no query
+    // goes upstream, and the test needs no network.
+    let out = env
+        .command(&[
+            "run",
+            "--allow",
+            "good.example",
+            "--",
+            "sh",
+            "-c",
+            "getent hosts new.example; getent hosts bad.example; true",
+        ])
+        .env("XDG_RUNTIME_DIR", rt.xdg())
+        .output()?;
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        stderr(&out).contains("see them: pent denials"),
+        "{}",
+        stderr(&out)
+    );
+    let out = rt.pent(&["denials"]).stdout(Stdio::piped()).output()?;
+    let text = stdout(&out);
+    assert!(out.status.success(), "{out:?}");
+    let line = |name: &str| {
+        text.lines()
+            .find(|l| l.contains(&format!("domain {name}")))
+            .map(str::to_string)
+    };
+    let new = line("new.example").ok_or_else(|| format!("no refusal of new.example: {text}"))?;
+    assert!(
+        new.contains("by sh") && new.ends_with("(the base)"),
+        "{new}"
+    );
+    let bad = line("bad.example").ok_or_else(|| format!("no refusal of bad.example: {text}"))?;
+    assert!(bad.ends_with("(a rule)"), "{bad}");
+    assert!(line("good.example").is_none(), "{text}");
     Ok(())
 }
 
@@ -594,10 +646,9 @@ fn pent_run_does_not_wait_for_a_pentd_that_cannot_start() -> TestResult {
     std::fs::set_permissions(rt.pent_dir(), std::fs::Permissions::from_mode(0o700))?;
     std::fs::write(rt.socket(), "not a socket")?;
     let env = TestEnv::new()?;
-    env.install_profile("sh", "")?;
     let begin = Instant::now();
     let out = env
-        .command(&["run", "--profile", "sh", "--", "sh", "-c", "exit 0"])
+        .command(&["run", "--", "sh", "-c", "exit 0"])
         .env("XDG_RUNTIME_DIR", rt.xdg())
         .output()?;
     let took = begin.elapsed();
@@ -1901,25 +1952,27 @@ mod notify {
 }
 
 #[test]
-fn a_profile_that_names_a_parent_does_not_bring_back_the_socket_of_pentd() -> TestResult {
-    let test = "a_profile_that_names_a_parent_does_not_bring_back_the_socket_of_pentd";
+fn a_flag_that_names_a_parent_does_not_bring_back_the_socket_of_pentd() -> TestResult {
+    let test = "a_flag_that_names_a_parent_does_not_bring_back_the_socket_of_pentd";
     if !sandbox_ready(test) {
         return Ok(());
     }
     let env = TestEnv::new()?;
-    // The profile names the runtime directory of the test itself, the
-    // parent of `pent/`, as a profile can name `/run/user/<uid>`.
+    // The flag names the runtime directory of the test itself, the parent
+    // of `pent/`, as a flag can name `/run/user/<uid>`.
     let runtime = env.runtime.display().to_string();
-    env.install_profile("sh", &format!("[filesystem]\nread = [\"{runtime}\"]\n"))?;
     std::fs::write(env.runtime.join("visible"), "PENT_VISIBLE")?;
     let script = format!(
         "cat '{runtime}/visible'; echo; echo PENTLS $(ls -A '{runtime}/pent' 2>&1 | tr '\\n' ' ')"
     );
+    // A rule over a parent of a directory of pent does not go into the
+    // sandbox (`HeldBack::PentFiles`), so the test names the directory with
+    // the flag.
     let out = env
-        .command(&["run", "--profile", "sh", "--", "sh", "-c", &script])
+        .command(&["run", "--read", &runtime, "--", "sh", "-c", &script])
         .output()?;
     let text = String::from_utf8_lossy(&out.stdout);
-    // The positive control: the profile brought the directory back.
+    // The positive control: the flag brought the directory back.
     assert!(text.contains("PENT_VISIBLE"), "{text}");
     // `pent run` started pentd there, so the host has the socket.
     assert!(
@@ -2007,17 +2060,14 @@ fn a_runtime_directory_that_appears_after_the_start_stays_hidden() -> TestResult
     }
     let env = TestEnv::new()?;
     let runtime = env.runtime.display().to_string();
-    // The file name `.pentsh` is not a valid key, so `pent run` holds no
-    // pentd and makes no runtime directory itself: only the sandbox can
-    // make it before the masks.
-    let bin = env.runtime.join("bin");
-    std::fs::create_dir(&bin)?;
-    let shell = bin.join(".pentsh");
-    std::os::unix::fs::symlink("/bin/sh", &shell)?;
-    let bin = bin.display().to_string();
-    env.install_profile(
-        "sh",
-        &format!("[filesystem]\nread = [\"{runtime}\"]\nexecute = [\"{bin}\"]\n"),
+    // `pent run` makes the runtime directory before the sandbox when it
+    // starts pentd. `pent watch` holds no pentd, so only the sandbox can
+    // make the directory before the masks. A global mount brings back its
+    // parent, as a mount of `/run/user/<uid>` does.
+    std::fs::create_dir_all(env.config_dir().join("pent"))?;
+    std::fs::write(
+        env.config_dir().join("pent/pent.toml"),
+        format!("[[sandbox.mounts]]\npath = \"{runtime}\"\n"),
     )?;
     // No `pent/` yet when the run starts.
     if env.runtime.join("pent").exists() {
@@ -2030,11 +2080,12 @@ fn a_runtime_directory_that_appears_after_the_start_stays_hidden() -> TestResult
     );
     let mut child = Reap(
         env.command(&[
-            "run",
+            "watch",
+            "--yes",
             "--profile",
-            "sh",
+            "w",
             "--",
-            &shell.display().to_string(),
+            "sh",
             "-c",
             &script,
         ])
@@ -2064,13 +2115,8 @@ fn a_runtime_directory_that_appears_after_the_start_stays_hidden() -> TestResult
     if let Some(mut stream) = child.0.stderr.take() {
         stream.read_to_string(&mut err)?;
     }
-    assert!(status.success(), "{status:?}: {text}");
-    // `.pentsh` is not a valid key, and pent says so.
-    assert!(
-        err.contains("pent runs this program without pentd"),
-        "{err}"
-    );
-    // The positive control: the profile brought the directory back.
+    assert!(status.success(), "{status:?}: {text}: {err}");
+    // The positive control: the mount brought the directory back.
     assert!(text.contains("PENT_VISIBLE"), "{text}");
     assert!(env.runtime.join("pent/pentd.lock").exists(), "no pentd ran");
     let line = text

@@ -67,8 +67,8 @@ The three tests that had an `OPEN` mark have no mark now, and they pass:
 
 | Test | Finding |
 |------|---------|
-| `test_unix_socket_connect_outside_profile` | LS-1, fixed by `dab7058` |
-| `a_profile_path_below_a_private_dir_keeps_its_siblings_hidden` | NET-3, fixed by `dedaf2e` |
+| `test_unix_socket_connect_outside_the_rules` | LS-1, fixed by `dab7058` |
+| `a_rule_path_below_a_private_dir_keeps_its_siblings_hidden` | NET-3, fixed by `dedaf2e` |
 | `p4_persistence_rules_follow_the_xdg_config_directory` | H-14, fixed by `918b6db` |
 
 ### What the audit found
@@ -78,11 +78,11 @@ on the audit host.
 
 | # | File:line | Test | Reason string | Result then | Verdict | State |
 |---|-----------|------|---------------|-------------|---------|-------|
-| I1 | `crates/pent/tests/security_linux_sandbox.rs:695` | `test_unix_socket_connect_outside_profile` | `OPEN VULN LS-1 (partial)` | **Fails** on its real assertion | **Keep the ignore.** The finding is open. | Not in this scope |
+| I1 | `crates/pent/tests/security_linux_sandbox.rs:695` | `test_unix_socket_connect_outside_the_rules` | `OPEN VULN LS-1 (partial)` | **Fails** on its real assertion | **Keep the ignore.** The finding is open. | Not in this scope |
 | I2 | `crates/pent/tests/e2e_linux.rs:181` | `linux::network_claude` | `needs the internet` | **Passes** | **Remove the ignore.** | Not in this scope |
 | I3 | `crates/pent/tests/e2e_linux.rs:187` | `linux::network_codex` | `needs the internet` | **Passes** | **Remove the ignore.** | Not in this scope |
 | I4 | `crates/pent/tests/e2e_linux.rs:193` | `linux::network_gemini` | `needs the internet` | **Passes** | **Remove the ignore.** | Not in this scope |
-| I5 | `crates/pent/tests/e2e_linux.rs:608` | `linux::network_watch_trust_run_review` | `needs the internet` | **Passes** | **Remove the ignore.** | Not in this scope |
+| I5 | `crates/pent/tests/e2e_linux.rs:608` | `linux::network_watch_trust_run_review` (since step 3.1: `network_watch_records_the_domain` and `network_rules_allow_the_domain_and_deny_others`) | `needs the internet` | **Passes** | **Remove the ignore.** | Not in this scope |
 | I9 | `crates/pent-sandbox/src/linux_watch.rs:2102` | `linux_watch::tests::bench_recorder_overhead` | `a benchmark, not a check` | **Passes** | **Keep the ignore, and give the test a threshold.** | Not in this scope |
 
 ### I1 — the failing assertion
@@ -91,7 +91,7 @@ The test fails on the assertion that it claims to make. This is the output
 of the run:
 
 ```
-thread 'test_unix_socket_connect_outside_profile' panicked at
+thread 'test_unix_socket_connect_outside_the_rules' panicked at
 crates/pent/tests/security_linux_sandbox.rs:735:5:
 LS-1: the child connected to a Unix socket outside its profile:
 CONNECTED b'VICTIM_SECRET'
@@ -146,8 +146,8 @@ property come first.
 |-----------|------|------|------------------------|--------|-------|
 | `crates/pent/tests/security_linux_sandbox.rs:126` | `sandbox_unavailable` (the guard of all 17 tests) | 4 | The guard reads the output of the child and skips when the text holds `Landlock`, `user namespace` or `sandbox is not available`. A real error of pent holds those same words, so a broken sandbox turns into a pass. | Probe the host one time with `pent check`, as `common::e2e::sandbox_ready` does. Do not read the output of the test run. | Open |
 | `crates/pent/tests/security_linux_sandbox.rs:20` | the whole suite (17 tests) | 3 | No CI job runs this binary. The Docker job does not name it, and on `ubuntu-latest` the guard skips every test. | Add the binary to the `CMD` of `e2e/Dockerfile`. | Fixed: the Docker job runs the whole workspace. `test(proxy): give the tests of the proxy an assertion that can fail` |
-| `crates/pent/tests/security_linux_sandbox.rs:151` | `test_read_outside_profile_denied` | 5 | The only assertion is `!text.contains("SECRETDATA")`. A missing `sh`, a failed `exec`, or any error of pent gives the same empty output and passes. | Add a positive control. Read a file that the profile allows in the same run, and assert that the text holds its content. | Open |
-| `crates/pent/tests/security_linux_sandbox.rs:171` | `test_write_outside_profile_denied` | 5 | Same shape: it asserts only that the target file is absent. A child that never starts leaves the same state. | Same fix: assert a write inside the workspace in the same run. | Open |
+| `crates/pent/tests/security_linux_sandbox.rs:151` | `test_read_outside_the_rules_denied` | 5 | The only assertion is `!text.contains("SECRETDATA")`. A missing `sh`, a failed `exec`, or any error of pent gives the same empty output and passes. | Add a positive control. Read a file that the profile allows in the same run, and assert that the text holds its content. | Open |
+| `crates/pent/tests/security_linux_sandbox.rs:171` | `test_write_outside_the_rules_denied` | 5 | Same shape: it asserts only that the target file is absent. A child that never starts leaves the same state. | Same fix: assert a write inside the workspace in the same run. | Open |
 | `crates/pent/tests/security_linux_sandbox.rs:194` | `test_abstract_unix_socket_blocked` | 5 | It asserts only `!text.contains("CONNECTED")`. When the victim fails to bind, `wait_for` gives up after 5 s and the probe prints `BLOCKED`. The test passes with no victim. | Assert that the victim bound the socket, and assert that the text holds `BLOCKED`. | Open |
 | `crates/pent/tests/security_linux_sandbox.rs:281` | `test_signal_to_host_process_denied` | 5 | It asserts only `!text.contains("SIGNAL_ALLOWED")`. A probe that never runs passes. | Assert that the text holds `SIGNAL_DENIED`. | Open |
 | `crates/pent/tests/security_linux_sandbox.rs:315` | `test_proc_environ_of_host_process_denied` | 5 | Same shape, with `ENVIRON_SECRET`. | Assert that the text holds `ENVIRON_DENIED` or `ENVIRON_EMPTY`. | Open |

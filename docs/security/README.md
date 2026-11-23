@@ -13,6 +13,7 @@ result.
 | [rules.md](rules.md) | The rule model, the classes and the rule files of the new design (branch `next`) |
 | [protocol.md](protocol.md) | The messages and the codec of `pentd.sock` (branch `next`) |
 | [pentd.md](pentd.md) | The daemon, its socket, its lock and its holds (branch `next`) |
+| [run.md](run.md) | The rules in `pent run`: the key, the chain of deciders, the grants and the events (branch `next`) |
 | [fuzzing.md](fuzzing.md) | The parsers that read bytes which an attacker chooses: the fuzz run and its findings |
 
 ## The state of the branch `next`
@@ -22,15 +23,17 @@ The branch `next` builds the design in `docs/design/pent.md`, one step of
 for each claim, in the same commit. Thus the reports always describe the
 code of the branch:
 
-- [rules.md](rules.md), [protocol.md](protocol.md) and [pentd.md](pentd.md)
-  describe the parts of the new design that exist: the rule model, the
-  classes, the rule files, the protocol and pentd. `pent run` holds pentd
-  and starts it, but it asks no question yet, and it does not use the
-  rules yet.
-- The other reports describe the flow of version 0.2.x (profiles, `pent
-  watch`, `pent trust`). This flow still runs on `next`, and its tests still
-  pass. Phase 8 of `PLAN.md` removes it, and the reports of the removed code
-  go with it.
+- [rules.md](rules.md), [protocol.md](protocol.md), [pentd.md](pentd.md)
+  and [run.md](run.md) describe the parts of the new design that exist: the
+  rule model, the classes, the rule files, the protocol, pentd and the rules
+  in `pent run`. `pent run` reads the rules of its key and sends its events
+  to pentd, but no hook asks a question yet (steps 3.2 to 3.4, and phase 5
+  for the files).
+- `pent run` no longer reads profiles or the trust store. The other reports
+  still describe the sandbox, the proxy and the supervisor of `pent run`,
+  and the flow of version 0.2.x (`pent watch`, `pent trust`). This flow
+  still runs on `next`, and its tests still pass. Phase 8 of `PLAN.md`
+  removes it, and the reports of the removed code go with it.
 
 ## The threat model
 

@@ -294,27 +294,46 @@ fn p6_cli_review_without_terminal_keeps_blocked_items_out() -> TestResult {
     Ok(())
 }
 
-/// `pent run` refuses a profile when one byte changed after the trust. The
+/// `pent run` refuses a rule file that is not valid: it never runs with a
+/// part of the rules, and it never runs as if the file were absent. The
 /// check runs before the sandbox starts, so this test needs no privilege.
 #[test]
-fn p5_cli_run_refuses_a_profile_that_changed_after_trust() -> TestResult {
+fn p5_cli_run_refuses_a_rule_file_that_is_not_valid() -> TestResult {
     let env = Env::new()?;
-    let text = "[network]\ndomains = [\"a.example.com\"]\n";
-    env.install("tool", text)?;
-    let profile = env.profile_path("tool");
-    for changed in [
-        format!("{text} "),
-        format!("{text}# c\n"),
-        text.replace("a.example.com", "*.example.com"),
+    let valid = common::rule_file_text(&["domain a.example.com"]).map_err(|e| e.to_string())?;
+    let path = env.state.join("pent/rules/tool.toml");
+    for bad in [
+        format!("{valid}["),
+        valid.replace("version = 1", "version = 99"),
+        valid.replace("kind = \"domain\"", "kind = \"nothing\""),
+        valid.replace("decision = \"allow\"", "decision = \"maybe\""),
+        format!(
+            "{valid}\n[[rule]]\nkind = \"read\"\nwidth = \"subtree\"\npath = \"rel\"\n\
+                 decision = \"allow\"\nsource = \"human\"\ncreated = 2026-11-22T12:00:00Z\n"
+        ),
     ] {
-        fs::write(&profile, &changed)?;
+        common::write_rule_file(&env.state, "tool", &bad)?;
         let out = env.pent(&["run", "--", "tool"])?;
-        assert!(!out.status.success(), "{}", stderr(&out));
+        assert!(!out.status.success(), "{bad}\n{}", stderr(&out));
         assert!(
-            stderr(&out).contains("changed after you trusted it"),
-            "{}",
+            stderr(&out).contains(&path.display().to_string()),
+            "{bad}\n{}",
             stderr(&out)
         );
     }
+
+    // A symbolic link in the place of the rule file: pent does not follow
+    // it.
+    let target = env.state.join("elsewhere.toml");
+    fs::write(&target, &valid)?;
+    fs::remove_file(&path)?;
+    std::os::unix::fs::symlink(&target, &path)?;
+    let out = env.pent(&["run", "--", "tool"])?;
+    assert!(!out.status.success(), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains(&path.display().to_string()),
+        "{}",
+        stderr(&out)
+    );
     Ok(())
 }

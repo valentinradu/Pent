@@ -1,4 +1,10 @@
-//! `pent run`: run a command in the sandbox with its trusted profile.
+//! `pent run`: run a command in the sandbox with the rules of its key.
+//!
+//! The key is the file name of the command, or `--key NAME`. `pent run`
+//! reads the rules of the key at the start and gives them to the static
+//! layers (see [`crate::commands::decide`]). It sends an event to pentd for
+//! each decision that it sees, so `pent denials` shows the refusals of the
+//! run.
 
 use std::collections::{HashMap, HashSet};
 use std::io::Write as _;
@@ -6,15 +12,15 @@ use std::num::NonZeroU16;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use pent_profile::{Outcome, ProfileName, WatchEvent};
+use pent_profile::{Outcome, ProfileName, RuleKey, RuleSet, WatchEvent};
 use pent_proxy::{ProxyPolicy, TraceEvent};
 use pent_sandbox::{
     build_env, check_availability, spawn_sandboxed, LocalhostPorts, NetworkMode, SandboxConfig,
 };
-use pent_settings::{ConfigLoader, EventLog, ProfileStore};
+use pent_settings::{ConfigLoader, ProfileStore, RuleStore};
 
 use crate::cli::{NetworkModeArg, RunArgs};
-use crate::commands::select::{generic_warning, load_trusted, profile_paths, select_profile};
+use crate::commands::decide::{Decider, FlagLists, Grants};
 use crate::commands::session::{
     drain, exit_like_child, forward_std, forward_tokio, is_broad_workspace, start_proxy,
     wait_child, ForwardStop, ProxyChannels, SessionCleanup, SignalRelay,
@@ -27,34 +33,55 @@ use crate::ui;
 const FINAL_DRAIN: Duration = Duration::from_secs(2);
 
 /// One event of the run: a line for the trace log, or a structured access
-/// event for the log of denied accesses.
+/// event for pentd.
 enum RunEvent {
     Trace(TraceLine),
     Access(WatchEvent),
 }
 
+/// The key of the run: `--key NAME`, else the file name of the command.
+///
+/// # Errors
+/// Returns an error when the name is not a valid key. The message names
+/// `--key`, so the user can give another one.
+fn run_key(flag: Option<&str>, command: &[String]) -> Result<RuleKey, CliError> {
+    let result = match flag {
+        Some(name) => name.parse::<RuleKey>(),
+        None => {
+            let first = command
+                .first()
+                .ok_or_else(|| CliError::Other("command list is empty".to_string()))?;
+            RuleKey::from_command(first)
+        }
+    };
+    result.map_err(|e| CliError::Other(format!("{e}; give a key with --key NAME")))
+}
+
+/// The warning for a key that comes from a generic command (a shell or an
+/// interpreter), or `None`.
+fn generic_key_warning(key: &RuleKey, flag: Option<&str>) -> Option<String> {
+    let generic = flag.is_none()
+        && key
+            .as_str()
+            .parse::<ProfileName>()
+            .is_ok_and(|name| name.is_generic());
+    generic.then(|| {
+        format!(
+            "the key \"{key}\" comes from a generic command: all programs that run \
+             through {key} share its rules. Give each program its own key with --key NAME"
+        )
+    })
+}
+
 /// Hold pentd for this run, and start it when no pentd runs. The session
 /// connects in the background, so the program starts at once.
 ///
-/// `pent run` asks no question yet (phase 3 of PLAN.md), so a failure does
-/// not stop the run. The design asks the same: without pentd, the rules
-/// still apply (`docs/design/pent.md`, section 2).
-fn hold_pentd(command: &[String]) -> Option<crate::daemon::client::Session> {
-    let key = match command
-        .first()
-        .map(|c| pent_profile::RuleKey::from_command(c))
-    {
-        Some(Ok(key)) => key,
-        Some(Err(e)) => {
-            // Until phase 3 nothing asks, but the user must know that this
-            // program can keep no rule.
-            ui::warn(format!("{e}; pent runs this program without pentd"));
-            return None;
-        }
-        None => return None,
-    };
+/// A failure does not stop the run: without pentd, the rules still apply
+/// (`docs/design/pent.md`, section 2), and each question gets the error of
+/// a refusal.
+fn hold_pentd(key: &RuleKey, command: &[String]) -> Option<crate::daemon::client::Session> {
     let hold = pent_profile::Hold::Run {
-        key,
+        key: key.clone(),
         command: command.to_vec(),
     };
     let runtime = pent_settings::RuntimeDir::from_env();
@@ -71,41 +98,51 @@ fn hold_pentd(command: &[String]) -> Option<crate::daemon::client::Session> {
 // split it would hide this order.
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
-    // ── Profile ──────────────────────────────────────────────────────────────
-    let selected = select_profile(args.profile.as_deref(), &args.command)?;
-    if let Some(warning) = generic_warning(&selected) {
+    // ── Rules ────────────────────────────────────────────────────────────────
+    let key = run_key(args.key.as_deref(), &args.command)?;
+    if let Some(warning) = generic_key_warning(&key, args.key.as_deref()) {
         ui::warn(warning);
     }
-    let store = ProfileStore::open_default()?;
-    let profile = load_trusted(&store, &selected, &args.command)?;
-    let name = selected.name;
+    let rules = RuleStore::open_default()?.load(&key)?;
     let settings = ConfigLoader::load(&cwd, pent_settings::PentDirs::from_env().as_ref())?;
-    // After the settings: a run that fails on its settings starts no pentd.
-    let _pentd = hold_pentd(&args.command);
+    // After the settings and the rules: a run that fails on them starts no
+    // pentd.
+    let classes = dirs::home_dir().map(|home| {
+        crate::daemon::classes::Classes::new(&home, &crate::daemon::server::pent_dirs())
+    });
+    let grants = Grants::of(&rules, classes.as_ref(), Path::is_dir);
+    let decider = make_decider(&args, &cwd, classes, rules, hold_pentd(&key, &args.command));
+    for (target, why) in &grants.held_back {
+        ui::warn(format!(
+            "this run does not apply the rule \"{}\": {}",
+            pent_profile::safe(&target.to_string()),
+            why.text()
+        ));
+    }
 
-    let mut paths = profile_paths(&profile);
+    let mut paths = grants.paths.clone();
     add_cli_paths(&mut paths, &args);
     paths.resolve_relative(&cwd);
     // The read_write paths must be exact filenames — glob ('*') patterns
     // are not supported because overlayfs requires specific paths to mount over.
     paths.validate_no_rw_globs()?;
 
-    // Decide the network mode before `--allow` merges into the profile
-    // domains, so that the two sources stay separate.
-    let decision = resolve_network(args.network, &args.allow, &profile.network.domains);
-    let domains = merge_domains(&profile.network.domains, &args.allow);
+    // Decide the network mode before `--allow` merges into the domains of
+    // the rules, so that the two sources stay separate.
+    let decision = resolve_network(args.network, &args.allow, &grants.domains);
+    let domains = merge_domains(&grants.domains, &args.allow);
     let localhost_ports = if blocks_localhost(decision) {
-        if let Some(source) = closed_ports_source(&profile.network.localhost, &args.localhost) {
+        if let Some(source) = closed_ports_source(&grants.ports, &args.localhost) {
             ui::warn(format!(
                 "{source} have no effect: --network blocked closes the ports on localhost too"
             ));
         }
         Vec::new()
     } else {
-        merge_ports(&profile.network.localhost, &args.localhost)
+        merge_ports(&grants.ports, &args.localhost)
     };
     let env_map = build_run_env(&args.env);
-    let trace_log_path = open_trace_log(args.trace, &store, &name);
+    let trace_log_path = open_trace_log(args.trace, &key);
 
     for warning in network_warnings(decision, &args.allow, args.trace) {
         ui::warn(warning);
@@ -113,7 +150,8 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
 
     // ── Events ───────────────────────────────────────────────────────────────
     // All event sources send into one channel: the proxy (trace lines and
-    // structured events) and the recorder of the sandbox (`--trace`).
+    // structured events), the supervisor and the recorder of the sandbox
+    // (`--trace`).
     let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<RunEvent>();
     let stop = ForwardStop::default();
 
@@ -123,11 +161,10 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
         forward_tokio(access_rx, event_tx.clone(), RunEvent::Access, &stop);
         let trace_tx = if args.trace {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<TraceEvent>();
-            let profile_name = name.clone();
             forward_tokio(
                 rx,
                 event_tx.clone(),
-                move |e| RunEvent::Trace(proxy_trace_line(e, &profile_name)),
+                |e| RunEvent::Trace(proxy_trace_line(e)),
                 &stop,
             );
             Some(tx)
@@ -169,8 +206,7 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
             .with_network(resolved_network)
             .with_env(env_map);
     sandbox_cfg.record_events = args.trace;
-    sandbox_cfg.unix_sockets =
-        unix_socket_paths(&profile.filesystem.unix_sockets, &args.unix_socket, &cwd);
+    sandbox_cfg.unix_sockets = unix_socket_paths(&grants.unix_sockets, &args.unix_socket, &cwd);
     sandbox_cfg.localhost = LocalhostPorts::Listed(localhost_ports);
 
     if let Some(data_dir) = args.data_dir {
@@ -239,15 +275,16 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
     // Only the forwarders keep senders. When they stop, the channel closes.
     drop(event_tx);
 
-    let mut denied = DeniedRecorder::new(&store, &name);
+    let mut denied = DeniedCount::default();
     let mut sink = |event: RunEvent| match event {
         RunEvent::Trace(line) => write_trace_line(trace_log_path.as_deref(), &line),
         RunEvent::Access(event) => {
             // The recorder sends the filesystem denials only with --trace.
             // Write them to the trace log too.
-            if let Some(line) = access_trace_line(&event, &name) {
+            if let Some(line) = access_trace_line(&event) {
                 write_trace_line(trace_log_path.as_deref(), &line);
             }
+            decider.report_watch(&event);
             denied.record(&event);
         }
     };
@@ -265,14 +302,39 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
     }
     drain(rest, FINAL_DRAIN, &mut sink).await;
 
-    if let Some(message) = denied.summary() {
+    if let Some(message) = denied_message(denied.count()) {
         ui::warn(message);
     }
+    // The events wait in the task of the session. Drop the decider only
+    // after they leave: the drop of the session ends its task.
+    decider.flush().await;
 
     exit_like_child(exit_status)
 }
 
-/// Add the paths of the CLI flags to the profile paths.
+/// The chain of deciders of the run: the flags, the rules `rules`, the
+/// classes of the user and the hold on pentd.
+fn make_decider(
+    args: &RunArgs,
+    cwd: &Path,
+    classes: Option<crate::daemon::classes::Classes>,
+    rules: RuleSet,
+    session: Option<crate::daemon::client::Session>,
+) -> Decider {
+    let flags = FlagLists {
+        traverse: &args.traverse,
+        read: &args.read,
+        write: &args.write,
+        execute: &args.execute,
+        allow: &args.allow,
+        unix_sockets: &args.unix_socket,
+        localhost: &args.localhost,
+    }
+    .rules(rules.key.clone(), cwd);
+    Decider::new(flags, rules, classes, session)
+}
+
+/// Add the paths of the CLI flags to the paths of the rules.
 fn add_cli_paths(paths: &mut pent_settings::SandboxPaths, args: &RunArgs) {
     let strings = |list: &[PathBuf]| -> Vec<String> {
         list.iter()
@@ -285,13 +347,13 @@ fn add_cli_paths(paths: &mut pent_settings::SandboxPaths, args: &RunArgs) {
     paths.execute.extend(strings(&args.execute));
 }
 
-/// The Unix sockets of the profile and of `--unix-socket`, without
-/// duplicates.
+/// The Unix sockets of the rules (or of a profile) and of `--unix-socket`,
+/// without duplicates.
 ///
 /// A leading `~` expands to the home directory, as it does for the other
 /// path lists. A relative path resolves against the workspace.
 pub(crate) fn unix_socket_paths(
-    profile: &[String],
+    granted: &[impl AsRef<Path>],
     flags: &[PathBuf],
     workspace: &Path,
 ) -> Vec<PathBuf> {
@@ -307,8 +369,8 @@ pub(crate) fn unix_socket_paths(
             out.push(path);
         }
     };
-    for entry in profile {
-        add(Path::new(entry));
+    for entry in granted {
+        add(entry.as_ref());
     }
     for entry in flags {
         add(entry);
@@ -318,25 +380,25 @@ pub(crate) fn unix_socket_paths(
 
 /// Return true when the user closed the network with `--network blocked`.
 /// The ports on localhost then close too. A network that is blocked only
-/// because the profile has no domains keeps the ports of the profile.
+/// because no rule allows a domain keeps the ports of the rules.
 fn blocks_localhost(decision: NetworkDecision) -> bool {
     decision.source == NetworkSource::NetworkFlag && decision.choice == NetworkChoice::Blocked
 }
 
 /// Name the source of the ports that `--network blocked` closes, or `None`
 /// when no source has a port.
-fn closed_ports_source(profile: &[NonZeroU16], flags: &[NonZeroU16]) -> Option<&'static str> {
-    match (profile.is_empty(), flags.is_empty()) {
+fn closed_ports_source(rules: &[NonZeroU16], flags: &[NonZeroU16]) -> Option<&'static str> {
+    match (rules.is_empty(), flags.is_empty()) {
         (true, true) => None,
-        (false, true) => Some("the localhost ports of the profile"),
+        (false, true) => Some("the localhost rules"),
         (true, false) => Some("the --localhost flags"),
-        (false, false) => Some("the localhost ports of the profile and the --localhost flags"),
+        (false, false) => Some("the localhost rules and the --localhost flags"),
     }
 }
 
-/// The ports of the profile and of `--localhost`, without duplicates.
-fn merge_ports(profile: &[NonZeroU16], flags: &[NonZeroU16]) -> Vec<NonZeroU16> {
-    let mut ports = profile.to_vec();
+/// The ports of the rules and of `--localhost`, without duplicates.
+fn merge_ports(rules: &[NonZeroU16], flags: &[NonZeroU16]) -> Vec<NonZeroU16> {
+    let mut ports = rules.to_vec();
     for port in flags {
         if !ports.contains(port) {
             ports.push(*port);
@@ -366,9 +428,9 @@ fn localhost_status(network: &NetworkMode, ports: &LocalhostPorts) -> Option<Str
     }
 }
 
-/// The profile domains and the `--allow` domains, without duplicates.
-fn merge_domains(profile: &[String], allow: &[String]) -> Vec<String> {
-    let mut domains = profile.to_vec();
+/// The domains of the rules and of `--allow`, without duplicates.
+fn merge_domains(rules: &[String], allow: &[String]) -> Vec<String> {
+    let mut domains = rules.to_vec();
     for d in allow {
         if !domains.contains(d) {
             domains.push(d.clone());
@@ -396,17 +458,26 @@ fn build_run_env(args_env: &[String]) -> HashMap<String, String> {
     env_map
 }
 
-/// Create the trace log of `name` when `trace` is true; emit a warning on
+/// Create the trace log of `key` when `trace` is true; emit a warning on
 /// failure.
 ///
 /// The log is in the state directory of pent, not in the workspace: the
 /// sandboxed process can write the workspace, so it could put a symbolic link
 /// there and make pent write to another file.
-fn open_trace_log(trace: bool, store: &ProfileStore, name: &ProfileName) -> Option<PathBuf> {
+fn open_trace_log(trace: bool, key: &RuleKey) -> Option<PathBuf> {
     if !trace {
         return None;
     }
-    match store.create_trace_log(name) {
+    let result = ProfileStore::open_default()
+        .map_err(|e| e.to_string())
+        .and_then(|store| {
+            let name = key
+                .as_str()
+                .parse::<ProfileName>()
+                .map_err(|e| e.to_string())?;
+            store.create_trace_log(&name).map_err(|e| e.to_string())
+        });
+    match result {
         Ok(path) => {
             ui::status("tracing", path.display());
             Some(path)
@@ -420,74 +491,35 @@ fn open_trace_log(trace: bool, store: &ProfileStore, name: &ProfileName) -> Opti
 
 // ── Denied accesses ──────────────────────────────────────────────────────────
 
-/// Writes the denied accesses of this run to the denied log of the profile.
-///
-/// The recorder writes each distinct event one time, and opens the log only
-/// at the first denial.
-struct DeniedRecorder<'a> {
-    store: &'a ProfileStore,
-    name: &'a ProfileName,
-    log: Option<EventLog>,
+/// Counts the distinct refusals of this run.
+#[derive(Default)]
+struct DeniedCount {
     seen: HashSet<String>,
-    /// True after the first write error; pent then shows no more warnings.
-    failed: bool,
 }
 
-impl<'a> DeniedRecorder<'a> {
-    fn new(store: &'a ProfileStore, name: &'a ProfileName) -> Self {
-        Self {
-            store,
-            name,
-            log: None,
-            seen: HashSet::new(),
-            failed: false,
-        }
-    }
-
-    /// Record `event` if the policy denied it.
+impl DeniedCount {
+    /// Count `event` if the sandbox or the proxy refused it.
     fn record(&mut self, event: &WatchEvent) {
-        if event.outcome() != Outcome::Denied {
+        if event.outcome() == Outcome::Allowed {
             return;
         }
-        let Ok(key) = event.to_json_line() else {
-            return;
-        };
-        if !self.seen.insert(key) {
-            return;
-        }
-        if self.failed {
-            return;
-        }
-        let result = match &mut self.log {
-            Some(log) => log.append(event),
-            None => self.store.denied_log(self.name).and_then(|mut log| {
-                let result = log.append(event);
-                self.log = Some(log);
-                result
-            }),
-        };
-        if let Err(e) = result {
-            self.failed = true;
-            ui::warn(format!("cannot record a denied access: {e}"));
+        if let Ok(line) = event.to_json_line() {
+            self.seen.insert(line);
         }
     }
 
-    /// The message for the end of the run, if the run had denied accesses.
-    fn summary(&self) -> Option<String> {
-        denied_message(self.seen.len(), self.name)
+    /// The number of distinct refusals.
+    fn count(&self) -> usize {
+        self.seen.len()
     }
 }
 
-/// The message for `count` denied accesses of the profile `name`.
-fn denied_message(count: usize, name: &ProfileName) -> Option<String> {
+/// The message for `count` refusals.
+fn denied_message(count: usize) -> Option<String> {
     match count {
         0 => None,
-        1 => Some(format!(
-            "1 access denied; review it: pent trust {name} --review"
-        )),
-        n => Some(format!(
-            "{n} accesses denied; review them: pent trust {name} --review"
-        )),
+        1 => Some("1 access denied; see it: pent denials".to_string()),
+        n => Some(format!("{n} accesses denied; see them: pent denials")),
     }
 }
 
@@ -521,8 +553,8 @@ pub(crate) enum NetworkSource {
     NetworkFlag,
     /// One or more `--allow` flags.
     AllowFlag,
-    /// The profile has domains.
-    ProfileDomains,
+    /// A rule allows a domain.
+    RuleDomains,
     /// No input; pent uses the default.
     Default,
 }
@@ -541,15 +573,15 @@ pub(crate) struct NetworkDecision {
 /// The precedence, from high to low:
 /// 1. An explicit `--network` flag.
 /// 2. `--allow` (this implies proxy mode).
-/// 3. Domains in the profile (this implies proxy mode).
+/// 3. A rule that allows a domain (this implies proxy mode).
 /// 4. The default: blocked.
 ///
 /// `--trace` is not an input: tracing never changes the network mode.
-/// `profile_domains` must not contain the `--allow` values.
+/// `rule_domains` must not contain the `--allow` values.
 pub(crate) fn resolve_network(
     network_flag: Option<NetworkModeArg>,
     allow_flags: &[String],
-    profile_domains: &[String],
+    rule_domains: &[String],
 ) -> NetworkDecision {
     let decide = |choice, source| NetworkDecision { choice, source };
     if let Some(flag) = network_flag {
@@ -564,8 +596,8 @@ pub(crate) fn resolve_network(
     if !allow_flags.is_empty() {
         return decide(NetworkChoice::Proxy, NetworkSource::AllowFlag);
     }
-    if !profile_domains.is_empty() {
-        return decide(NetworkChoice::Proxy, NetworkSource::ProfileDomains);
+    if !rule_domains.is_empty() {
+        return decide(NetworkChoice::Proxy, NetworkSource::RuleDomains);
     }
     decide(NetworkChoice::Blocked, NetworkSource::Default)
 }
@@ -614,7 +646,7 @@ pub(crate) fn network_status(mode: &NetworkMode, source: NetworkSource) -> Optio
         // The proxy is the expected mode.
         NetworkMode::ProxyOnly { .. } => None,
         NetworkMode::Blocked if source == NetworkSource::Default => {
-            Some("blocked (the profile has no domains)")
+            Some("blocked (no rule allows a domain)")
         }
         NetworkMode::Blocked => Some("blocked"),
         NetworkMode::LocalhostOnly => Some("localhost only"),
@@ -661,15 +693,15 @@ fn write_trace_line(log_path: Option<&Path>, line: &TraceLine) {
 }
 
 /// Convert one proxy event into a trace line with a fix hint.
-fn proxy_trace_line(event: TraceEvent, profile: &ProfileName) -> TraceLine {
+fn proxy_trace_line(event: TraceEvent) -> TraceLine {
     match event {
         TraceEvent::Access(msg) => TraceLine::Allowed(msg),
         TraceEvent::Violation(msg) => TraceLine::Denied {
-            fix: Some(proxy_violation_fix(&msg, profile)),
+            fix: Some(proxy_violation_fix(&msg)),
             message: msg,
         },
         TraceEvent::LocalhostClosed { message, port } => TraceLine::Denied {
-            fix: Some(localhost_fix(port, profile)),
+            fix: Some(localhost_fix(port)),
             message,
         },
     }
@@ -679,7 +711,7 @@ fn proxy_trace_line(event: TraceEvent, profile: &ProfileName) -> TraceLine {
 ///
 /// Returns `None` for other events and for accesses that the sandbox did not
 /// deny.
-fn access_trace_line(event: &WatchEvent, profile: &ProfileName) -> Option<TraceLine> {
+fn access_trace_line(event: &WatchEvent) -> Option<TraceLine> {
     if let WatchEvent::LocalhostConnect {
         port,
         process,
@@ -691,10 +723,7 @@ fn access_trace_line(event: &WatchEvent, profile: &ProfileName) -> Option<TraceL
                 "network: \"{}\" (pid {}) was denied a connection to port {port} on localhost",
                 process.name, process.pid
             ),
-            fix: Some(format!(
-                "allow it for one run with --localhost {port}, or add it to the profile: \
-                 pent trust {profile} --review"
-            )),
+            fix: Some(localhost_fix(*port)),
         });
     }
     let WatchEvent::Fs {
@@ -719,26 +748,19 @@ fn access_trace_line(event: &WatchEvent, profile: &ProfileName) -> Option<TraceL
             "filesystem: \"{}\" (pid {}) was denied {verb} on \"{path}\"",
             process.name, process.pid
         ),
-        fix: Some(format!(
-            "allow it for one run with {flag} \"{path}\", or add it to the profile: \
-             pent trust {profile} --review"
-        )),
+        fix: Some(format!("allow it for one run with {flag} \"{path}\"")),
     })
 }
 
 /// The fix hint for a closed port on localhost.
-fn localhost_fix(port: u16, profile: &ProfileName) -> String {
-    format!(
-        "allow it for one run with --localhost {port}, or add it to the profile: \
-         pent trust {profile} --review"
-    )
+fn localhost_fix(port: u16) -> String {
+    format!("allow it for one run with --localhost {port}")
 }
 
 /// Compute a fix hint for a proxy violation message.
-fn proxy_violation_fix(violation: &str, profile: &ProfileName) -> String {
-    let review = format!("pent trust {profile} --review");
+fn proxy_violation_fix(violation: &str) -> String {
     let Some(rest) = violation.strip_prefix("network: ") else {
-        return format!("review the denied accesses: {review}");
+        return "see the denied accesses: pent denials".to_string();
     };
     // The message names the domain in quotes, for example:
     //   DNS query for "x.com" (A) blocked: the domain is not in the allowlist
@@ -749,9 +771,7 @@ fn proxy_violation_fix(violation: &str, profile: &ProfileName) -> String {
         .map(|(domain, _)| domain);
     if rest.contains("the domain is not in the allowlist") {
         if let Some(domain) = quoted_domain {
-            return format!(
-                "allow it for one run with --allow {domain}, or add it to the profile: {review}"
-            );
+            return format!("allow it for one run with --allow {domain}");
         }
     }
     if rest.contains("the domain resolves to the") || rest.contains("blocked: the address is") {
@@ -759,9 +779,7 @@ fn proxy_violation_fix(violation: &str, profile: &ProfileName) -> String {
                 private_destinations = \"allow\" in the [proxy] section of pent.toml"
             .to_string();
     }
-    format!(
-        "make sure that the process uses DNS names, and add the domain to the profile: {review}"
-    )
+    "make sure that the process uses DNS names, and allow the domain with --allow".to_string()
 }
 
 #[cfg(test)]
@@ -775,10 +793,6 @@ mod tests {
         vec!["example.com".to_string()]
     }
 
-    fn profile_name() -> ProfileName {
-        "claude".parse().unwrap()
-    }
-
     #[test]
     fn network_flag_wins_over_everything() {
         let flags = [
@@ -789,15 +803,15 @@ mod tests {
         ];
         for (flag, expected) in flags {
             for allow in [vec![], domains()] {
-                for profile in [vec![], domains()] {
-                    let d = resolve_network(Some(flag), &allow, &profile);
+                for rules in [vec![], domains()] {
+                    let d = resolve_network(Some(flag), &allow, &rules);
                     assert_eq!(
                         d,
                         NetworkDecision {
                             choice: expected,
                             source: NetworkSource::NetworkFlag
                         },
-                        "flag {expected:?}, allow {allow:?}, profile {profile:?}"
+                        "flag {expected:?}, allow {allow:?}, rules {rules:?}"
                     );
                 }
             }
@@ -805,19 +819,19 @@ mod tests {
     }
 
     #[test]
-    fn allow_flag_wins_over_profile() {
-        for profile in [vec![], domains()] {
-            let d = resolve_network(None, &domains(), &profile);
+    fn allow_flag_wins_over_the_rules() {
+        for rules in [vec![], domains()] {
+            let d = resolve_network(None, &domains(), &rules);
             assert_eq!(d.choice, NetworkChoice::Proxy);
             assert_eq!(d.source, NetworkSource::AllowFlag);
         }
     }
 
     #[test]
-    fn profile_domains_imply_proxy() {
+    fn rule_domains_imply_proxy() {
         let d = resolve_network(None, &[], &domains());
         assert_eq!(d.choice, NetworkChoice::Proxy);
-        assert_eq!(d.source, NetworkSource::ProfileDomains);
+        assert_eq!(d.source, NetworkSource::RuleDomains);
     }
 
     #[test]
@@ -856,7 +870,7 @@ mod tests {
 
     #[test]
     fn no_warning_for_proxy_mode() {
-        let d = decision(NetworkChoice::Proxy, NetworkSource::ProfileDomains);
+        let d = decision(NetworkChoice::Proxy, NetworkSource::RuleDomains);
         assert!(network_warnings(d, &[], false).is_empty());
         assert!(network_warnings(d, &[], true).is_empty());
     }
@@ -871,7 +885,7 @@ mod tests {
     #[test]
     fn blocked_hint_only_for_default() {
         let hint = network_status(&NetworkMode::Blocked, NetworkSource::Default);
-        assert!(hint.is_some_and(|h| h.contains("no domains")));
+        assert!(hint.is_some_and(|h| h.contains("no rule allows a domain")));
         let explicit = network_status(&NetworkMode::Blocked, NetworkSource::NetworkFlag);
         assert_eq!(explicit, Some("blocked"));
     }
@@ -879,46 +893,58 @@ mod tests {
     // ── denied accesses ──────────────────────────────────────────────────────
 
     #[test]
-    fn denied_message_names_the_review_command() {
-        let n = profile_name();
-        assert_eq!(denied_message(0, &n), None);
+    fn denied_message_names_pent_denials() {
+        assert_eq!(denied_message(0), None);
         assert_eq!(
-            denied_message(3, &n).as_deref(),
-            Some("3 accesses denied; review them: pent trust claude --review")
+            denied_message(3).as_deref(),
+            Some("3 accesses denied; see them: pent denials")
         );
         assert_eq!(
-            denied_message(1, &n).as_deref(),
-            Some("1 access denied; review it: pent trust claude --review")
+            denied_message(1).as_deref(),
+            Some("1 access denied; see it: pent denials")
         );
     }
 
     #[test]
-    fn denied_recorder_writes_distinct_denials_only() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = ProfileStore::new(pent_settings::PentDirs {
-            config: dir.path().join("c"),
-            state: dir.path().join("s"),
-        });
-        let n = profile_name();
+    fn the_denied_count_counts_distinct_refusals_only() {
         let connect = |host: &str, outcome| WatchEvent::Connect {
             host: host.to_string(),
             port: 443,
             protocol: pent_profile::NetProtocol::HttpConnect,
             outcome,
         };
-        {
-            let mut rec = DeniedRecorder::new(&store, &n);
-            rec.record(&connect("ok.com", Outcome::Allowed));
-            assert!(rec.summary().is_none());
-            assert!(!store.denied_path(&n).exists(), "no log without a denial");
-            rec.record(&connect("evil.com", Outcome::Denied));
-            rec.record(&connect("evil.com", Outcome::Denied));
-            rec.record(&connect("bad.com", Outcome::Denied));
-            assert!(rec
-                .summary()
-                .is_some_and(|m| m.starts_with("2 accesses denied")));
-        }
-        assert_eq!(store.read_denied(&n).unwrap().len(), 2);
+        let mut count = DeniedCount::default();
+        count.record(&connect("ok.com", Outcome::Allowed));
+        assert_eq!(count.count(), 0);
+        count.record(&connect("evil.com", Outcome::Denied));
+        count.record(&connect("evil.com", Outcome::Denied));
+        count.record(&connect(
+            "bad.com",
+            Outcome::Blocked(pent_profile::GuardClass::Credential),
+        ));
+        assert_eq!(count.count(), 2);
+    }
+
+    #[test]
+    fn a_key_comes_from_the_flag_or_the_command() {
+        let cmd = |w: &[&str]| w.iter().map(ToString::to_string).collect::<Vec<_>>();
+        let key = run_key(None, &cmd(&["/home/u/.local/bin/claude", "--resume"]));
+        assert!(key.is_ok_and(|k| k.as_str() == "claude"));
+        let key = run_key(Some("train"), &cmd(&["python3", "train.py"]));
+        let Ok(key) = key else {
+            return assert!(key.is_ok(), "{key:?}");
+        };
+        assert_eq!(key.as_str(), "train");
+        assert_eq!(generic_key_warning(&key, Some("train")), None);
+        let bad = run_key(Some("a/b"), &cmd(&["x"]));
+        assert!(
+            matches!(&bad, Err(e) if e.to_string().contains("--key NAME")),
+            "{bad:?}"
+        );
+        let bash = run_key(None, &cmd(&["bash", "-c", "npm test"])).unwrap();
+        let warning = generic_key_warning(&bash, None).unwrap_or_default();
+        assert!(warning.contains("\"bash\""), "{warning}");
+        assert!(warning.contains("--key NAME"), "{warning}");
     }
 
     // ── trace log ────────────────────────────────────────────────────────────
@@ -928,13 +954,8 @@ mod tests {
         let fix = proxy_violation_fix(
             "network: SOCKS5 connection to \"evil.example\" port 443 blocked: \
              the domain is not in the allowlist",
-            &profile_name(),
         );
-        assert_eq!(
-            fix,
-            "allow it for one run with --allow evil.example, or add it to the profile: \
-             pent trust claude --review"
-        );
+        assert_eq!(fix, "allow it for one run with --allow evil.example");
     }
 
     #[test]
@@ -942,7 +963,6 @@ mod tests {
         let fix = proxy_violation_fix(
             "network: CONNECT connection to \"intra.example\" port 443 blocked: \
              the domain resolves to the private address 10.0.0.5",
-            &profile_name(),
         );
         assert!(fix.contains("private_destinations"), "{fix}");
     }
@@ -975,20 +995,15 @@ mod tests {
             },
             outcome,
         };
-        let line = access_trace_line(&event(Outcome::Denied), &profile_name());
+        let line = access_trace_line(&event(Outcome::Denied));
         assert_eq!(
-            line.map(|l| format_trace_line(&l)),
-            Some(format!(
+            line.map(|l| format_trace_line(&l)).as_deref(),
+            Some(
                 "pent: [denied] filesystem: \"sh\" (pid 7) was denied create on \"/srv/out.txt\"\n\
-                 pent: fix: allow it for one run with --write \"/srv/out.txt\", or add it to the \
-                 profile: pent trust {} --review\n\n",
-                profile_name()
-            ))
+                 pent: fix: allow it for one run with --write \"/srv/out.txt\"\n\n"
+            )
         );
-        assert_eq!(
-            access_trace_line(&event(Outcome::Allowed), &profile_name()),
-            None
-        );
+        assert_eq!(access_trace_line(&event(Outcome::Allowed)), None);
     }
 
     #[test]
@@ -1001,21 +1016,16 @@ mod tests {
             },
             outcome,
         };
-        let line = access_trace_line(&event(Outcome::Denied), &profile_name());
+        let line = access_trace_line(&event(Outcome::Denied));
         assert_eq!(
-            line.map(|l| format_trace_line(&l)),
-            Some(format!(
+            line.map(|l| format_trace_line(&l)).as_deref(),
+            Some(
                 "pent: [denied] network: \"psql\" (pid 9) was denied a connection to port 5432 \
                  on localhost\n\
-                 pent: fix: allow it for one run with --localhost 5432, or add it to the \
-                 profile: pent trust {} --review\n\n",
-                profile_name()
-            ))
+                 pent: fix: allow it for one run with --localhost 5432\n\n"
+            )
         );
-        assert_eq!(
-            access_trace_line(&event(Outcome::Allowed), &profile_name()),
-            None
-        );
+        assert_eq!(access_trace_line(&event(Outcome::Allowed)), None);
     }
 
     #[test]
@@ -1050,7 +1060,7 @@ mod tests {
         assert_eq!(closed_ports_source(&[], &[]), None);
         assert_eq!(
             closed_ports_source(&[port(1)], &[]),
-            Some("the localhost ports of the profile")
+            Some("the localhost rules")
         );
         assert_eq!(
             closed_ports_source(&[], &[port(1)]),
@@ -1066,7 +1076,7 @@ mod tests {
             message: "network: SOCKS5 connection to 127.0.0.1 port 5432 blocked".to_string(),
             port: 5432,
         };
-        let fix = match proxy_trace_line(event, &profile_name()) {
+        let fix = match proxy_trace_line(event) {
             TraceLine::Denied { fix, .. } => fix.unwrap_or_default(),
             TraceLine::Allowed(line) => format!("a closed port must be a denial: {line}"),
         };

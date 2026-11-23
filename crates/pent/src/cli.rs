@@ -19,7 +19,7 @@ pub(crate) struct Cli {
 
 #[derive(Subcommand)]
 pub(crate) enum Command {
-    /// Run a command in the sandbox with its trusted profile
+    /// Run a command in the sandbox with the rules of its key
     Run(RunArgs),
     /// Record what a command does and make a draft profile from it.
     /// Watch mode does not sandbox the command
@@ -117,14 +117,14 @@ pub(crate) struct DaemonArgs {
 
 #[derive(Args)]
 pub(crate) struct RunArgs {
-    /// The profile to apply. The default is the file name of the command
+    /// The key of the rules. The default is the file name of the command
     /// (for example `claude` for `~/.local/bin/claude`)
     #[arg(long, value_name = "NAME")]
-    pub profile: Option<String>,
+    pub key: Option<String>,
 
     /// Network containment mode. This flag has precedence over --allow and
-    /// over the profile. Without it, the mode is proxy when the profile or
-    /// --allow gives domains, else blocked
+    /// over the rules. Without it, the mode is proxy when a rule or --allow
+    /// gives domains, else blocked
     #[arg(long, value_enum)]
     pub network: Option<NetworkModeArg>,
 

@@ -3,7 +3,7 @@
 //!
 //! `docs/security/linux-sandbox.md` (LS-1) claims:
 //!
-//! 1. A connection to a socket that the profile names works, and the
+//! 1. A connection to a socket that a rule allows works, and the
 //!    descriptor of the child keeps its number, its kind and its flags.
 //! 2. Every other address gets `EACCES`.
 //! 3. The supervisor never answers `SECCOMP_USER_NOTIF_FLAG_CONTINUE`
@@ -44,10 +44,10 @@ use common::e2e::{have_tools, sandbox_ready, stderr, stdout, TestEnv, TestResult
 /// The marker that each probe prints first.
 const RAN: &str = "PENT_CHILD_RAN";
 
-/// The banner of the socket that the profile names.
+/// The banner of the socket that a rule allows.
 const ALLOWED_BANNER: &str = "PENT_ALLOWED_BANNER";
 
-/// The banner of a socket that the profile does not name.
+/// The banner of a socket that no rule allows.
 const VICTIM_SECRET: &str = "PENT_VICTIM_SECRET";
 
 fn ready(test: &str) -> bool {
@@ -144,32 +144,27 @@ fn peer_pid(stream: &UnixStream) -> i32 {
     }
 }
 
-/// A profile that names `sockets` in `filesystem.unix_sockets`.
-fn profile_with(sockets: &[&Path]) -> String {
-    let list: Vec<String> = sockets
+/// Write one `unix-socket` allow rule for each path of `sockets` in the
+/// rule file of the key `python3`.
+fn install_socket_rules(env: &TestEnv, sockets: &[&Path]) -> TestResult {
+    let targets: Vec<String> = sockets
         .iter()
-        .map(|p| format!("{:?}", p.display().to_string()))
+        .map(|p| format!("unix-socket {}", p.display()))
         .collect();
-    format!("[filesystem]\nunix_sockets = [{}]\n", list.join(", "))
+    let targets: Vec<&str> = targets.iter().map(String::as_str).collect();
+    env.install_rules("python3", &targets)
 }
 
-/// Run a python script under `pent run` with the profile `python3`.
+/// Run a python script under `pent run` with the key `python3`.
 fn run(env: &TestEnv, script: &str) -> std::io::Result<Output> {
     env.pent(&[
-        "run",
-        "--profile",
-        "python3",
-        "--",
-        "python3",
-        "-I",
-        "-c",
-        script,
+        "run", "--key", "python3", "--", "python3", "-I", "-c", script,
     ])
 }
 
 // ── Property 1: a named socket works, with its kind and its flags ──────────
 
-/// A connection to a socket that the profile names works, and the
+/// A connection to a socket that a rule allows works, and the
 /// descriptor that the child gets keeps the number, the kind, `O_NONBLOCK`
 /// and `FD_CLOEXEC` that the child asked for.
 #[test]
@@ -194,7 +189,7 @@ fn a_named_socket_works_and_keeps_the_kind_and_the_flags() -> TestResult {
             }
         });
     }
-    env.install_profile("python3", &profile_with(&[&stream.path, &dgram_path]))?;
+    install_socket_rules(&env, &[&stream.path, &dgram_path])?;
     let script = format!(
         "import socket, os, fcntl\n\
          print('{RAN}')\n\
@@ -225,7 +220,7 @@ fn a_named_socket_works_and_keeps_the_kind_and_the_flags() -> TestResult {
     );
     let out = run(&env, &script)?;
     let all = assert_ran(&out);
-    assert_allowed(&all, "the socket that the profile names");
+    assert_allowed(&all, "the socket that a rule allows");
     for tag in ["BLOCKING", "NONBLOCK", "INHERIT"] {
         let line = all
             .lines()
@@ -263,7 +258,7 @@ fn the_server_sees_pent_as_the_peer_not_the_child() -> TestResult {
     }
     let env = TestEnv::new()?;
     let server = Server::bind(env.root.join("allowed.sock"), ALLOWED_BANNER)?;
-    env.install_profile("python3", &profile_with(&[&server.path]))?;
+    install_socket_rules(&env, &[&server.path])?;
     let script = format!(
         "import socket\n\
          print('{RAN}')\n\
@@ -274,7 +269,7 @@ fn the_server_sees_pent_as_the_peer_not_the_child() -> TestResult {
     );
     let out = run(&env, &script)?;
     let all = assert_ran(&out);
-    assert_allowed(&all, "the socket that the profile names");
+    assert_allowed(&all, "the socket that a rule allows");
     let pid = server.peer.load(Ordering::SeqCst);
     assert!(pid > 0, "the server read no peer credentials:\n{all}");
     let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
@@ -287,12 +282,12 @@ fn the_server_sees_pent_as_the_peer_not_the_child() -> TestResult {
 
 // ── Property 2: every other address is refused ─────────────────────────────
 
-/// A connection to any address that the profile does not name fails with
+/// A connection to any address that no rule allows fails with
 /// `EACCES`: another path, an abstract name, a relative path, a path that
-/// does not exist, and a symbolic link to a socket outside the profile.
+/// does not exist, and a symbolic link to a socket that no rule allows.
 #[test]
-fn every_address_outside_the_profile_is_refused() -> TestResult {
-    let test = "every_address_outside_the_profile_is_refused";
+fn every_address_outside_the_rules_is_refused() -> TestResult {
+    let test = "every_address_outside_the_rules_is_refused";
     if !ready(test) {
         return Ok(());
     }
@@ -305,7 +300,7 @@ fn every_address_outside_the_profile_is_refused() -> TestResult {
     let relative = Server::bind(env.ws.join("relative.sock"), VICTIM_SECRET)?;
     // An abstract socket of the test process.
     let abstract_name = format!("pent-ct-{}", std::process::id());
-    env.install_profile("python3", &profile_with(&[&allowed.path]))?;
+    install_socket_rules(&env, &[&allowed.path])?;
     let script = format!(
         "import socket\n\
          print('{RAN}')\n\
@@ -329,10 +324,10 @@ fn every_address_outside_the_profile_is_refused() -> TestResult {
     );
     let out = run(&env, &script)?;
     let all = assert_ran(&out);
-    assert_allowed(&all, "the socket that the profile names");
+    assert_allowed(&all, "the socket that a rule allows");
     assert!(
         !all.contains(VICTIM_SECRET),
-        "the child reached a socket outside its profile:\n{all}"
+        "the child reached a socket that no rule allows:\n{all}"
     );
     assert_eq!(
         victim.reached.load(Ordering::SeqCst) + relative.reached.load(Ordering::SeqCst),
@@ -354,7 +349,7 @@ fn every_address_outside_the_profile_is_refused() -> TestResult {
 }
 
 /// A socket that exists only in the private `/tmp` of the child is not
-/// reachable: it has no path on the host, so the profile cannot name it.
+/// reachable: it has no path on the host, so no rule can name it.
 /// `docs/security/linux-sandbox.md` states this limit under LS-1.
 #[test]
 fn a_socket_only_in_the_private_tmp_is_not_reachable() -> TestResult {
@@ -364,7 +359,7 @@ fn a_socket_only_in_the_private_tmp_is_not_reachable() -> TestResult {
     }
     let env = TestEnv::new()?;
     let allowed = Server::bind(env.root.join("allowed.sock"), ALLOWED_BANNER)?;
-    env.install_profile("python3", &profile_with(&[&allowed.path]))?;
+    install_socket_rules(&env, &[&allowed.path])?;
     let script = format!(
         "import socket, threading\n\
          print('{RAN}')\n\
@@ -384,7 +379,7 @@ fn a_socket_only_in_the_private_tmp_is_not_reachable() -> TestResult {
     );
     let out = run(&env, &script)?;
     let all = assert_ran(&out);
-    assert_allowed(&all, "the socket that the profile names");
+    assert_allowed(&all, "the socket that a rule allows");
     assert!(
         all.contains(&format!("INNER ERR {}", libc::EACCES)),
         "the child reached a socket of its own private /tmp:\n{all}"
@@ -411,7 +406,7 @@ fn the_supervisor_answers_every_connection() -> TestResult {
     // A permitted path that is a regular file, not a socket.
     let not_a_socket = env.root.join("not-a-socket");
     std::fs::write(&not_a_socket, "x")?;
-    env.install_profile("python3", &profile_with(&[&allowed.path, &not_a_socket]))?;
+    install_socket_rules(&env, &[&allowed.path, &not_a_socket])?;
     let script = format!(
         "import ctypes, os, socket, struct, sys\n\
          print('{RAN}', flush=True)\n\
@@ -524,7 +519,7 @@ fn a_blocking_connection_to_a_full_queue_ends_with_an_error() -> TestResult {
             Err(_) => break,
         }
     }
-    env.install_profile("python3", &profile_with(&[&allowed.path, &full]))?;
+    install_socket_rules(&env, &[&allowed.path, &full])?;
     let script = format!(
         "import socket, time\n\
          print('{RAN}', flush=True)\n\
@@ -575,7 +570,7 @@ fn a_second_thread_cannot_change_the_path_after_the_check() -> TestResult {
     let env = TestEnv::new()?;
     let allowed = Server::bind(env.root.join("allowed.sock"), ALLOWED_BANNER)?;
     let victim = Server::bind(env.root.join("victim.sock"), VICTIM_SECRET)?;
-    env.install_profile("python3", &profile_with(&[&allowed.path]))?;
+    install_socket_rules(&env, &[&allowed.path])?;
     let script = format!(
         "import ctypes, socket, struct, threading\n\
          print('{RAN}', flush=True)\n\
@@ -609,10 +604,10 @@ fn a_second_thread_cannot_change_the_path_after_the_check() -> TestResult {
     );
     let out = run(&env, &script)?;
     let all = assert_ran(&out);
-    assert_allowed(&all, "the socket that the profile names");
+    assert_allowed(&all, "the socket that a rule allows");
     assert!(
         !all.contains(VICTIM_SECRET),
-        "a second thread moved the connection to a socket outside the profile:\n{all}"
+        "a second thread moved the connection to a socket that no rule allows:\n{all}"
     );
     assert_eq!(
         victim.reached.load(Ordering::SeqCst),
@@ -636,8 +631,8 @@ fn a_symbolic_link_cannot_change_the_target_after_the_check() -> TestResult {
     let victim = Server::bind(env.root.join("victim.sock"), VICTIM_SECRET)?;
     let link = env.root.join("link.sock");
     std::os::unix::fs::symlink(&real.path, &link)?;
-    // The profile names the link. The supervisor keeps its canonical form.
-    env.install_profile("python3", &profile_with(&[&link]))?;
+    // The rule names the link. The supervisor keeps its canonical form.
+    install_socket_rules(&env, &[&link])?;
     // The thread of the test moves the link only after the child started
     // and after it made its first connection. Pent reads the allowlist
     // before the child runs, so a move before that point would only
@@ -654,7 +649,9 @@ fn a_symbolic_link_cannot_change_the_target_after_the_check() -> TestResult {
         );
         std::thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(60);
-            while !ready.exists() && Instant::now() < deadline {
+            // A run that fails early never writes `ready`. The test then
+            // sets `stop`, and the thread ends at once, not after 60 s.
+            while !ready.exists() && stop.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(5));
             }
             let tmp = link.with_extension("tmp");
@@ -693,10 +690,10 @@ fn a_symbolic_link_cannot_change_the_target_after_the_check() -> TestResult {
     stop.store(1, Ordering::SeqCst);
     mover.join().map_err(|_| "the mover thread failed")?;
     let all = assert_ran(&out);
-    assert_allowed(&all, "the socket that the profile names");
+    assert_allowed(&all, "the socket that a rule allows");
     assert!(
         !all.contains(VICTIM_SECRET),
-        "a moved symbolic link sent the child to a socket outside the profile:\n{all}"
+        "a moved symbolic link sent the child to a socket that no rule allows:\n{all}"
     );
     assert_eq!(
         victim.reached.load(Ordering::SeqCst),
@@ -708,9 +705,9 @@ fn a_symbolic_link_cannot_change_the_target_after_the_check() -> TestResult {
 
 // ── Property 5: the empty allowlist ────────────────────────────────────────
 
-/// With an empty allowlist the child still makes a socket of the
+/// With no rule file (an empty allowlist) the child still makes a socket of the
 /// `AF_UNIX` family, for its own use. `socketpair(2)` works, and each
-/// path that the profile does not name gets `EACCES` (NET-4 in
+/// path that no rule allows gets `EACCES` (NET-4 in
 /// `docs/security/network.md`).
 #[test]
 fn an_empty_allowlist_keeps_the_family_and_refuses_each_path() -> TestResult {
@@ -720,7 +717,6 @@ fn an_empty_allowlist_keeps_the_family_and_refuses_each_path() -> TestResult {
     }
     let env = TestEnv::new()?;
     let victim = Server::bind(env.root.join("victim.sock"), VICTIM_SECRET)?;
-    env.install_profile("python3", "[filesystem]\nread = []\n")?;
     let script = format!(
         "import socket\n\
          print('{RAN}')\n\
@@ -756,7 +752,7 @@ fn an_empty_allowlist_keeps_the_family_and_refuses_each_path() -> TestResult {
     );
     assert!(
         all.contains(&format!("VICTIM ERR {}", libc::EACCES)),
-        "a path that the profile does not name must get EACCES:\n{all}"
+        "a path that no rule allows must get EACCES:\n{all}"
     );
     assert_eq!(
         victim.reached.load(Ordering::SeqCst),
@@ -786,7 +782,7 @@ fn a_second_thread_cannot_change_the_address_family() -> TestResult {
     let env = TestEnv::new()?;
     let allowed = Server::bind(env.root.join("allowed.sock"), ALLOWED_BANNER)?;
     let victim = Server::bind(env.root.join("victim.sock"), VICTIM_SECRET)?;
-    env.install_profile("python3", &profile_with(&[&allowed.path]))?;
+    install_socket_rules(&env, &[&allowed.path])?;
     let script = format!(
         "import ctypes, socket, struct, threading\n\
          print('{RAN}', flush=True)\n\
@@ -817,29 +813,28 @@ fn a_second_thread_cannot_change_the_address_family() -> TestResult {
     );
     let out = run(&env, &script)?;
     let all = assert_ran(&out);
-    assert_allowed(&all, "the socket that the profile names");
+    assert_allowed(&all, "the socket that a rule allows");
     assert_eq!(
         victim.reached.load(Ordering::SeqCst),
         0,
-        "the family race moved a connection to a socket outside the profile:\n{all}"
+        "the family race moved a connection to a socket that no rule allows:\n{all}"
     );
     assert!(
         !all.contains(VICTIM_SECRET),
-        "the family race gave the child the content of a socket outside the profile:\n{all}"
+        "the family race gave the child the content of a socket that no rule allows:\n{all}"
     );
     Ok(())
 }
 
-/// `sendto(2)` must not reach a Unix socket that the profile does not
-/// name.
+/// `sendto(2)` must not reach a Unix socket that no rule allows.
 ///
 /// It does. The supervisor traps only `connect(2)`. A datagram socket
 /// carries the address in `sendto(2)`, so the child sends data to any
 /// socket file that it can resolve. `docs/security/linux-sandbox.md`
 /// names this way under "What stays open"; no test held it until now.
 #[test]
-fn sendto_cannot_reach_a_socket_outside_the_profile() -> TestResult {
-    let test = "sendto_cannot_reach_a_socket_outside_the_profile";
+fn sendto_cannot_reach_a_socket_outside_the_rules() -> TestResult {
+    let test = "sendto_cannot_reach_a_socket_outside_the_rules";
     if !ready(test) {
         return Ok(());
     }
@@ -859,7 +854,7 @@ fn sendto_cannot_reach_a_socket_outside_the_profile() -> TestResult {
             }
         });
     }
-    env.install_profile("python3", &profile_with(&[&allowed.path]))?;
+    install_socket_rules(&env, &[&allowed.path])?;
     let script = format!(
         "import socket\n\
          print('{RAN}', flush=True)\n\
@@ -875,12 +870,12 @@ fn sendto_cannot_reach_a_socket_outside_the_profile() -> TestResult {
     );
     let out = run(&env, &script)?;
     let all = assert_ran(&out);
-    assert_allowed(&all, "the socket that the profile names");
+    assert_allowed(&all, "the socket that a rule allows");
     std::thread::sleep(Duration::from_millis(200));
     assert_eq!(
         got.load(Ordering::SeqCst),
         0,
-        "sendto(2) reached a socket that the profile does not name:\n{all}"
+        "sendto(2) reached a socket that no rule allows:\n{all}"
     );
     Ok(())
 }

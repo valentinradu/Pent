@@ -18,11 +18,11 @@ use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use pent_profile::{Ask, Hold, Message, QuestionId, Verdict};
+use pent_profile::{Ask, Event, Hold, Message, QuestionId, Verdict};
 use pent_settings::RuntimeDir;
 use tokio::io::{AsyncWriteExt as _, BufReader};
 use tokio::net::UnixStream;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
 use super::{read_message, DaemonError};
 
@@ -35,6 +35,9 @@ const RETRY_PAUSE: Duration = Duration::from_millis(25);
 /// How many times in a row the client holds again after a lost connection.
 const MAX_RECONNECTS: u32 = 3;
 
+/// The longest wait of [`Session::flush`].
+const FLUSH_WAIT: Duration = Duration::from_secs(2);
+
 /// A connection that lasts this long resets the count of reconnects.
 const STABLE: Duration = Duration::from_secs(30);
 
@@ -45,20 +48,34 @@ pub(crate) enum Outcome {
     /// pentd sent the verdict of an answer.
     Answered(Verdict),
     /// The deadline came first. The access gets the error of a refusal,
-    /// and the question stays open in pentd.
-    Deadline,
+    /// and the question stays open in pentd. The number is `None` when
+    /// pentd gave no number before the deadline.
+    Deadline(Option<QuestionId>),
     /// pentd is not reachable, or it refused the question. The access gets
     /// the error of a refusal.
     Unavailable,
 }
 
-/// The answer that the task gives to one question.
-type Reply = oneshot::Sender<Option<Verdict>>;
+/// A step of one question, from the task to [`Session::ask`].
+#[derive(Debug)]
+enum Step {
+    /// pentd gave the question its number.
+    Numbered(QuestionId),
+    /// The verdict, or `None` for the error of a refusal.
+    Done(Option<Verdict>),
+}
+
+/// The channel that the task gives the steps of one question to.
+type Reply = mpsc::UnboundedSender<Step>;
 
 /// A command from [`Session`] to its task.
-#[cfg_attr(not(test), allow(dead_code))] // `pent run` asks from phase 3 of PLAN.md; until then only the tests ask.
 enum Command {
+    #[cfg_attr(not(test), allow(dead_code))]
+    // `pent run` asks from step 3.2 of PLAN.md; until then only the tests ask.
     Ask(Box<Ask>, Reply),
+    Event(Box<Event>),
+    /// Reply when each command before this one left.
+    Flush(tokio::sync::oneshot::Sender<()>),
 }
 
 /// How the task connects again after a lost connection.
@@ -71,8 +88,6 @@ struct Reconnect {
 /// One run of `pent run` in pentd. The hold ends when the value drops.
 #[derive(Debug)]
 pub(crate) struct Session {
-    #[cfg_attr(not(test), allow(dead_code))]
-    // `pent run` asks from phase 3 of PLAN.md; until then only the tests ask.
     commands: mpsc::UnboundedSender<Command>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -107,6 +122,13 @@ impl Session {
         Self::spawn(Some(stream), reconnect)
     }
 
+    /// A session over `stream`, which sent its hold already. A lost
+    /// connection ends the session.
+    #[cfg(test)]
+    pub(crate) fn over_stream(stream: UnixStream) -> Self {
+        Self::over(stream, None)
+    }
+
     /// Start the task. With no `stream`, the task connects first.
     fn spawn(stream: Option<UnixStream>, reconnect: Option<Reconnect>) -> Self {
         let (commands, inbox) = mpsc::unbounded_channel();
@@ -114,11 +136,33 @@ impl Session {
         Self { commands, task }
     }
 
+    /// Send `event` to pentd. pentd puts the number of this session in
+    /// it. Without pentd the event goes nowhere: the events are for the
+    /// human, and the decision of the access does not depend on them.
+    pub(crate) fn send_event(&self, event: Event) {
+        if self.commands.send(Command::Event(Box::new(event))).is_err() {
+            tracing::debug!("the session ended; an event goes nowhere");
+        }
+    }
+
+    /// Wait until each event and each question before this call left for
+    /// pentd, at most [`FLUSH_WAIT`]. Call it before the process exits:
+    /// the exit ends the task, also with events in its queue.
+    pub(crate) async fn flush(&self) {
+        let (done, wait) = tokio::sync::oneshot::channel();
+        if self.commands.send(Command::Flush(done)).is_err() {
+            return;
+        }
+        if tokio::time::timeout(FLUSH_WAIT, wait).await.is_err() {
+            tracing::debug!("the events did not leave for pentd in time");
+        }
+    }
+
     /// Ask `ask` and wait for the verdict, at most until its deadline.
-    #[cfg_attr(not(test), allow(dead_code))] // `pent run` asks from phase 3 of PLAN.md; until then only the tests ask.
+    #[cfg_attr(not(test), allow(dead_code))] // `pent run` asks from step 3.2 of PLAN.md; until then only the tests ask.
     pub(crate) async fn ask(&self, ask: Ask) -> Outcome {
-        let deadline = ask.deadline.duration();
-        let (reply, verdict) = oneshot::channel();
+        let deadline = tokio::time::Instant::now() + ask.deadline.duration();
+        let (reply, mut steps) = mpsc::unbounded_channel();
         if self
             .commands
             .send(Command::Ask(Box::new(ask), reply))
@@ -126,10 +170,14 @@ impl Session {
         {
             return Outcome::Unavailable;
         }
-        match tokio::time::timeout(deadline, verdict).await {
-            Ok(Ok(Some(verdict))) => Outcome::Answered(verdict),
-            Ok(Ok(None) | Err(_)) => Outcome::Unavailable,
-            Err(_) => Outcome::Deadline,
+        let mut number = None;
+        loop {
+            match tokio::time::timeout_at(deadline, steps.recv()).await {
+                Ok(Some(Step::Numbered(id))) => number = Some(id),
+                Ok(Some(Step::Done(Some(verdict)))) => return Outcome::Answered(verdict),
+                Ok(Some(Step::Done(None)) | None) => return Outcome::Unavailable,
+                Err(_) => return Outcome::Deadline(number),
+            }
         }
     }
 }
@@ -149,11 +197,11 @@ impl Waiting {
     fn fail_all(&mut self) {
         for reply in self.unnumbered.drain(..) {
             // The caller can be gone after its deadline.
-            let _ = reply.send(None);
+            let _ = reply.send(Step::Done(None));
         }
         for reply in self.numbered.drain().flat_map(|(_, r)| r) {
             // The caller can be gone after its deadline.
-            let _ = reply.send(None);
+            let _ = reply.send(Step::Done(None));
         }
     }
 
@@ -172,6 +220,8 @@ impl Waiting {
         match message {
             Message::Question(question) => {
                 if let Some(reply) = self.unnumbered.pop_front() {
+                    // The caller can be gone after its deadline.
+                    let _ = reply.send(Step::Numbered(question.id));
                     self.numbered.entry(question.id).or_default().push(reply);
                 }
                 self.forget_gone();
@@ -179,7 +229,7 @@ impl Waiting {
             Message::Verdict(verdict) => {
                 for reply in self.numbered.remove(&verdict.id).unwrap_or_default() {
                     // The caller can be gone after its deadline.
-                    let _ = reply.send(Some(verdict.clone()));
+                    let _ = reply.send(Step::Done(Some(verdict.clone())));
                 }
             }
             // pentd refused an ask in place of a number. A refusal with a
@@ -187,7 +237,7 @@ impl Waiting {
             Message::Rejected(rejected) if rejected.id.is_none() => {
                 if let Some(reply) = self.unnumbered.pop_front() {
                     // The caller can be gone after its deadline.
-                    let _ = reply.send(None);
+                    let _ = reply.send(Step::Done(None));
                 }
             }
             other => tracing::debug!("the session does not take {other:?}"),
@@ -234,10 +284,20 @@ async fn run(
             Err(e) => tracing::debug!("cannot hold pentd again: {e}"),
         }
     }
-    // Without pentd, each later question gets the error of a refusal.
-    while let Some(Command::Ask(_, reply)) = commands.recv().await {
-        // The caller can be gone after its deadline.
-        let _ = reply.send(None);
+    // Without pentd, each later question gets the error of a refusal, and
+    // each later event goes nowhere.
+    while let Some(command) = commands.recv().await {
+        match command {
+            Command::Ask(_, reply) => {
+                // The caller can be gone after its deadline.
+                let _ = reply.send(Step::Done(None));
+            }
+            Command::Flush(done) => {
+                // The caller can be gone after its wait.
+                let _ = done.send(());
+            }
+            Command::Event(_) => {}
+        }
     }
 }
 
@@ -277,7 +337,7 @@ async fn serve(stream: UnixStream, commands: &mut mpsc::UnboundedReceiver<Comman
                         Err(e) => {
                             tracing::debug!("the session cannot send a question: {e}");
                             // The caller can be gone after its deadline.
-                            let _ = reply.send(None);
+                            let _ = reply.send(Step::Done(None));
                             continue;
                         }
                     };
@@ -285,6 +345,25 @@ async fn serve(stream: UnixStream, commands: &mut mpsc::UnboundedReceiver<Comman
                     if write.write_all(line.as_bytes()).await.is_err() {
                         break Served::Lost;
                     }
+                }
+                Some(Command::Event(event)) => {
+                    // An event that cannot be one line goes alone, as an
+                    // ask does.
+                    let line = match Message::Event(*event).encode_line() {
+                        Ok(line) => line,
+                        Err(e) => {
+                            tracing::debug!("the session cannot send an event: {e}");
+                            continue;
+                        }
+                    };
+                    if write.write_all(line.as_bytes()).await.is_err() {
+                        break Served::Lost;
+                    }
+                }
+                Some(Command::Flush(done)) => {
+                    // Each write before this one is in the socket now. The
+                    // caller can be gone after its wait.
+                    let _ = done.send(());
                 }
             },
             message = incoming.recv() => match message {
@@ -442,9 +521,25 @@ mod tests {
             tokio::spawn(fake_pentd(theirs, |q| vec![Message::Question(q)]));
             let session = Session::over(ours, None);
             let start = tokio::time::Instant::now();
-            assert_eq!(session.ask(ask(deadline)).await, Outcome::Deadline);
+            // The paused clock can pass the deadline before the number
+            // arrives; the next test checks the number.
+            assert!(matches!(
+                session.ask(ask(deadline)).await,
+                Outcome::Deadline(_)
+            ));
             assert_eq!(start.elapsed(), deadline, "{deadline:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_deadline_names_the_number_of_its_question() {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        tokio::spawn(fake_pentd(theirs, |q| vec![Message::Question(q)]));
+        let session = Session::over(ours, None);
+        assert_eq!(
+            session.ask(ask(Duration::from_millis(300))).await,
+            Outcome::Deadline(Some(QuestionId(0)))
+        );
     }
 
     #[tokio::test]
@@ -526,7 +621,7 @@ mod tests {
     fn the_replies_of_expired_questions_go() {
         let mut waiting = Waiting::default();
         for _ in 0..3 {
-            let (reply, receiver) = oneshot::channel();
+            let (reply, receiver) = mpsc::unbounded_channel();
             waiting.unnumbered.push_back(reply);
             drop(receiver);
         }
@@ -542,7 +637,7 @@ mod tests {
     #[test]
     fn a_refusal_with_a_number_does_not_take_the_place_of_a_number() {
         let mut waiting = Waiting::default();
-        let (reply, mut receiver) = oneshot::channel();
+        let (reply, mut receiver) = mpsc::unbounded_channel();
         waiting.unnumbered.push_back(reply);
         waiting.take(Message::Rejected(Rejected {
             id: Some(QuestionId(5)),

@@ -322,6 +322,22 @@ impl TestEnv {
         Ok(out)
     }
 
+    /// The rule file of `key`.
+    pub fn rules_path(&self, key: &str) -> PathBuf {
+        self.state_dir().join(format!("pent/rules/{key}.toml"))
+    }
+
+    /// Write the allow rules `targets` as the rule file of `key`. See
+    /// [`super::rule_file_text`] for the form of a target.
+    ///
+    /// # Errors
+    /// Returns an error if a target is not valid or the file cannot be
+    /// written.
+    pub fn install_rules(&self, key: &str, targets: &[&str]) -> TestResult {
+        super::write_rule_file(&self.state_dir(), key, &super::rule_file_text(targets)?)?;
+        Ok(())
+    }
+
     /// Write `toml` as the draft of `name` and trust it with
     /// `pent trust NAME --yes`.
     ///
@@ -441,10 +457,9 @@ pub fn sandbox_ready(test: &str) -> bool {
                     stderr(&out)
                 )));
             }
-            env.install_profile("probe", "")?;
             let outside = env.root.join("outside");
             let script = format!("echo probe > '{}'", outside.display());
-            let out = env.pent(&["run", "--profile", "probe", "--", "sh", "-c", &script])?;
+            let out = env.pent(&["run", "--key", "probe", "--", "sh", "-c", &script])?;
             if outside.exists() {
                 return Ok(Err("the sandbox does not enforce its rules".to_string()));
             }

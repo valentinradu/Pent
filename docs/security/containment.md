@@ -42,7 +42,7 @@ cargo test -p pent --test 'containment_*' -- --include-ignored  # also the findi
 | ID | Severity | One line | State | Test |
 |----|----------|----------|-------|------|
 | CT-1 | High | A second thread changes the address family of `connect(2)` after the supervisor read it, and the child reaches any Unix socket of the host. | Fixed by `c3162d9` | `a_second_thread_cannot_change_the_address_family` |
-| CT-2 | High | `sendto(2)` is not trapped, so the child sends data to any Unix socket that it can resolve. | Fixed by `bfac3e0` | `sendto_cannot_reach_a_socket_outside_the_profile` |
+| CT-2 | High | `sendto(2)` is not trapped, so the child sends data to any Unix socket that it can resolve. | Fixed by `bfac3e0` | `sendto_cannot_reach_a_socket_outside_the_rules` |
 | CT-3 | Low | `SIGKILL` of the command gave pent the exit code 137, not the signal. | **Fixed** by `fix(cli): die from the signal of the command, also SIGKILL` | `sigkill_of_the_command_reaches_the_caller` |
 | CT-4 | Low | A socket that only `unix_sockets` names stays covered with `/dev/null`, against what the README says. | Fixed by `c3162d9` | `a_socket_that_the_configuration_names_is_not_hidden` |
 
@@ -252,7 +252,7 @@ Each test below passes. It guards a property that holds.
 |----------|------|
 | A named socket works; the descriptor keeps its number, its kind, `O_NONBLOCK` and `FD_CLOEXEC`. A datagram socket keeps its kind and its data arrives. | `a_named_socket_works_and_keeps_the_kind_and_the_flags` |
 | The server sees pent as the peer, not the child. | `the_server_sees_pent_as_the_peer_not_the_child` |
-| Each address outside the profile gets `EACCES`: another path, a symbolic link, a relative path, a path that does not exist, an abstract name, an empty name. | `every_address_outside_the_profile_is_refused` |
+| Each address outside the profile gets `EACCES`: another path, a symbolic link, a relative path, a path that does not exist, an abstract name, an empty name. | `every_address_outside_the_rules_is_refused` |
 | A socket that exists only in the private `/tmp` of the child is not reachable. | `a_socket_only_in_the_private_tmp_is_not_reachable` |
 | The supervisor answers every call: a descriptor that is not a socket (`EACCES`), a closed descriptor (`EACCES`), an address that is too short (`EFAULT`), an address with no name (`EINVAL`), an address that it cannot read (`EFAULT`), a permitted path with no server (`ECONNREFUSED`), and 320 calls from four threads. | `the_supervisor_answers_every_connection` |
 | A blocking connection to a queue that is full ends with an error, and the supervisor still serves the next call. | `a_blocking_connection_to_a_full_queue_ends_with_an_error` |
@@ -278,7 +278,7 @@ Each test below passes. It guards a property that holds.
 |----------|------|
 | The filter blocks `ioctl(TIOCSTI)` and `ioctl(TIOCLINUX)` with `EPERM`, and lets another `ioctl` through. | `the_filter_blocks_tiocsti_and_tioclinux` |
 | `<workspace>/.pent` is readable and read-only. | `the_dot_pent_directory_of_the_workspace_is_read_only` |
-| The profile covers the full process tree, three levels deep. | `the_profile_covers_the_full_process_tree` |
+| The rules cover the full process tree, three levels deep. | `the_rules_cover_the_full_process_tree` |
 | Pent ignores `SIGINT`, and the command of the process group sees it. | `pent_ignores_sigint_and_lets_the_command_see_it` |
 | `/tmp` and `/var/tmp` keep the mode 1777, `/run` keeps 0755. | `the_private_directories_keep_their_modes` |
 | A directory of `PATH` below `/tmp` comes back, and its sibling stays hidden. | `a_path_directory_below_a_private_directory_comes_back` |

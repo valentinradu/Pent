@@ -117,6 +117,10 @@ decision, so the property of the target now compares the rules in any
 order. `docs/security/rules.md` (RF-11) and
 `docs/security/protocol.md` (PR-7) name the properties.
 
+**The record of `protocol_line` is stale.** Step 3.1 adds the cause `base`
+to `Event` (`DecidedBy::Base`). The target reads the new form, but it did
+not run with it yet. Run it again before phase 3 ends.
+
 ## The property tests
 
 Each test ran with `PENT_PROPERTY_ROUNDS=1000000`. The whole run took 196

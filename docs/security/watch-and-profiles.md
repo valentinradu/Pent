@@ -224,7 +224,7 @@ See H-13 in `docs/security/linux-sandbox.md`. The test is
 | A symlink at an event log path is not followed | Pass | `p5_symlink_at_event_log_is_not_followed` |
 | `trust` records the hash of exactly the bytes that it moves | Pass | `p5_trust_records_the_hash_of_the_moved_bytes` |
 | A profile that changed after the trust is not applied (library) | Pass | `p5_profile_that_changed_after_trust_is_not_applied`, `p5_profile_replaced_by_a_symlink_is_not_applied` |
-| `pent run` refuses a profile that changed after the trust (CLI) | Pass | `p5_cli_run_refuses_a_profile_that_changed_after_trust` |
+| `pent run` refuses a rule file that is not valid, and a link at its path (CLI). Since step 3.1, `pent run` reads no profile ([run.md](run.md), RN-2). | Pass | `p5_cli_run_refuses_a_rule_file_that_is_not_valid` |
 | `pent trust` trusts the bytes that it showed | Pass | `p5_trust_moves_the_bytes_that_the_user_saw` |
 | The guard protects the files of pent when the XDG variables are set | Pass | `p5_guard_protects_pent_files_in_xdg_dirs` |
 | Profile names reject `/`, `\`, `..`, a leading dot, control characters, bidi characters and non-ASCII text | Pass | `p5_profile_names_reject_unsafe_text`, `p5_store_paths_stay_in_their_directories`, `p5_list_skips_files_with_invalid_names` |

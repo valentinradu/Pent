@@ -221,15 +221,21 @@ fn the_guard_protects_the_store_of_pent_in_the_xdg_directories() -> TestResult {
     env.install_profile("victim", "[filesystem]\nread = []\n")?;
     let profile = env.profile_path("victim");
     let trusted = env.config_dir().join("pent/trusted.toml");
+    // The rule file of `pent run` is in the store too.
+    env.install_rules("victim", &[&format!("read {}/data/**", env.root.display())])?;
+    let rule_file = env.rules_path("victim");
     let before_profile = std::fs::read_to_string(&profile)?;
     let before_trusted = std::fs::read_to_string(&trusted)?;
+    let before_rules = std::fs::read_to_string(&rule_file)?;
     let free = env.home_path("notes.txt");
     let script = format!(
         "echo {RAN}; echo 'read = [\"/\"]' > '{p}' 2>&1; echo P rc=$?; \
          echo x > '{t}' 2>&1; echo T rc=$?; \
+         echo x > '{r}' 2>&1; echo R rc=$?; \
          echo OK > '{f}' 2>&1; echo FREE rc=$?",
         p = profile.display(),
         t = trusted.display(),
+        r = rule_file.display(),
         f = free.display()
     );
     let out = watch(&env, &["sh", "-c", &script])?;
@@ -247,6 +253,11 @@ fn the_guard_protects_the_store_of_pent_in_the_xdg_directories() -> TestResult {
         std::fs::read_to_string(&trusted)?,
         before_trusted,
         "the watched program rewrote the trust store of pent"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&rule_file)?,
+        before_rules,
+        "the watched program rewrote a rule file of pent"
     );
     Ok(())
 }
@@ -355,12 +366,11 @@ fn an_inherited_descriptor_does_not_reach_the_command() -> TestResult {
     let secret = env.root.join("outside-secret");
     std::fs::write(&secret, "PENT_INHERITED_SECRET")?;
     std::fs::write(env.ws.join("allowed.txt"), "PENT_ALLOWED_DATA")?;
-    env.install_profile("sh", "[filesystem]\nread = []\n")?;
     let file = std::fs::File::open(&secret)?;
     let raw = file.as_raw_fd();
     let mut cmd = env.command(&[
         "run",
-        "--profile",
+        "--key",
         "sh",
         "--",
         "sh",
