@@ -234,7 +234,7 @@ const PUBLIC_IP: Ipv4Addr = Ipv4Addr::new(93, 184, 216, 34); // documentation IP
 // ── Tests: DNS filtering ────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn disallowed_name_gets_nxdomain_and_is_not_forwarded_upstream() {
+async fn disallowed_name_gets_refused_and_is_not_forwarded_upstream() {
     let h = start(
         &["allowed.example.com"],
         PUBLIC_IP,
@@ -252,7 +252,7 @@ async fn disallowed_name_gets_nxdomain_and_is_not_forwarded_upstream() {
     let mut buf = [0u8; 512];
     let (n, _) = client.recv_from(&mut buf).expect("recv");
     let rcode = buf[3] & 0x0F;
-    assert_eq!(rcode, 3, "disallowed name must get NXDOMAIN");
+    assert_eq!(rcode, 5, "disallowed name must get REFUSED, never NXDOMAIN");
     assert!(n >= 12);
 
     // The upstream must never have seen the disallowed name.

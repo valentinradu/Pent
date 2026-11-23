@@ -1173,10 +1173,10 @@ mod tests {
         )
         .await??;
 
-        // Should get NXDOMAIN (RCODE = 3 in byte 3)
+        // Should get REFUSED (RCODE = 5 in byte 3), never NXDOMAIN
         assert!(len > 12);
         let rcode = buf[3] & 0x0F;
-        assert_eq!(rcode, 3, "Expected NXDOMAIN RCODE");
+        assert_eq!(rcode, 5, "Expected REFUSED RCODE");
 
         handle.shutdown().await?;
         Ok(())
@@ -1208,14 +1208,14 @@ mod tests {
         })?;
         let timeout = std::time::Duration::from_secs(2);
 
-        // DNS over UDP: a blocked name gets NXDOMAIN.
+        // DNS over UDP: a blocked name gets REFUSED.
         let query = build_test_dns_query("blocked.com", 1);
         let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
         socket.send_to(&query, udp_addr).await?;
         let mut buf = [0u8; 512];
         let (len, _) = tokio::time::timeout(timeout, socket.recv_from(&mut buf)).await??;
         assert!(len > 12);
-        assert_eq!(buf[3] & 0x0F, 3, "Expected NXDOMAIN over UDP");
+        assert_eq!(buf[3] & 0x0F, 5, "Expected REFUSED over UDP");
 
         // DNS over TCP: the same answer with a length prefix. Two queries on
         // one connection.
@@ -1229,7 +1229,7 @@ mod tests {
             let mut reply = vec![0u8; usize::from(u16::from_be_bytes(len_buf))];
             tokio::time::timeout(timeout, stream.read_exact(&mut reply)).await??;
             assert!(reply.len() > 12);
-            assert_eq!(reply[3] & 0x0F, 3, "Expected NXDOMAIN over TCP");
+            assert_eq!(reply[3] & 0x0F, 5, "Expected REFUSED over TCP");
         }
 
         // The proxy port: a SOCKS5 greeting gets the SOCKS5 answer.
@@ -1361,7 +1361,7 @@ mod tests {
         )
         .await??;
         assert!(len > 12);
-        assert_eq!(buf[3] & 0x0F, 3, "the parent name must get NXDOMAIN");
+        assert_eq!(buf[3] & 0x0F, 5, "the parent name must get REFUSED");
 
         handle.shutdown().await?;
         Ok(())

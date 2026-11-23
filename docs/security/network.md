@@ -11,8 +11,9 @@ reach services on the host or on the local network.
 Since step 3.2 of `PLAN.md`, the allowlist of the proxy holds the flags
 and the whole rules of `pent run`. A CONNECT or SOCKS request for another
 name waits for the chain of deciders, which can ask pentd (RN-15 to RN-17
-in [run.md](run.md)). The DNS server still answers only the names of the
-allowlist until step 3.3.
+in [run.md](run.md)). Since step 3.3 a DNS query for another name waits
+for the chain too, nothing goes upstream before an "allow", and a refusal
+is `REFUSED`, not `NXDOMAIN` (RN-18 and RN-19).
 
 Each finding has a test. A test that passes proves a defense. A test that
 fails proves a vulnerability. The failing test keeps the secure assertion and
@@ -288,8 +289,9 @@ Each item below has a test that passes. The test stays as a regression test.
 
 Proxy level (`crates/pent-proxy/tests/security_network.rs`):
 
-- A disallowed name gets NXDOMAIN. The proxy does not forward it upstream.
-  (`disallowed_name_gets_nxdomain_and_is_not_forwarded_upstream`)
+- A disallowed name gets REFUSED, never NXDOMAIN (since step 3.3). The
+  proxy does not forward it upstream.
+  (`disallowed_name_gets_refused_and_is_not_forwarded_upstream`)
 - A SOCKS5 connection to a disallowed domain gets the code
   "connection not allowed". (`socks5_connect_to_disallowed_domain_is_refused`)
 - An HTTP CONNECT to a disallowed domain gets 403.

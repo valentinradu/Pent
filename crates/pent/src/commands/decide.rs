@@ -35,6 +35,22 @@ struct Answers {
     questions: Vec<QuestionId>,
 }
 
+impl Answers {
+    /// Keep the verdict `verdict`, one time for each question.
+    fn keep(&mut self, verdict: &pent_profile::Verdict) {
+        if self.questions.contains(&verdict.id) {
+            return;
+        }
+        self.rules.rules.push(Rule {
+            target: verdict.target.clone(),
+            decision: verdict.decision,
+            source: verdict.source,
+            created: SystemTime::now(),
+        });
+        self.questions.push(verdict.id);
+    }
+}
+
 /// The chain of deciders of one run.
 pub(crate) struct Decider {
     /// The answers in advance: the flags of `pent run`.
@@ -117,10 +133,17 @@ impl Decider {
         if let Some(decision) = decide_in(&self.rules, &access, sensitive) {
             return Some(DecidedBy::Rule(decision));
         }
-        let answers = self
+        let mut answers = self
             .answers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A late verdict (its access stopped the wait at the deadline)
+        // applies now, so a later try gets the answer with no new question.
+        if let Some(session) = &self.session {
+            for verdict in session.take_verdicts() {
+                answers.keep(&verdict);
+            }
+        }
         let decision = decide_in(&answers.rules, &access, sensitive)?;
         // The event names one answer that alone gives the same decision.
         // For a sensitive access, only an exact answer counts.
@@ -209,18 +232,10 @@ impl Decider {
         };
         match session.ask(ask).await {
             client::Outcome::Answered(verdict) => {
-                let mut answers = self
-                    .answers
+                self.answers
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                answers.rules.rules.push(Rule {
-                    target: verdict.target.clone(),
-                    decision: verdict.decision,
-                    source: verdict.source,
-                    created: SystemTime::now(),
-                });
-                answers.questions.push(verdict.id);
-                drop(answers);
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .keep(&verdict);
                 DecidedBy::Answer {
                     question: verdict.id,
                     decision: verdict.decision,
@@ -303,10 +318,10 @@ impl pent_proxy::DomainDecider for ProxyDecider {
                 .0
                 .decide(&key, Request::Domain(name.clone()), deadline)
                 .await;
-            if decided_by.is_refusal() {
-                Decision::Deny
-            } else {
-                Decision::Allow
+            match decided_by {
+                DecidedBy::Deadline { .. } => pent_proxy::DomainVerdict::Deadline,
+                d if d.is_refusal() => pent_proxy::DomainVerdict::Deny,
+                _ => pent_proxy::DomainVerdict::Allow,
             }
         })
     }
@@ -1191,6 +1206,65 @@ mod tests {
             }
         }
         assert_eq!(causes, vec![deadline, DecidedBy::Base(Decision::Deny)]);
+    }
+
+    /// The verdict of a question comes after the deadline of its access
+    /// (as at the 4 s of DNS). The next access of the same width gets the
+    /// answer, and pentd gets no new question.
+    #[tokio::test]
+    async fn a_late_answer_applies_to_the_next_access() {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let (read, mut write) = theirs.into_split();
+        let asks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&asks);
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(read).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let Ok(Message::Ask(ask)) = Message::decode_line(&line) else {
+                    continue;
+                };
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let id = QuestionId(7);
+                let numbered = Message::Question(Question { id, ask });
+                let line = numbered.encode_line().unwrap();
+                write.write_all(line.as_bytes()).await.unwrap();
+                // The human answers after the deadline of the access.
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                let verdict = Message::Verdict(Verdict {
+                    id,
+                    decision: Decision::Allow,
+                    target: Target::Domain("**.late.example".parse().unwrap()),
+                    scope: Scope::Run,
+                    source: Source::Human,
+                });
+                write
+                    .write_all(verdict.encode_line().unwrap().as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        let session = Session::over_stream(ours);
+        let chain = Decider::new(set(vec![]), set(vec![]), classes(), Some(session));
+        assert_eq!(
+            chain
+                .decide("dig", domain("a.late.example"), Duration::from_millis(100))
+                .await,
+            DecidedBy::Deadline {
+                question: QuestionId(7)
+            }
+        );
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        let answer = DecidedBy::Answer {
+            question: QuestionId(7),
+            decision: Decision::Allow,
+        };
+        assert_eq!(
+            chain
+                .decide("dig", domain("b.late.example"), Duration::from_millis(100))
+                .await,
+            answer
+        );
+        assert_eq!(asks.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

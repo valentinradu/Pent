@@ -93,17 +93,29 @@ use std::sync::Arc;
 /// Result type for proxy operations.
 pub type Result<T> = std::result::Result<T, ProxyError>;
 
+/// The decision of a [`DomainDecider`] about a domain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DomainVerdict {
+    /// Permit the access.
+    Allow,
+    /// Refuse the access: a rule, an answer, or no pentd.
+    Deny,
+    /// The deadline came first. The access gets the error of a refusal,
+    /// and the question stays open, so a later try can get the answer.
+    Deadline,
+}
+
 /// The future of a decision of a [`DomainDecider`].
 pub type DecisionFuture<'a> =
-    std::pin::Pin<Box<dyn std::future::Future<Output = pent_profile::Decision> + Send + 'a>>;
+    std::pin::Pin<Box<dyn std::future::Future<Output = DomainVerdict> + Send + 'a>>;
 
-/// Decides a connection to a domain that the allowlist does not hold.
+/// Decides an access to a domain that the allowlist does not hold: a DNS
+/// query or a connection.
 ///
 /// `pent run` gives its chain of deciders, which can ask pentd. The proxy
-/// waits for the decision, and the decider keeps to `deadline`: at the
-/// deadline it gives [`pent_profile::Decision::Deny`].
+/// waits for the decision, and the decider keeps to `deadline`.
 pub trait DomainDecider: Send + Sync + std::fmt::Debug {
-    /// Decide a connection to `name`, and wait at most `deadline`.
+    /// Decide an access to `name`, and wait at most `deadline`.
     fn decide<'a>(
         &'a self,
         name: &'a pent_profile::DomainName,
@@ -570,21 +582,33 @@ impl SharedState {
     }
 
     /// Decide whether the policy permits a connection to `domain`, a
-    /// normalized name. In observe mode it permits each domain. In enforce
-    /// mode, the allowlist permits it, else the decider decides, within
-    /// [`pent_profile::PROXY_DEADLINE`]. Without a decider, the domain must
-    /// be on the allowlist.
+    /// normalized name, within [`pent_profile::PROXY_DEADLINE`]. See
+    /// [`SharedState::decide_domain`].
     pub async fn permits_connection(&self, domain: &str) -> bool {
+        self.decide_domain(domain, pent_profile::PROXY_DEADLINE)
+            .await
+            == DomainVerdict::Allow
+    }
+
+    /// Decide an access to `domain`, a normalized name. In observe mode
+    /// the policy permits each domain. In enforce mode, the allowlist
+    /// permits it, else the decider decides within `deadline`. Without a
+    /// decider, a domain off the allowlist gets `Deny`.
+    pub async fn decide_domain(
+        &self,
+        domain: &str,
+        deadline: std::time::Duration,
+    ) -> DomainVerdict {
         if self.is_permitted(domain) {
-            return true;
+            return DomainVerdict::Allow;
         }
         let Some(decider) = &self.decider else {
-            return false;
+            return DomainVerdict::Deny;
         };
         let Ok(name) = domain.parse::<pent_profile::DomainName>() else {
-            return false;
+            return DomainVerdict::Deny;
         };
-        decider.decide(&name, pent_profile::PROXY_DEADLINE).await == pent_profile::Decision::Allow
+        decider.decide(&name, deadline).await
     }
 
     /// The policy of the proxy.

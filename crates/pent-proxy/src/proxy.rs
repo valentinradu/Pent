@@ -1818,12 +1818,12 @@ mod tests {
     /// that it got.
     #[derive(Debug)]
     struct FixedDecider {
-        decision: pent_profile::Decision,
+        decision: crate::DomainVerdict,
         asked: std::sync::Mutex<Vec<(String, Duration)>>,
     }
 
     impl FixedDecider {
-        fn new(decision: pent_profile::Decision) -> Arc<Self> {
+        fn new(decision: crate::DomainVerdict) -> Arc<Self> {
             Arc::new(Self {
                 decision,
                 asked: std::sync::Mutex::new(Vec::new()),
@@ -1870,7 +1870,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_name_off_the_allowlist_waits_for_the_decider() {
-        use pent_profile::Decision;
+        use crate::DomainVerdict as Decision;
         // `.invalid` never resolves, so a name that the policy permits
         // ends with a DNS error, and a refused name with `DomainBlocked`.
         let target = domain_target("new.invalid");
@@ -1906,7 +1906,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_allowlist_and_observe_mode_do_not_ask() {
-        use pent_profile::Decision;
+        use crate::DomainVerdict as Decision;
         let target = domain_target("listed.invalid");
         for (allowlist, policy) in [
             (&["listed.invalid"][..], ProxyPolicy::Enforce),
@@ -1930,7 +1930,7 @@ mod tests {
     #[tokio::test]
     async fn a_sni_name_asks_only_when_it_differs_from_the_request() {
         use crate::inspect::tests::client_hello;
-        use pent_profile::Decision;
+        use crate::DomainVerdict as Decision;
         let decider = FixedDecider::new(Decision::Deny);
         let proxy = decided_proxy(&[], &decider, ProxyPolicy::Enforce);
         let target = domain_target("a.example");

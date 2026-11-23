@@ -1,7 +1,7 @@
 //! DNS server with domain filtering.
 //!
 //! Intercepts DNS queries from sandboxed processes and only resolves
-//! domains that are on the allowlist. Blocked domains receive NXDOMAIN.
+//! domains that are on the allowlist. Blocked domains receive REFUSED.
 //!
 //! # Protocol Support
 //!
@@ -28,7 +28,7 @@
 //!      |                 v
 //!      |           Return the upstream answer
 //!      |
-//!      +-- no --> Return NXDOMAIN
+//!      +-- no --> Return REFUSED (SERVFAIL at the deadline of a question)
 //! ```
 //!
 
@@ -107,6 +107,7 @@ mod rcode {
     pub(super) const SERVFAIL: u8 = 2;
     pub(super) const NXDOMAIN: u8 = 3;
     pub(super) const NOTIMP: u8 = 4;
+    pub(super) const REFUSED: u8 = 5;
 }
 
 /// Record types that the server handles in a special way.
@@ -531,7 +532,7 @@ fn build_error_response(query: &[u8], question_end: Option<usize>, code: u8) -> 
 /// DNS server that filters queries by domain allowlist.
 ///
 /// Only resolves domains that match the configured allowlist.
-/// All other domains receive NXDOMAIN responses.
+/// All other domains receive REFUSED responses.
 pub struct DnsServer {
     /// Server configuration.
     config: DnsServerConfig,
@@ -781,7 +782,8 @@ impl DnsServer {
     ///   server does not reject as not implemented
     /// * If allowed: forwards the query type to upstream, caches A/AAAA
     ///   answers, returns the upstream answer
-    /// * If blocked: returns NXDOMAIN response
+    /// * If blocked: returns REFUSED; at the deadline of a question,
+    ///   SERVFAIL
     async fn handle_query(&self, query: &[u8]) -> Result<Vec<u8>> {
         // Validate minimum DNS header size
         if query.len() < HEADER_LEN {
@@ -812,19 +814,17 @@ impl DnsServer {
             return Ok(respond(rcode::NOTIMP));
         }
 
-        // Check domain against allowlist (ASCII case-insensitive). The server
-        // forwards the same normalized name that it checks.
-        // In observe mode, the policy permits each valid name.
+        // Check the domain against the policy (ASCII case-insensitive). The
+        // server forwards the same normalized name that it checks, and
+        // nothing goes upstream before the policy permits the name. In
+        // observe mode, the policy permits each valid name.
+        //
+        // A refusal is REFUSED, never NXDOMAIN: pent never says that a name
+        // that exists does not exist. At the deadline of a question the
+        // answer is SERVFAIL ("cannot answer now"), and the question stays
+        // open, so a later try can get the answer.
         let name = match normalize_hostname(&question.name) {
-            Ok(name) if self.state.is_permitted(&name) => name,
-            Ok(name) => {
-                self.state.report_violation(format!(
-                    "network: DNS query for \"{name}\" ({type_name}) blocked: \
-                     the domain is not in the allowlist"
-                ));
-                self.emit_dns(name, type_name, Outcome::Denied);
-                return Ok(respond(rcode::NXDOMAIN));
-            }
+            Ok(name) => name,
             Err(e) => {
                 self.state.report_violation(format!(
                     "network: DNS query for {:?} ({type_name}) blocked: {e}",
@@ -834,9 +834,32 @@ impl DnsServer {
                 // event uses the lowercase name without the trailing dot.
                 let raw = question.name.trim_end_matches('.').to_ascii_lowercase();
                 self.emit_dns(raw, type_name, Outcome::Denied);
-                return Ok(respond(rcode::NXDOMAIN));
+                return Ok(respond(rcode::REFUSED));
             }
         };
+        match self
+            .state
+            .decide_domain(&name, pent_profile::DNS_DEADLINE)
+            .await
+        {
+            crate::DomainVerdict::Allow => {}
+            crate::DomainVerdict::Deny => {
+                self.state.report_violation(format!(
+                    "network: DNS query for \"{name}\" ({type_name}) blocked: \
+                     the domain is not in the allowlist"
+                ));
+                self.emit_dns(name, type_name, Outcome::Denied);
+                return Ok(respond(rcode::REFUSED));
+            }
+            crate::DomainVerdict::Deadline => {
+                self.state.report_violation(format!(
+                    "network: DNS query for \"{name}\" ({type_name}) blocked: \
+                     no answer came in time, and the question stays open"
+                ));
+                self.emit_dns(name, type_name, Outcome::Denied);
+                return Ok(respond(rcode::SERVFAIL));
+            }
+        }
         self.state.report_access(format!(
             "network: DNS query for \"{name}\" ({type_name}) allowed"
         ));
@@ -992,16 +1015,16 @@ impl DnsServer {
         }
     }
 
-    /// Build an NXDOMAIN response for a blocked domain.
+    /// Build a REFUSED response for a blocked domain.
     ///
     /// # Arguments
     /// * `query` - The original query (for copying ID and question)
     #[cfg(test)]
-    fn build_nxdomain_response(query: &[u8]) -> Vec<u8> {
+    fn build_refused_response(query: &[u8]) -> Vec<u8> {
         let question_end = read_question(query, Pointers::Forbidden)
             .ok()
             .map(|q| q.end);
-        build_error_response(query, question_end, rcode::NXDOMAIN)
+        build_error_response(query, question_end, rcode::REFUSED)
     }
 }
 
@@ -1175,7 +1198,7 @@ mod tests {
         // The wildcard does not allow the parent name itself.
         let query = build_test_dns_query("example.com", rtype::A);
         let response = server.handle_query(&query).await.unwrap();
-        assert_eq!(rcode_of(&response), rcode::NXDOMAIN);
+        assert_eq!(rcode_of(&response), rcode::REFUSED);
     }
 
     #[tokio::test]
@@ -1252,7 +1275,7 @@ mod tests {
 
     #[tokio::test]
 
-    async fn test_dns_query_blocked_domain_returns_nxdomain() {
+    async fn test_dns_query_blocked_domain_returns_refused() {
         use crate::SharedState;
         let state = Arc::new(SharedState::new(vec!["allowed.com".to_string()]));
         let config = DnsServerConfig::default();
@@ -1261,8 +1284,8 @@ mod tests {
         let query = build_test_dns_query("blocked.com", 1);
         let response = server.handle_query(&query).await.unwrap();
 
-        // RCODE should be 3 (NXDOMAIN)
-        assert_eq!(response[3] & 0x0F, 3);
+        // A refusal is REFUSED, never NXDOMAIN.
+        assert_eq!(response[3] & 0x0F, rcode::REFUSED);
     }
 
     #[tokio::test]
@@ -1295,8 +1318,8 @@ mod tests {
         let query = build_test_dns_query("any-domain.com", 1);
         let response = server.handle_query(&query).await.unwrap();
 
-        // RCODE should be 3 (NXDOMAIN)
-        assert_eq!(response[3] & 0x0F, 3);
+        // A refusal is REFUSED, never NXDOMAIN.
+        assert_eq!(response[3] & 0x0F, rcode::REFUSED);
     }
 
     // ========================================================================
@@ -1305,13 +1328,13 @@ mod tests {
 
     #[test]
 
-    fn test_build_nxdomain_response_preserves_query_id() {
+    fn test_build_refused_response_preserves_query_id() {
         // Query with ID 0x1234
         let mut query = build_test_dns_query("test.com", 1);
         query[0] = 0x12;
         query[1] = 0x34;
 
-        let response = DnsServer::build_nxdomain_response(&query);
+        let response = DnsServer::build_refused_response(&query);
 
         // Response ID should match query ID
         assert_eq!(response[0], 0x12);
@@ -1320,13 +1343,13 @@ mod tests {
 
     #[test]
 
-    fn test_build_nxdomain_response_has_correct_rcode() {
+    fn test_build_refused_response_has_correct_rcode() {
         let query = build_test_dns_query("test.com", 1);
-        let response = DnsServer::build_nxdomain_response(&query);
+        let response = DnsServer::build_refused_response(&query);
 
         // RCODE is in the lower 4 bits of byte 3
         let rcode = response[3] & 0x0F;
-        assert_eq!(rcode, 3); // NXDOMAIN
+        assert_eq!(rcode, rcode::REFUSED);
     }
 
     // ========================================================================
@@ -1549,10 +1572,10 @@ mod tests {
         assert!(state.cache.is_empty());
 
         // The same type for a name that the allowlist does not have gets
-        // NXDOMAIN, like every other type.
+        // REFUSED, like every other type.
         let query = build_test_dns_query("other.example", 15);
         let response = server.handle_query(&query).await.unwrap();
-        assert_eq!(rcode_of(&response), rcode::NXDOMAIN);
+        assert_eq!(rcode_of(&response), rcode::REFUSED);
     }
 
     #[tokio::test]
@@ -1569,10 +1592,10 @@ mod tests {
         let query = build_test_dns_query(&domain, 1);
         let result = server.handle_query(&query).await;
 
-        // Should parse long domain and return NXDOMAIN (blocked)
+        // Should parse long domain and return REFUSED (blocked)
         assert!(result.is_ok());
         let response = result.unwrap();
-        assert_eq!(response[3] & 0x0F, 3); // NXDOMAIN
+        assert_eq!(response[3] & 0x0F, rcode::REFUSED);
     }
 
     #[tokio::test]
@@ -1588,10 +1611,10 @@ mod tests {
         let query = build_test_dns_query("xn--nxasmq5b.example.com", 1);
         let result = server.handle_query(&query).await;
 
-        // Should parse punycode and return NXDOMAIN (blocked)
+        // Should parse punycode and return REFUSED (blocked)
         assert!(result.is_ok());
         let response = result.unwrap();
-        assert_eq!(response[3] & 0x0F, 3); // NXDOMAIN
+        assert_eq!(response[3] & 0x0F, rcode::REFUSED);
     }
 
     // ========================================================================
@@ -1908,6 +1931,95 @@ mod tests {
         };
         let server = DnsServer::new(config, Arc::clone(&state)).unwrap();
         (server, state, rx)
+    }
+
+    /// A decider that gives one verdict and counts its calls.
+    #[derive(Debug)]
+    struct CountingDecider {
+        verdict: crate::DomainVerdict,
+        calls: std::sync::Mutex<Vec<(String, Duration)>>,
+    }
+
+    impl crate::DomainDecider for CountingDecider {
+        fn decide<'a>(
+            &'a self,
+            name: &'a pent_profile::DomainName,
+            deadline: Duration,
+        ) -> crate::DecisionFuture<'a> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((name.to_string(), deadline));
+            Box::pin(std::future::ready(self.verdict))
+        }
+    }
+
+    /// A fake upstream that answers each query and counts them.
+    async fn counting_upstream() -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::clone(&count);
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            while let Ok((len, src)) = socket.recv_from(&mut buf).await {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if let Some(answer) = fake_answer(&buf[..len]) {
+                    let _ = socket.send_to(&answer, src).await;
+                }
+            }
+        });
+        (addr, count)
+    }
+
+    /// A server with the upstream `upstream`, no allowlist, and a decider
+    /// that gives `verdict`.
+    fn decided_server(
+        upstream: SocketAddr,
+        verdict: crate::DomainVerdict,
+    ) -> (DnsServer, Arc<CountingDecider>) {
+        let decider = Arc::new(CountingDecider {
+            verdict,
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+        let shared: Arc<dyn crate::DomainDecider> = Arc::clone(&decider) as _;
+        let state = Arc::new(SharedState::new(Vec::new()).with_decider(Some(shared)));
+        let config = DnsServerConfig {
+            upstream: Some(vec![upstream]),
+            resolve_timeout: Duration::from_secs(3),
+            ..Default::default()
+        };
+        (DnsServer::new(config, state).unwrap(), decider)
+    }
+
+    /// Nothing goes upstream before an "allow": a "deny" gets REFUSED, the
+    /// deadline gets SERVFAIL, and the upstream sees no query in both
+    /// cases. The decider gets the DNS deadline.
+    #[tokio::test]
+    async fn a_name_off_the_allowlist_goes_upstream_only_after_an_allow() {
+        use crate::DomainVerdict;
+        use std::sync::atomic::Ordering;
+        let (upstream, count) = counting_upstream().await;
+        let query = build_test_dns_query("asked.example", rtype::A);
+        for (verdict, code) in [
+            (DomainVerdict::Deny, rcode::REFUSED),
+            (DomainVerdict::Deadline, rcode::SERVFAIL),
+        ] {
+            let (server, decider) = decided_server(upstream, verdict);
+            let response = server.handle_query(&query).await.unwrap();
+            assert_eq!(rcode_of(&response), code, "{verdict:?}");
+            assert_eq!(
+                decider.calls.lock().unwrap().clone(),
+                vec![("asked.example".to_string(), pent_profile::DNS_DEADLINE)]
+            );
+        }
+        assert_eq!(count.load(Ordering::SeqCst), 0, "a query went upstream");
+
+        let (server, _decider) = decided_server(upstream, DomainVerdict::Allow);
+        let response = server.handle_query(&query).await.unwrap();
+        assert_eq!(rcode_of(&response), rcode::NOERROR);
+        assert_eq!(first_answer(&response).0, rtype::A);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 
     /// Return `(type, ttl)` of the first answer record of a response.
@@ -2624,7 +2736,7 @@ mod tests {
 
         let query = build_test_dns_query("blocked.test", rtype::AAAA);
         let response = server.handle_query(&query).await.unwrap();
-        assert_eq!(rcode_of(&response), rcode::NXDOMAIN);
+        assert_eq!(rcode_of(&response), rcode::REFUSED);
         assert_eq!(
             rx.try_recv().unwrap(),
             dns_event("blocked.test", "AAAA", Outcome::Denied)
@@ -2851,7 +2963,7 @@ mod tests {
         assert_eq!(rcode_of(&response), rcode::NOTIMP);
     }
 
-    /// A question whose name is not a valid host name gets NXDOMAIN, the
+    /// A question whose name is not a valid host name gets REFUSED, the
     /// server reports a violation, and the event holds the name in
     /// lowercase without the trailing dot.
     #[tokio::test]
@@ -2864,7 +2976,7 @@ mod tests {
         // A label with a character that a host name cannot hold.
         let query = build_test_dns_query("BAD$NAME.example", rtype::A);
         let response = server.handle_query(&query).await.unwrap();
-        assert_eq!(rcode_of(&response), rcode::NXDOMAIN);
+        assert_eq!(rcode_of(&response), rcode::REFUSED);
         let Ok(crate::TraceEvent::Violation(message)) = rx.try_recv() else {
             panic!("the server must report a violation");
         };
@@ -3078,7 +3190,7 @@ mod tests {
         drop(broken);
 
         // A new connection with a complete query. The name is not on the
-        // allowlist, thus the server answers NXDOMAIN and asks no upstream.
+        // allowlist, thus the server answers REFUSED and asks no upstream.
         let query = build_test_dns_query("blocked.example", rtype::A);
         let mut request = u16::try_from(query.len()).unwrap().to_be_bytes().to_vec();
         request.extend_from_slice(&query);
@@ -3121,7 +3233,7 @@ mod tests {
             task.abort();
             panic!("the server gave no answer after the broken connection");
         };
-        assert_eq!(rcode_of(&response), rcode::NXDOMAIN);
+        assert_eq!(rcode_of(&response), rcode::REFUSED);
         assert_eq!(response.get(..2), query.get(..2), "another transaction");
 
         task.abort();

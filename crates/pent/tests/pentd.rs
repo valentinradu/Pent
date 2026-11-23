@@ -457,7 +457,7 @@ fn the_program_cannot_see_the_socket_of_pentd() -> TestResult {
 #[test]
 fn pent_denials_shows_the_refusals_of_a_real_run() -> TestResult {
     let test = "pent_denials_shows_the_refusals_of_a_real_run";
-    if !have_tools(test, &["sh", "getent"]) || !sandbox_ready(test) {
+    if !have_tools(test, &["sh", "cat", "getent"]) || !sandbox_ready(test) {
         return Ok(());
     }
     let rt = Runtime::new()?;
@@ -466,17 +466,24 @@ fn pent_denials_shows_the_refusals_of_a_real_run() -> TestResult {
     assert!(rt.wait_for_socket());
     let env = TestEnv::new()?;
     env.install_rules("sh", &["deny domain bad.example"])?;
-    // `--allow` starts the proxy. The two names are refused, so no query
-    // goes upstream, and the test needs no network.
+    let outside = env.root.join("outside.txt");
+    std::fs::write(&outside, "secret\n")?;
+    let outside = outside.to_str().ok_or("the path is not UTF-8")?;
+    // `--allow` starts the proxy. The rule refuses the name, so no query
+    // goes upstream, and the test needs no network. `--trace` records the
+    // refusal of Landlock, which no rule and no question decides: the
+    // base. (A name with no rule asks a question since step 3.3.)
+    let script = format!("cat '{outside}'; getent hosts bad.example; true");
     let out = env
         .command(&[
             "run",
+            "--trace",
             "--allow",
             "good.example",
             "--",
             "sh",
             "-c",
-            "getent hosts new.example; getent hosts bad.example; true",
+            &script,
         ])
         .env("XDG_RUNTIME_DIR", rt.xdg())
         .output()?;
@@ -489,19 +496,21 @@ fn pent_denials_shows_the_refusals_of_a_real_run() -> TestResult {
     let out = rt.pent(&["denials"]).stdout(Stdio::piped()).output()?;
     let text = stdout(&out);
     assert!(out.status.success(), "{out:?}");
-    let line = |name: &str| {
+    let line = |needle: &str| {
         text.lines()
-            .find(|l| l.contains(&format!("domain {name}")))
+            .find(|l| l.contains(needle))
             .map(str::to_string)
     };
-    let new = line("new.example").ok_or_else(|| format!("no refusal of new.example: {text}"))?;
+    let read = line(&format!("read {outside}"))
+        .ok_or_else(|| format!("no refusal of the read: {text}"))?;
     assert!(
-        new.contains("by sh") && new.ends_with("(the base)"),
-        "{new}"
+        read.contains("by cat") && read.ends_with("(the base)"),
+        "{read}"
     );
-    let bad = line("bad.example").ok_or_else(|| format!("no refusal of bad.example: {text}"))?;
-    assert!(bad.ends_with("(a rule)"), "{bad}");
-    assert!(line("good.example").is_none(), "{text}");
+    let bad =
+        line("domain bad.example").ok_or_else(|| format!("no refusal of bad.example: {text}"))?;
+    assert!(bad.contains("by sh") && bad.ends_with("(a rule)"), "{bad}");
+    assert!(line("domain good.example").is_none(), "{text}");
     Ok(())
 }
 
@@ -627,6 +636,103 @@ fn a_proxy_question_waits_for_an_allow() -> TestResult {
     assert!(stdout(&out).contains("CODE=200"), "{out:?}");
     // An answer with the scope "run" writes no rule.
     assert!(!env.rules_path("fetch").exists());
+    Ok(())
+}
+
+/// Start a run of `script` with no rule for the key `dns`, and give it the
+/// runtime directory of `rt`.
+fn spawn_dns_run(rt: &Runtime, env: &TestEnv, script: &str) -> std::io::Result<Child> {
+    env.command(&[
+        "run",
+        "--network",
+        "proxy",
+        "--key",
+        "dns",
+        "--",
+        "sh",
+        "-c",
+        script,
+    ])
+    .env("XDG_RUNTIME_DIR", rt.xdg())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+}
+
+/// A DNS query with no rule waits for the question. A "deny" gives
+/// `REFUSED` at once, so the program learns that the name is refused, not
+/// that it does not exist, and `pent denials` names the answer. The test
+/// needs no network: the refused name never goes upstream.
+#[test]
+fn a_dns_question_waits_for_a_deny() -> TestResult {
+    let test = "a_dns_question_waits_for_a_deny";
+    if !have_tools(test, &["sh", "getent"]) || !sandbox_ready(test) {
+        return Ok(());
+    }
+    let rt = Runtime::new()?;
+    let _pentd = Reap(rt.pent(&["daemon"]).spawn()?);
+    assert!(rt.wait_for_socket());
+    let env = TestEnv::new()?;
+    let begin = Instant::now();
+    let run = spawn_dns_run(&rt, &env, "getent hosts asked.example; echo RC=$?")?;
+    let code = question_code(&rt, "asked.example")?;
+    let answer = rt.pent(&["deny", &code]).output()?;
+    assert!(answer.status.success(), "{answer:?}");
+    let out = run.wait_with_output()?;
+    let took = begin.elapsed();
+    // getent exits with 2 when the name has no address.
+    assert!(stdout(&out).contains("RC=2"), "{out:?}");
+    // A deny ends the wait; the deadline of DNS is 4 s for each try.
+    assert!(took < Duration::from_secs(4), "the run took {took:?}");
+    let denials = rt.pent(&["denials"]).stdout(Stdio::piped()).output()?;
+    let text = stdout(&denials);
+    assert!(
+        text.lines().any(|l| l.contains("domain asked.example")
+            && l.ends_with(&format!("(the answer to question {code})"))),
+        "{text}"
+    );
+    Ok(())
+}
+
+/// The human answers after the deadline of DNS. The program got SERVFAIL
+/// and tries again, and the next try gets the answer with no new question:
+/// the question that stayed open got the answer.
+#[test]
+fn a_late_dns_answer_applies_to_the_next_try() -> TestResult {
+    let test = "a_late_dns_answer_applies_to_the_next_try";
+    if !have_tools(test, &["sh", "getent"]) || !sandbox_ready(test) || !internet(test) {
+        return Ok(());
+    }
+    let rt = Runtime::new()?;
+    let _pentd = Reap(rt.pent(&["daemon"]).spawn()?);
+    assert!(rt.wait_for_socket());
+    let env = TestEnv::new()?;
+    let script = "i=0; while [ $i -lt 30 ]; do \
+                  if getent hosts example.com > /dev/null; then echo RESOLVED=$i; exit 0; fi; \
+                  i=$((i+1)); sleep 1; done; echo NEVER";
+    let run = spawn_dns_run(&rt, &env, script)?;
+    let code = question_code(&rt, "example.com")?;
+    // Wait past the deadline of DNS, so the first try ends with SERVFAIL.
+    std::thread::sleep(pent_profile::DNS_DEADLINE + Duration::from_secs(1));
+    let answer = rt.pent(&["allow", &code]).output()?;
+    assert!(answer.status.success(), "{answer:?}");
+    let out = run.wait_with_output()?;
+    assert!(stdout(&out).contains("RESOLVED="), "{out:?}");
+    // A try before the answer got SERVFAIL at the deadline: the refusal
+    // names the deadline of the same question. (glibc tries again after
+    // SERVFAIL, so the answer can reach the first call of getent.)
+    let denials = rt.pent(&["denials"]).stdout(Stdio::piped()).output()?;
+    let text = stdout(&denials);
+    assert!(
+        text.lines().any(|l| l.contains("domain example.com")
+            && l.ends_with(&format!("(the deadline of question {code})"))),
+        "{text}"
+    );
+    let left = rt
+        .pent(&["questions", "--json"])
+        .stdout(Stdio::piped())
+        .output()?;
+    assert_eq!(stdout(&left), "", "a new question stayed open");
     Ok(())
 }
 

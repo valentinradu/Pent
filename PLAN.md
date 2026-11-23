@@ -1,6 +1,6 @@
 # Plan: the new pent
 
-**Cursor: step 3.3.** Steps with `[x]` are done. Work on the branch `next`,
+**Cursor: step 3.4.** Steps with `[x]` are done. Work on the branch `next`,
 one commit for each step, and move this cursor when a step is done.
 
 **The way of work.** One commit for each step. Then the user runs
@@ -178,12 +178,23 @@ not their structure.
       question.
     - The tests that need a refusal with no wait use a deny rule; the
       tests of `pentd.rs` cover the question.
-- [ ] **3.3 DNS.** A query for a name with no rule waits for an answer.
+- [x] **3.3 DNS.** A query for a name with no rule waits for an answer.
   Nothing goes upstream before an "allow". `SERVFAIL` at about 4 s,
   `REFUSED` after a "deny". `NXDOMAIN` only for a name that does not exist.
   - Files: `pent-proxy/src/dns.rs`.
   - Done: a test proves that the upstream resolver gets no query before an
     "allow".
+  - Files: `pent-proxy/src/dns.rs`; `DomainVerdict` and
+    `SharedState::decide_domain` in `pent-proxy/src/lib.rs`; the kept
+    verdicts in `pent/src/daemon/client.rs`; RN-18 and RN-19 in
+    `docs/security/run.md`.
+  - Decisions (2026-11-23):
+    - Each refusal of DNS is `REFUSED`, also a refusal with no decider and
+      a name that is not a valid host name: pent never says that a name
+      does not exist.
+    - The session keeps each verdict, also a late one, and the chain takes
+      them, so the next try after a `SERVFAIL` gets the answer with no new
+      question.
 - [ ] **3.4 Unix sockets and ports on localhost.** The supervisor holds the
   call and asks, in a worker thread (as `defer_connect` does), so one
   question does not stop the other calls. A refusal gives `EACCES` for a

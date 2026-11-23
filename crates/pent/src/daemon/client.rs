@@ -40,6 +40,13 @@ const MAX_RECONNECTS: u32 = 3;
 /// a limit. The events are for the human; no decision depends on them.
 const MAX_QUEUED_EVENTS: usize = 4096;
 
+/// The most verdicts that wait for [`Session::take_verdicts`]. An older
+/// verdict goes first.
+const MAX_KEPT_VERDICTS: usize = 4096;
+
+/// The verdicts that reached a session, for the chain of deciders.
+type KeptVerdicts = std::sync::Arc<std::sync::Mutex<VecDeque<Verdict>>>;
+
 /// The longest wait of [`Session::flush`].
 const FLUSH_WAIT: Duration = Duration::from_secs(2);
 
@@ -106,6 +113,9 @@ pub(crate) struct Session {
     commands: mpsc::UnboundedSender<Command>,
     /// The number of events in the queue of the task.
     queued: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Each verdict that reached the session, also a late one: the verdict
+    /// of a question whose access stopped its wait at the deadline.
+    verdicts: KeptVerdicts,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -149,10 +159,17 @@ impl Session {
     /// Start the task. With no `stream`, the task connects first.
     fn spawn(stream: Option<UnixStream>, reconnect: Option<Reconnect>) -> Self {
         let (commands, inbox) = mpsc::unbounded_channel();
-        let task = tokio::spawn(run(stream, reconnect, inbox));
+        let verdicts = KeptVerdicts::default();
+        let task = tokio::spawn(run(
+            stream,
+            reconnect,
+            inbox,
+            std::sync::Arc::clone(&verdicts),
+        ));
         Self {
             commands,
             queued: std::sync::Arc::default(),
+            verdicts,
             task,
         }
     }
@@ -183,6 +200,17 @@ impl Session {
     #[cfg(test)]
     fn queued(&self) -> usize {
         self.queued.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Take each verdict that reached the session since the last call, in
+    /// the order of arrival. A late verdict is here too, so a later access
+    /// gets the answer with no new question.
+    pub(crate) fn take_verdicts(&self) -> Vec<Verdict> {
+        self.verdicts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain(..)
+            .collect()
     }
 
     /// Wait until each event and each question before this call left for
@@ -230,6 +258,8 @@ struct Waiting {
     unnumbered: VecDeque<Reply>,
     /// The numbered questions. The same access asked twice has one number.
     numbered: HashMap<QuestionId, Vec<Reply>>,
+    /// Each verdict that arrives, for [`Session::take_verdicts`].
+    kept: KeptVerdicts,
 }
 
 impl Waiting {
@@ -271,6 +301,14 @@ impl Waiting {
                     // The caller can be gone after its deadline.
                     let _ = reply.send(Step::Done(Some(verdict.clone())));
                 }
+                let mut kept = self
+                    .kept
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if kept.len() >= MAX_KEPT_VERDICTS {
+                    kept.pop_front();
+                }
+                kept.push_back(verdict);
             }
             // pentd refused an ask in place of a number. A refusal with a
             // number is for an answer, and a session does not answer.
@@ -291,6 +329,7 @@ async fn run(
     stream: Option<UnixStream>,
     reconnect: Option<Reconnect>,
     mut commands: mpsc::UnboundedReceiver<Command>,
+    kept: KeptVerdicts,
 ) {
     let mut stream = stream;
     if stream.is_none() {
@@ -304,7 +343,7 @@ async fn run(
     let mut reconnects = 0_u32;
     while let Some(current) = stream.take() {
         let since = tokio::time::Instant::now();
-        let ended = serve(current, &mut commands).await;
+        let ended = serve(current, &mut commands, &kept).await;
         if ended == Served::SessionGone {
             return;
         }
@@ -351,7 +390,11 @@ enum Served {
 }
 
 /// Serve one connection until it ends.
-async fn serve(stream: UnixStream, commands: &mut mpsc::UnboundedReceiver<Command>) -> Served {
+async fn serve(
+    stream: UnixStream,
+    commands: &mut mpsc::UnboundedReceiver<Command>,
+    kept: &KeptVerdicts,
+) -> Served {
     let (read, mut write) = stream.into_split();
     // A separate task reads, because a read of a line must not stop in the
     // middle when the other branch below wins.
@@ -364,7 +407,10 @@ async fn serve(stream: UnixStream, commands: &mut mpsc::UnboundedReceiver<Comman
             }
         }
     });
-    let mut waiting = Waiting::default();
+    let mut waiting = Waiting {
+        kept: std::sync::Arc::clone(kept),
+        ..Waiting::default()
+    };
     let result = loop {
         tokio::select! {
             command = commands.recv() => match command {
