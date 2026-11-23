@@ -819,7 +819,13 @@ mod linux {
             log.contains("pent: [denied] network:") && log.contains("\"denied.example\""),
             "{log}"
         );
-        assert!(log.contains("--allow denied.example"), "{log}");
+        // A deny rule refused the name: the hint names the cause, not
+        // `--allow`, so it does not push the user to undo the rule.
+        assert!(
+            log.contains("see the cause of the refusal: pent denials"),
+            "{log}"
+        );
+        assert!(!log.contains("--allow denied.example"), "{log}");
         assert!(!log.contains("pent trust"), "{log}");
         Ok(())
     }

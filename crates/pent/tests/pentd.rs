@@ -869,6 +869,118 @@ fn a_port_question_decides_the_connection() -> TestResult {
     Ok(())
 }
 
+/// A port that nothing serves on the host asks no question: the program
+/// gets `ECONNREFUSED` at once, as without pent.
+#[test]
+fn a_port_that_the_host_does_not_serve_asks_no_question() -> TestResult {
+    let test = "a_port_that_the_host_does_not_serve_asks_no_question";
+    if !have_tools(test, &["python3"]) || !sandbox_ready(test) {
+        return Ok(());
+    }
+    let rt = Runtime::new()?;
+    let _pentd = Reap(rt.pent(&["daemon"]).spawn()?);
+    assert!(rt.wait_for_socket());
+    let env = TestEnv::new()?;
+    let free = std::net::TcpListener::bind("127.0.0.1:0")?
+        .local_addr()?
+        .port();
+    let begin = Instant::now();
+    let out = env
+        .command(&[
+            "run",
+            "--key",
+            "probe",
+            "--",
+            "python3",
+            "-c",
+            SOCKET_PROBE,
+            &free.to_string(),
+        ])
+        .env("XDG_RUNTIME_DIR", rt.xdg())
+        .output()?;
+    assert!(
+        stdout(&out).contains("ERR ConnectionRefusedError"),
+        "{out:?}"
+    );
+    assert!(begin.elapsed() < Duration::from_secs(10), "the run waited");
+    let open = rt
+        .pent(&["questions", "--json"])
+        .stdout(Stdio::piped())
+        .output()?;
+    assert_eq!(stdout(&open), "", "a question opened");
+    Ok(())
+}
+
+/// A rule decides a socket with no question, also for the path as the
+/// program writes it: a deny rule on a link refuses at once, and the event
+/// names the form that the rule names. After an "allow", a second
+/// connection of the same run asks no new question.
+#[test]
+fn a_known_decision_of_a_socket_asks_no_question() -> TestResult {
+    let test = "a_known_decision_of_a_socket_asks_no_question";
+    if !have_tools(test, &["python3"]) || !sandbox_ready(test) {
+        return Ok(());
+    }
+    let rt = Runtime::new()?;
+    let _pentd = Reap(rt.pent(&["daemon"]).spawn()?);
+    assert!(rt.wait_for_socket());
+    let env = TestEnv::new()?;
+    let path = env.root.join("service.sock");
+    HostServer::Unix(std::os::unix::net::UnixListener::bind(&path)?).serve();
+    let link = env.root.join("link.sock");
+    std::os::unix::fs::symlink(&path, &link)?;
+    let target = path.to_str().ok_or("the path is not UTF-8")?;
+    let link = link.to_str().ok_or("the path is not UTF-8")?;
+    env.install_rules("probe", &[&format!("deny unix-socket {link}")])?;
+    let begin = Instant::now();
+    let out = env
+        .command(&[
+            "run",
+            "--key",
+            "probe",
+            "--",
+            "python3",
+            "-c",
+            SOCKET_PROBE,
+            link,
+        ])
+        .env("XDG_RUNTIME_DIR", rt.xdg())
+        .output()?;
+    assert!(stdout(&out).contains("ERR PermissionError"), "{out:?}");
+    assert!(begin.elapsed() < Duration::from_secs(10), "the run waited");
+    let denials = rt.pent(&["denials"]).stdout(Stdio::piped()).output()?;
+    let text = stdout(&denials);
+    assert!(
+        text.lines()
+            .any(|l| l.contains(&format!("unix-socket {link}")) && l.ends_with("(a rule)")),
+        "{text}"
+    );
+
+    // Two connections in one run: one question, one answer.
+    std::fs::remove_file(env.rules_path("probe"))?;
+    let twice = format!(
+        "import socket\nfor _ in range(2):\n    s = socket.socket(socket.AF_UNIX)\n    \
+         s.connect({target:?})\n    print('GOT', s.recv(5).decode())\n"
+    );
+    let run = env
+        .command(&["run", "--key", "probe", "--", "python3", "-c", &twice])
+        .env("XDG_RUNTIME_DIR", rt.xdg())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let code = question_for(&rt, &format!("unix-socket {target}"))?;
+    let answer = rt.pent(&["allow", &code]).output()?;
+    assert!(answer.status.success(), "{answer:?}");
+    let out = run.wait_with_output()?;
+    assert_eq!(stdout(&out).matches("GOT HELLO").count(), 2, "{out:?}");
+    let open = rt
+        .pent(&["questions", "--json"])
+        .stdout(Stdio::piped())
+        .output()?;
+    assert_eq!(stdout(&open), "", "the second connection asked again");
+    Ok(())
+}
+
 /// `--network blocked` refuses a Unix socket, a port and a name off the
 /// lists with no question.
 #[test]

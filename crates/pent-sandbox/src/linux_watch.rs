@@ -1449,6 +1449,22 @@ fn add_fd(listener: &OwnedFd, id: u64, fd: &OwnedFd, at: RawFd, cloexec: bool) -
 }
 
 /// The response that fails the call with `err`.
+/// The outcome of an event for the decision `decision`.
+const fn outcome_of(decision: pent_profile::Decision) -> Outcome {
+    match decision {
+        pent_profile::Decision::Allow => Outcome::Allowed,
+        pent_profile::Decision::Deny => Outcome::Denied,
+    }
+}
+
+/// Return true if the notification `id` of `listener` still waits: its
+/// task runs and has not been answered.
+fn notif_id_valid(listener: &OwnedFd, id: u64) -> bool {
+    // SAFETY: the ioctl reads one u64.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    unsafe { libc::ioctl(listener.as_raw_fd(), NOTIF_ID_VALID, &raw const id) == 0 }
+}
+
 const fn fail_resp(id: u64, err: i32) -> libc::seccomp_notif_resp {
     libc::seccomp_notif_resp {
         id,
@@ -1546,6 +1562,8 @@ struct Supervisor {
     /// The decider of a Unix socket or a port that the lists do not hold.
     /// A worker thread asks it.
     decider: Option<std::sync::Arc<dyn crate::AccessDecider>>,
+    /// The listening sockets of the host, for a question about a port.
+    host_tables: crate::linux_loopback::HostTables,
 }
 
 impl Supervisor {
@@ -1598,6 +1616,7 @@ impl Supervisor {
             events: None,
             workers: std::sync::Arc::default(),
             decider: plan.decider,
+            host_tables: crate::linux_loopback::HostTables::default(),
         }
     }
 
@@ -1691,9 +1710,7 @@ impl Supervisor {
     }
 
     fn id_valid(&self, id: u64) -> bool {
-        // SAFETY: the ioctl reads one u64.
-        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-        unsafe { libc::ioctl(self.listener.as_raw_fd(), NOTIF_ID_VALID, &raw const id) == 0 }
+        notif_id_valid(&self.listener, id)
     }
 
     fn respond(&mut self, id: u64) {
@@ -2173,11 +2190,15 @@ impl Supervisor {
         self.record_unix_event(tid, &target, decision.outcome());
     }
 
-    /// Ask the decider about a Unix socket that the list does not hold, in
-    /// a worker thread. After an "allow" the worker makes the connection
-    /// and gives the socket to the child; after a "deny" or the deadline
-    /// the child gets `EACCES`. The worker sends the event of the decision
-    /// also without `--trace`.
+    /// Decide a Unix socket that the list does not hold, with the decider.
+    ///
+    /// A rule, a flag or an answer of this run decides at once, in this
+    /// thread: an "allow" makes the connection, and a "deny" gives
+    /// `EACCES`. The chain sees the canonical path and the path as the
+    /// program wrote it; a deny of either form wins. Else a worker thread
+    /// asks, with the canonical path, and answers after the decision; it
+    /// checks the notification again before it connects. The event names
+    /// the canonical path, also without `--trace`.
     ///
     /// Return false, and do nothing, when no decider is set, the path may
     /// not be asked about (see [`crate::linux_unixconn::UnixPolicy::askable`]),
@@ -2191,49 +2212,99 @@ impl Supervisor {
         target: &UnixAddr,
         flags: crate::linux_unixconn::FdFlags,
     ) -> bool {
+        use pent_profile::{Decision, Request, RulePath};
+
         let Some(decider) = self.decider.clone() else {
             return false;
         };
         let Some(path) = self.unix.policy().askable(target) else {
             return false;
         };
-        let Ok(rule_path) = pent_profile::RulePath::new(path.clone()) else {
+        let Ok(canonical) = RulePath::new(path.clone()) else {
             return false;
         };
-        let process = self.procs.get(tid);
-        let display = target.display();
-        self.defer_job(move |listener| {
-            let decision = decider.decide(
-                &process.name,
-                pent_profile::Request::UnixSocket(rule_path),
-                pent_profile::FILE_DEADLINE,
-            );
-            let (resp, outcome) = match decision {
-                pent_profile::Decision::Allow => {
-                    match crate::linux_unixconn::connect_for_child(
-                        tid,
-                        sockfd,
-                        kind,
-                        &path,
-                        flags,
-                        crate::linux_unixconn::CONNECT_LIMIT,
-                    ) {
-                        Ok(fd) => (
-                            give_resp(listener, id, &fd, sockfd, flags.cloexec, 0),
-                            Outcome::Allowed,
-                        ),
-                        Err(err) => (fail_resp(id, err), Outcome::Allowed),
-                    }
+        let mut forms = vec![canonical.clone()];
+        if let UnixAddr::Path(written) = target {
+            if let Ok(written) = RulePath::new(written.clone()) {
+                if written != canonical {
+                    forms.push(written);
                 }
-                pent_profile::Decision::Deny => (fail_resp(id, libc::EACCES), Outcome::Denied),
-            };
-            let event = WatchEvent::UnixConnect {
-                target: display,
-                process,
-                outcome,
-            };
-            (resp, Some(event))
-        })
+            }
+        }
+        // A deny of either form wins. The event names the form that
+        // decided, so the chain finds the same rule again for its cause.
+        let known: Vec<(&RulePath, Decision)> = forms
+            .iter()
+            .filter_map(|p| {
+                decider
+                    .known(&Request::UnixSocket(p.clone()))
+                    .map(|d| (p, d))
+            })
+            .collect();
+        let known = known
+            .iter()
+            .find(|(_, d)| *d == Decision::Deny)
+            .or_else(|| known.first())
+            .map(|(p, d)| (p.as_path().to_string_lossy().into_owned(), *d));
+        let process = self.procs.get(tid);
+        let display = path.to_string_lossy().into_owned();
+        let connect = move || {
+            crate::linux_unixconn::connect_for_child(
+                tid,
+                sockfd,
+                kind,
+                &path,
+                flags,
+                crate::linux_unixconn::CONNECT_LIMIT,
+            )
+        };
+        match known {
+            Some((form, decision)) => {
+                self.answer = match decision {
+                    Decision::Allow => match connect() {
+                        Ok(fd) => Answer::Give {
+                            fd,
+                            at: sockfd,
+                            cloexec: flags.cloexec,
+                            error: 0,
+                        },
+                        Err(err) => Answer::Fail(err),
+                    },
+                    Decision::Deny => Answer::Fail(libc::EACCES),
+                };
+                self.out.push(WatchEvent::UnixConnect {
+                    target: form,
+                    process,
+                    outcome: outcome_of(decision),
+                });
+                true
+            }
+            None => self.defer_job(move |listener| {
+                let decision = decider.decide(
+                    &process.name,
+                    Request::UnixSocket(canonical),
+                    pent_profile::FILE_DEADLINE,
+                );
+                // The task can be gone after the wait: then no connection
+                // goes to the service of the host.
+                if !notif_id_valid(listener, id) {
+                    return (fail_resp(id, libc::EACCES), None);
+                }
+                let resp = match decision {
+                    Decision::Allow => match connect() {
+                        Ok(fd) => give_resp(listener, id, &fd, sockfd, flags.cloexec, 0),
+                        Err(err) => fail_resp(id, err),
+                    },
+                    Decision::Deny => fail_resp(id, libc::EACCES),
+                };
+                let event = WatchEvent::UnixConnect {
+                    target: display,
+                    process,
+                    outcome: outcome_of(decision),
+                };
+                (resp, Some(event))
+            }),
+        }
     }
 
     /// Let a worker thread run `job` and send the answer that it gives to
@@ -2367,20 +2438,53 @@ impl Supervisor {
         if policy != PortPolicy::Open && !record && self.decider.is_none() {
             return;
         }
-        let decision = loopback::decide(policy, || loopback::child_listens(tid, dest));
-        if decision == LoopbackDecision::Refuse && self.ask_port(notif.id, tid, sockfd, dest) {
-            // A worker thread asks, answers and sends the event.
+        // A closed port asks only when the host serves it. Nothing serves
+        // it: the call stays in the namespace of the child, with no
+        // question and no look at the sockets of the child.
+        let host_serves = self.decider.is_some()
+            && policy == PortPolicy::Closed
+            && self.host_tables.listens(dest);
+        if policy == PortPolicy::Closed && !record && !host_serves {
             return;
         }
-        let event =
-            decision
-                .outcome()
-                .filter(|_| record)
-                .map(|outcome| WatchEvent::LocalhostConnect {
-                    port,
-                    process: self.procs.get(tid),
-                    outcome,
-                });
+        let mut decision = loopback::decide(policy, || loopback::child_listens(tid, dest));
+        let mut decided = false;
+        if decision == LoopbackDecision::Refuse && host_serves {
+            let known = std::num::NonZeroU16::new(port).and_then(|p| {
+                self.decider
+                    .as_ref()
+                    .and_then(|d| d.known(&pent_profile::Request::Localhost(p)))
+            });
+            match known {
+                Some(pent_profile::Decision::Allow) => {
+                    decision = LoopbackDecision::Host;
+                    decided = true;
+                }
+                Some(pent_profile::Decision::Deny) => {
+                    self.answer = Answer::Fail(libc::ECONNREFUSED);
+                    self.out.push(WatchEvent::LocalhostConnect {
+                        port,
+                        process: self.procs.get(tid),
+                        outcome: Outcome::Denied,
+                    });
+                    return;
+                }
+                None => {
+                    if self.ask_port(notif.id, tid, sockfd, dest) {
+                        // A worker thread asks, answers and sends the event.
+                        return;
+                    }
+                }
+            }
+        }
+        let event = decision
+            .outcome()
+            .filter(|_| record || decided)
+            .map(|outcome| WatchEvent::LocalhostConnect {
+                port,
+                process: self.procs.get(tid),
+                outcome,
+            });
         if decision == LoopbackDecision::Host {
             // A dead task must get no descriptor, and its identifier can
             // belong to another process now.
@@ -2429,10 +2533,11 @@ impl Supervisor {
     }
 
     /// Ask the decider about a port of the host that the policy does not
-    /// open, in a worker thread. After an "allow" the worker connects on
-    /// the host and gives the socket to the child; after a "deny" or the
-    /// deadline the child gets `ECONNREFUSED`. The worker sends the event
-    /// of the decision also without `--trace`.
+    /// open and that the host serves, in a worker thread. After an "allow"
+    /// the worker checks the notification again, connects on the host and
+    /// gives the socket to the child; after a "deny" or the deadline the
+    /// child gets `ECONNREFUSED`. The worker sends the event of the
+    /// decision also without `--trace`.
     ///
     /// Return false, and do nothing, when no decider is set or no worker
     /// can start: the call then stays in the namespace of the child.
@@ -2454,6 +2559,11 @@ impl Supervisor {
                 pent_profile::Request::Localhost(port),
                 pent_profile::FILE_DEADLINE,
             );
+            // The task can be gone after the wait: then no connection goes
+            // to the service of the host.
+            if !notif_id_valid(listener, id) {
+                return (fail_resp(id, libc::ECONNREFUSED), None);
+            }
             let (resp, outcome) = match decision {
                 pent_profile::Decision::Allow => {
                     let connected = crate::linux_loopback::start_on_host(dest).and_then(|conn| {

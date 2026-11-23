@@ -70,11 +70,24 @@ pub(crate) struct Decider {
     /// [`MAX_HOOKED`]. The event of a hook comes later from the static
     /// layer (the proxy), and it takes its cause from here: an answer or a
     /// deadline has a question that the chain alone cannot know again.
-    hooked: Mutex<std::collections::VecDeque<(Request, DecidedBy)>>,
+    hooked: Mutex<std::collections::VecDeque<Hooked>>,
 }
 
 /// The most hook decisions that wait for their event.
 const MAX_HOOKED: usize = 1024;
+
+/// How long a hook decision waits for its event. The event comes at once
+/// after the decision; an entry that waits longer has no event (for
+/// example a TLS SNI name, whose event names the request), and a later
+/// event must not take its cause.
+const HOOKED_LIFE: Duration = Duration::from_secs(10);
+
+/// One hook decision that waits for its event.
+struct Hooked {
+    request: Request,
+    decided_by: DecidedBy,
+    at: std::time::Instant,
+}
 
 impl Decider {
     /// A chain with the flags `flags` and the rules `rules`.
@@ -186,7 +199,11 @@ impl Decider {
         if hooked.len() >= MAX_HOOKED {
             hooked.pop_front();
         }
-        hooked.push_back((request, decided_by));
+        hooked.push_back(Hooked {
+            request,
+            decided_by,
+            at: std::time::Instant::now(),
+        });
         decided_by
     }
 
@@ -197,11 +214,12 @@ impl Decider {
             .hooked
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        hooked.retain(|h| h.at.elapsed() < HOOKED_LIFE);
         let refusal = decision == Decision::Deny;
         let place = hooked
             .iter()
-            .position(|(r, d)| r == request && d.is_refusal() == refusal)?;
-        hooked.remove(place).map(|(_, decided_by)| decided_by)
+            .position(|h| h.request == *request && h.decided_by.is_refusal() == refusal)?;
+        hooked.remove(place).map(|h| h.decided_by)
     }
 
     /// Ask pentd, and keep the verdict for the rest of the run.
@@ -307,6 +325,18 @@ impl std::fmt::Debug for ProxyDecider {
 }
 
 impl pent_proxy::DomainDecider for ProxyDecider {
+    fn known(&self, name: &pent_profile::DomainName) -> Option<pent_proxy::DomainVerdict> {
+        self.0
+            .known(&Request::Domain(name.clone()))
+            .map(|decided_by| {
+                if decided_by.is_refusal() {
+                    pent_proxy::DomainVerdict::Deny
+                } else {
+                    pent_proxy::DomainVerdict::Allow
+                }
+            })
+    }
+
     fn decide<'a>(
         &'a self,
         name: &'a pent_profile::DomainName,
@@ -331,7 +361,9 @@ impl pent_proxy::DomainDecider for ProxyDecider {
 /// and ports). The supervisor calls it in a worker thread, which waits on
 /// the runtime of `pent run` for the decision.
 pub(crate) struct SandboxDecider {
+    /// The chain of the run.
     pub decider: std::sync::Arc<Decider>,
+    /// The runtime of `pent run`, where the worker thread waits.
     pub runtime: tokio::runtime::Handle,
 }
 
@@ -344,6 +376,16 @@ impl std::fmt::Debug for SandboxDecider {
 }
 
 impl pent_sandbox::AccessDecider for SandboxDecider {
+    fn known(&self, request: &Request) -> Option<Decision> {
+        self.decider.known(request).map(|decided_by| {
+            if decided_by.is_refusal() {
+                Decision::Deny
+            } else {
+                Decision::Allow
+            }
+        })
+    }
+
     fn decide(&self, program: &str, request: Request, deadline: Duration) -> Decision {
         let decided_by = self
             .runtime
@@ -453,12 +495,19 @@ fn request_of(event: &WatchEvent, key: &RuleKey) -> Option<(String, Request, Dec
 /// directory. A flag that is not a valid target stays out of the chain;
 /// the static layer still gets it.
 pub(crate) struct FlagLists<'a> {
+    /// `--traverse`.
     pub traverse: &'a [PathBuf],
+    /// `--read`.
     pub read: &'a [PathBuf],
+    /// `--write`.
     pub write: &'a [PathBuf],
+    /// `--execute`.
     pub execute: &'a [PathBuf],
+    /// `--allow`.
     pub allow: &'a [String],
+    /// `--unix-socket`.
     pub unix_sockets: &'a [PathBuf],
+    /// `--localhost`.
     pub localhost: &'a [NonZeroU16],
 }
 
@@ -1294,6 +1343,38 @@ mod tests {
             answer
         );
         assert_eq!(asks.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// A hook decision that waits longer than its life has no event any
+    /// more, so a later event does not take its cause.
+    #[test]
+    fn an_old_hook_decision_names_no_later_event() {
+        let chain = Decider::new(set(vec![]), set(vec![]), classes(), None);
+        let deadline = DecidedBy::Deadline {
+            question: QuestionId(4),
+        };
+        let old = std::time::Instant::now()
+            .checked_sub(HOOKED_LIFE + Duration::from_secs(1))
+            .unwrap();
+        chain.hooked.lock().unwrap().push_back(Hooked {
+            request: domain("b.example"),
+            decided_by: deadline,
+            at: old,
+        });
+        assert_eq!(
+            chain.take_hooked(&domain("b.example"), Decision::Deny),
+            None
+        );
+        assert!(chain.hooked.lock().unwrap().is_empty());
+        chain.hooked.lock().unwrap().push_back(Hooked {
+            request: domain("b.example"),
+            decided_by: deadline,
+            at: std::time::Instant::now(),
+        });
+        assert_eq!(
+            chain.take_hooked(&domain("b.example"), Decision::Deny),
+            Some(deadline)
+        );
     }
 
     #[tokio::test]

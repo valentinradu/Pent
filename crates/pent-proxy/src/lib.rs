@@ -93,6 +93,18 @@ use std::sync::Arc;
 /// Result type for proxy operations.
 pub type Result<T> = std::result::Result<T, ProxyError>;
 
+/// The reason of the refusal of a domain, for a trace message. Without a
+/// decider, the allowlist alone decides. With one, a rule, an answer, a
+/// deadline or a missing pentd refused it, and `pent denials` names the
+/// cause.
+pub(crate) fn refusal_reason(state: &SharedState) -> &'static str {
+    if state.has_decider() {
+        "the domain is denied (see the cause: pent denials)"
+    } else {
+        "the domain is not in the allowlist"
+    }
+}
+
 /// The decision of a [`DomainDecider`] about a domain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DomainVerdict {
@@ -115,6 +127,10 @@ pub type DecisionFuture<'a> =
 /// `pent run` gives its chain of deciders, which can ask pentd. The proxy
 /// waits for the decision, and the decider keeps to `deadline`.
 pub trait DomainDecider: Send + Sync + std::fmt::Debug {
+    /// The decision about `name` with no question (a rule, a flag, an
+    /// answer of this run), or `None` when only a question can decide it.
+    fn known(&self, name: &pent_profile::DomainName) -> Option<DomainVerdict>;
+
     /// Decide an access to `name`, and wait at most `deadline`.
     fn decide<'a>(
         &'a self,
@@ -609,6 +625,27 @@ impl SharedState {
             return DomainVerdict::Deny;
         };
         decider.decide(&name, deadline).await
+    }
+
+    /// Return true if the policy permits `domain`, a normalized name, with
+    /// no question: observe mode, the allowlist, or a decision that the
+    /// decider knows already.
+    pub fn permits_now(&self, domain: &str) -> bool {
+        if self.is_permitted(domain) {
+            return true;
+        }
+        let (Some(decider), Ok(name)) = (&self.decider, domain.parse::<pent_profile::DomainName>())
+        else {
+            return false;
+        };
+        decider.known(&name) == Some(DomainVerdict::Allow)
+    }
+
+    /// Return true if a decider decides the domains off the allowlist. A
+    /// refusal then comes from a rule, an answer, a deadline or a missing
+    /// pentd, not from the allowlist alone.
+    pub const fn has_decider(&self) -> bool {
+        self.decider.is_some()
     }
 
     /// The policy of the proxy.

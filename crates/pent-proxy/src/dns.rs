@@ -845,8 +845,8 @@ impl DnsServer {
             crate::DomainVerdict::Allow => {}
             crate::DomainVerdict::Deny => {
                 self.state.report_violation(format!(
-                    "network: DNS query for \"{name}\" ({type_name}) blocked: \
-                     the domain is not in the allowlist"
+                    "network: DNS query for \"{name}\" ({type_name}) blocked: {}",
+                    crate::refusal_reason(&self.state)
                 ));
                 self.emit_dns(name, type_name, Outcome::Denied);
                 return Ok(respond(rcode::REFUSED));
@@ -1941,6 +1941,10 @@ mod tests {
     }
 
     impl crate::DomainDecider for CountingDecider {
+        fn known(&self, _name: &pent_profile::DomainName) -> Option<crate::DomainVerdict> {
+            None
+        }
+
         fn decide<'a>(
             &'a self,
             name: &'a pent_profile::DomainName,

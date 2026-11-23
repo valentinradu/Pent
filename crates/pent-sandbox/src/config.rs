@@ -153,6 +153,11 @@ pub struct SandboxConfig {
 /// decision. The decider keeps to `deadline`, and it gives
 /// [`pent_profile::Decision::Deny`] at the deadline.
 pub trait AccessDecider: Send + Sync + std::fmt::Debug {
+    /// The decision of `request` with no question (a rule, a flag, an
+    /// answer of this run), or `None` when only a question can decide it.
+    /// The supervisor calls it in its own thread, so it must not wait.
+    fn known(&self, request: &pent_profile::Request) -> Option<pent_profile::Decision>;
+
     /// Decide `request` of the program `program`, and wait at most
     /// `deadline`.
     fn decide(

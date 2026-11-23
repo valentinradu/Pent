@@ -142,6 +142,16 @@ makes one mutation by hand. The test must fail on the mutant. No
 | 3.4 | `--network blocked` asks. | `network_blocked_asks_no_question_for_a_socket` |
 | 3.4 | The supervisor sends no event without `--trace`. | `a_unix_socket_question_decides_the_connection` |
 | 3.5 | The default mode is `blocked`. | `a_dns_question_waits_for_a_deny`, `run::tests::the_default_is_the_proxy_which_asks` |
+| 3.5 (review) | A port asks when the host does not serve it. | `a_port_that_the_host_does_not_serve_asks_no_question` |
+| 3.5 (review) | The path as the program wrote it does not count. | `a_known_decision_of_a_socket_asks_no_question` |
+| 3.5 (review) | A TLS SNI name waits for a question. | `proxy::tests::a_sni_name_never_waits_for_a_question` |
+| 3.5 (review) | An old hook decision names a later event. | `decide::tests::an_old_hook_decision_names_no_later_event` |
+| 3.5 (review) | A denied domain gets the hint `--allow`. | `linux::trace_logs_filesystem_and_network_denials` |
+
+The check of the notification after a question (`notif_id_valid` in the
+workers of `ask_unix` and `ask_port`) has no test: it needs a task that
+ends while its question waits, and the effect shows only on the side of the
+service. No mutation ran for it.
 
 The first form of `pent_run_starts_pentd_and_holds_it_for_the_run` passed on
 the mutant: the client started a new pentd each time that it lost one. The

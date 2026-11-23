@@ -774,6 +774,9 @@ fn proxy_violation_fix(violation: &str) -> String {
         .split_once('"')
         .and_then(|(_, tail)| tail.split_once('"'))
         .map(|(domain, _)| domain);
+    if rest.contains("the domain is denied") {
+        return "see the cause of the refusal: pent denials".to_string();
+    }
     if rest.contains("the domain is not in the allowlist") {
         if let Some(domain) = quoted_domain {
             return format!("allow it for one run with --allow {domain}");
@@ -964,6 +967,17 @@ mod tests {
              the domain is not in the allowlist",
         );
         assert_eq!(fix, "allow it for one run with --allow evil.example");
+    }
+
+    /// A refusal of a rule, an answer or a deadline names `pent denials`,
+    /// not `--allow`: the hint must not push the user to undo an answer.
+    #[test]
+    fn a_denied_domain_names_pent_denials_not_allow() {
+        let fix = proxy_violation_fix(
+            "network: DNS query for \"evil.example\" (A) blocked: \
+             the domain is denied (see the cause: pent denials)",
+        );
+        assert_eq!(fix, "see the cause of the refusal: pent denials");
     }
 
     #[test]

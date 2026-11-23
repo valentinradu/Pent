@@ -311,6 +311,37 @@ pub(crate) fn child_listens(tid: u32, dest: SocketAddr) -> bool {
     })
 }
 
+/// How long [`HostTables`] keeps one read of the tables of the host.
+const HOST_TABLE_AGE: Duration = Duration::from_secs(1);
+
+/// The listening sockets of the network of the host, from
+/// `/proc/self/net/tcp` and `tcp6` of the process of pent. The supervisor
+/// reads them at most one time in [`HOST_TABLE_AGE`], so a program that
+/// connects many times pays one read in that time.
+#[derive(Debug, Default)]
+pub(crate) struct HostTables {
+    read_at: Option<Instant>,
+    text: String,
+}
+
+impl HostTables {
+    /// Return true if a socket of the host listens on an address that takes
+    /// a connection to `dest`. A server that started less than
+    /// [`HOST_TABLE_AGE`] ago can be missing.
+    pub(crate) fn listens(&mut self, dest: SocketAddr) -> bool {
+        let fresh = self.read_at.is_some_and(|at| at.elapsed() < HOST_TABLE_AGE);
+        if !fresh {
+            self.text = ["tcp", "tcp6"]
+                .iter()
+                .filter_map(|t| std::fs::read_to_string(format!("/proc/self/net/{t}")).ok())
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.read_at = Some(Instant::now());
+        }
+        table_listens(&self.text, dest)
+    }
+}
+
 /// Return true if the text of `/proc/<pid>/net/tcp` or `tcp6` has a
 /// listening socket that takes a connection to `dest`. The columns are
 /// `sl local_address rem_address st ...`; `local_address` is
@@ -687,6 +718,22 @@ mod tests {
         };
         let addr = listener.local_addr()?;
         assert!(child_listens(std::process::id(), addr));
+        Ok(())
+    }
+
+    /// The tables of the host show a listener of this process, and not a
+    /// port that nothing serves.
+    #[test]
+    fn the_host_tables_show_a_listener_of_the_host() -> TestResult {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let open = listener.local_addr()?;
+        let closed = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0")?;
+            probe.local_addr()?
+        };
+        let mut tables = HostTables::default();
+        assert!(tables.listens(open));
+        assert!(!tables.listens(closed));
         Ok(())
     }
 

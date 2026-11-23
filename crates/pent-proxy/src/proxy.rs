@@ -755,8 +755,8 @@ impl TcpProxy {
                 };
                 if !self.state.permits_connection(&name).await {
                     self.state.report_violation(format!(
-                        "network: {protocol} connection to \"{name}\" port {port} blocked: \
-                         the domain is not in the allowlist"
+                        "network: {protocol} connection to \"{name}\" port {port} blocked: {}",
+                        crate::refusal_reason(&self.state)
                     ));
                     return Err(ProxyError::DomainBlocked { domain: name });
                 }
@@ -866,9 +866,11 @@ impl TcpProxy {
 
     /// Check the host name in the TLS SNI or the HTTP `Host` header.
     ///
-    /// If the client data contains a host name, the policy must permit it:
-    /// the allowlist, else the decider. A name equal to the domain of the
-    /// request has its decision already, so it does not ask again. If the
+    /// If the client data contains a host name, the policy must permit it.
+    /// A name equal to the domain of the request, or one that the DNS
+    /// server resolved to its address, has its decision already. Another
+    /// name needs the allowlist or a decision that the decider knows; it
+    /// asks no question. If the
     /// data contains no name (for example with ECH, or for a protocol that
     /// the proxy cannot read), the checks before the connect are the only
     /// checks. In observe mode, the name does not block the connection.
@@ -889,16 +891,22 @@ impl TcpProxy {
             Inspect::Tls => "TLS SNI",
             Inspect::Http => "HTTP Host header",
         };
+        // The name of the request, or a name that the DNS server resolved
+        // to the address of the request, has its decision already.
         let decided = match (&name, target) {
             (Some(n), Target::Domain { host, .. }) => {
                 normalize_hostname(host).ok().as_ref() == Some(n)
             }
-            _ => false,
+            (Some(n), Target::Ip(addr)) => self.state.lookup_resolved_all(&addr.ip()).contains(n),
+            (None, _) => false,
         };
+        // Another name (domain fronting) asks no question: the tunnel is
+        // open already, and the TLS client would wait for the answer. Only
+        // the allowlist or a decision that the chain knows permits it.
         let allowed = match (&name, self.state.policy()) {
             (_, ProxyPolicy::Observe) => true,
             _ if decided => true,
-            (Some(n), ProxyPolicy::Enforce) => self.state.permits_connection(n).await,
+            (Some(n), ProxyPolicy::Enforce) => self.state.permits_now(n),
             (None, ProxyPolicy::Enforce) => false,
         };
         if allowed {
@@ -1819,6 +1827,7 @@ mod tests {
     #[derive(Debug)]
     struct FixedDecider {
         decision: crate::DomainVerdict,
+        known: Option<crate::DomainVerdict>,
         asked: std::sync::Mutex<Vec<(String, Duration)>>,
     }
 
@@ -1826,6 +1835,15 @@ mod tests {
         fn new(decision: crate::DomainVerdict) -> Arc<Self> {
             Arc::new(Self {
                 decision,
+                known: None,
+                asked: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn knowing(known: crate::DomainVerdict) -> Arc<Self> {
+            Arc::new(Self {
+                decision: crate::DomainVerdict::Deny,
+                known: Some(known),
                 asked: std::sync::Mutex::new(Vec::new()),
             })
         }
@@ -1836,6 +1854,10 @@ mod tests {
     }
 
     impl crate::DomainDecider for FixedDecider {
+        fn known(&self, _name: &pent_profile::DomainName) -> Option<crate::DomainVerdict> {
+            self.known
+        }
+
         fn decide<'a>(
             &'a self,
             name: &'a pent_profile::DomainName,
@@ -1927,36 +1949,56 @@ mod tests {
         }
     }
 
+    /// A TLS SNI name never waits for a question: the tunnel is open, and
+    /// the client waits. The name of the request, or a name that DNS
+    /// resolved to the address, has its decision. Another name needs the
+    /// list or a decision that the chain knows.
     #[tokio::test]
-    async fn a_sni_name_asks_only_when_it_differs_from_the_request() {
+    async fn a_sni_name_never_waits_for_a_question() {
         use crate::inspect::tests::client_hello;
         use crate::DomainVerdict as Decision;
-        let decider = FixedDecider::new(Decision::Deny);
-        let proxy = decided_proxy(&[], &decider, ProxyPolicy::Enforce);
         let target = domain_target("a.example");
         let same = client_hello(Some("a.example"));
+        let other = client_hello(Some("b.example"));
+        // A decider that would allow on a question.
+        let decider = FixedDecider::new(Decision::Allow);
+        let proxy = decided_proxy(&[], &decider, ProxyPolicy::Enforce);
         assert!(proxy
             .check_requested_host(Protocol::Socks5, &target, Inspect::Tls, &same)
             .await
             .is_ok());
-        assert!(decider.asked().is_empty());
-        let other = client_hello(Some("b.example"));
         assert!(proxy
             .check_requested_host(Protocol::Socks5, &target, Inspect::Tls, &other)
             .await
             .is_err());
-        assert_eq!(decider.asked().len(), 1);
-        assert_eq!(
-            decider.asked().first().map(|a| a.0.as_str()),
-            Some("b.example")
-        );
+        assert!(decider.asked().is_empty(), "a SNI name asked");
 
-        let allow = FixedDecider::new(Decision::Allow);
-        let proxy = decided_proxy(&[], &allow, ProxyPolicy::Enforce);
+        // A known answer for the other name permits it.
+        let knowing = FixedDecider::knowing(Decision::Allow);
+        let proxy = decided_proxy(&[], &knowing, ProxyPolicy::Enforce);
         assert!(proxy
             .check_requested_host(Protocol::Socks5, &target, Inspect::Tls, &other)
             .await
             .is_ok());
+
+        // An address whose name DNS resolved: the same name is decided.
+        let proxy = decided_proxy(&[], &decider, ProxyPolicy::Enforce);
+        let ip: std::net::IpAddr = "93.184.216.34".parse().unwrap();
+        proxy.state.insert_resolved(crate::ResolvedAddress {
+            domain: "b.example".to_string(),
+            addresses: vec![ip],
+            expires_at: std::time::Instant::now() + Duration::from_secs(60),
+        });
+        let by_ip = Target::Ip(SocketAddr::new(ip, 443));
+        assert!(proxy
+            .check_requested_host(Protocol::Socks5, &by_ip, Inspect::Tls, &other)
+            .await
+            .is_ok());
+        assert!(proxy
+            .check_requested_host(Protocol::Socks5, &by_ip, Inspect::Tls, &same)
+            .await
+            .is_err());
+        assert!(decider.asked().is_empty());
     }
 
     // ========================================================================

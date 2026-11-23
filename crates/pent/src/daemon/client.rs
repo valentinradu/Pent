@@ -54,7 +54,6 @@ const FLUSH_WAIT: Duration = Duration::from_secs(2);
 const STABLE: Duration = Duration::from_secs(30);
 
 /// The result of a question.
-#[cfg_attr(not(test), allow(dead_code))] // `pent run` asks from phase 3 of PLAN.md; until then only the tests ask.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Outcome {
     /// pentd sent the verdict of an answer.
@@ -82,8 +81,6 @@ type Reply = mpsc::UnboundedSender<Step>;
 
 /// A command from [`Session`] to its task.
 enum Command {
-    #[cfg_attr(not(test), allow(dead_code))]
-    // `pent run` asks from step 3.2 of PLAN.md; until then only the tests ask.
     Ask(Box<Ask>, Reply),
     Event(Box<Event>, Queued),
     /// Reply when each command before this one left.
@@ -227,7 +224,6 @@ impl Session {
     }
 
     /// Ask `ask` and wait for the verdict, at most until its deadline.
-    #[cfg_attr(not(test), allow(dead_code))] // `pent run` asks from step 3.2 of PLAN.md; until then only the tests ask.
     pub(crate) async fn ask(&self, ask: Ask) -> Outcome {
         let deadline = tokio::time::Instant::now() + ask.deadline.duration();
         let (reply, mut steps) = mpsc::unbounded_channel();
