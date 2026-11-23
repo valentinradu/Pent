@@ -101,6 +101,12 @@ makes one mutation by hand. The test must fail on the mutant. No
 | 2.5 | A watcher that answers gets its batch after the broadcast. | `hub::tests::a_watcher_that_answers_gets_rule_not_kept_before_the_verdicts` |
 | 2.5 | The monitor ignores `gone`. | `model::tests::a_gone_or_unknown_question_leaves_the_screen` |
 | 2.5 | An answer with the scope `run` resolves the questions of other sessions. | `model::tests::the_cover_count_follows_the_width`, `queue::tests::the_scope_decides_which_sessions_share_the_answer` |
+| 2.5 | `pent watch` gets no mask of the runtime directory. | `pent_watch_also_hides_the_socket_of_pentd_under_a_bound_parent` |
+| 2.5 | The socket policy takes a path inside the runtime directory. | `linux_unixconn::tests::the_policy_never_takes_a_socket_in_the_files_of_pent` |
+| 2.5 | pentd classifies only the path as the session sent it. | `classes::tests::each_name_of_a_credential_is_sensitive`, `each_name_of_a_file_of_pent_is_in_the_pent_class` |
+| 2.5 | pentd knows only one form of the home directory. | `classes::tests::each_name_of_a_credential_is_sensitive`, `a_normal_file_gets_the_shortest_menu_of_each_name_of_the_home` |
+| 2.5 | A merged connection keeps the old start of the idle time. | `server::tests::a_merged_connection_starts_the_idle_time_again` |
+| 2.5 | `forget` keeps a rule file with no rules. | `store::tests::rules::forget_keeps_the_other_rules_and_removes_an_empty_file` |
 
 The first form of `pent_run_starts_pentd_and_holds_it_for_the_run` passed on
 the mutant: the client started a new pentd each time that it lost one. The

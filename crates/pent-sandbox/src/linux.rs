@@ -3081,11 +3081,9 @@ pub(crate) fn spawn_linux(
     if let Err(e) = runtime_dir.ensure() {
         tracing::debug!("the runtime directory of pent is not usable: {e}");
     }
-    if let Ok(runtime) = std::fs::canonicalize(runtime_dir.path()) {
-        if !mask_dirs.iter().any(|d| runtime.starts_with(d)) {
-            mask_dirs.push(runtime);
-        }
-    }
+    // This mask goes in also without `enforce`, in `pent watch`: a bind of
+    // a parent would show `pentd.sock` there too.
+    let runtime_mask: Option<PathBuf> = std::fs::canonicalize(runtime_dir.path()).ok();
     let mask_dirs: Vec<PathBuf> = mask_dirs
         .into_iter()
         .filter(|p| !private.hides(p))
@@ -3113,6 +3111,14 @@ pub(crate) fn spawn_linux(
                 .filter(|p| !private.hides(p))
                 .filter_map(|p| to_cstring(p)),
         );
+    }
+    if let Some(runtime) = &runtime_mask {
+        // A mask of a parent hides it already; a second mask inside it
+        // would fail.
+        let covered = enforce && mask_dirs.iter().any(|d| runtime.starts_with(d));
+        if (enforce || watch) && !covered && !private.hides(runtime) {
+            mounts.mask_dirs.extend(to_cstring(runtime));
+        }
     }
     if enforce {
         let dot_pent = config.workspace.join(".pent");
@@ -3143,7 +3149,11 @@ pub(crate) fn spawn_linux(
     } else {
         crate::linux_unixconn::AbstractNames::Private
     };
-    let unix_policy = crate::linux_unixconn::UnixPolicy::new(unix_sockets, abstract_names);
+    let unix_policy = crate::linux_unixconn::UnixPolicy::new(
+        unix_sockets,
+        abstract_names,
+        runtime_mask.as_slice(),
+    );
     let unix = if enforce {
         crate::linux_unixconn::UnixControl::Enforce(unix_policy)
     } else {

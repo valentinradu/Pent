@@ -21,7 +21,7 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use pent_profile::{Denial, Event, Message, RuleKey, SessionId, SessionInfo};
+use pent_profile::{Denial, Event, Message, RuleKey, SessionId, SessionInfo, MAX_LINE_LEN};
 
 /// The most refusals that pentd keeps for one session.
 pub(crate) const MAX_PER_SESSION: usize = 128;
@@ -34,6 +34,11 @@ pub(crate) const MAX_ENDED: usize = 64;
 
 /// The most recent events that pentd keeps for one session.
 pub(crate) const MAX_RECENT: usize = 256;
+
+/// The bytes that a `Denial` line has more than the `Event` line of the
+/// same event, without the key: `"denial":{"key":"","event":` and `}`
+/// against `"event":`, and room to spare. A test checks the bound.
+const DENIAL_EXTRA: usize = 64;
 
 /// The log of one session.
 #[derive(Debug)]
@@ -116,29 +121,31 @@ impl Denials {
 
     /// Keep `event` of the session `session` in its recent events, and in
     /// its refusals when it is a refusal. pentd gives the code of the
-    /// session, so the code in `event` does not count. Returns the event
-    /// with that code, for the watchers, or `None` when pentd does not keep
-    /// it.
-    pub(crate) fn record(&mut self, session: SessionId, mut event: Event) -> Option<Event> {
+    /// session, so the code in `event` does not count. Returns the encoded
+    /// line of the event with that code, for the watchers, or `None` when
+    /// pentd does not keep it. pentd encodes each event one time.
+    pub(crate) fn record(&mut self, session: SessionId, mut event: Event) -> Option<String> {
         let log = self.log_mut(session)?;
         event.session = session;
-        // An event that cannot go on one line with its key could never
-        // reach a client, so pentd does not keep it.
-        let denial = Message::Denial(Denial {
-            key: log.key.clone(),
-            event,
-        });
-        if denial.encode_line().is_err() {
+        let message = Message::Event(event);
+        let line = message.encode_line().ok()?;
+        // An event that cannot go on one line in a `Denial`, with its key,
+        // could never reach `pent denials`, so pentd does not keep it.
+        let denial_len = line
+            .len()
+            .saturating_add(log.key.as_str().len())
+            .saturating_add(DENIAL_EXTRA);
+        if denial_len > MAX_LINE_LEN {
             return None;
         }
-        let Message::Denial(Denial { event, .. }) = denial else {
+        let Message::Event(event) = message else {
             return None;
         };
-        push_bounded(&mut log.recent, event.clone(), MAX_RECENT);
         if event.decided_by.is_refusal() {
             push_bounded(&mut log.events, event.clone(), MAX_PER_SESSION);
         }
-        Some(event)
+        push_bounded(&mut log.recent, event, MAX_RECENT);
+        Some(line)
     }
 
     /// The session `session` ended at `now`. When more than [`MAX_ENDED`]
@@ -326,7 +333,8 @@ mod tests {
         let total = i64::try_from(MAX_RECENT).unwrap() + 10;
         for t in 2..total {
             let kept = d.record(SessionId(1), event(t, DecidedBy::Rule(Decision::Allow)));
-            assert_eq!(kept.map(|e| e.session), Some(SessionId(1)));
+            let line = kept.and_then(|l| Message::decode_line(&l).ok());
+            assert!(matches!(line, Some(Message::Event(e)) if e.session == SessionId(1)));
         }
         let recent = d.recent();
         assert_eq!(recent.len(), MAX_RECENT);
@@ -354,5 +362,37 @@ mod tests {
         assert!(!infos[0].live);
         assert!(infos[1].live);
         assert_eq!(d.info(SessionId(2)).map(|i| i.key), Some(key("node")));
+    }
+
+    #[test]
+    fn the_bound_of_a_denial_line_holds_for_the_longest_key() {
+        let key = key(&"k".repeat(64));
+        let mut e = event(1, DecidedBy::Rule(Decision::Deny));
+        e.program = "p".repeat(1000);
+        let event_line = Message::Event(e.clone()).encode_line().unwrap();
+        let denial_line = Message::Denial(Denial {
+            key: key.clone(),
+            event: e,
+        })
+        .encode_line()
+        .unwrap();
+        assert!(
+            denial_line.len() <= event_line.len() + key.as_str().len() + DENIAL_EXTRA,
+            "{} > {} + {} + {DENIAL_EXTRA}",
+            denial_line.len(),
+            event_line.len(),
+            key.as_str().len()
+        );
+    }
+
+    #[test]
+    fn an_event_too_long_for_a_denial_line_is_not_kept() {
+        let mut d = Denials::default();
+        d.start(SessionId(1), key("cargo"), vec![]);
+        let mut long = event(1, DecidedBy::Hidden);
+        let base = Message::Event(long.clone()).encode_line().unwrap().len();
+        long.program = "a".repeat(MAX_LINE_LEN - base);
+        assert!(d.record(SessionId(1), long).is_none());
+        assert!(d.recent().is_empty());
     }
 }

@@ -331,6 +331,7 @@ async fn accept_loop(
     let mut changes = hub.subscribe();
     let own_uid = pent_settings::current_uid();
     let mut idle_since = (!holds_itself).then(tokio::time::Instant::now);
+    let mut last_opened = 0_u64;
     let mut expire = tokio::time::interval(EXPIRE_EVERY);
     let mut flush = tokio::time::interval(super::hub::FLUSH_EVERY);
     flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -351,12 +352,14 @@ async fn accept_loop(
                 }
             },
             Ok(()) = changes.changed() => {
-                let idle = changes.borrow_and_update().is_idle();
-                idle_since = match (idle && !holds_itself, idle_since) {
-                    (true, Some(since)) => Some(since),
-                    (true, None) => Some(tokio::time::Instant::now()),
-                    (false, _) => None,
-                };
+                let activity = *changes.borrow_and_update();
+                idle_since = next_idle(
+                    idle_since,
+                    activity,
+                    &mut last_opened,
+                    holds_itself,
+                    tokio::time::Instant::now(),
+                );
             }
             _ = expire.tick() => hub.expire(),
             _ = flush.tick() => hub.flush_events(),
@@ -376,7 +379,7 @@ async fn accept_loop(
 /// The classes of the user: the home directory, and the directories of pent
 /// (config, state, runtime) also when the XDG variables move them. Returns
 /// `None` when the home directory is not known.
-fn classifier() -> Option<pent_profile::Classifier> {
+fn classifier() -> Option<super::classes::Classes> {
     let Some(home) = dirs::home_dir() else {
         tracing::warn!("pentd does not know the home directory; it refuses each question");
         return None;
@@ -386,7 +389,29 @@ fn classifier() -> Option<pent_profile::Classifier> {
         pent_dirs.push(dirs.config);
         pent_dirs.push(dirs.state);
     }
-    Some(pent_profile::Classifier::new(&home, &pent_dirs))
+    Some(super::classes::Classes::new(&home, &pent_dirs))
+}
+
+/// The start of the idle time after a change of `activity`, or `None` when
+/// something keeps pentd alive. A connection that came since the last look
+/// (`opened` changed) starts the idle time again, also when the channel
+/// merged its open and its close into one change.
+fn next_idle(
+    since: Option<tokio::time::Instant>,
+    activity: super::hub::Activity,
+    last_opened: &mut u64,
+    holds_itself: bool,
+    now: tokio::time::Instant,
+) -> Option<tokio::time::Instant> {
+    let fresh = activity.opened != *last_opened;
+    *last_opened = activity.opened;
+    if holds_itself || !activity.is_idle() {
+        return None;
+    }
+    match since {
+        Some(since) if !fresh => Some(since),
+        _ => Some(now),
+    }
 }
 
 /// The task of the notification hook. It stops when pentd stops.
@@ -475,6 +500,35 @@ async fn connection(stream: UnixStream, hub: Arc<Hub>, own_uid: u32, live: Conne
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_merged_connection_starts_the_idle_time_again() {
+        use super::super::hub::Activity;
+        let t0 = tokio::time::Instant::now();
+        let later = t0 + Duration::from_secs(4);
+        let mut last = 0;
+        let idle = Activity::default();
+        assert_eq!(next_idle(Some(t0), idle, &mut last, false, later), Some(t0));
+        // A connection opened and closed between two looks: the channel
+        // shows only an idle state, but `opened` moved.
+        let merged = Activity {
+            opened: 1,
+            ..Activity::default()
+        };
+        assert_eq!(
+            next_idle(Some(t0), merged, &mut last, false, later),
+            Some(later)
+        );
+        assert_eq!(last, 1);
+        // A live connection keeps pentd alive, and a holder never idles.
+        let live = Activity {
+            connections: 1,
+            opened: 2,
+            ..Activity::default()
+        };
+        assert_eq!(next_idle(Some(t0), live, &mut last, false, later), None);
+        assert_eq!(next_idle(Some(t0), idle, &mut last, true, later), None);
+    }
 
     #[test]
     fn only_the_same_user_may_talk_to_pentd() {

@@ -1939,6 +1939,67 @@ fn a_profile_that_names_a_parent_does_not_bring_back_the_socket_of_pentd() -> Te
 }
 
 #[test]
+fn pent_watch_also_hides_the_socket_of_pentd_under_a_bound_parent() -> TestResult {
+    let test = "pent_watch_also_hides_the_socket_of_pentd_under_a_bound_parent";
+    if !sandbox_ready(test) {
+        return Ok(());
+    }
+    let env = TestEnv::new()?;
+    let runtime = env.runtime.display().to_string();
+    // A global mount brings back the parent of `pent/`, as a mount of
+    // `/run/user/<uid>` does.
+    let settings = env.config_dir().join("pent/pent.toml");
+    std::fs::create_dir_all(env.config_dir().join("pent"))?;
+    std::fs::write(
+        &settings,
+        format!("[[sandbox.mounts]]\npath = \"{runtime}\"\n"),
+    )?;
+    std::fs::write(env.runtime.join("visible"), "PENT_VISIBLE")?;
+    let _pentd = Reap(
+        env.command(&["daemon"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?,
+    );
+    let deadline = Instant::now() + WAIT;
+    while !env.runtime.join("pent/pentd.sock").exists() {
+        if Instant::now() >= deadline {
+            return Err("pentd never listened".into());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let script = format!(
+        "cat '{runtime}/visible'; echo; echo PENTLS $(ls -A '{runtime}/pent' 2>&1 | tr '\\n' ' ')"
+    );
+    let out = env
+        .command(&[
+            "watch",
+            "--yes",
+            "--profile",
+            "w",
+            "--",
+            "sh",
+            "-c",
+            &script,
+        ])
+        .output()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    // The positive control: the mount brought the directory back.
+    assert!(text.contains("PENT_VISIBLE"), "{text}");
+    let line = text
+        .lines()
+        .find(|l| l.starts_with("PENTLS"))
+        .ok_or("no listing")?;
+    assert_eq!(
+        line.trim(),
+        "PENTLS",
+        "pent watch shows the files of pent: {line}"
+    );
+    Ok(())
+}
+
+#[test]
 fn a_runtime_directory_that_appears_after_the_start_stays_hidden() -> TestResult {
     let test = "a_runtime_directory_that_appears_after_the_start_stays_hidden";
     if !sandbox_ready(test) {

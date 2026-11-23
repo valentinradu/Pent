@@ -204,13 +204,13 @@ impl Model {
         let Some(target) = question.ask.menu.get(usize::from(self.width_of(question))) else {
             return 0;
         };
-        let answer = Resolving {
-            key: &question.ask.key,
-            session: question.ask.session,
+        let answer = Resolving::new(
+            &question.ask.key,
+            question.ask.session,
             target,
             decision,
-            scope: self.scope,
-        };
+            self.scope,
+        );
         self.questions
             .iter()
             .filter(|q| q.id == question.id || answer.resolves(&q.ask))

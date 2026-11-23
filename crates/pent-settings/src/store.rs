@@ -23,7 +23,7 @@ use std::io::{BufRead as _, Write as _};
 use std::path::{Path, PathBuf};
 
 use pent_profile::{
-    DocError, ProfileDoc, ProfileName, RuleFileError, RuleKey, RuleSet, WatchEvent,
+    DocError, ProfileDoc, ProfileName, RuleFileError, RuleKey, RuleSet, Target, WatchEvent,
 };
 use thiserror::Error;
 
@@ -924,6 +924,46 @@ impl RuleStore {
         Ok(keys)
     }
 
+    /// Remove each rule of `key` with the target `target`, or each rule of
+    /// `key` for `None`, under the lock of the key. Returns how many rules
+    /// went. When no rule is left, the rule file goes too, so no key stays
+    /// with an empty file. A key with no file stays with no file. The lock
+    /// file stays: a removal of a lock file that another process holds
+    /// would break the lock.
+    ///
+    /// # Errors
+    /// Returns the errors of [`RuleStore::update`].
+    pub fn forget(&self, key: &RuleKey, target: Option<&Target>) -> Result<usize, StoreError> {
+        let _lock = self.lock(key)?;
+        let path = self.path(key);
+        let (mut rules, old) = self.read(key)?;
+        let Some(old) = old else {
+            return Ok(0);
+        };
+        let before = rules.rules.len();
+        match target {
+            Some(target) => rules.rules.retain(|r| r.target != *target),
+            None => rules.rules.clear(),
+        }
+        let count = before.saturating_sub(rules.rules.len());
+        if count == 0 {
+            return Ok(0);
+        }
+        if rules.rules.is_empty() {
+            remove_optional(&path)?;
+            return Ok(count);
+        }
+        let text = rules
+            .update_toml(&old)
+            .map_err(|source| StoreError::Rules {
+                path: path.clone(),
+                source: Box::new(source),
+            })?;
+        write_atomic_private(&path, text.as_bytes())
+            .map_err(|source| StoreError::Io { path, source })?;
+        Ok(count)
+    }
+
     /// Remove the rule file of `key`. Returns `true` when the file existed.
     ///
     /// # Errors
@@ -1712,6 +1752,32 @@ mod tests {
 
         fn key(s: &str) -> RuleKey {
             s.parse().unwrap()
+        }
+
+        #[test]
+        fn forget_keeps_the_other_rules_and_removes_an_empty_file() {
+            let (_root, store) = rules_fixture();
+            let set = sample("cargo");
+            assert!(set.rules.len() >= 2);
+            store.save(&set).unwrap();
+            let first = set.rules[0].target.clone();
+            assert_eq!(store.forget(&key("cargo"), Some(&first)).unwrap(), 1);
+            let left = store.load(&key("cargo")).unwrap();
+            assert_eq!(left.rules.len(), set.rules.len() - 1);
+            assert!(left.rules.iter().all(|r| r.target != first));
+            // The same target again: nothing goes, and the file stays.
+            assert_eq!(store.forget(&key("cargo"), Some(&first)).unwrap(), 0);
+            assert!(store.path(&key("cargo")).exists());
+            // Each rule: the file goes too.
+            assert_eq!(
+                store.forget(&key("cargo"), None).unwrap(),
+                set.rules.len() - 1
+            );
+            assert!(!store.path(&key("cargo")).exists());
+            assert!(store.keys().unwrap().is_empty());
+            // A key with no file gets no file.
+            assert_eq!(store.forget(&key("node"), None).unwrap(), 0);
+            assert!(!store.path(&key("node")).exists());
         }
 
         fn sample(k: &str) -> RuleSet {

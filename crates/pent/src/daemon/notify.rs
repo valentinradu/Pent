@@ -45,8 +45,15 @@ pub(crate) async fn run(hub: Arc<Hub>) {
         if pending == 0 {
             continue;
         }
-        let Some(command) = notify_command() else {
-            continue;
+        // The read of `pent.toml` blocks; a slow home directory must not
+        // stop a thread of the runtime.
+        let command = match tokio::task::spawn_blocking(notify_command).await {
+            Ok(Some(command)) => command,
+            Ok(None) => continue,
+            Err(e) => {
+                tracing::warn!("pentd cannot read the notify command: {e}");
+                continue;
+            }
         };
         match spawn(&command, pending) {
             Ok(mut child) => {

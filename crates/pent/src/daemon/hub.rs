@@ -31,11 +31,13 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use pent_profile::Class;
 use pent_profile::{
     Answer, EventsDropped, Forget, Forgotten, Hold, Message, QuestionId, RejectReason, Rejected,
     RuleKey, Scope, SessionId, SessionInfo, Verdict,
 };
-use pent_profile::{Class, Classifier};
+
+use super::classes::Classes;
 use pent_settings::RuleStore;
 use tokio::sync::{mpsc, watch, Notify};
 
@@ -177,6 +179,10 @@ pub(crate) struct Activity {
     /// The open questions. A question of an ended session keeps pentd
     /// alive, so a late answer can still become a rule.
     pub(crate) questions: usize,
+    /// The count of connections since the start. The `watch` channel can
+    /// merge an open and a close into one change; this count still shows
+    /// that a connection came.
+    pub(crate) opened: u64,
 }
 
 impl Activity {
@@ -193,7 +199,8 @@ struct State {
     sessions: HashMap<SessionId, Outbox>,
     watchers: Vec<Watcher>,
     /// The events for the watchers since the last flush.
-    pending: Vec<pent_profile::Event>,
+    /// The encoded line of each event.
+    pending: Vec<String>,
     /// The events above [`MAX_PENDING`] since the last flush.
     pending_lost: u64,
 }
@@ -213,7 +220,7 @@ pub(crate) struct Hub {
     /// The classes of the user. pentd computes the class and the menu of
     /// each question itself, so a faulty session cannot make a sensitive
     /// access look normal or offer a wide target for it.
-    classes: Option<Classifier>,
+    classes: Option<Classes>,
     /// One answer at a time from the queue to the rule file, so the file
     /// gets the answers in the order of the queue.
     writes: tokio::sync::Mutex<()>,
@@ -264,7 +271,7 @@ impl Hub {
     /// then an answer with the scope `remember` holds only for this run.
     /// `classes` is `None` when pent does not know the home directory; then
     /// pentd refuses each question with `NoAnswer`.
-    pub(crate) fn new(rules: Option<RuleStore>, classes: Option<Classifier>) -> Arc<Self> {
+    pub(crate) fn new(rules: Option<RuleStore>, classes: Option<Classes>) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(State {
                 queue: Queue::default(),
@@ -290,8 +297,10 @@ impl Hub {
     /// Count a new connection until the guard drops. The accept loop takes
     /// the guard before it starts the task of the connection.
     pub(crate) fn connection(self: &Arc<Self>) -> ConnectionGuard {
-        self.activity
-            .send_modify(|a| a.connections = a.connections.saturating_add(1));
+        self.activity.send_modify(|a| {
+            a.connections = a.connections.saturating_add(1);
+            a.opened = a.opened.wrapping_add(1);
+        });
         ConnectionGuard(Arc::clone(self))
     }
 
@@ -358,11 +367,11 @@ impl Hub {
                     return;
                 };
                 let mut state = self.lock();
-                if let Some(event) = state.denials.record(*id, event) {
+                if let Some(line) = state.denials.record(*id, event) {
                     if state.watchers.is_empty() {
                         // Nobody watches: the log of the session keeps it.
                     } else if state.pending.len() < MAX_PENDING {
-                        state.pending.push(event);
+                        state.pending.push(line);
                     } else {
                         state.pending_lost = state.pending_lost.saturating_add(1);
                     }
@@ -472,9 +481,7 @@ impl Hub {
             reject(outbox, None, RejectReason::NoAnswer);
             return;
         };
-        let access = ask.request.as_access();
-        ask.class = classes.classify(&access);
-        ask.menu = classes.widths(&access);
+        (ask.class, ask.menu) = classes.decide(&ask.request);
         if ask.class == Class::Pent {
             reject(outbox, None, RejectReason::NoAnswer);
             return;
@@ -581,21 +588,9 @@ impl Hub {
         };
         let Forget { key, target } = forget;
         let file_key = key.clone();
-        let write = tokio::task::spawn_blocking(move || {
-            // A key with no rule needs no write, and pentd does not create
-            // an empty file for it.
-            if store.load(&file_key)?.rules.is_empty() {
-                return Ok(0);
-            }
-            store.update(&file_key, |set| {
-                let before = set.rules.len();
-                match &target {
-                    Some(target) => set.rules.retain(|r| r.target != *target),
-                    None => set.rules.clear(),
-                }
-                before.saturating_sub(set.rules.len())
-            })
-        });
+        // The store removes the file when no rule is left, and it creates
+        // no file for a key with no rule.
+        let write = tokio::task::spawn_blocking(move || store.forget(&file_key, target.as_ref()));
         match write.await {
             Ok(Ok(count)) => send(
                 outbox,
@@ -708,10 +703,8 @@ impl Hub {
 fn flush(state: &mut State) {
     let events = std::mem::take(&mut state.pending);
     let lost = std::mem::take(&mut state.pending_lost);
-    let mut lines = Batch::default();
-    for event in events.iter().cloned() {
-        lines.push(&Message::Event(event));
-    }
+    // The lines are encoded already (`Denials::record`).
+    let lines = Batch(events.concat());
     let count = u64::try_from(events.len()).unwrap_or(u64::MAX);
     for watcher in &mut state.watchers {
         let missed = watcher.dropped.saturating_add(lost);
@@ -901,7 +894,7 @@ mod tests {
     fn hub_with(rules: Option<RuleStore>) -> Arc<Hub> {
         Hub::new(
             rules,
-            Some(Classifier::new(std::path::Path::new("/home/u"), &[])),
+            Some(Classes::new(std::path::Path::new("/home/u"), &[])),
         )
     }
 

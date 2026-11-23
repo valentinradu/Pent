@@ -79,8 +79,9 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
     let store = ProfileStore::open_default()?;
     let profile = load_trusted(&store, &selected, &args.command)?;
     let name = selected.name;
-    let _pentd = hold_pentd(&args.command);
     let settings = ConfigLoader::load(&cwd, pent_settings::PentDirs::from_env().as_ref())?;
+    // After the settings: a run that fails on its settings starts no pentd.
+    let _pentd = hold_pentd(&args.command);
 
     let mut paths = profile_paths(&profile);
     add_cli_paths(&mut paths, &args);

@@ -13,6 +13,7 @@
 //! themselves, so they never stop for this reason.
 
 pub(crate) mod call;
+pub(crate) mod classes;
 pub(crate) mod client;
 pub(crate) mod denials;
 pub(crate) mod hub;

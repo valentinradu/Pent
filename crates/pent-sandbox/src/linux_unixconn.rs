@@ -193,13 +193,29 @@ pub(crate) struct UnixPolicy {
 
 impl UnixPolicy {
     /// Build the policy from the paths of the profile. A path that does not
-    /// canonicalize does not enter the list: no path can match it.
-    /// `abstract_names` says whether the child has its own network
-    /// namespace.
-    pub(crate) fn new(paths: &[PathBuf], abstract_names: AbstractNames) -> Self {
+    /// canonicalize does not enter the list: no path can match it. A path
+    /// below one of `forbidden` (the runtime directory of pent, which holds
+    /// `pentd.sock`) does not enter the list either, so no profile can give
+    /// the program the socket of pentd. `abstract_names` says whether the
+    /// child has its own network namespace.
+    pub(crate) fn new(
+        paths: &[PathBuf],
+        abstract_names: AbstractNames,
+        forbidden: &[PathBuf],
+    ) -> Self {
         let mut allowed: Vec<PathBuf> = paths
             .iter()
             .filter_map(|p| std::fs::canonicalize(p).ok())
+            .filter(|p| {
+                let inside = forbidden.iter().any(|f| p.starts_with(f));
+                if inside {
+                    tracing::warn!(
+                        "pent refuses the Unix socket {}: it is a file of pent",
+                        p.display()
+                    );
+                }
+                !inside
+            })
             .collect();
         allowed.sort();
         allowed.dedup();
@@ -837,13 +853,43 @@ mod tests {
     }
 
     #[test]
+    fn the_policy_never_takes_a_socket_in_the_files_of_pent() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        let dir = std::fs::canonicalize(tmp.path())?;
+        let pent = dir.join("pent");
+        std::fs::create_dir(&pent)?;
+        let socket = pent.join("pentd.sock");
+        let _pentd = UnixListener::bind(&socket)?;
+        let other = dir.join("other.sock");
+        let _other = UnixListener::bind(&other)?;
+        // A link outside the files of pent points into them.
+        std::os::unix::fs::symlink(&socket, dir.join("link.sock"))?;
+        let paths = [socket.clone(), dir.join("link.sock"), other.clone()];
+        let policy = UnixPolicy::new(&paths, AbstractNames::Private, std::slice::from_ref(&pent));
+        assert_eq!(
+            policy.decide(&UnixAddr::Path(socket.clone())),
+            UnixDecision::Refuse
+        );
+        assert_eq!(
+            policy.decide(&UnixAddr::Path(dir.join("link.sock"))),
+            UnixDecision::Refuse
+        );
+        // The positive control: the other socket stays allowed.
+        assert_eq!(
+            policy.decide(&UnixAddr::Path(other.clone())),
+            UnixDecision::Perform(other)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn the_policy_compares_canonical_paths() -> TestResult {
         let tmp = tempfile::tempdir()?;
         let dir = std::fs::canonicalize(tmp.path())?;
         let real = dir.join("real.sock");
         let _listener = UnixListener::bind(&real)?;
         std::os::unix::fs::symlink(&real, dir.join("link.sock"))?;
-        let policy = UnixPolicy::new(std::slice::from_ref(&real), AbstractNames::Private);
+        let policy = UnixPolicy::new(std::slice::from_ref(&real), AbstractNames::Private, &[]);
         let perform = UnixDecision::Perform(real.clone());
         assert_eq!(policy.decide(&UnixAddr::Path(real.clone())), perform);
         assert_eq!(
@@ -858,7 +904,7 @@ mod tests {
         assert_eq!(UnixDecision::Refuse.outcome(), Outcome::Denied);
         assert_eq!(UnixDecision::Child.outcome(), Outcome::Allowed);
         // A path that does not exist yet matches nothing.
-        let pending = UnixPolicy::new(&[dir.join("missing.sock")], AbstractNames::Private);
+        let pending = UnixPolicy::new(&[dir.join("missing.sock")], AbstractNames::Private, &[]);
         assert_eq!(
             pending.decide(&UnixAddr::Path(dir.join("missing.sock"))),
             UnixDecision::Refuse
@@ -871,9 +917,9 @@ mod tests {
     #[test]
     fn the_policy_permits_an_abstract_name_in_a_private_namespace() {
         let name = UnixAddr::Abstract("own".into());
-        let private = UnixPolicy::new(&[], AbstractNames::Private);
+        let private = UnixPolicy::new(&[], AbstractNames::Private, &[]);
         assert_eq!(private.decide(&name), UnixDecision::Child);
-        let shared = UnixPolicy::new(&[], AbstractNames::Shared);
+        let shared = UnixPolicy::new(&[], AbstractNames::Shared, &[]);
         assert_eq!(shared.decide(&name), UnixDecision::Refuse);
     }
 
@@ -886,7 +932,7 @@ mod tests {
         let dir = std::fs::canonicalize(tmp.path())?;
         let real = dir.join("real.sock");
         let _listener = UnixListener::bind(&real)?;
-        let policy = UnixPolicy::new(std::slice::from_ref(&real), AbstractNames::Private);
+        let policy = UnixPolicy::new(std::slice::from_ref(&real), AbstractNames::Private, &[]);
         assert_eq!(
             policy.decide_many(&UnixAddr::Path(real)),
             UnixDecision::Refuse

@@ -109,8 +109,8 @@ pub(crate) enum RulesSubcommand {
 
 #[derive(Args)]
 pub(crate) struct DaemonArgs {
-    /// Started by `pent run`: stop a few seconds after the last hold, and
-    /// stop in silence when another pentd runs
+    /// `pent run` starts pentd with this flag: pentd stops a few seconds
+    /// after the last hold, and it stops in silence when another pentd runs
     #[arg(long, hide = true)]
     pub spawned: bool,
 }

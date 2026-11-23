@@ -93,21 +93,35 @@ impl Plan {
 /// An answer as it resolves the open questions: the key and the session of
 /// the answered question, the target, the decision and the scope.
 /// `pent monitor` uses the same rule to count what an answer would resolve.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct Resolving<'a> {
-    /// The key of the answered question.
-    pub(crate) key: &'a RuleKey,
-    /// The session of the answered question.
-    pub(crate) session: SessionId,
-    /// The target of the answer.
-    pub(crate) target: &'a Target,
-    /// Allow or deny.
-    pub(crate) decision: Decision,
-    /// The scope that holds.
-    pub(crate) scope: Scope,
+    key: &'a RuleKey,
+    session: SessionId,
+    target: &'a Target,
+    scope: Scope,
+    /// A rule set with the one rule of the answer, built one time.
+    covering: RuleSet,
 }
 
-impl Resolving<'_> {
+impl<'a> Resolving<'a> {
+    /// An answer for the question of `key` and `session`, with `target`,
+    /// `decision` and the scope that holds.
+    pub(crate) fn new(
+        key: &'a RuleKey,
+        session: SessionId,
+        target: &'a Target,
+        decision: Decision,
+        scope: Scope,
+    ) -> Self {
+        Self {
+            key,
+            session,
+            target,
+            scope,
+            covering: covering_set(key, target, decision),
+        }
+    }
+
     /// Return true if this answer resolves the open question `other`: the
     /// same key, and with the scope `run` the same session; the target
     /// covers the access; and a sensitive question needs its own exact
@@ -116,9 +130,7 @@ impl Resolving<'_> {
         let same_group = other.key == *self.key
             && (self.scope == Scope::Remember || other.session == self.session);
         let access = other.request.as_access();
-        let covered = covering_set(self.key, self.target, self.decision)
-            .decide(&access)
-            .is_some();
+        let covered = self.covering.decide(&access).is_some();
         let allowed =
             !matches!(other.class, Class::Sensitive(_)) || exact_target(&access) == *self.target;
         same_group && covered && allowed
@@ -247,13 +259,7 @@ impl Queue {
     /// `remember` and in the session of the question for `run`. pentd calls
     /// this after the write of the rule, with `run` when the write failed.
     pub(crate) fn resolve(&mut self, plan: &Plan, scope: Scope) -> Vec<(SessionId, Verdict)> {
-        let answer = Resolving {
-            key: &plan.key,
-            session: plan.session,
-            target: &plan.target,
-            decision: plan.decision,
-            scope,
-        };
+        let answer = Resolving::new(&plan.key, plan.session, &plan.target, plan.decision, scope);
         let resolved: Vec<QuestionId> = self
             .open
             .values()
