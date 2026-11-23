@@ -120,6 +120,11 @@ makes one mutation by hand. The test must fail on the mutant. No
 | 3.1 | `pent run` sends no event. | `pent_denials_shows_the_refusals_of_a_real_run` |
 | 3.1 | The flush of a session waits for nothing. | `decide::tests::an_answer_decides_and_covers_the_rest_of_its_width`, `a_static_event_names_its_cause` |
 | 3.1 | An address at the proxy becomes a domain in an event. | `decide::tests::a_static_event_names_its_cause` |
+| 3.1 | An exec rule goes only into the execute list. | `decide::tests::a_static_grant_holds_each_kind_that_the_sandbox_gives` |
+| 3.1 | A write rule must hold only as a write. | `decide::tests::a_static_grant_holds_each_kind_that_the_sandbox_gives` |
+| 3.1 | A rule path with a trailing `*` goes into Landlock. | `decide::tests::a_static_grant_holds_each_kind_that_the_sandbox_gives` |
+| 3.1 | A wide answer names a sensitive access. | `decide::tests::a_sensitive_access_names_its_exact_answer` |
+| 3.1 | The queue of events has no limit. | `client::tests::the_queue_of_events_has_a_limit` |
 
 The first form of `pent_run_starts_pentd_and_holds_it_for_the_run` passed on
 the mutant: the client started a new pentd each time that it lost one. The

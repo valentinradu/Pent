@@ -35,6 +35,11 @@ const RETRY_PAUSE: Duration = Duration::from_millis(25);
 /// How many times in a row the client holds again after a lost connection.
 const MAX_RECONNECTS: u32 = 3;
 
+/// The most events that wait in the queue of a session. A later event goes
+/// nowhere, so a pentd that reads slowly cannot make the queue grow without
+/// a limit. The events are for the human; no decision depends on them.
+const MAX_QUEUED_EVENTS: usize = 4096;
+
 /// The longest wait of [`Session::flush`].
 const FLUSH_WAIT: Duration = Duration::from_secs(2);
 
@@ -73,9 +78,19 @@ enum Command {
     #[cfg_attr(not(test), allow(dead_code))]
     // `pent run` asks from step 3.2 of PLAN.md; until then only the tests ask.
     Ask(Box<Ask>, Reply),
-    Event(Box<Event>),
+    Event(Box<Event>, Queued),
     /// Reply when each command before this one left.
     Flush(tokio::sync::oneshot::Sender<()>),
+}
+
+/// The place of one event in the count of the queue. The drop leaves the
+/// count, when the task takes the event or when the queue drops it.
+struct Queued(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for Queued {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// How the task connects again after a lost connection.
@@ -89,6 +104,8 @@ struct Reconnect {
 #[derive(Debug)]
 pub(crate) struct Session {
     commands: mpsc::UnboundedSender<Command>,
+    /// The number of events in the queue of the task.
+    queued: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -133,16 +150,39 @@ impl Session {
     fn spawn(stream: Option<UnixStream>, reconnect: Option<Reconnect>) -> Self {
         let (commands, inbox) = mpsc::unbounded_channel();
         let task = tokio::spawn(run(stream, reconnect, inbox));
-        Self { commands, task }
+        Self {
+            commands,
+            queued: std::sync::Arc::default(),
+            task,
+        }
     }
 
     /// Send `event` to pentd. pentd puts the number of this session in
     /// it. Without pentd the event goes nowhere: the events are for the
     /// human, and the decision of the access does not depend on them.
+    /// When [`MAX_QUEUED_EVENTS`] events wait already, the event goes
+    /// nowhere too.
     pub(crate) fn send_event(&self, event: Event) {
-        if self.commands.send(Command::Event(Box::new(event))).is_err() {
+        use std::sync::atomic::Ordering;
+        let before = self.queued.fetch_add(1, Ordering::Relaxed);
+        let place = Queued(std::sync::Arc::clone(&self.queued));
+        if before >= MAX_QUEUED_EVENTS {
+            tracing::debug!("the queue of events is full; an event goes nowhere");
+            return;
+        }
+        if self
+            .commands
+            .send(Command::Event(Box::new(event), place))
+            .is_err()
+        {
             tracing::debug!("the session ended; an event goes nowhere");
         }
+    }
+
+    /// The number of events in the queue of the task.
+    #[cfg(test)]
+    fn queued(&self) -> usize {
+        self.queued.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Wait until each event and each question before this call left for
@@ -296,7 +336,7 @@ async fn run(
                 // The caller can be gone after its wait.
                 let _ = done.send(());
             }
-            Command::Event(_) => {}
+            Command::Event(..) => {}
         }
     }
 }
@@ -346,7 +386,7 @@ async fn serve(stream: UnixStream, commands: &mut mpsc::UnboundedReceiver<Comman
                         break Served::Lost;
                     }
                 }
-                Some(Command::Event(event)) => {
+                Some(Command::Event(event, _place)) => {
                     // An event that cannot be one line goes alone, as an
                     // ask does.
                     let line = match Message::Event(*event).encode_line() {
@@ -452,8 +492,8 @@ fn start_pentd(socket: &Path) -> Result<std::sync::mpsc::Receiver<()>, DaemonErr
 #[allow(clippy::panic, clippy::unwrap_used)] // a test fails on a branch that it must not reach
 mod tests {
     use pent_profile::{
-        Class, Deadline, Decision, Question, RejectReason, Rejected, Request, Scope, SessionId,
-        Source, Target, Timestamp, DNS_DEADLINE, FILE_DEADLINE, PROXY_DEADLINE,
+        Class, Deadline, Decision, Event, Question, RejectReason, Rejected, Request, Scope,
+        SessionId, Source, Target, Timestamp, DNS_DEADLINE, FILE_DEADLINE, PROXY_DEADLINE,
     };
     use tokio::io::AsyncBufReadExt as _;
 
@@ -615,6 +655,31 @@ mod tests {
             session.ask(ask(FILE_DEADLINE)).await,
             Outcome::Answered(verdict(0))
         );
+    }
+
+    #[tokio::test]
+    async fn the_queue_of_events_has_a_limit() {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        // pentd never reads, so the socket fills and the task waits on a
+        // write.
+        let session = Session::over(ours, None);
+        let event = Event {
+            session: SessionId(0),
+            time: Timestamp(0),
+            program: "x".repeat(1000),
+            request: Request::Localhost(std::num::NonZeroU16::new(1).unwrap()),
+            decided_by: pent_profile::DecidedBy::Base(Decision::Deny),
+        };
+        for _ in 0..3 * MAX_QUEUED_EVENTS {
+            session.send_event(event.clone());
+        }
+        assert!(
+            session.queued() <= MAX_QUEUED_EVENTS,
+            "{}",
+            session.queued()
+        );
+        assert!(session.queued() > 0, "the socket took each event");
+        drop(theirs);
     }
 
     #[test]

@@ -470,13 +470,7 @@ fn open_trace_log(trace: bool, key: &RuleKey) -> Option<PathBuf> {
     }
     let result = ProfileStore::open_default()
         .map_err(|e| e.to_string())
-        .and_then(|store| {
-            let name = key
-                .as_str()
-                .parse::<ProfileName>()
-                .map_err(|e| e.to_string())?;
-            store.create_trace_log(&name).map_err(|e| e.to_string())
-        });
+        .and_then(|store| store.create_trace_log(key).map_err(|e| e.to_string()));
     match result {
         Ok(path) => {
             ui::status("tracing", path.display());

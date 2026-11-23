@@ -28,6 +28,13 @@ use pent_settings::SandboxPaths;
 use crate::daemon::classes::Classes;
 use crate::daemon::client::{self, Session};
 
+/// The answers of one run: the rules of the verdicts, and the question of
+/// each rule at the same place.
+struct Answers {
+    rules: RuleSet,
+    questions: Vec<QuestionId>,
+}
+
 /// The chain of deciders of one run.
 pub(crate) struct Decider {
     /// The answers in advance: the flags of `pent run`.
@@ -37,7 +44,7 @@ pub(crate) struct Decider {
     /// The answers of this run, of each scope, with their questions. pentd
     /// writes the rules of the scope "remember"; this list applies them at
     /// once.
-    answers: Mutex<Vec<(QuestionId, Rule)>>,
+    answers: Mutex<Answers>,
     /// The classes of the user, or `None` when the home directory is not
     /// known.
     classes: Option<Classes>,
@@ -53,10 +60,14 @@ impl Decider {
         classes: Option<Classes>,
         session: Option<Session>,
     ) -> Self {
+        let answers = RuleSet::new(rules.key.clone());
         Self {
             flags,
             rules,
-            answers: Mutex::new(Vec::new()),
+            answers: Mutex::new(Answers {
+                rules: answers,
+                questions: Vec::new(),
+            }),
             classes,
             session,
         }
@@ -101,20 +112,22 @@ impl Decider {
             .answers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let one = |rule: &Rule| RuleSet {
-            key: self.rules.key.clone(),
-            rules: vec![rule.clone()],
-        };
-        let all = RuleSet {
-            key: self.rules.key.clone(),
-            rules: answers.iter().map(|(_, rule)| rule.clone()).collect(),
-        };
-        let decision = decide_in(&all, &access, sensitive)?;
-        // The event names one answer with the same decision.
+        let decision = decide_in(&answers.rules, &access, sensitive)?;
+        // The event names one answer that alone gives the same decision.
+        // For a sensitive access, only an exact answer counts.
         answers
+            .rules
+            .rules
             .iter()
-            .find(|(_, rule)| one(rule).decide(&access) == Some(decision))
-            .map(|(question, _)| DecidedBy::Answer {
+            .zip(&answers.questions)
+            .find(|(rule, _)| {
+                (!sensitive || is_exact(&rule.target))
+                    && answers
+                        .rules
+                        .decide_where(&access, |r| std::ptr::eq(r, *rule))
+                        == Some(decision)
+            })
+            .map(|(_, question)| DecidedBy::Answer {
                 question: *question,
                 decision,
             })
@@ -166,18 +179,18 @@ impl Decider {
         };
         match session.ask(ask).await {
             client::Outcome::Answered(verdict) => {
-                self.answers
+                let mut answers = self
+                    .answers
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .push((
-                        verdict.id,
-                        Rule {
-                            target: verdict.target,
-                            decision: verdict.decision,
-                            source: verdict.source,
-                            created: SystemTime::now(),
-                        },
-                    ));
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                answers.rules.rules.push(Rule {
+                    target: verdict.target.clone(),
+                    decision: verdict.decision,
+                    source: verdict.source,
+                    created: SystemTime::now(),
+                });
+                answers.questions.push(verdict.id);
+                drop(answers);
                 DecidedBy::Answer {
                     question: verdict.id,
                     decision: verdict.decision,
@@ -241,16 +254,7 @@ fn decide_in(rules: &RuleSet, access: &Access<'_>, sensitive: bool) -> Option<De
     if decision == Decision::Deny || !sensitive {
         return Some(decision);
     }
-    RuleSet {
-        key: rules.key.clone(),
-        rules: rules
-            .rules
-            .iter()
-            .filter(|rule| is_exact(&rule.target))
-            .cloned()
-            .collect(),
-    }
-    .decide(access)
+    rules.decide_where(access, |rule| is_exact(&rule.target))
 }
 
 /// Return true if `target` names one path, one name, one socket or one
@@ -432,6 +436,9 @@ pub(crate) enum HeldBack {
     /// A subtree covers a sensitive path or a file of pent: only an exact
     /// rule gives such a path.
     Sensitive,
+    /// The sandbox cannot take the path as it is: the path is not UTF-8,
+    /// or it ends with `*`, which the sandbox reads as a pattern.
+    PathForm,
 }
 
 impl HeldBack {
@@ -441,6 +448,9 @@ impl HeldBack {
             Self::Hole => "a deny rule is inside it",
             Self::Directory => "it names one directory, and the sandbox gives only whole trees",
             Self::PentFiles => "it names the files of pent",
+            Self::PathForm => {
+                "the sandbox cannot take this path as it is (a name that is not UTF-8, or a trailing *)"
+            }
             Self::Sensitive => {
                 "a sensitive path or a file of pent is inside it, and only an exact rule gives such a path"
             }
@@ -458,51 +468,36 @@ impl Grants {
         is_dir: impl Fn(&Path) -> bool,
     ) -> Self {
         let mut grants = Self::default();
-        let whole = rules.whole_allows();
         for rule in rules.rules.iter().filter(|r| r.decision == Decision::Allow) {
-            if !whole.contains(&rule) {
+            if !rules.is_whole(rule) {
                 grants.held_back.push((rule.target.clone(), HeldBack::Hole));
                 continue;
             }
             match &rule.target {
                 Target::File { kind, width } => {
-                    let (PathWidth::Exact(base) | PathWidth::Subtree(base)) = width;
-                    let path = base.as_path();
-                    let subtree = matches!(width, PathWidth::Subtree(_));
-                    let class = classes.map(|c| {
-                        c.decide(&Request::File {
-                            kind: *kind,
-                            path: base.clone(),
-                        })
-                        .0
-                    });
-                    let held = match class {
-                        Some(Class::Pent) => Some(HeldBack::PentFiles),
-                        Some(Class::Sensitive(_)) if subtree => Some(HeldBack::Sensitive),
-                        _ if subtree
-                            && classes.is_none_or(|c| c.subtree_holds_guard(path, *kind)) =>
-                        {
-                            Some(HeldBack::Sensitive)
-                        }
-                        _ if !subtree && is_dir(path) => Some(HeldBack::Directory),
-                        _ => None,
-                    };
-                    if let Some(why) = held {
+                    if let Some(why) = file_held_back(rules, *kind, width, classes, &is_dir) {
                         grants.held_back.push((rule.target.clone(), why));
                         continue;
                     }
-                    let list = match kind {
-                        FileKind::List => &mut grants.paths.traversal,
-                        FileKind::Read => &mut grants.paths.read,
-                        FileKind::Write => &mut grants.paths.read_write,
-                        FileKind::Exec => &mut grants.paths.execute,
-                    };
-                    push_new(list, path);
+                    let (PathWidth::Exact(base) | PathWidth::Subtree(base)) = width;
+                    let path = base.as_path();
+                    let lists = &mut grants.paths;
+                    match kind {
+                        FileKind::List => push_new(&mut lists.traversal, path),
+                        FileKind::Read => push_new(&mut lists.read, path),
+                        FileKind::Write => push_new(&mut lists.read_write, path),
+                        // The execute list of the sandbox gives no read of
+                        // a file, and an exec rule includes the read.
+                        FileKind::Exec => {
+                            push_new(&mut lists.read, path);
+                            push_new(&mut lists.execute, path);
+                        }
+                    }
                     // The program must reach the path: each parent below
                     // `/` gets the traversal. `/` is in the defaults.
                     for parent in path.ancestors().skip(1) {
                         if parent.parent().is_some() {
-                            push_new(&mut grants.paths.traversal, parent);
+                            push_new(&mut lists.traversal, parent);
                         }
                     }
                 }
@@ -515,7 +510,67 @@ impl Grants {
     }
 }
 
-/// Add the text of `path` to `list` when it is not there.
+/// The kinds that the sandbox gives for a file rule of the kind `kind`. A
+/// write grant of Landlock also gives the right to run a file, so a write
+/// rule must hold as an exec rule too.
+const fn static_kinds(kind: FileKind) -> &'static [FileKind] {
+    match kind {
+        FileKind::List => &[FileKind::List],
+        FileKind::Read => &[FileKind::Read],
+        FileKind::Write => &[FileKind::Write, FileKind::Exec],
+        FileKind::Exec => &[FileKind::Exec],
+    }
+}
+
+/// Why a whole file rule of the kind `kind` on `width` cannot go into
+/// Landlock, or `None` when it can.
+fn file_held_back(
+    rules: &RuleSet,
+    kind: FileKind,
+    width: &PathWidth,
+    classes: Option<&Classes>,
+    is_dir: impl Fn(&Path) -> bool,
+) -> Option<HeldBack> {
+    let (PathWidth::Exact(base) | PathWidth::Subtree(base)) = width;
+    let path = base.as_path();
+    if path.to_str().is_none_or(|text| text.ends_with('*')) {
+        return Some(HeldBack::PathForm);
+    }
+    let subtree = matches!(width, PathWidth::Subtree(_));
+    for &given in static_kinds(kind) {
+        let same_width = Rule {
+            target: Target::File {
+                kind: given,
+                width: width.clone(),
+            },
+            decision: Decision::Allow,
+            source: Source::Human,
+            created: SystemTime::UNIX_EPOCH,
+        };
+        if !rules.is_whole(&same_width) {
+            return Some(HeldBack::Hole);
+        }
+        let class = classes.map(|c| {
+            c.decide(&Request::File {
+                kind: given,
+                path: base.clone(),
+            })
+            .0
+        });
+        match class {
+            Some(Class::Pent) => return Some(HeldBack::PentFiles),
+            Some(Class::Sensitive(_)) if subtree => return Some(HeldBack::Sensitive),
+            _ if subtree && classes.is_none_or(|c| c.subtree_holds_guard(path, given)) => {
+                return Some(HeldBack::Sensitive)
+            }
+            _ => {}
+        }
+    }
+    (!subtree && is_dir(path)).then_some(HeldBack::Directory)
+}
+
+/// Add the text of `path` to `list` when it is not there. The caller
+/// checked that the path is UTF-8.
 fn push_new(list: &mut Vec<String>, path: &Path) {
     let text = path.to_string_lossy().into_owned();
     if !list.contains(&text) {
@@ -530,6 +585,8 @@ mod tests {
     use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
     use tokio::net::UnixStream;
     use tokio::sync::mpsc;
+
+    use std::os::unix::ffi::OsStrExt as _;
 
     use super::*;
 
@@ -657,6 +714,7 @@ mod tests {
             grants.paths.read,
             vec![
                 "/home/u/.cargo/registry",
+                "/opt/tool",
                 "/home/u/.ssh/id_ed25519",
                 "/home/u/bin"
             ]
@@ -698,6 +756,102 @@ mod tests {
         );
         assert!(blind.paths.execute.is_empty());
         assert_eq!(blind.paths.read_write, vec!["/home/u/notes.txt"]);
+    }
+
+    #[test]
+    fn a_static_grant_holds_each_kind_that_the_sandbox_gives() {
+        let rules = set(vec![
+            // An exec rule includes the read, so it goes into both lists.
+            file(
+                FileKind::Exec,
+                PathWidth::Subtree(path("/opt/tool")),
+                Decision::Allow,
+            ),
+            // Landlock gives a write grant the right to run a file, so an
+            // exec deny inside a write allow makes a hole.
+            file(
+                FileKind::Write,
+                PathWidth::Subtree(path("/srv/proj")),
+                Decision::Allow,
+            ),
+            file(
+                FileKind::Exec,
+                PathWidth::Subtree(path("/srv/proj/bin")),
+                Decision::Deny,
+            ),
+            // The sandbox reads a trailing `*` as a pattern.
+            file(
+                FileKind::Read,
+                PathWidth::Exact(path("/home/u/.ssh*")),
+                Decision::Allow,
+            ),
+        ]);
+        let classes = classes();
+        let grants = Grants::of(&rules, classes.as_ref(), |_| false);
+        assert_eq!(grants.paths.read, vec!["/opt/tool"]);
+        assert_eq!(grants.paths.execute, vec!["/opt/tool"]);
+        assert!(grants.paths.read_write.is_empty());
+        let held: Vec<(String, HeldBack)> = grants
+            .held_back
+            .iter()
+            .map(|(t, why)| (t.to_string(), *why))
+            .collect();
+        assert_eq!(
+            held,
+            vec![
+                ("write /srv/proj/**".to_string(), HeldBack::Hole),
+                ("read /home/u/.ssh*".to_string(), HeldBack::PathForm),
+            ]
+        );
+        // A path that is not UTF-8.
+        let latin = std::ffi::OsStr::from_bytes(b"/srv/caf\xe9");
+        let rules = set(vec![file(
+            FileKind::Read,
+            PathWidth::Exact(RulePath::new(latin).unwrap()),
+            Decision::Allow,
+        )]);
+        let grants = Grants::of(&rules, classes.as_ref(), |_| false);
+        assert!(grants.paths.read.is_empty());
+        assert_eq!(grants.held_back.len(), 1);
+        assert_eq!(
+            grants.held_back.first().map(|h| h.1),
+            Some(HeldBack::PathForm)
+        );
+    }
+
+    #[test]
+    fn a_sensitive_access_names_its_exact_answer() {
+        let chain = Decider::new(set(vec![]), set(vec![]), classes(), None);
+        {
+            let mut answers = chain.answers.lock().unwrap();
+            answers.rules.rules.push(file(
+                FileKind::Read,
+                PathWidth::Subtree(path("/home/u/.ssh")),
+                Decision::Allow,
+            ));
+            answers.questions.push(QuestionId(3));
+            answers.rules.rules.push(file(
+                FileKind::Read,
+                PathWidth::Exact(path("/home/u/.ssh/id_ed25519")),
+                Decision::Allow,
+            ));
+            answers.questions.push(QuestionId(5));
+        }
+        assert_eq!(
+            chain.known(&read("/home/u/.ssh/id_ed25519")),
+            Some(DecidedBy::Answer {
+                question: QuestionId(5),
+                decision: Decision::Allow
+            })
+        );
+        // A normal path names the wide answer.
+        assert_eq!(
+            chain.known(&read("/home/u/.ssh/known_hosts.d/x")),
+            Some(DecidedBy::Answer {
+                question: QuestionId(3),
+                decision: Decision::Allow
+            })
+        );
     }
 
     #[test]

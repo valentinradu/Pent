@@ -439,17 +439,17 @@ impl ProfileStore {
             .join(format!("{name}.{LOG_EXTENSION}"))
     }
 
-    /// The trace log of `name` (`pent run --trace`):
-    /// `$XDG_STATE_HOME/pent/trace/<name>.log`.
+    /// The trace log of the key `key` (`pent run --trace`):
+    /// `$XDG_STATE_HOME/pent/trace/<key>.log`. A key is a safe file name.
     ///
     /// The log is not in the workspace, because the sandboxed process can
     /// write the workspace and could put a symbolic link there.
     #[must_use]
-    pub fn trace_log_path(&self, name: &ProfileName) -> PathBuf {
-        self.dirs.state.join("trace").join(format!("{name}.log"))
+    pub fn trace_log_path(&self, key: &RuleKey) -> PathBuf {
+        self.dirs.state.join("trace").join(format!("{key}.log"))
     }
 
-    /// Create an empty trace log for `name` and return its path.
+    /// Create an empty trace log for the key `key` and return its path.
     ///
     /// The directory gets the mode `0700` and the file the mode `0600`. Pent
     /// does not follow a symbolic link at the path of the log.
@@ -457,8 +457,8 @@ impl ProfileStore {
     /// # Errors
     /// Returns an error if the directory or the file cannot be created, or
     /// if the path of the log is a symbolic link.
-    pub fn create_trace_log(&self, name: &ProfileName) -> Result<PathBuf, StoreError> {
-        let path = self.trace_log_path(name);
+    pub fn create_trace_log(&self, key: &RuleKey) -> Result<PathBuf, StoreError> {
+        let path = self.trace_log_path(key);
         if let Some(parent) = path.parent() {
             create_private_dir(parent)?;
         }
@@ -1213,8 +1213,10 @@ mod tests {
             config: tmp.path().join("config"),
             state: tmp.path().join("state"),
         });
-        let name: ProfileName = "tool".parse().unwrap();
+        // A key may hold `+`, which a profile name may not.
+        let name: RuleKey = "g++".parse().unwrap();
         let path = store.create_trace_log(&name).unwrap();
+        assert!(path.ends_with("trace/g++.log"), "{path:?}");
         assert!(!path.starts_with(tmp.path().join("config")));
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&path), 0o600);

@@ -607,8 +607,21 @@ impl RuleSet {
     /// or `None` when no rule covers it. On a tie, `Deny` wins.
     #[must_use]
     pub fn decide(&self, access: &Access<'_>) -> Option<Decision> {
+        self.decide_where(access, |_| true)
+    }
+
+    /// Return the decision of the most specific rule that `keep` takes and
+    /// that covers `access`, or `None` when no such rule covers it. On a
+    /// tie, `Deny` wins.
+    #[must_use]
+    pub fn decide_where(
+        &self,
+        access: &Access<'_>,
+        keep: impl Fn(&Rule) -> bool,
+    ) -> Option<Decision> {
         self.rules
             .iter()
+            .filter(|rule| keep(rule))
             .filter_map(|rule| rule.matches(access).map(|rank| (rank, rule.decision)))
             .max_by(|(ra, da), (rb, db)| {
                 ra.cmp(rb)
@@ -627,8 +640,16 @@ impl RuleSet {
     pub fn whole_allows(&self) -> Vec<&Rule> {
         self.rules
             .iter()
-            .filter(|rule| rule.decision == Decision::Allow && !self.has_hole(rule))
+            .filter(|rule| self.is_whole(rule))
             .collect()
+    }
+
+    /// Return true if `rule` is an allow rule that holds on its whole width
+    /// against the deny rules of the set. `rule` need not be in the set: a
+    /// caller can ask this of a rule of another kind on the same width.
+    #[must_use]
+    pub fn is_whole(&self, rule: &Rule) -> bool {
+        rule.decision == Decision::Allow && !self.has_hole(rule)
     }
 
     /// Return true if a deny rule of the set wins over `allow` at a point
@@ -645,12 +666,13 @@ impl RuleSet {
             .iter()
             .filter(|rule| rule.decision == Decision::Deny)
             .any(|deny| {
-                let pair = Self {
-                    key: self.key.clone(),
-                    rules: vec![allow.clone(), deny.clone()],
-                };
+                // A deny wins over the allow at a point when both cover it
+                // and its rank is not lower: a deny wins a tie.
                 let wins_at = |access: &Access<'_>| {
-                    allow.matches(access).is_some() && pair.decide(access) == Some(Decision::Deny)
+                    matches!(
+                        (allow.matches(access), deny.matches(access)),
+                        (Some(ra), Some(rd)) if rd >= ra
+                    )
                 };
                 match (&allow.target, &deny.target) {
                     (Target::File { width: wa, .. }, Target::File { width: wd, .. }) => {
