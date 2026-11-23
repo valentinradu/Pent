@@ -1,6 +1,6 @@
 # Plan: the new pent
 
-**Cursor: step 3.5.** Steps with `[x]` are done. Work on the branch `next`,
+**Cursor: step 4.1.** Steps with `[x]` are done. Work on the branch `next`,
 one commit for each step, and move this cursor when a step is done.
 
 **The way of work.** One commit for each step. Then the user runs
@@ -217,8 +217,14 @@ not their structure.
       list.
     - The tests of a static refusal keep pentd away (`block_pentd`) or use
       `--network blocked`; the tests of `pentd.rs` cover the questions.
-- [ ] **3.5 The network modes.** The default asks. `--network blocked`
+- [x] **3.5 The network modes.** The default asks. `--network blocked`
   refuses each access with no question. `--network unrestricted` stays.
+  - Files: `pent/src/cli.rs`, `pent/src/commands/run.rs`; RN-24 and RN-26
+    in `docs/security/run.md`.
+  - Decisions (2026-11-23):
+    - The default is proxy mode, also with no domain rule.
+    - `--network` takes only `blocked` and `unrestricted`: `proxy` is the
+      default, and `localhost` has no place in the design.
 
 ## Phase 4: the base and the flags
 

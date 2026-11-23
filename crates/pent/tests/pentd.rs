@@ -532,8 +532,6 @@ fn answer_a_proxy_question(
     let run = env
         .command(&[
             "run",
-            "--network",
-            "proxy",
             "--key",
             "fetch",
             "--",
@@ -647,21 +645,11 @@ fn a_proxy_question_waits_for_an_allow() -> TestResult {
 /// Start a run of `script` with no rule for the key `dns`, and give it the
 /// runtime directory of `rt`.
 fn spawn_dns_run(rt: &Runtime, env: &TestEnv, script: &str) -> std::io::Result<Child> {
-    env.command(&[
-        "run",
-        "--network",
-        "proxy",
-        "--key",
-        "dns",
-        "--",
-        "sh",
-        "-c",
-        script,
-    ])
-    .env("XDG_RUNTIME_DIR", rt.xdg())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-    .spawn()
+    env.command(&["run", "--key", "dns", "--", "sh", "-c", script])
+        .env("XDG_RUNTIME_DIR", rt.xdg())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
 }
 
 /// A DNS query with no rule waits for the question. A "deny" gives
@@ -881,8 +869,8 @@ fn a_port_question_decides_the_connection() -> TestResult {
     Ok(())
 }
 
-/// `--network blocked` refuses a Unix socket and a port off the lists
-/// with no question.
+/// `--network blocked` refuses a Unix socket, a port and a name off the
+/// lists with no question.
 #[test]
 fn network_blocked_asks_no_question_for_a_socket() -> TestResult {
     let test = "network_blocked_asks_no_question_for_a_socket";
@@ -913,6 +901,23 @@ fn network_blocked_asks_no_question_for_a_socket() -> TestResult {
         .env("XDG_RUNTIME_DIR", rt.xdg())
         .output()?;
     assert!(stdout(&out).contains("ERR PermissionError"), "{out:?}");
+    // `blocked` starts no proxy and no DNS server: a name gets no
+    // question either.
+    let out = env
+        .command(&[
+            "run",
+            "--network",
+            "blocked",
+            "--key",
+            "probe",
+            "--",
+            "sh",
+            "-c",
+            "getent hosts asked.example; echo RC=$?",
+        ])
+        .env("XDG_RUNTIME_DIR", rt.xdg())
+        .output()?;
+    assert!(stdout(&out).contains("RC=2"), "{out:?}");
     assert!(begin.elapsed() < Duration::from_secs(10), "the run waited");
     let open = rt
         .pent(&["questions", "--json"])
@@ -2592,7 +2597,9 @@ fn a_runtime_directory_that_appears_after_the_start_stays_hidden() -> TestResult
             .stderr(Stdio::null())
             .spawn()?,
     );
-    let status = wait_exit(&mut child.0, WAIT)?.ok_or("the run did not end")?;
+    // The loop of the script starts about 150 programs under the recorder
+    // of `pent watch`, which traces each call; that takes several seconds.
+    let status = wait_exit(&mut child.0, Duration::from_secs(30))?.ok_or("the run did not end")?;
     let mut text = String::new();
     if let Some(mut out) = child.0.stdout.take() {
         out.read_to_string(&mut text)?;

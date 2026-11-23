@@ -1,6 +1,6 @@
 # The rules in `pent run`
 
-Status: the branch `next`, steps 3.1 to 3.4 of `PLAN.md` (2026-11-23). This report
+Status: the branch `next`, phase 3 of `PLAN.md` (steps 3.1 to 3.5, 2026-11-23). This report
 lists the security properties of the rules in `pent run`: the key, the
 chain of deciders, the grants that the rules give to the static layers,
 and the events of a run. It gives the test of each property, and the
@@ -88,7 +88,8 @@ cargo test -p pent --test pentd pent_denials_shows_the_refusals_of_a_real_run
 | RN-21 | A TCP connection to a port of the host off the list waits for the chain in the same way. After an "allow" the supervisor connects on the host; after a "deny" or the deadline the child gets `ECONNREFUSED`. A server that the program runs itself needs no question. | `a_port_question_decides_the_connection`, `child_cannot_reach_a_host_loopback_service` |
 | RN-22 | A worker thread waits for each question, so one question does not stop the other calls of the program. At most 64 workers wait at one time; a question above this limit gets the refusal at once. | `a_question_does_not_stop_the_other_connections`, `a_slow_host_port_does_not_stop_other_connections` |
 | RN-23 | No question asks for a socket below the runtime directory of pent, for a path that does not exist, or for an abstract name. In its own network namespace the child gets no question for a resolver socket (`nscd`, `systemd-resolved`): such a socket reaches the network past the proxy, and glibc tries it on each lookup. | `linux_unixconn::tests::a_question_asks_only_for_an_existing_path_outside_pent` |
-| RN-24 | `--network blocked` refuses a Unix socket and a port off the lists with no question. | `network_blocked_asks_no_question_for_a_socket` |
+| RN-24 | `--network blocked` refuses a Unix socket, a port and a name off the lists with no question. It starts no proxy and no DNS server. | `network_blocked_asks_no_question_for_a_socket` |
+| RN-26 | Without `--network`, a run is in proxy mode, with or without a domain rule, so DNS, the proxy, the Unix sockets and the ports ask. `--network` takes only `blocked` and `unrestricted`; `unrestricted` gives the network of the host and asks nothing for the network. | `run::tests::the_default_is_the_proxy_which_asks`, `network_flag_wins_over_everything`, `a_proxy_question_waits_for_a_deny`, `a_dns_question_waits_for_a_deny` |
 | RN-25 | The supervisor sends the event of each question also without `--trace`, so `pent denials` shows the refusal and names the answer. | `a_unix_socket_question_decides_the_connection` |
 
 ## The limits

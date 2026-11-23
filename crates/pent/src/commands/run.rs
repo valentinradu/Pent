@@ -257,7 +257,7 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
 
     // Print network mode hint BEFORE spawn so the user sees it even if spawn
     // takes time or stalls during namespace init.
-    if let Some(line) = network_status(&sandbox_cfg.network, decision.source) {
+    if let Some(line) = network_status(&sandbox_cfg.network) {
         ui::status("network", line);
     }
     if let Some(line) = localhost_status(&sandbox_cfg.network, &sandbox_cfg.localhost) {
@@ -541,7 +541,6 @@ fn denied_message(count: usize) -> Option<String> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NetworkChoice {
     Unrestricted,
-    Localhost,
     Proxy,
     Blocked,
 }
@@ -551,7 +550,6 @@ impl NetworkChoice {
     const fn flag_value(self) -> &'static str {
         match self {
             Self::Unrestricted => "unrestricted",
-            Self::Localhost => "localhost",
             Self::Proxy => "proxy",
             Self::Blocked => "blocked",
         }
@@ -567,7 +565,7 @@ pub(crate) enum NetworkSource {
     AllowFlag,
     /// A rule allows a domain.
     RuleDomains,
-    /// No input; pent uses the default.
+    /// No input; pent uses the default: the proxy, which asks.
     Default,
 }
 
@@ -586,7 +584,8 @@ pub(crate) struct NetworkDecision {
 /// 1. An explicit `--network` flag.
 /// 2. `--allow` (this implies proxy mode).
 /// 3. A rule that allows a domain (this implies proxy mode).
-/// 4. The default: blocked.
+/// 4. The default: proxy mode, where DNS and the proxy ask a question for a
+///    name that no rule answers.
 ///
 /// `--trace` is not an input: tracing never changes the network mode.
 /// `rule_domains` must not contain the `--allow` values.
@@ -599,8 +598,6 @@ pub(crate) fn resolve_network(
     if let Some(flag) = network_flag {
         let choice = match flag {
             NetworkModeArg::Unrestricted => NetworkChoice::Unrestricted,
-            NetworkModeArg::Localhost => NetworkChoice::Localhost,
-            NetworkModeArg::Proxy => NetworkChoice::Proxy,
             NetworkModeArg::Blocked => NetworkChoice::Blocked,
         };
         return decide(choice, NetworkSource::NetworkFlag);
@@ -611,14 +608,13 @@ pub(crate) fn resolve_network(
     if !rule_domains.is_empty() {
         return decide(NetworkChoice::Proxy, NetworkSource::RuleDomains);
     }
-    decide(NetworkChoice::Blocked, NetworkSource::Default)
+    decide(NetworkChoice::Proxy, NetworkSource::Default)
 }
 
 /// The network mode for a choice without a proxy.
 pub(crate) const fn base_network_mode(choice: NetworkChoice) -> NetworkMode {
     match choice {
         NetworkChoice::Unrestricted => NetworkMode::Unrestricted,
-        NetworkChoice::Localhost => NetworkMode::LocalhostOnly,
         NetworkChoice::Blocked => NetworkMode::Blocked,
         // Pent starts the proxy for this choice; the proxy gives the mode.
         // Without a proxy, nothing may go out.
@@ -653,13 +649,10 @@ pub(crate) fn network_warnings(
 }
 
 /// Return the status line for the network mode, if there is one.
-pub(crate) fn network_status(mode: &NetworkMode, source: NetworkSource) -> Option<&'static str> {
+pub(crate) fn network_status(mode: &NetworkMode) -> Option<&'static str> {
     match mode {
         // The proxy is the expected mode.
         NetworkMode::ProxyOnly { .. } => None,
-        NetworkMode::Blocked if source == NetworkSource::Default => {
-            Some("blocked (no rule allows a domain)")
-        }
         NetworkMode::Blocked => Some("blocked"),
         NetworkMode::LocalhostOnly => Some("localhost only"),
         NetworkMode::Unrestricted => Some("unrestricted"),
@@ -809,8 +802,6 @@ mod tests {
     fn network_flag_wins_over_everything() {
         let flags = [
             (NetworkModeArg::Unrestricted, NetworkChoice::Unrestricted),
-            (NetworkModeArg::Localhost, NetworkChoice::Localhost),
-            (NetworkModeArg::Proxy, NetworkChoice::Proxy),
             (NetworkModeArg::Blocked, NetworkChoice::Blocked),
         ];
         for (flag, expected) in flags {
@@ -847,9 +838,9 @@ mod tests {
     }
 
     #[test]
-    fn default_is_blocked() {
+    fn the_default_is_the_proxy_which_asks() {
         let d = resolve_network(None, &[], &[]);
-        assert_eq!(d.choice, NetworkChoice::Blocked);
+        assert_eq!(d.choice, NetworkChoice::Proxy);
         assert_eq!(d.source, NetworkSource::Default);
         assert_eq!(
             base_network_mode(NetworkChoice::Proxy),
@@ -895,11 +886,16 @@ mod tests {
     }
 
     #[test]
-    fn blocked_hint_only_for_default() {
-        let hint = network_status(&NetworkMode::Blocked, NetworkSource::Default);
-        assert!(hint.is_some_and(|h| h.contains("no rule allows a domain")));
-        let explicit = network_status(&NetworkMode::Blocked, NetworkSource::NetworkFlag);
-        assert_eq!(explicit, Some("blocked"));
+    fn the_status_names_each_mode_but_the_proxy() {
+        assert_eq!(network_status(&NetworkMode::Blocked), Some("blocked"));
+        assert_eq!(
+            network_status(&NetworkMode::Unrestricted),
+            Some("unrestricted")
+        );
+        assert_eq!(
+            network_status(&base_network_mode(NetworkChoice::Proxy)),
+            Some("blocked")
+        );
     }
 
     // ── denied accesses ──────────────────────────────────────────────────────
@@ -1067,7 +1063,7 @@ mod tests {
         let flag = resolve_network(Some(NetworkModeArg::Blocked), &[], &[]);
         assert!(blocks_localhost(flag));
         let default = resolve_network(None, &[], &[]);
-        assert_eq!(default.choice, NetworkChoice::Blocked);
+        assert_eq!(default.choice, NetworkChoice::Proxy);
         assert!(!blocks_localhost(default));
         assert_eq!(closed_ports_source(&[], &[]), None);
         assert_eq!(

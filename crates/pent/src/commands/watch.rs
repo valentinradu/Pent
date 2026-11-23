@@ -189,7 +189,7 @@ pub(crate) async fn watch(args: WatchArgs, cwd: PathBuf) -> Result<(), CliError>
         || base_network_mode(net.decision.choice),
         |p| p.network.clone(),
     );
-    if let Some(line) = network_status(&network, net.decision.source) {
+    if let Some(line) = network_status(&network) {
         ui::status("network", line);
     }
 

@@ -141,6 +141,7 @@ makes one mutation by hand. The test must fail on the mutant. No
 | 3.4 | A resolver socket asks. | `linux_unixconn::tests::a_question_asks_only_for_an_existing_path_outside_pent` |
 | 3.4 | `--network blocked` asks. | `network_blocked_asks_no_question_for_a_socket` |
 | 3.4 | The supervisor sends no event without `--trace`. | `a_unix_socket_question_decides_the_connection` |
+| 3.5 | The default mode is `blocked`. | `a_dns_question_waits_for_a_deny`, `run::tests::the_default_is_the_proxy_which_asks` |
 
 The first form of `pent_run_starts_pentd_and_holds_it_for_the_run` passed on
 the mutant: the client started a new pentd each time that it lost one. The

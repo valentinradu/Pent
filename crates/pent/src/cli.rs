@@ -122,9 +122,11 @@ pub(crate) struct RunArgs {
     #[arg(long, value_name = "NAME")]
     pub key: Option<String>,
 
-    /// Network containment mode. This flag has precedence over --allow and
-    /// over the rules. Without it, the mode is proxy when a rule or --allow
-    /// gives domains, else blocked
+    /// Network containment mode. Without it, DNS, the proxy, the Unix
+    /// sockets and the ports ask a question for each access that no rule
+    /// answers. `blocked` refuses each such access with no question, and
+    /// `unrestricted` gives the network of the host. This flag has
+    /// precedence over --allow and over the rules
     #[arg(long, value_enum)]
     pub network: Option<NetworkModeArg>,
 
@@ -189,8 +191,6 @@ pub(crate) struct RunArgs {
 #[derive(ValueEnum, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NetworkModeArg {
     Unrestricted,
-    Localhost,
-    Proxy,
     Blocked,
 }
 
