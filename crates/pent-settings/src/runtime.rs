@@ -40,7 +40,9 @@ pub enum RuntimeDirError {
     /// another user.
     #[error(
         "{} is not a private directory of this user (it must be a directory \
-         with the mode 0700 that this user owns)",
+         with the mode 0700 that this user owns); if it is yours, run: \
+         chmod 700 {}",
+        path.display(),
         path.display()
     )]
     NotPrivate {
@@ -195,11 +197,15 @@ mod tests {
         // A second call accepts the directory.
         assert!(d.ensure().is_ok());
 
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(matches!(
-            d.ensure(),
-            Err(RuntimeDirError::NotPrivate { .. })
-        ));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o750)).unwrap();
+        let err = d.ensure().map(Path::to_path_buf);
+        assert!(matches!(err, Err(RuntimeDirError::NotPrivate { .. })));
+        // The message tells the user how to repair the directory.
+        let text = err.err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            text.ends_with(&format!("chmod 700 {}", path.display())),
+            "{text}"
+        );
 
         // A link at the path is refused, also to a private directory.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();

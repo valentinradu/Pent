@@ -89,15 +89,116 @@ pub enum ProtocolError {
 #[error("the deadline of {0} ms is longer than the limit of {limit} s", limit = MAX_DEADLINE.as_secs())]
 pub struct DeadlineTooLong(u64);
 
-/// The number of a session: one run of `pent run`. pentd gives it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct SessionId(pub u64);
+/// The characters of a code: the digits and the lowercase letters, without
+/// `0`, `1`, `i`, `l` and `o`, which look like other characters.
+pub const CODE_ALPHABET: &[u8; 31] = b"23456789abcdefghjkmnpqrstuvwxyz";
 
-/// The number of a question. pentd gives it, and `pent allow ID` names it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct QuestionId(pub u64);
+/// The length of a code.
+pub const CODE_LEN: usize = 6;
+
+/// The number of codes: 31^6. The value of a [`SessionId`] or of a
+/// [`QuestionId`] is below it.
+pub const CODE_SPACE: u64 = 887_503_681;
+
+/// The base of a code: the number of its characters.
+const CODE_BASE: u64 = 31;
+
+/// A code is not valid.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{} is not a code of pent: a code has {CODE_LEN} characters from 2-9 and a-z, without i, l and o", safe(.0))]
+pub struct BadCode(String);
+
+/// The text of `value` as a code. A value at or above [`CODE_SPACE`] has
+/// no code.
+fn code_text(value: u64) -> Option<String> {
+    if value >= CODE_SPACE {
+        return None;
+    }
+    let mut digits = [b'2'; CODE_LEN];
+    let mut rest = value;
+    for digit in digits.iter_mut().rev() {
+        let index = usize::try_from(rest % CODE_BASE).ok()?;
+        *digit = *CODE_ALPHABET.get(index)?;
+        rest /= CODE_BASE;
+    }
+    Some(digits.iter().map(|&b| char::from(b)).collect())
+}
+
+/// The value of the code `text`. An uppercase letter counts as lowercase.
+fn code_value(text: &str) -> Result<u64, BadCode> {
+    let bad = || BadCode(text.to_string());
+    if text.chars().count() != CODE_LEN {
+        return Err(bad());
+    }
+    text.chars().try_fold(0_u64, |value, c| {
+        let lower = u8::try_from(c.to_ascii_lowercase()).map_err(|_| bad())?;
+        let index = CODE_ALPHABET
+            .iter()
+            .position(|&a| a == lower)
+            .ok_or_else(bad)?;
+        let index = u64::try_from(index).map_err(|_| bad())?;
+        // Six digits of base 31 stay far below `u64::MAX`.
+        Ok(value.saturating_mul(CODE_BASE).saturating_add(index))
+    })
+}
+
+/// A number that pent shows as a code of [`CODE_LEN`] characters, for
+/// example `k3m9tx`. pentd draws each number at random, so a number of a
+/// pentd that stopped does not name a question of the next pentd, and a
+/// typo rarely names another open question.
+macro_rules! code_id {
+    ($(#[$doc:meta])* $name:ident) => {
+        $(#[$doc])*
+        ///
+        /// The value is below [`CODE_SPACE`]. The text and the JSON form are
+        /// the code.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        pub struct $name(pub u64);
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                match code_text(self.0) {
+                    Some(text) => f.write_str(&text),
+                    None => write!(f, "<{} out of range>", self.0),
+                }
+            }
+        }
+
+        impl std::str::FromStr for $name {
+            type Err = BadCode;
+
+            fn from_str(text: &str) -> Result<Self, Self::Err> {
+                code_value(text).map(Self)
+            }
+        }
+
+        impl Serialize for $name {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                let text = code_text(self.0)
+                    .ok_or_else(|| serde::ser::Error::custom("the number has no code"))?;
+                serializer.serialize_str(&text)
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                let text = String::deserialize(deserializer)?;
+                text.parse().map_err(serde::de::Error::custom)
+            }
+        }
+    };
+}
+
+code_id!(
+    /// The number of a session: one run of `pent run`. pentd gives it.
+    SessionId
+);
+
+code_id!(
+    /// The number of a question. pentd gives it, and `pent allow ID` names
+    /// it.
+    QuestionId
+);
 
 /// The place of a target in the width menu of a question, from 0 (the
 /// narrowest). pentd checks it against the menu.
@@ -456,12 +557,16 @@ pub enum RejectReason {
     UnknownSession,
     /// pentd could not change the rule file of a [`Forget`].
     RulesNotWritten,
+    /// Nobody may answer the access: it is in the pent class, or pentd
+    /// cannot classify it (no home directory). The access gets the error
+    /// of a refusal.
+    NoAnswer,
 }
 
 impl fmt::Display for RejectReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::UnknownQuestion => "no open question has this number",
+            Self::UnknownQuestion => "no open question has this code",
             Self::BadWidth => "the width is not in the menu of the question, or it does not fit",
             Self::NotHuman => "only the human answers on the socket",
             Self::NotPermitted => "this connection may not send this message",
@@ -470,8 +575,9 @@ impl fmt::Display for RejectReason {
             Self::RuleNotKept => {
                 "pentd could not write the rule; the answer holds only for this run"
             }
-            Self::UnknownSession => "pentd knows no session with this number",
+            Self::UnknownSession => "pentd knows no session with this code",
             Self::RulesNotWritten => "pentd could not change the rule file; see the log of pentd",
+            Self::NoAnswer => "nobody may answer this access",
         })
     }
 }
@@ -721,6 +827,10 @@ mod tests {
                 id: None,
                 reason: RejectReason::UnknownSession,
             }),
+            Message::Rejected(Rejected {
+                id: None,
+                reason: RejectReason::NoAnswer,
+            }),
             Message::Questions,
             Message::Denials(None),
             Message::Denials(Some(SessionId(4))),
@@ -774,7 +884,7 @@ mod tests {
         });
         assert_eq!(
             answer.encode_line()?,
-            "{\"v\":1,\"msg\":{\"answer\":{\"id\":7,\"decision\":\"allow\",\"width\":1,\
+            "{\"v\":1,\"msg\":{\"answer\":{\"id\":\"222229\",\"decision\":\"allow\",\"width\":1,\
              \"scope\":\"remember\",\"source\":\"human\"}}}\n"
         );
         let hold = Message::Hold(Hold::Daemon);
@@ -820,7 +930,7 @@ mod tests {
         let line = |msg: &str| format!("{{\"v\":1,\"msg\":{msg}}}");
         let event = |request: &str| {
             line(&format!(
-                r#"{{"event":{{"session":1,"time":0,"program":"x","request":{request},"decided_by":"hidden"}}}}"#
+                r#"{{"event":{{"session":"222223","time":0,"program":"x","request":{request},"decided_by":"hidden"}}}}"#
             ))
         };
         let mut bad = vec![
@@ -835,13 +945,19 @@ mod tests {
             line(r#"{"hold":{"run":{"key":".hidden","command":[]}}}"#),
             // An unknown field, an unknown message, an unknown value.
             line(
-                r#"{"answer":{"id":1,"decision":"allow","width":0,"scope":"run","source":"human","extra":1}}"#,
+                r#"{"answer":{"id":"222223","decision":"allow","width":0,"scope":"run","source":"human","extra":1}}"#,
             ),
             line(r#"{"grant":{"id":1}}"#),
             line(
-                r#"{"answer":{"id":1,"decision":"maybe","width":0,"scope":"run","source":"human"}}"#,
+                r#"{"answer":{"id":"222223","decision":"maybe","width":0,"scope":"run","source":"human"}}"#,
             ),
+            // A number, and a code with a character that it does not use.
+            line(r#"{"denials":7}"#),
+            line(r#"{"denials":"22222o"}"#),
         ];
+        // The positive controls: with good values, the same forms decode.
+        assert!(Message::decode_line(&event(r#"{"unix_socket":"/run/x"}"#)).is_ok());
+        assert!(Message::decode_line(&line(r#"{"denials":"22222z"}"#)).is_ok());
         // A menu entry with a wildcard at a public suffix, with an unknown
         // field, and a deadline above the limit.
         let Ok(text) = Message::Ask(Ask {
@@ -962,6 +1078,37 @@ mod tests {
         ] {
             assert_eq!(decided_by.is_refusal(), refusal, "{decided_by:?}");
         }
+    }
+
+    #[test]
+    fn a_code_has_six_characters_and_survives_a_round_trip() {
+        for value in [0, 1, 30, 31, 123_456_789, CODE_SPACE - 1] {
+            let id = QuestionId(value);
+            let text = id.to_string();
+            assert_eq!(text.len(), CODE_LEN, "{text}");
+            assert!(text.bytes().all(|b| CODE_ALPHABET.contains(&b)), "{text}");
+            assert_eq!(text.parse::<QuestionId>(), Ok(id));
+            assert_eq!(
+                text.to_uppercase().parse::<SessionId>(),
+                Ok(SessionId(value))
+            );
+        }
+        assert_eq!(QuestionId(0).to_string(), "222222");
+        assert_eq!(SessionId(CODE_SPACE - 1).to_string(), "zzzzzz");
+        for bad in [
+            "", "22222", "2222222", "22222o", "22222l", "2222 2", "22222é",
+        ] {
+            assert!(bad.parse::<QuestionId>().is_err(), "{bad}");
+        }
+        // A number out of the range has no JSON form.
+        let answer = Message::Answer(Answer {
+            id: QuestionId(CODE_SPACE),
+            decision: Decision::Allow,
+            width: MenuIndex(0),
+            scope: Scope::Run,
+            source: Source::Human,
+        });
+        assert!(answer.encode_line().is_err());
     }
 
     #[test]

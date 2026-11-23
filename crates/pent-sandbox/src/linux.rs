@@ -3072,8 +3072,16 @@ pub(crate) fn spawn_linux(
     // a parent of it (for example `/run/user/<uid>`) binds it back, and the
     // program has the same user ID, so `SO_PEERCRED` would let it answer
     // its own questions. The mask hides the directory always, also when a
-    // profile names it: no answer opens the files of pent.
-    if let Ok(runtime) = std::fs::canonicalize(pent_settings::RuntimeDir::from_env().path()) {
+    // profile names it: no answer opens the files of pent. Pent makes the
+    // directory first, because a pentd that starts after the sandbox would
+    // put its socket in a directory with no mask. A directory that `ensure`
+    // refuses gets no mask, but pentd refuses it too, so no socket appears
+    // there.
+    let runtime_dir = pent_settings::RuntimeDir::from_env();
+    if let Err(e) = runtime_dir.ensure() {
+        tracing::debug!("the runtime directory of pent is not usable: {e}");
+    }
+    if let Ok(runtime) = std::fs::canonicalize(runtime_dir.path()) {
         if !mask_dirs.iter().any(|d| runtime.starts_with(d)) {
             mask_dirs.push(runtime);
         }

@@ -13,6 +13,9 @@ pub(crate) enum CliError {
     Rule(#[from] pent_profile::RuleError),
 
     #[error("{0}")]
+    Code(#[from] pent_profile::BadCode),
+
+    #[error("{0}")]
     ProfileName(#[from] pent_profile::ProfileNameError),
 
     #[error("{0}")]

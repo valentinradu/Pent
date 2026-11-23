@@ -837,6 +837,20 @@ mod queue {
         let r = rejected(&mut session, Message::Watch)?;
         assert_eq!(r.reason, RejectReason::NotPermitted);
 
+        // A hold is only the first message: a watcher never becomes a
+        // session, so it cannot ask, and it gets no verdict of its own.
+        let mut watcher = Client::connect(&rt)?;
+        watcher.send(Message::Watch)?;
+        assert!(matches!(watcher.recv()?, Message::Question(q) if q.id == id));
+        let hold = Message::Hold(Hold::Run {
+            key: "cargo".parse()?,
+            command: vec![],
+        });
+        let r = rejected(&mut watcher, hold)?;
+        assert_eq!(r.reason, RejectReason::NotPermitted);
+        let r = rejected(&mut watcher, Message::Ask(port_ask(81)?))?;
+        assert_eq!(r.reason, RejectReason::NotPermitted);
+
         let mut client = Client::connect(&rt)?;
         let r = rejected(&mut client, Message::Ask(port_ask(80)?))?;
         assert_eq!(r.reason, RejectReason::NotPermitted);
@@ -878,7 +892,7 @@ mod queue {
                 other => return Err(format!("{other:?}").into()),
             }
         }
-        got.sort();
+        // The verdicts come in the order of the asks.
         assert_eq!(got, vec![a, b]);
         // `c` is still open: an answer to it works.
         client.send(Message::Answer(answer(c, 0, Scope::Run)))?;
@@ -1186,7 +1200,7 @@ mod clients {
 
         let (out, _) = ok(&pent(&rt, state.path(), &["questions"])?)?;
         assert!(
-            out.starts_with(&format!("{}  cargo  read /home/u/reg/a\n", id.0)),
+            out.starts_with(&format!("{id}  cargo  read /home/u/reg/a\n")),
             "{out}"
         );
         assert!(
@@ -1197,7 +1211,7 @@ mod clients {
         let question: Question = serde_json::from_str(json.trim())?;
         assert_eq!(question.id, id);
 
-        let number = id.0.to_string();
+        let number = id.to_string();
         let args = ["allow", number.as_str(), "--width", "1", "--remember"];
         let (_, err) = ok(&pent(&rt, state.path(), &args)?)?;
         assert!(
@@ -1238,7 +1252,7 @@ mod clients {
         let _pentd = ready(&rt, state.path())?;
         let mut session = Client::session(&rt, "psql")?;
         let id = session.ask(port_ask(5432)?)?;
-        let number = id.0.to_string();
+        let number = id.to_string();
 
         let err = fails(&pent(
             &rt,
@@ -1246,8 +1260,11 @@ mod clients {
             &["deny", &number, "--width", "5"],
         )?)?;
         assert!(err.contains("the width is not in the menu"), "{err}");
-        let err = fails(&pent(&rt, state.path(), &["allow", "999"])?)?;
-        assert!(err.contains("no open question has this number"), "{err}");
+        let err = fails(&pent(&rt, state.path(), &["allow", "zzzzzz"])?)?;
+        assert!(err.contains("no open question has this code"), "{err}");
+        // A number of the old form is not a code.
+        let err = fails(&pent(&rt, state.path(), &["allow", "7"])?)?;
+        assert!(err.contains("7 is not a code of pent"), "{err}");
 
         let (_, err) = ok(&pent(&rt, state.path(), &["deny", &number])?)?;
         assert!(err.contains("deny localhost 5432 (this run)"), "{err}");
@@ -1319,7 +1336,7 @@ mod clients {
             "{out}"
         );
 
-        let number = first_session.0.to_string();
+        let number = first_session.to_string();
         let (out, _) = ok(&pent(&rt, state.path(), &["denials", &number])?)?;
         assert!(
             out.starts_with(&format!("session {number}  npm\n")),
@@ -1327,7 +1344,7 @@ mod clients {
         );
         assert!(!out.contains("x.example"), "{out}");
 
-        let err = fails(&pent(&rt, state.path(), &["denials", "4242"])?)?;
+        let err = fails(&pent(&rt, state.path(), &["denials", "zzzzzz"])?)?;
         assert!(err.contains("knows no session"), "{err}");
         Ok(())
     }
@@ -1468,6 +1485,103 @@ created = 2026-11-22T12:00:01Z
     }
 
     #[test]
+    fn a_list_longer_than_the_outbox_reaches_the_client_whole() -> TestResult {
+        let rt = Runtime::new()?;
+        let state = tempfile::tempdir()?;
+        let _pentd = ready(&rt, state.path())?;
+        // 600 open questions: more than the 256 items of an outbox.
+        let mut sessions = Vec::new();
+        for run in 0..2_u16 {
+            let mut session = Client::session(&rt, "cargo")?;
+            for port in 1..=300_u16 {
+                session.ask(port_ask(run * 1000 + port)?)?;
+            }
+            sessions.push(session);
+        }
+        let (out, _) = ok(&pent(&rt, state.path(), &["questions", "--json"])?)?;
+        assert_eq!(out.lines().count(), 600);
+        // A watcher gets each open question too.
+        let mut watcher = Client::connect(&rt)?;
+        watcher.send(Message::Watch)?;
+        for i in 0..600 {
+            if !matches!(watcher.recv()?, Message::Question(_)) {
+                return Err(format!("message {i} is not a question").into());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_wide_answer_for_more_questions_than_the_outbox_reaches_each_one() -> TestResult {
+        let rt = Runtime::new()?;
+        let state = tempfile::tempdir()?;
+        let _pentd = ready(&rt, state.path())?;
+        let mut session = Client::session(&rt, "cargo")?;
+        let mut first = None;
+        for i in 0..300 {
+            let id = session.ask(read_ask(&format!("/home/u/reg/f{i}"), "/home/u/reg")?)?;
+            first.get_or_insert(id);
+        }
+        let first = first.ok_or("no question")?;
+        let number = first.to_string();
+        let (_, err) = ok(&pent(
+            &rt,
+            state.path(),
+            &["allow", &number, "--width", "1"],
+        )?)?;
+        assert!(err.contains("allow read /home/u/reg/**"), "{err}");
+        for i in 0..300 {
+            if !matches!(session.recv()?, Message::Verdict(_)) {
+                return Err(format!("message {i} is not a verdict").into());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn pentd_computes_the_class_and_the_menu_and_ignores_those_of_the_session() -> TestResult {
+        let rt = Runtime::new()?;
+        let state = tempfile::tempdir()?;
+        let _pentd = ready(&rt, state.path())?;
+        // pentd has `HOME` = `state`. A faulty session calls a key in it
+        // normal and offers the subtree of `.ssh`.
+        let home = state.path().display().to_string();
+        let mut session = Client::session(&rt, "cargo")?;
+        let mut ask = read_ask(&format!("{home}/.ssh/id_ed25519"), &format!("{home}/.ssh"))?;
+        ask.class = pent_profile::Class::Normal;
+        session.send(Message::Ask(ask))?;
+        let question = match session.recv()? {
+            Message::Question(q) => q,
+            other => return Err(format!("{other:?}").into()),
+        };
+        assert!(
+            matches!(question.ask.class, pent_profile::Class::Sensitive(_)),
+            "{:?}",
+            question.ask.class
+        );
+        assert_eq!(question.ask.menu.len(), 1, "{:?}", question.ask.menu);
+        let number = question.id.to_string();
+        let err = fails(&pent(
+            &rt,
+            state.path(),
+            &["allow", &number, "--width", "1"],
+        )?)?;
+        assert!(err.contains("the width is not in the menu"), "{err}");
+
+        // An access in the pent class gets no question.
+        let rules = format!("{home}/pent/rules/cargo.toml");
+        session.send(Message::Ask(read_ask(
+            &rules,
+            &format!("{home}/pent/rules"),
+        )?))?;
+        match session.recv()? {
+            Message::Rejected(r) => assert_eq!(r.reason, RejectReason::NoAnswer),
+            other => return Err(format!("{other:?}").into()),
+        }
+        Ok(())
+    }
+
+    #[test]
     fn a_client_stops_when_pentd_does_not_reply() -> TestResult {
         let rt = Runtime::new()?;
         let state = tempfile::tempdir()?;
@@ -1501,8 +1615,8 @@ created = 2026-11-22T12:00:01Z
         std::fs::create_dir_all(state.path().join("pent/rules"))?;
         std::fs::write(state.path().join("pent/rules/cargo.toml"), TWO_RULES)?;
         for args in [
-            &["allow", "1"][..],
-            &["deny", "1"],
+            &["allow", "222223"][..],
+            &["deny", "222223"],
             &["questions"],
             &["denials"],
             &["rules", "forget", "cargo"],
@@ -1718,6 +1832,82 @@ fn a_profile_that_names_a_parent_does_not_bring_back_the_socket_of_pentd() -> Te
         env.runtime.join("pent/pentd.sock").exists()
             || env.runtime.join("pent/pentd.lock").exists()
     );
+    let line = text
+        .lines()
+        .find(|l| l.starts_with("PENTLS"))
+        .ok_or("no listing")?;
+    assert_eq!(
+        line.trim(),
+        "PENTLS",
+        "the child sees the files of pent: {line}"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_runtime_directory_that_appears_after_the_start_stays_hidden() -> TestResult {
+    let test = "a_runtime_directory_that_appears_after_the_start_stays_hidden";
+    if !sandbox_ready(test) {
+        return Ok(());
+    }
+    let env = TestEnv::new()?;
+    let runtime = env.runtime.display().to_string();
+    // The file name `.pentsh` is not a valid key, so `pent run` holds no
+    // pentd and makes no runtime directory itself: only the sandbox can
+    // make it before the masks.
+    let bin = env.runtime.join("bin");
+    std::fs::create_dir(&bin)?;
+    let shell = bin.join(".pentsh");
+    std::os::unix::fs::symlink("/bin/sh", &shell)?;
+    let bin = bin.display().to_string();
+    env.install_profile(
+        "sh",
+        &format!("[filesystem]\nread = [\"{runtime}\"]\nexecute = [\"{bin}\"]\n"),
+    )?;
+    // No `pent/` yet when the run starts.
+    if env.runtime.join("pent").exists() {
+        std::fs::remove_dir_all(env.runtime.join("pent"))?;
+    }
+    std::fs::write(env.runtime.join("visible"), "PENT_VISIBLE")?;
+    let script = format!(
+        "cat '{runtime}/visible'; echo; i=0; while [ $i -lt 50 ]; do ls -A '{runtime}/pent' 2>/dev/null | grep -q sock && break; \
+         sleep 0.1; i=$((i+1)); done; echo PENTLS $(ls -A '{runtime}/pent' 2>&1 | tr '\\n' ' ')"
+    );
+    let mut child = Reap(
+        env.command(&[
+            "run",
+            "--profile",
+            "sh",
+            "--",
+            &shell.display().to_string(),
+            "-c",
+            &script,
+        ])
+        .stdout(Stdio::piped())
+        .spawn()?,
+    );
+    // A pentd that starts after the sandbox, as another `pent run` starts
+    // it.
+    std::thread::sleep(Duration::from_millis(300));
+    let _pentd = Reap(
+        Command::new(PENT)
+            .args(["daemon"])
+            .env("XDG_RUNTIME_DIR", &env.runtime)
+            .env("PENTD_LINGER_MS", LINGER_MS)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?,
+    );
+    let status = wait_exit(&mut child.0, WAIT)?.ok_or("the run did not end")?;
+    let mut text = String::new();
+    if let Some(mut out) = child.0.stdout.take() {
+        out.read_to_string(&mut text)?;
+    }
+    assert!(status.success(), "{status:?}: {text}");
+    // The positive control: the profile brought the directory back.
+    assert!(text.contains("PENT_VISIBLE"), "{text}");
+    assert!(env.runtime.join("pent/pentd.lock").exists(), "no pentd ran");
     let line = text
         .lines()
         .find(|l| l.starts_with("PENTLS"))

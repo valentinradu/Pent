@@ -326,7 +326,7 @@ async fn accept_loop(
             None
         }
     };
-    let hub = Hub::new(rules);
+    let hub = Hub::new(rules, classifier());
     let _notifier = NotifyTask(tokio::spawn(super::notify::run(Arc::clone(&hub))));
     let mut changes = hub.subscribe();
     let own_uid = pent_settings::current_uid();
@@ -370,6 +370,22 @@ async fn accept_loop(
     }
 }
 
+/// The classes of the user: the home directory, and the directories of pent
+/// (config, state, runtime) also when the XDG variables move them. Returns
+/// `None` when the home directory is not known.
+fn classifier() -> Option<pent_profile::Classifier> {
+    let Some(home) = dirs::home_dir() else {
+        tracing::warn!("pentd does not know the home directory; it refuses each question");
+        return None;
+    };
+    let mut pent_dirs = vec![RuntimeDir::from_env().path().to_path_buf()];
+    if let Some(dirs) = pent_settings::PentDirs::from_env() {
+        pent_dirs.push(dirs.config);
+        pent_dirs.push(dirs.state);
+    }
+    Some(pent_profile::Classifier::new(&home, &pent_dirs))
+}
+
 /// The task of the notification hook. It stops when pentd stops.
 struct NotifyTask(tokio::task::JoinHandle<()>);
 
@@ -411,18 +427,9 @@ async fn connection(stream: UnixStream, hub: Arc<Hub>, own_uid: u32, live: Conne
     let (outbox, mut inbox, close) = Outbox::new();
     let mut writer = tokio::spawn(async move {
         use tokio::io::AsyncWriteExt as _;
-        while let Some(message) = inbox.recv().await {
-            let line = match message.encode_line() {
-                Ok(line) => line,
-                Err(e) => {
-                    // The hub checks the length of each question before it
-                    // sends it, so this does not break the order of the
-                    // numbers.
-                    tracing::warn!("pentd cannot encode a message: {e}");
-                    continue;
-                }
-            };
-            if write.write_all(line.as_bytes()).await.is_err() {
+        // The hub encodes each message; the writer only writes.
+        while let Some(batch) = inbox.recv().await {
+            if write.write_all(batch.as_bytes()).await.is_err() {
                 break;
             }
         }

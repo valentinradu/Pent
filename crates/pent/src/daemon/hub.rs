@@ -18,7 +18,11 @@
 //! Each connection has a bounded [`Outbox`]. A client that does not read
 //! fills it, and pentd then closes that connection: a lost message would
 //! break the order of the numbers, and an unbounded outbox would let a
-//! client make pentd grow without a limit.
+//! client make pentd grow without a limit. One item of the outbox is a
+//! [`Batch`] of encoded lines: a reply with a list (`Questions`, `Denials`,
+//! the first questions of `Watch`) and the verdicts of one answer for one
+//! connection take one item, so a long list does not fill the outbox.
+//! pentd encodes each message one time, and the writer only writes.
 //!
 //! Each live connection keeps pentd alive, and so does each open question.
 //! Thus pentd never stops between the accept of a connection and its first
@@ -31,27 +35,62 @@ use pent_profile::{
     Answer, Forget, Forgotten, Hold, Message, QuestionId, RejectReason, Rejected, RuleKey, Scope,
     SessionId, Verdict,
 };
+use pent_profile::{Class, Classifier};
 use pent_settings::RuleStore;
 use tokio::sync::{mpsc, watch, Notify};
 
 use super::denials::Denials;
 use super::queue::{Plan, Queue};
+use super::random;
 
 /// How many messages wait for one connection before pentd closes it.
 pub(crate) const OUTBOX_LEN: usize = 256;
+
+/// One or more encoded lines, each with its `\n`, for one write.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Batch(String);
+
+impl Batch {
+    /// Encode `message` and add its line. A message that cannot be one line
+    /// is not added: the hub checks the length of each question before it
+    /// queues it, so this does not break the order of the numbers.
+    fn push(&mut self, message: &Message) {
+        match message.encode_line() {
+            Ok(line) => self.0.push_str(&line),
+            Err(e) => tracing::warn!("pentd cannot encode a message: {e}"),
+        }
+    }
+
+    /// A batch of one message.
+    fn of(message: &Message) -> Self {
+        let mut batch = Self::default();
+        batch.push(message);
+        batch
+    }
+
+    /// Return true if the batch has no line.
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The text of the lines.
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+}
 
 /// The messages to one connection. When the client does not read and the
 /// outbox is full, the outbox asks the connection to close.
 #[derive(Debug, Clone)]
 pub(crate) struct Outbox {
-    tx: mpsc::Sender<Message>,
+    tx: mpsc::Sender<Batch>,
     close: Arc<Notify>,
 }
 
 impl Outbox {
     /// A new outbox, the receiver for the writer of the connection, and the
     /// signal to close the connection.
-    pub(crate) fn new() -> (Self, mpsc::Receiver<Message>, Arc<Notify>) {
+    pub(crate) fn new() -> (Self, mpsc::Receiver<Batch>, Arc<Notify>) {
         let (tx, rx) = mpsc::channel(OUTBOX_LEN);
         let close = Arc::new(Notify::new());
         (
@@ -64,10 +103,14 @@ impl Outbox {
         )
     }
 
-    /// Send `message`. Returns false when the connection is gone or full;
-    /// a full connection gets the signal to close.
-    fn send(&self, message: Message) -> bool {
-        match self.tx.try_send(message) {
+    /// Send `batch`. Returns false when the connection is gone or full;
+    /// a full connection gets the signal to close. An empty batch is not
+    /// sent.
+    fn send(&self, batch: Batch) -> bool {
+        if batch.is_empty() {
+            return true;
+        }
+        match self.tx.try_send(batch) {
             Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(_)) => {
                 self.close.notify_one();
@@ -104,7 +147,6 @@ impl Activity {
 struct State {
     queue: Queue,
     denials: Denials,
-    next_session: u64,
     sessions: HashMap<SessionId, Outbox>,
     watchers: Vec<Outbox>,
 }
@@ -121,6 +163,10 @@ pub(crate) struct Hub {
     state: Mutex<State>,
     activity: watch::Sender<Activity>,
     rules: Option<RuleStore>,
+    /// The classes of the user. pentd computes the class and the menu of
+    /// each question itself, so a faulty session cannot make a sensitive
+    /// access look normal or offer a wide target for it.
+    classes: Option<Classifier>,
     /// One answer at a time from the queue to the rule file, so the file
     /// gets the answers in the order of the queue.
     writes: tokio::sync::Mutex<()>,
@@ -131,8 +177,12 @@ pub(crate) struct Hub {
 /// The role of one connection.
 #[derive(Debug)]
 pub(crate) enum Role {
-    /// No hold yet.
+    /// No message yet.
     Client,
+    /// A client that sent a message other than a hold first. It may not
+    /// hold any more: a hold is only the first message, so a watcher never
+    /// becomes a session.
+    Plain,
     /// A holder that is not a session.
     Holder,
     /// A run of `pent run`.
@@ -165,17 +215,19 @@ impl Drop for ConnectionGuard {
 impl Hub {
     /// A new hub. `rules` is `None` when pent cannot find the rule files;
     /// then an answer with the scope `remember` holds only for this run.
-    pub(crate) fn new(rules: Option<RuleStore>) -> Arc<Self> {
+    /// `classes` is `None` when pent does not know the home directory; then
+    /// pentd refuses each question with `NoAnswer`.
+    pub(crate) fn new(rules: Option<RuleStore>, classes: Option<Classifier>) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(State {
                 queue: Queue::default(),
                 denials: Denials::default(),
-                next_session: 0,
                 sessions: HashMap::new(),
                 watchers: Vec::new(),
             }),
             activity: watch::Sender::new(Activity::default()),
             rules,
+            classes,
             writes: tokio::sync::Mutex::new(()),
             new_questions: watch::Sender::new(0),
         })
@@ -232,6 +284,9 @@ impl Hub {
         outbox: &Outbox,
         message: Message,
     ) {
+        if matches!(role, Role::Client) && !matches!(message, Message::Hold(_)) {
+            *role = Role::Plain;
+        }
         match message {
             Message::Hold(hold) => self.hold(role, outbox, hold),
             Message::Ask(ask) => {
@@ -260,11 +315,12 @@ impl Hub {
                     reject(outbox, None, RejectReason::NotPermitted);
                     return;
                 }
-                let state = self.lock();
-                for question in state.queue.open() {
-                    send(outbox, Message::Question(question.clone()));
+                let mut batch = Batch::default();
+                for question in self.lock().queue.open() {
+                    batch.push(&Message::Question(question.clone()));
                 }
-                send(outbox, Message::End);
+                batch.push(&Message::End);
+                outbox.send(batch);
             }
             Message::Denials(session) => {
                 if matches!(role, Role::Session { .. }) {
@@ -275,10 +331,12 @@ impl Hub {
                     reject(outbox, None, RejectReason::UnknownSession);
                     return;
                 };
+                let mut batch = Batch::default();
                 for denial in denials {
-                    send(outbox, Message::Denial(denial));
+                    batch.push(&Message::Denial(denial));
                 }
-                send(outbox, Message::End);
+                batch.push(&Message::End);
+                outbox.send(batch);
             }
             Message::Forget(forget) => {
                 if matches!(role, Role::Session { .. }) {
@@ -298,25 +356,33 @@ impl Hub {
                 if state.watches(outbox) {
                     return;
                 }
+                let mut batch = Batch::default();
                 for question in state.queue.open() {
-                    send(outbox, Message::Question(question.clone()));
+                    batch.push(&Message::Question(question.clone()));
                 }
-                state.watchers.push(outbox.clone());
+                if outbox.send(batch) {
+                    state.watchers.push(outbox.clone());
+                }
             }
             other => tracing::debug!("pentd does not take {other:?} from a client"),
         }
     }
 
-    /// Take the first hold of a connection.
+    /// Take the hold of a connection. Only the first message may hold; a
+    /// later hold gets `NotPermitted`.
     fn hold(&self, role: &mut Role, outbox: &Outbox, hold: Hold) {
         if !matches!(role, Role::Client) {
+            reject(outbox, None, RejectReason::NotPermitted);
             return;
         }
         *role = match hold {
             Hold::Run { key, .. } => {
                 let mut state = self.lock();
-                let id = SessionId(state.next_session);
-                state.next_session = state.next_session.saturating_add(1);
+                // A code that no live session and no list of refusals has.
+                let id = SessionId(random::fresh(|v| {
+                    let id = SessionId(v);
+                    state.sessions.contains_key(&id) || state.denials.knows(id)
+                }));
                 state.sessions.insert(id, outbox.clone());
                 state.denials.start(id, key.clone());
                 Role::Session { id, key }
@@ -325,8 +391,21 @@ impl Hub {
         };
     }
 
-    /// Queue the question `ask` of the session `session`.
-    fn ask(&self, session: SessionId, key: &RuleKey, outbox: &Outbox, ask: pent_profile::Ask) {
+    /// Queue the question `ask` of the session `session`. pentd replaces
+    /// the class and the menu of the ask with its own. An access in the pent
+    /// class gets `NoAnswer`: nobody answers it.
+    fn ask(&self, session: SessionId, key: &RuleKey, outbox: &Outbox, mut ask: pent_profile::Ask) {
+        let Some(classes) = &self.classes else {
+            reject(outbox, None, RejectReason::NoAnswer);
+            return;
+        };
+        let access = ask.request.as_access();
+        ask.class = classes.classify(&access);
+        ask.menu = classes.widths(&access);
+        if ask.class == Class::Pent {
+            reject(outbox, None, RejectReason::NoAnswer);
+            return;
+        }
         let mut state = self.lock();
         let (question, new) = match state.queue.ask(session, key, ask) {
             Ok(asked) => asked,
@@ -336,21 +415,21 @@ impl Hub {
             }
         };
         let id = question.id;
-        let message = Message::Question(question);
         // pentd adds the number and the key, so a question can be too long
         // for one line where its ask was not. The session then gets a
         // refusal in its place, and the order of the numbers stays true.
-        if message.encode_line().is_err() {
+        let Ok(line) = Message::Question(question).encode_line() else {
             if new {
                 state.queue.remove(id);
             }
             reject(outbox, None, RejectReason::TooLong);
             self.publish(&state);
             return;
-        }
-        send(outbox, message.clone());
+        };
+        let batch = Batch(line);
+        outbox.send(batch.clone());
         if new {
-            broadcast(&mut state.watchers, &message);
+            broadcast(&mut state.watchers, &batch);
             self.new_questions.send_modify(|n| *n = n.wrapping_add(1));
         }
         self.publish(&state);
@@ -365,8 +444,10 @@ impl Hub {
     /// run of the question, as an answer with the scope `run` does, and the
     /// client that answered gets `RuleNotKept` before the verdicts. A
     /// question that came during the write is resolved too. When the
-    /// answered question went during the write, the client gets
-    /// `UnknownQuestion` and no verdict.
+    /// answered question went during the write, see [`answer_end`].
+    ///
+    /// Each connection gets the verdicts of one answer as one batch, so a
+    /// wide answer that resolves many questions does not fill an outbox.
     async fn answer(&self, outbox: &Outbox, answer: &Answer) {
         let _write = self.writes.lock().await;
         let plan = match self.lock().queue.check(answer) {
@@ -380,25 +461,38 @@ impl Hub {
             Scope::Remember if self.write_rule(&plan).await => Scope::Remember,
             Scope::Remember | Scope::Run => Scope::Run,
         };
-        let kept = scope == plan.scope;
         let mut state = self.lock();
         let verdicts = state.queue.resolve(&plan, scope);
         self.publish(&state);
-        if let Some(reason) = answer_error(plan.id, &verdicts, kept) {
-            reject(outbox, Some(answer.id), reason);
+        let mut to_answerer = Batch::default();
+        match answer_end(plan.id, &verdicts, plan.scope, scope) {
+            AnswerEnd::Verdicts => {}
+            AnswerEnd::NotKept => to_answerer.push(&rejected(answer.id, RejectReason::RuleNotKept)),
+            AnswerEnd::Gone => {
+                to_answerer.push(&rejected(answer.id, RejectReason::UnknownQuestion))
+            }
+            AnswerEnd::GoneButKept => to_answerer.push(&Message::Verdict(plan.verdict(scope))),
         }
-        let answerer_watches = state.watches(outbox);
+        let mut to_sessions: HashMap<SessionId, Batch> = HashMap::new();
+        let mut to_watchers = Batch::default();
         for (session, verdict) in verdicts {
             let message = Message::Verdict(verdict);
+            let line = Batch::of(&message);
+            to_sessions.entry(session).or_default().0.push_str(&line.0);
+            to_watchers.0.push_str(&line.0);
+        }
+        for (session, batch) in to_sessions {
             if let Some(target) = state.sessions.get(&session) {
-                send(target, message.clone());
-            }
-            broadcast(&mut state.watchers, &message);
-            // A watcher got the verdict above; one copy is enough.
-            if !answerer_watches {
-                send(outbox, message);
+                target.send(batch);
             }
         }
+        // A watcher gets the verdicts with the other watchers; one copy is
+        // enough.
+        if !state.watches(outbox) {
+            to_answerer.0.push_str(&to_watchers.0);
+        }
+        broadcast(&mut state.watchers, &to_watchers);
+        outbox.send(to_answerer);
     }
 
     /// Remove the rules of `forget` from the rule file of its key, and send
@@ -430,7 +524,7 @@ impl Hub {
         match write.await {
             Ok(Ok(count)) => send(
                 outbox,
-                Message::Forgotten(Forgotten {
+                &Message::Forgotten(Forgotten {
                     key,
                     count: u32::try_from(count).unwrap_or(u32::MAX),
                 }),
@@ -503,42 +597,69 @@ impl Hub {
     }
 }
 
-/// The error for the client that answered `id`, which pentd sends before
-/// the verdicts. When the question went during the write (its session ended
-/// long ago, and the queue dropped it), no verdict names it: the client
-/// gets `UnknownQuestion`, so it does not wait for a verdict that never
-/// comes. A kept rule stays. Else a rule that pentd did not keep gives
-/// `RuleNotKept`.
-fn answer_error(
+/// What the client that answered gets besides the verdicts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnswerEnd {
+    /// The verdicts name the question, and the answer holds as asked.
+    Verdicts,
+    /// pentd did not keep the rule: `RuleNotKept` comes before the
+    /// verdicts.
+    NotKept,
+    /// The question went during the write (its session ended long ago, and
+    /// the queue dropped it), but pentd kept the rule: the client gets a
+    /// verdict for its question, so it does not report a failure for a rule
+    /// that holds.
+    GoneButKept,
+    /// The question went during the write, and nothing holds:
+    /// `UnknownQuestion`, so the client does not wait for a verdict that
+    /// never comes.
+    Gone,
+}
+
+/// The end of the answer to `id`, from the verdicts of the queue, the scope
+/// that the answer asked for and the scope that holds after the write.
+fn answer_end(
     id: QuestionId,
     verdicts: &[(SessionId, Verdict)],
-    kept: bool,
-) -> Option<RejectReason> {
-    if !verdicts.iter().any(|(_, v)| v.id == id) {
-        Some(RejectReason::UnknownQuestion)
-    } else if !kept {
-        Some(RejectReason::RuleNotKept)
-    } else {
-        None
+    asked: Scope,
+    holds: Scope,
+) -> AnswerEnd {
+    let named = verdicts.iter().any(|(_, v)| v.id == id);
+    match (named, holds) {
+        (false, Scope::Remember) => AnswerEnd::GoneButKept,
+        (false, Scope::Run) => AnswerEnd::Gone,
+        (true, _) if asked != holds => AnswerEnd::NotKept,
+        (true, _) => AnswerEnd::Verdicts,
     }
 }
 
 /// Send `message` to one connection. A closed or a full connection is not
 /// an error here: its task ends soon.
-fn send(outbox: &Outbox, message: Message) {
+fn send(outbox: &Outbox, message: &Message) {
     // A false result means that the connection ends; nothing else to do.
-    let _ = outbox.send(message);
+    let _ = outbox.send(Batch::of(message));
 }
 
-/// Send `message` to each watcher, and forget each watcher that is gone or
+/// Send `batch` to each watcher, and forget each watcher that is gone or
 /// full.
-fn broadcast(watchers: &mut Vec<Outbox>, message: &Message) {
-    watchers.retain(|w| w.send(message.clone()));
+fn broadcast(watchers: &mut Vec<Outbox>, batch: &Batch) {
+    if batch.is_empty() {
+        return;
+    }
+    watchers.retain(|w| w.send(batch.clone()));
+}
+
+/// The refusal of the answer to `id`.
+fn rejected(id: QuestionId, reason: RejectReason) -> Message {
+    Message::Rejected(Rejected {
+        id: Some(id),
+        reason,
+    })
 }
 
 /// Refuse a message of a client.
 fn reject(outbox: &Outbox, id: Option<QuestionId>, reason: RejectReason) {
-    send(outbox, Message::Rejected(Rejected { id, reason }));
+    send(outbox, &Message::Rejected(Rejected { id, reason }));
 }
 
 #[cfg(test)]
@@ -564,25 +685,22 @@ mod tests {
 
     #[test]
     fn the_client_gets_an_end_when_its_question_went_or_its_rule_was_not_kept() {
+        use Scope::{Remember, Run};
         let id = QuestionId(1);
         let with = [verdict(0), verdict(1)];
         let without = [verdict(0)];
-        assert_eq!(answer_error(id, &with, true), None);
+        assert_eq!(answer_end(id, &with, Run, Run), AnswerEnd::Verdicts);
         assert_eq!(
-            answer_error(id, &with, false),
-            Some(RejectReason::RuleNotKept)
+            answer_end(id, &with, Remember, Remember),
+            AnswerEnd::Verdicts
         );
+        assert_eq!(answer_end(id, &with, Remember, Run), AnswerEnd::NotKept);
         assert_eq!(
-            answer_error(id, &without, true),
-            Some(RejectReason::UnknownQuestion)
+            answer_end(id, &without, Remember, Remember),
+            AnswerEnd::GoneButKept
         );
-        assert_eq!(
-            answer_error(id, &without, false),
-            Some(RejectReason::UnknownQuestion)
-        );
-        assert_eq!(
-            answer_error(id, &[], true),
-            Some(RejectReason::UnknownQuestion)
-        );
+        assert_eq!(answer_end(id, &without, Remember, Run), AnswerEnd::Gone);
+        assert_eq!(answer_end(id, &without, Run, Run), AnswerEnd::Gone);
+        assert_eq!(answer_end(id, &[], Run, Run), AnswerEnd::Gone);
     }
 }

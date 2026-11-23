@@ -14,7 +14,7 @@
 //! that session in each event, so a session cannot put an event in the
 //! list of another session.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use pent_profile::{Denial, Event, Message, RuleKey, SessionId};
@@ -37,23 +37,47 @@ struct Log {
     ended: Option<Instant>,
 }
 
-/// The refusals of each session that pentd knows.
+/// The refusals of each session that pentd knows, in the order of the
+/// starts. The list is short (the live sessions and at most [`MAX_ENDED`]
+/// ended ones), so a search is a scan.
 #[derive(Debug, Default)]
 pub(crate) struct Denials {
-    logs: BTreeMap<SessionId, Log>,
+    logs: Vec<(SessionId, Log)>,
 }
 
 impl Denials {
     /// Start the list of the session `session` with the key `key`.
     pub(crate) fn start(&mut self, session: SessionId, key: RuleKey) {
-        self.logs.insert(
+        self.logs.retain(|(id, _)| *id != session);
+        self.logs.push((
             session,
             Log {
                 key,
                 events: VecDeque::new(),
                 ended: None,
             },
-        );
+        ));
+    }
+
+    /// Return true if pentd knows the session `session`.
+    pub(crate) fn knows(&self, session: SessionId) -> bool {
+        self.log(session).is_some()
+    }
+
+    /// The list of `session`.
+    fn log(&self, session: SessionId) -> Option<&Log> {
+        self.logs
+            .iter()
+            .find(|(id, _)| *id == session)
+            .map(|(_, log)| log)
+    }
+
+    /// The list of `session`, to change it.
+    fn log_mut(&mut self, session: SessionId) -> Option<&mut Log> {
+        self.logs
+            .iter_mut()
+            .find(|(id, _)| *id == session)
+            .map(|(_, log)| log)
     }
 
     /// Keep `event` of the session `session` when it is a refusal. pentd
@@ -63,7 +87,7 @@ impl Denials {
         if !event.decided_by.is_refusal() {
             return;
         }
-        let Some(log) = self.logs.get_mut(&session) else {
+        let Some(log) = self.log_mut(session) else {
             return;
         };
         event.session = session;
@@ -88,7 +112,7 @@ impl Denials {
     /// The session `session` ended at `now`. When more than [`MAX_ENDED`]
     /// sessions ended, the oldest end goes.
     pub(crate) fn end(&mut self, session: SessionId, now: Instant) {
-        if let Some(log) = self.logs.get_mut(&session) {
+        if let Some(log) = self.log_mut(session) {
             log.ended = Some(now);
         }
         let mut ended: Vec<(Instant, SessionId)> = self
@@ -101,21 +125,21 @@ impl Denials {
         }
         ended.sort();
         let extra = ended.len().saturating_sub(MAX_ENDED);
-        for (_, id) in ended.into_iter().take(extra) {
-            self.logs.remove(&id);
+        for (_, gone) in ended.into_iter().take(extra) {
+            self.logs.retain(|(id, _)| *id != gone);
         }
     }
 
     /// Drop each ended session older than [`ENDED_TTL`] at `now`.
     pub(crate) fn expire(&mut self, now: Instant) {
-        self.logs.retain(|_, log| {
+        self.logs.retain(|(_, log)| {
             log.ended
                 .is_none_or(|at| now.saturating_duration_since(at) < ENDED_TTL)
         });
     }
 
     /// The refusals of `session`, or of each session for `None`, in the
-    /// order of the sessions and then of the events. Returns `None` when
+    /// order of the starts of the sessions and then of the events. Returns `None` when
     /// pentd does not know the session.
     pub(crate) fn list(&self, session: Option<SessionId>) -> Option<Vec<Denial>> {
         let denials = |log: &Log| {
@@ -128,8 +152,8 @@ impl Denials {
                 .collect::<Vec<_>>()
         };
         match session {
-            Some(id) => self.logs.get(&id).map(denials),
-            None => Some(self.logs.values().flat_map(denials).collect()),
+            Some(id) => self.log(id).map(denials),
+            None => Some(self.logs.iter().flat_map(|(_, log)| denials(log)).collect()),
         }
     }
 }
@@ -229,13 +253,13 @@ mod tests {
     }
 
     #[test]
-    fn the_list_of_each_session_follows_the_numbers() {
+    fn the_list_of_each_session_follows_the_starts_not_the_codes() {
         let mut d = Denials::default();
         d.start(SessionId(2), key("node"));
         d.start(SessionId(1), key("cargo"));
-        d.record(SessionId(2), event(20, DecidedBy::Hidden));
         d.record(SessionId(1), event(10, DecidedBy::Hidden));
+        d.record(SessionId(2), event(20, DecidedBy::Hidden));
         d.record(SessionId(1), event(11, DecidedBy::Hidden));
-        assert_eq!(times(&d.list(None).unwrap()), [10, 11, 20]);
+        assert_eq!(times(&d.list(None).unwrap()), [20, 10, 11]);
     }
 }

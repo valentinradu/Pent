@@ -13,9 +13,10 @@ pentd speaks the protocol since step 2.1, and it has the queue since step
 - `crates/pent-profile/src/protocol.rs`: the messages `Hold`, `Ask`,
   `Question`, `Answer`, `Verdict`, `Watch`, `Rejected`, `Event`,
   `Questions`, `Denials`, `Denial`, `Forget`, `Forgotten` and `End`, and the
-  JSON lines codec. `Rejected` names one of nine reasons:
+  JSON lines codec. `Rejected` names one of ten reasons:
   `unknown_question`, `bad_width`, `not_human`, `not_permitted`, `too_long`,
-  `too_many`, `rule_not_kept`, `unknown_session` and `rules_not_written`. [pentd.md](pentd.md) has the rules of the queue.
+  `too_many`, `rule_not_kept`, `unknown_session`, `rules_not_written` and
+  `no_answer`. A session and a question have a code of 6 characters. [pentd.md](pentd.md) has the rules of the queue.
 - The serde forms of the rule types in `rule.rs` and `class.rs`, which the
   messages carry.
 
@@ -56,21 +57,22 @@ cargo +nightly fuzz run protocol_line -- -max_total_time=150 -rss_limit_mb=4096
 | PR-4 | The decoder checks each value with the type of the rules: a path is absolute, has no `..` component and no NUL byte, a key is a safe file name, a port is not 0, and a wildcard does not cover a public suffix. | `a_line_with_a_bad_value_is_refused` |
 | PR-5 | An unknown field is an error at each level, also in a target of a menu. An unknown message and an unknown value are errors. | `a_line_with_a_bad_value_is_refused` |
 | PR-6 | A test holds the form of a line, so a change of the form is a decision, not an accident. | `the_form_of_a_line_is_stable` |
-| PR-7 | A line that the decoder accepts encodes to one line that decodes to the same message. | The fuzz target `protocol_line`: 6,911,494 inputs in 151 seconds with the messages and the reasons of step 2.4, no finding (2026-11-22). The test suite ran on the same machine during the run, so the count is lower than the count of the run of step 2.3 (13,620,427). |
+| PR-7 | A line that the decoder accepts encodes to one line that decodes to the same message. | The fuzz target `protocol_line`: 11,700,590 inputs in 151 seconds with the messages, the reasons and the codes of step 2.4, no finding (2026-11-22). |
 | PR-8 | A deadline has at most 600 s (`MAX_DEADLINE`). The decoder refuses a longer one, so `Instant::now() + deadline` in pentd cannot overflow. | `a_line_with_a_bad_value_is_refused`, `a_deadline_has_a_limit` |
 | PR-9 | A time is a signed number of milliseconds since 1970. A host with a clock before 1970 can still encode each message. | `a_time_before_1970_is_negative_and_survives` |
 | PR-10 | `pent run` sends an `Ask`, which has no number. Only pentd gives a number, in a `Question`. Thus no number has a special meaning. | `each_message_survives_a_round_trip_on_one_line` |
 | PR-11 | The text of a decode error escapes each control character and each format character, because the error can quote the line. | `the_text_of_an_error_escapes_control_characters` |
 | PR-12 | The mappings between `Access` and `Request` are exhaustive in both directions, so a new kind of access does not compile until the protocol can carry it. | `a_request_and_an_access_map_both_ways` |
 | PR-13 | The reply to `questions` and to `denials` ends with `end`, so a client knows the end of a reply without a time limit. A `forget` carries a target that the decoder checks (PR-4), not the number of a rule, so it cannot name a rule by its place in a file that changed. | `each_message_survives_a_round_trip_on_one_line`, `pent_questions_and_pent_allow_answer_with_a_width_and_a_rule`, `a_forget_by_target_removes_only_that_target` |
+| PR-14 | The code of a session and of a question is a string of 6 characters from `23456789abcdefghjkmnpqrstuvwxyz`. The decoder refuses a number, a shorter or a longer string, and another character; an uppercase letter counts as lowercase. A value with no code does not encode. | `a_code_has_six_characters_and_survives_a_round_trip`, `a_line_with_a_bad_value_is_refused` |
 
 ## The properties that later steps add
 
 Step 2.1 added the mode of `pentd.sock`, the check of `SO_PEERCRED` and the
 limit of the reader. [pentd.md](pentd.md) has them (PD-2, PD-3, PD-8).
+pentd makes the menu of each question itself, and only the human answers on
+the socket (QU-3, QU-5, QU-16).
 
 | Step | Property |
 |---|---|
-| 2.2 | pentd checks the `MenuIndex` of an answer against the menu that pentd made, and it makes the menu itself. A client cannot name its own target. |
-| 2.2 | An answer for a sensitive question comes only from the human. |
 | 6.1 | `agent.sock` has its own messages, and none of them can allow. |

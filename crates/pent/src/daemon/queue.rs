@@ -1,6 +1,10 @@
 //! The queue of questions in pentd. The module has no I/O, so the tests
 //! cover each rule without a socket.
 //!
+//! - **The codes and the order.** Each question gets a random code
+//!   ([`random::fresh`]) that no open question has. The queue keeps the
+//!   questions in the order of the asks, not in the order of the codes.
+//!
 //! - **One question for a group.** The same access of the same session is
 //!   one question. An answer resolves each open question of the same key
 //!   that its target covers: with the scope `remember` in each session,
@@ -23,6 +27,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
+use super::random;
 use pent_profile::{
     exact_target, Access, Answer, Ask, Class, Decision, Question, QuestionId, RejectReason,
     Request, Rule, RuleKey, RuleSet, Scope, SessionId, Source, Target, Verdict,
@@ -72,6 +77,17 @@ impl Plan {
             created: SystemTime::now(),
         }
     }
+
+    /// The verdict of the answer for its own question, with `scope`.
+    pub(crate) fn verdict(&self, scope: Scope) -> Verdict {
+        Verdict {
+            id: self.id,
+            decision: self.decision,
+            target: self.target.clone(),
+            scope,
+            source: self.source,
+        }
+    }
 }
 
 /// The result of an accepted answer, for the tests.
@@ -89,8 +105,12 @@ pub(crate) struct Resolution {
 /// The queue.
 #[derive(Debug, Default)]
 pub(crate) struct Queue {
-    next_id: u64,
-    open: BTreeMap<QuestionId, Entry>,
+    /// The place of the next question in the order of the asks.
+    next_seq: u64,
+    /// The open questions, in the order of the asks.
+    open: BTreeMap<u64, Entry>,
+    /// The place of each open question in `open`.
+    seq_of: HashMap<QuestionId, u64>,
     /// The open question of each access of each session.
     index: HashMap<(SessionId, Request), QuestionId>,
     /// The number of open questions of each session.
@@ -117,7 +137,7 @@ impl Queue {
         if let Some(entry) = self
             .index
             .get(&(session, ask.request.clone()))
-            .and_then(|id| self.open.get(id))
+            .and_then(|id| self.entry(*id))
         {
             return Ok((entry.question.clone(), false));
         }
@@ -126,12 +146,14 @@ impl Queue {
             return Err(RejectReason::TooMany);
         }
         *count = count.saturating_add(1);
-        let id = QuestionId(self.next_id);
-        self.next_id = self.next_id.saturating_add(1);
+        let id = QuestionId(random::fresh(|v| self.seq_of.contains_key(&QuestionId(v))));
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.saturating_add(1);
+        self.seq_of.insert(id, seq);
         self.index.insert((session, ask.request.clone()), id);
         let question = Question { id, ask };
         self.open.insert(
-            id,
+            seq,
             Entry {
                 question: question.clone(),
                 orphaned: None,
@@ -153,10 +175,7 @@ impl Queue {
         if answer.source != Source::Human {
             return Err(RejectReason::NotHuman);
         }
-        let entry = self
-            .open
-            .get(&answer.id)
-            .ok_or(RejectReason::UnknownQuestion)?;
+        let entry = self.entry(answer.id).ok_or(RejectReason::UnknownQuestion)?;
         let ask = &entry.question.ask;
         let target = ask
             .menu
@@ -196,10 +215,10 @@ impl Queue {
         let covers = covering_set(&plan.key, &plan.target, plan.decision);
         let resolved: Vec<QuestionId> = self
             .open
-            .iter()
-            .filter(|(id, e)| {
+            .values()
+            .filter(|e| {
                 let q = &e.question.ask;
-                if **id == plan.id {
+                if e.question.id == plan.id {
                     return true;
                 }
                 let same_group =
@@ -211,7 +230,7 @@ impl Queue {
                     !matches!(q.class, Class::Sensitive(_)) || exact_target(&access) == plan.target;
                 same_group && covered && allowed
             })
-            .map(|(id, _)| *id)
+            .map(|e| e.question.id)
             .collect();
         let mut verdicts = Vec::with_capacity(resolved.len());
         for id in resolved {
@@ -220,10 +239,7 @@ impl Queue {
                     entry.question.ask.session,
                     Verdict {
                         id,
-                        decision: plan.decision,
-                        target: plan.target.clone(),
-                        scope,
-                        source: plan.source,
+                        ..plan.verdict(scope)
                     },
                 ));
             }
@@ -251,9 +267,15 @@ impl Queue {
         self.take(id);
     }
 
+    /// The open question `id`.
+    fn entry(&self, id: QuestionId) -> Option<&Entry> {
+        self.seq_of.get(&id).and_then(|seq| self.open.get(seq))
+    }
+
     /// Remove the question `id` from the queue and from the index.
     fn take(&mut self, id: QuestionId) -> Option<Entry> {
-        let entry = self.open.remove(&id)?;
+        let seq = self.seq_of.remove(&id)?;
+        let entry = self.open.remove(&seq)?;
         let ask = &entry.question.ask;
         self.index.remove(&(ask.session, ask.request.clone()));
         if let Some(count) = self.per_session.get_mut(&ask.session) {
@@ -279,12 +301,12 @@ impl Queue {
     pub(crate) fn expire(&mut self, now: std::time::Instant) -> usize {
         let old: Vec<QuestionId> = self
             .open
-            .iter()
-            .filter(|(_, e)| {
+            .values()
+            .filter(|e| {
                 e.orphaned
                     .is_some_and(|t| now.saturating_duration_since(t) >= ORPHAN_TTL)
             })
-            .map(|(id, _)| *id)
+            .map(|e| e.question.id)
             .collect();
         for id in &old {
             self.take(*id);
@@ -292,7 +314,7 @@ impl Queue {
         old.len()
     }
 
-    /// The open questions, in the order of their numbers.
+    /// The open questions, in the order of the asks.
     pub(crate) fn open(&self) -> impl Iterator<Item = &Question> {
         self.open.values().map(|e| &e.question)
     }
@@ -389,7 +411,9 @@ mod tests {
         let (a, new_a) = q.ask(S1, &key("cargo"), read("/home/u/a")).unwrap();
         let (b, new_b) = q.ask(S1, &key("cargo"), read("/home/u/b")).unwrap();
         assert!(new_a && new_b);
-        assert_eq!((a.id, b.id), (QuestionId(0), QuestionId(1)));
+        // Two codes, and the queue keeps the order of the asks.
+        assert_ne!(a.id, b.id);
+        assert_eq!(q.open().map(|x| x.id).collect::<Vec<_>>(), [a.id, b.id]);
         assert_eq!(a.ask.session, S1);
         assert_eq!(a.ask.key, key("cargo"));
         // The same access of the same session is the same question.

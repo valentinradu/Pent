@@ -1,8 +1,10 @@
 //! The client side of pentd for `pent run`: a [`Session`].
 //!
 //! A session holds pentd for the whole run, and it asks the questions of
-//! the run. When no pentd answers, it starts one (`pent daemon --spawned`)
-//! and connects again. When the connection ends during the run, it
+//! the run. Its task connects in the background, so the program starts at
+//! once; a question before the connection waits in the task, inside its
+//! deadline. When no pentd answers, the task starts one
+//! (`pent daemon --spawned`) and connects again. When the connection ends during the run, it
 //! connects again, a few times in a row; a connection that lasts
 //! [`STABLE`] resets the count.
 //!
@@ -82,26 +84,31 @@ impl Drop for Session {
 }
 
 impl Session {
-    /// Hold pentd with `hold`, and start pentd when no pentd answers.
+    /// Hold pentd with `hold` from a task, and start pentd when no pentd
+    /// answers. The call returns at once: the task connects in the
+    /// background. When it cannot reach pentd, each question gets the error
+    /// of a refusal.
     ///
     /// # Errors
-    /// Returns the errors of the runtime directory, `DaemonError::Unreachable`
-    /// when no pentd answers after a start, and the errors of the first write.
-    pub(crate) async fn connect(runtime: &RuntimeDir, hold: Hold) -> Result<Self, DaemonError> {
-        let socket = runtime.pentd_socket();
-        let hold_line = Message::Hold(hold).encode_line()?;
-        let stream = connect_or_start(runtime, &socket, &hold_line).await?;
+    /// Returns `DaemonError::Protocol` when the hold cannot be one line.
+    pub(crate) fn connect(runtime: &RuntimeDir, hold: Hold) -> Result<Self, DaemonError> {
         let reconnect = Reconnect {
             runtime: runtime.clone(),
-            socket,
-            hold_line,
+            socket: runtime.pentd_socket(),
+            hold_line: Message::Hold(hold).encode_line()?,
         };
-        Ok(Self::over(stream, Some(reconnect)))
+        Ok(Self::spawn(None, Some(reconnect)))
     }
 
     /// A session over `stream`, which sent its hold already. Without
     /// `reconnect`, a lost connection ends the session.
+    #[cfg(test)]
     fn over(stream: UnixStream, reconnect: Option<Reconnect>) -> Self {
+        Self::spawn(Some(stream), reconnect)
+    }
+
+    /// Start the task. With no `stream`, the task connects first.
+    fn spawn(stream: Option<UnixStream>, reconnect: Option<Reconnect>) -> Self {
         let (commands, inbox) = mpsc::unbounded_channel();
         let task = tokio::spawn(run(stream, reconnect, inbox));
         Self { commands, task }
@@ -188,14 +195,22 @@ impl Waiting {
     }
 }
 
-/// The task of a session: it writes the asks, and it reads the numbers and
-/// the verdicts.
+/// The task of a session: it connects when it has no `stream`, it writes
+/// the asks, and it reads the numbers and the verdicts.
 async fn run(
-    stream: UnixStream,
+    stream: Option<UnixStream>,
     reconnect: Option<Reconnect>,
     mut commands: mpsc::UnboundedReceiver<Command>,
 ) {
-    let mut stream = Some(stream);
+    let mut stream = stream;
+    if stream.is_none() {
+        if let Some(r) = &reconnect {
+            match connect_or_start(&r.runtime, &r.socket, &r.hold_line).await {
+                Ok(first) => stream = Some(first),
+                Err(e) => tracing::debug!("pent runs without pentd: {e}"),
+            }
+        }
+    }
     let mut reconnects = 0_u32;
     while let Some(current) = stream.take() {
         let since = tokio::time::Instant::now();

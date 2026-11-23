@@ -37,9 +37,9 @@ pub(crate) enum Command {
     Config(ConfigArgs),
     /// Run pentd, the daemon that holds the questions, in the foreground
     Daemon(DaemonArgs),
-    /// Allow one open question. `pent questions` shows the numbers
+    /// Allow one open question. `pent questions` shows the codes
     Allow(AnswerArgs),
-    /// Deny one open question. `pent questions` shows the numbers
+    /// Deny one open question. `pent questions` shows the codes
     Deny(AnswerArgs),
     /// List the open questions with their width menus
     Questions(QuestionsArgs),
@@ -51,8 +51,8 @@ pub(crate) enum Command {
 
 #[derive(Args)]
 pub(crate) struct AnswerArgs {
-    /// The number of the question
-    pub id: u64,
+    /// The code of the question, for example k3m9tx
+    pub id: String,
 
     /// The place of the target in the width menu of the question. 0 is
     /// the exact target. `pent questions` shows the menu
@@ -74,8 +74,9 @@ pub(crate) struct QuestionsArgs {
 
 #[derive(Args)]
 pub(crate) struct DenialsArgs {
-    /// The number of the session. Without it, pent shows each session
-    pub session: Option<u64>,
+    /// The code of the session, for example k3m9tx. Without it, pent shows
+    /// each session
+    pub session: Option<String>,
 }
 
 #[derive(Args)]

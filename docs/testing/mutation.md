@@ -78,6 +78,15 @@ makes one mutation by hand. The test must fail on the mutant. No
 | 2.4 | The answer to a question that went during the write gives no error. | `hub::tests::the_client_gets_an_end_when_its_question_went_or_its_rule_was_not_kept` |
 | 2.4 | The queue gives a verdict for the answered question also when the question went. | `queue::tests::a_question_that_goes_during_the_write_gets_no_verdict` |
 | 2.4 | A client ignores `PENT_REPLY_WAIT_MS` and waits 10 s. | `a_client_stops_when_pentd_does_not_reply` |
+| 2.4 | The reply to `questions` goes as one outbox item for each message. | `a_list_longer_than_the_outbox_reaches_the_client_whole` |
+| 2.4 | Each verdict goes to the session as its own outbox item. | `a_wide_answer_for_more_questions_than_the_outbox_reaches_each_one` |
+| 2.4 | A hold after another message is accepted. | `pentd_refuses_a_bad_answer_and_a_message_of_the_wrong_role` |
+| 2.4 | The sandbox does not make the runtime directory before its masks. | `a_runtime_directory_that_appears_after_the_start_stays_hidden` |
+| 2.4 | A kept rule for a question that went gives `unknown_question`. | `hub::tests::the_client_gets_an_end_when_its_question_went_or_its_rule_was_not_kept` |
+| 2.4 | pentd keeps the class of the `Ask`. | `pentd_computes_the_class_and_the_menu_and_ignores_those_of_the_session` |
+| 2.4 | pentd keeps the menu of the `Ask`. | `pentd_computes_the_class_and_the_menu_and_ignores_those_of_the_session` |
+| 2.4 | An access in the pent class gets a question. | `pentd_computes_the_class_and_the_menu_and_ignores_those_of_the_session` |
+| 2.4 | A fresh code ignores the codes that are taken. | `random::tests::a_taken_number_is_never_given` |
 
 The first form of `pent_run_starts_pentd_and_holds_it_for_the_run` passed on
 the mutant: the client started a new pentd each time that it lost one. The
@@ -91,7 +100,13 @@ connection. The test now asks for the end within 2 s. The first form of the
 hook (step 2.3) used `Notify`, which keeps one signal: the questions of the
 collection window left a signal, and one burst gave two runs.
 `one_burst_gives_one_run_with_the_number_of_open_questions` found it; the
-hook now counts the questions with a `watch` channel.
+hook now counts the questions with a `watch` channel. The first form of
+`a_runtime_directory_that_appears_after_the_start_stays_hidden` passed on
+its mutant: the background session of `pent run` made the directory before
+the sandbox computed its masks. The test now runs a program whose file name
+is not a valid key, so `pent run` holds no pentd. A mutation by hand also
+leaves a restored file with an older time than the last build, so the next
+`cargo test` can run the mutant: touch each restored file.
 
 ## How to repeat the run
 

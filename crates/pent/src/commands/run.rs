@@ -33,12 +33,13 @@ enum RunEvent {
     Access(WatchEvent),
 }
 
-/// Hold pentd for this run, and start it when no pentd runs.
+/// Hold pentd for this run, and start it when no pentd runs. The session
+/// connects in the background, so the program starts at once.
 ///
 /// `pent run` asks no question yet (phase 3 of PLAN.md), so a failure does
 /// not stop the run. The design asks the same: without pentd, the rules
 /// still apply (`docs/design/pent.md`, section 2).
-async fn hold_pentd(command: &[String]) -> Option<crate::daemon::client::Session> {
+fn hold_pentd(command: &[String]) -> Option<crate::daemon::client::Session> {
     let key = command
         .first()
         .and_then(|c| pent_profile::RuleKey::from_command(c).ok())?;
@@ -47,7 +48,7 @@ async fn hold_pentd(command: &[String]) -> Option<crate::daemon::client::Session
         command: command.to_vec(),
     };
     let runtime = pent_settings::RuntimeDir::from_env();
-    match crate::daemon::client::Session::connect(&runtime, hold).await {
+    match crate::daemon::client::Session::connect(&runtime, hold) {
         Ok(handle) => Some(handle),
         Err(e) => {
             tracing::debug!("pent runs without pentd: {e}");
@@ -68,7 +69,7 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
     let store = ProfileStore::open_default()?;
     let profile = load_trusted(&store, &selected, &args.command)?;
     let name = selected.name;
-    let _pentd = hold_pentd(&args.command).await;
+    let _pentd = hold_pentd(&args.command);
     let settings = ConfigLoader::load(&cwd, pent_settings::PentDirs::from_env().as_ref())?;
 
     let mut paths = profile_paths(&profile);

@@ -20,7 +20,7 @@ use crate::ui;
 
 /// `pent allow ID` and `pent deny ID`: answer one question.
 pub(crate) async fn answer(args: &AnswerArgs, decision: Decision) -> Result<(), CliError> {
-    let id = QuestionId(args.id);
+    let id: QuestionId = args.id.parse()?;
     let scope = if args.remember {
         Scope::Remember
     } else {
@@ -71,7 +71,7 @@ fn verdict_text(verdict: &Verdict) -> String {
     };
     format!(
         "question {}: {} {} ({scope})",
-        verdict.id.0,
+        verdict.id,
         verdict.decision.name(),
         safe(&verdict.target.to_string()),
     )
@@ -111,11 +111,11 @@ fn question_text(question: &Question) -> String {
     let ask = &question.ask;
     let mut text = format!(
         "{}  {}  {}\n    program {}, session {}, asked {}\n",
-        question.id.0,
+        question.id,
         ask.key,
         safe(&ask.request.to_string()),
         safe(&ask.program),
-        ask.session.0,
+        ask.session,
         time_text(ask.asked),
     );
     if let Class::Sensitive(sensitive) = ask.class {
@@ -132,14 +132,15 @@ fn question_text(question: &Question) -> String {
 
 /// `pent denials [SESSION]`: show the refusals of a session.
 pub(crate) async fn denials(args: &DenialsArgs) -> Result<(), CliError> {
-    let request = Message::Denials(args.session.map(SessionId));
+    let session: Option<SessionId> = args.session.as_deref().map(str::parse).transpose()?;
+    let request = Message::Denials(session);
     let mut call = Call::send(&RuntimeDir::from_env(), &request).await?;
     let mut last: Option<SessionId> = None;
     loop {
         match call.next().await? {
             Message::Denial(denial) => {
                 if last != Some(denial.event.session) {
-                    println!("session {}  {}", denial.event.session.0, denial.key);
+                    println!("session {}  {}", denial.event.session, denial.key);
                     last = Some(denial.event.session);
                 }
                 println!("{}", denial_text(&denial));
@@ -163,8 +164,8 @@ fn denial_text(denial: &Denial) -> String {
     let why = match event.decided_by {
         DecidedBy::Flag(_) => "a flag of pent run".to_string(),
         DecidedBy::Rule(_) => "a rule".to_string(),
-        DecidedBy::Answer { question, .. } => format!("the answer to question {}", question.0),
-        DecidedBy::Deadline { question } => format!("the deadline of question {}", question.0),
+        DecidedBy::Answer { question, .. } => format!("the answer to question {question}"),
+        DecidedBy::Deadline { question } => format!("the deadline of question {question}"),
         DecidedBy::Hidden => "a file of pent (ENOENT)".to_string(),
     };
     format!(
@@ -233,8 +234,8 @@ mod tests {
         let text = question_text(&question(Class::Normal));
         assert_eq!(
             text,
-            "7  claude  read /home/u/.ssh/id_ed25519\n    \
-             program /usr/bin/ssh\\u{1b}[2J, session 3, asked 2026-11-22T12:00:00Z\n    \
+            "222229  claude  read /home/u/.ssh/id_ed25519\n    \
+             program /usr/bin/ssh\\u{1b}[2J, session 222225, asked 2026-11-22T12:00:00Z\n    \
              --width 0  read /home/u/.ssh/id_ed25519\n    \
              --width 1  read /home/u/.ssh/**\n"
         );
@@ -267,7 +268,7 @@ mod tests {
             denial_text(&denial(DecidedBy::Deadline {
                 question: QuestionId(9)
             })),
-            "  -5 ms  localhost 5432  by psql\\u{a}  (the deadline of question 9)"
+            "  -5 ms  localhost 5432  by psql\\u{a}  (the deadline of question 22222b)"
         );
         assert!(denial_text(&denial(DecidedBy::Rule(Decision::Deny))).ends_with("(a rule)"));
         assert!(denial_text(&denial(DecidedBy::Hidden)).ends_with("(a file of pent (ENOENT))"));
@@ -284,7 +285,7 @@ mod tests {
         };
         assert_eq!(
             verdict_text(&verdict),
-            "question 7: deny domain *.npmjs.org (remembered)"
+            "question 222229: deny domain *.npmjs.org (remembered)"
         );
     }
 }
