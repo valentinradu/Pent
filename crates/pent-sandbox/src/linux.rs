@@ -181,9 +181,11 @@ const CGROUP_LIMIT_FILES: &[&str] = &[
     "pids.max",
 ];
 
-/// The file that holds the fixed identifier of the machine. The child sees
-/// a random identifier for each run in its place (see [`MachineIdMask`]).
-const MACHINE_ID_PATH: &str = "/etc/machine-id";
+/// The files that hold the fixed identifier of the machine: the file of
+/// systemd, and the copy of D-Bus that some distributions keep. The child
+/// sees one random identifier for each run in their place (see
+/// [`MachineIdMask`]).
+const MACHINE_ID_PATHS: &[&str] = &["/etc/machine-id", "/var/lib/dbus/machine-id"];
 
 // The sockets that the child hides are data in one place, in
 // `pent_profile::class`: `ESCAPE_SOCKETS` (unless the configuration names
@@ -255,8 +257,15 @@ const PRIVATE_KEEP: &[&str] = &[
 /// The set is a part of the accessible set that `spawn_with_landlock` gives
 /// to the overlay setup. The set does not tell the access type. To predict
 /// whether the policy denies one access, the recorder uses [`AccessPolicy`].
+///
+/// `read_files` are the files below `/sys` that the base reads (see
+/// [`base_read_files`]); the caller reads them one time for each spawn.
 #[must_use]
-pub fn compute_accessible_set(config: &SandboxConfig, path_dirs: &[PathBuf]) -> HashSet<PathBuf> {
+pub fn compute_accessible_set(
+    config: &SandboxConfig,
+    path_dirs: &[PathBuf],
+    read_files: &[PathBuf],
+) -> HashSet<PathBuf> {
     let (_, read_expanded, execute_expanded, rw_expanded) = config.paths.expand_paths();
     let mut accessible: HashSet<PathBuf> = HashSet::new();
     for (p, _) in read_expanded
@@ -280,7 +289,7 @@ pub fn compute_accessible_set(config: &SandboxConfig, path_dirs: &[PathBuf]) -> 
     {
         accessible.insert(PathBuf::from(p));
     }
-    accessible.extend(base_read_files());
+    accessible.extend(read_files.iter().cloned());
     for path_dir in path_dirs {
         accessible.insert(path_dir.clone());
     }
@@ -940,10 +949,13 @@ fn probe_proc_mount() -> libc::c_int {
 /// * `write_set` - write-listed files that an overlay covers (skipped here;
 ///   the overlay parent directory rule covers them).
 /// * `overlay_dirs` - directories with an overlay mount (read/write).
+/// * `read_files` - the files below `/sys` that the base reads (see
+///   [`base_read_files`]).
 fn add_ruleset_rules(
     ruleset: &mut impl RuleSink,
     config: &SandboxConfig,
     path_dirs: &[PathBuf],
+    read_files: &[PathBuf],
     write_set: &HashSet<PathBuf>,
     overlay_dirs: &HashSet<PathBuf>,
     resolv_target: Option<&Path>,
@@ -1023,8 +1035,8 @@ fn add_ruleset_rules(
     for p in DEV_READ_PATHS.iter().chain(PROC_PATHS) {
         ruleset.add_rule(Path::new(p), access::READ);
     }
-    for p in base_read_files() {
-        ruleset.add_rule(&p, access::READ);
+    for p in read_files {
+        ruleset.add_rule(p, access::READ);
     }
     // The `resolv.conf` of the proxy. On a host with `systemd-resolved`,
     // `/etc/resolv.conf` is a symbolic link into `/run`, and the target is
@@ -1055,7 +1067,8 @@ pub(crate) fn implicit_paths() -> Vec<PathBuf> {
 }
 
 /// Return the paths below `/sys` that the base gives for read: the CPU
-/// files and the limit files of the own cgroup.
+/// files and the limit files of the own cgroup. The function reads
+/// `/proc/self/cgroup` and the cgroup tree, so a spawn calls it one time.
 fn base_read_files() -> Vec<PathBuf> {
     let mut paths: Vec<PathBuf> = SYS_READ_PATHS.iter().map(PathBuf::from).collect();
     paths.extend(cgroup_limit_files());
@@ -1159,6 +1172,7 @@ pub fn build_landlock_ruleset(
         &mut ruleset,
         config,
         path_dirs,
+        &base_read_files(),
         &HashSet::new(),
         &HashSet::new(),
         None,
@@ -1854,9 +1868,9 @@ const MACHINE_ID_LEN: usize = 33;
 /// keeps the file, and no path of the child shows the stage.
 #[derive(Debug)]
 struct MachineIdMask {
-    /// The file that the mask covers: the canonical path of
-    /// `/etc/machine-id`.
-    target: CString,
+    /// The files that the mask covers: the canonical path of each file of
+    /// [`MACHINE_ID_PATHS`] that exists.
+    targets: Vec<CString>,
     /// The mount point of the stage, inside a private tmpfs of the child.
     stage: CString,
     /// The file in the stage.
@@ -1901,19 +1915,40 @@ fn random_bytes() -> Option<[u8; 16]> {
     (usize::try_from(ret).ok() == Some(bytes.len())).then_some(bytes)
 }
 
-/// Plan the mask over `/etc/machine-id`.
+/// Return the canonical path of each file of `paths` that exists as a
+/// regular file and that no private tmpfs hides, without duplicates (on
+/// most hosts the copy of D-Bus is a link to `/etc/machine-id`).
+fn machine_id_targets(paths: &[&Path], private: &PrivatePlan) -> Vec<PathBuf> {
+    let mut targets: Vec<PathBuf> = Vec::new();
+    for path in paths {
+        let Ok(real) = std::fs::canonicalize(path) else {
+            continue;
+        };
+        if real.is_file() && !private.hides(&real) && !targets.contains(&real) {
+            targets.push(real);
+        }
+    }
+    targets
+}
+
+/// Plan the mask over the files of [`MACHINE_ID_PATHS`].
 ///
-/// `None` when the host has no such file, or when a private tmpfs hides it
-/// already. `Some(Err(path))` when the child cannot write a random
+/// `None` when the host has none of them, or when a private tmpfs hides
+/// them already. `Some(Err(paths))` when the child cannot write a random
 /// identifier (no private tmpfs for the stage, or no random bytes): the
-/// child then hides the file with an empty one, so the protection never
+/// child then hides each file with an empty one, so the protection never
 /// goes in silence.
-fn plan_machine_id(private: &PrivatePlan) -> Option<Result<MachineIdMask, PathBuf>> {
-    let real = std::fs::canonicalize(MACHINE_ID_PATH).ok()?;
-    if !real.is_file() || private.hides(&real) {
+fn plan_machine_id(private: &PrivatePlan) -> Option<Result<MachineIdMask, Vec<PathBuf>>> {
+    let paths: Vec<&Path> = MACHINE_ID_PATHS.iter().map(Path::new).collect();
+    let real = machine_id_targets(&paths, private);
+    if real.is_empty() {
         return None;
     }
-    let Some(target) = to_cstring(&real) else {
+    let Some(targets) = real
+        .iter()
+        .map(|p| to_cstring(p))
+        .collect::<Option<Vec<_>>>()
+    else {
         return Some(Err(real));
     };
     let stage_dir = private
@@ -1930,7 +1965,7 @@ fn plan_machine_id(private: &PrivatePlan) -> Option<Result<MachineIdMask, PathBu
         return Some(Err(real));
     };
     Some(Ok(MachineIdMask {
-        target,
+        targets,
         stage,
         file,
         content: machine_id_text(bytes),
@@ -1938,7 +1973,7 @@ fn plan_machine_id(private: &PrivatePlan) -> Option<Result<MachineIdMask, PathBu
 }
 
 impl MachineIdMask {
-    /// Write the identifier and bind it over the target. Async-signal-safe.
+    /// Write the identifier and bind it over each target. Async-signal-safe.
     ///
     /// # Errors
     /// Returns the OS error of the stage, of the file or of a mount.
@@ -1977,7 +2012,9 @@ impl MachineIdMask {
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { libc::close(fd) };
         written?;
-        bind_readonly(&self.file, &self.target, 0)?;
+        for target in &self.targets {
+            bind_readonly(&self.file, target, 0)?;
+        }
         // The bind holds the file, so the stage can go. A stage that stays
         // shows only an empty directory, thus a failure is not fatal.
         // SAFETY: umount2(2) and rmdir(2) with a NUL-terminated string that
@@ -3222,7 +3259,9 @@ pub(crate) fn spawn_linux(
         accessible.insert(p.clone());
     }
     accessible.extend(write_set.iter().cloned());
-    accessible.extend(compute_accessible_set(config, path_dirs));
+    // The files below `/sys` of the base, read one time for this spawn.
+    let read_files = base_read_files();
+    accessible.extend(compute_accessible_set(config, path_dirs, &read_files));
     // A profile entry can name a symbolic link. The overlay shows only
     // the paths of this set, and Landlock binds a rule to an inode, so an
     // entry that names a link needs the file that the link reaches too;
@@ -3283,6 +3322,7 @@ pub(crate) fn spawn_linux(
             &mut rs,
             config,
             path_dirs,
+            &read_files,
             &write_set,
             &overlay_dirs,
             resolv_dst.as_deref(),
@@ -3440,7 +3480,9 @@ pub(crate) fn spawn_linux(
             .extend(mask_files.iter().filter_map(|p| to_cstring(p)));
         match plan_machine_id(&private) {
             Some(Ok(mask)) => mounts.machine_id = Some(mask),
-            Some(Err(path)) => mounts.mask_files.extend(to_cstring(&path)),
+            Some(Err(paths)) => mounts
+                .mask_files
+                .extend(paths.iter().filter_map(|p| to_cstring(p))),
             None => {}
         }
     }
@@ -3520,6 +3562,7 @@ pub(crate) fn spawn_linux(
                         &mut policy,
                         config,
                         path_dirs,
+                        &read_files,
                         &write_set,
                         &overlay_dirs,
                         resolv_dst.as_deref(),
@@ -5568,7 +5611,7 @@ mod tests {
             assert!(DEV_RW_PATHS.contains(&p), "{p} must be writable");
         }
         assert!(DEV_READ_PATHS.contains(&"/dev/urandom"));
-        let set = compute_accessible_set(&make_test_config(), &[]);
+        let set = compute_accessible_set(&make_test_config(), &[], &[]);
         assert!(!set.contains(Path::new("/dev")));
         assert!(set.contains(Path::new("/dev/null")));
     }
@@ -5598,11 +5641,11 @@ mod tests {
     fn two_plans_give_two_machine_ids() {
         let plan = plan_private_dirs(&make_test_config(), &[], &[], 4242);
         let (Some(Ok(a)), Some(Ok(b))) = (plan_machine_id(&plan), plan_machine_id(&plan)) else {
-            eprintln!("skip: this host has no {MACHINE_ID_PATH} or no private tmpfs");
+            eprintln!("skip: this host has no machine-id or no private tmpfs");
             return;
         };
         assert_ne!(a.content, b.content);
-        assert_eq!(a.target, b.target);
+        assert_eq!(a.targets, b.targets);
         // The stage is inside a private tmpfs, never on the host.
         let stage = PathBuf::from(a.stage.to_string_lossy().into_owned());
         assert!(
@@ -5610,6 +5653,30 @@ mod tests {
             "the stage {} is on the host",
             stage.display()
         );
+    }
+
+    /// The mask covers the copy of D-Bus too, one time when it is a link
+    /// to the file of systemd.
+    #[test]
+    fn the_machine_id_mask_covers_each_copy_one_time() -> TestResult {
+        let temp = tempfile::tempdir()?;
+        let root = std::fs::canonicalize(temp.path())?;
+        let systemd = root.join("machine-id");
+        let dbus = root.join("dbus-machine-id");
+        let link = root.join("dbus-link");
+        std::fs::write(&systemd, "x\n")?;
+        std::fs::write(&dbus, "y\n")?;
+        std::os::unix::fs::symlink(&systemd, &link)?;
+        let missing = root.join("missing");
+        let plan = PrivatePlan::default();
+        let paths = [
+            systemd.as_path(),
+            dbus.as_path(),
+            link.as_path(),
+            missing.as_path(),
+        ];
+        assert_eq!(machine_id_targets(&paths, &plan), vec![systemd, dbus]);
+        Ok(())
     }
 
     #[test]
@@ -6259,6 +6326,7 @@ mod tests {
         add_ruleset_rules(
             &mut policy,
             &config,
+            &[],
             &[],
             &HashSet::new(),
             &HashSet::new(),

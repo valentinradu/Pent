@@ -1420,6 +1420,22 @@ enum Answer {
     Deferred,
 }
 
+impl Answer {
+    /// The answer for a connection that the supervisor made for the
+    /// socket `at` of the child: the hand-over of the socket, or the error.
+    fn connected(made: Result<OwnedFd, i32>, at: RawFd, cloexec: bool) -> Self {
+        match made {
+            Ok(fd) => Self::Give {
+                fd,
+                at,
+                cloexec,
+                error: 0,
+            },
+            Err(err) => Self::Fail(err),
+        }
+    }
+}
+
 /// Put the descriptor `fd` of the supervisor at the number `at` in the
 /// child of the notification `id`.
 ///
@@ -1448,7 +1464,6 @@ fn add_fd(listener: &OwnedFd, id: u64, fd: &OwnedFd, at: RawFd, cloexec: bool) -
     Ok(())
 }
 
-/// The response that fails the call with `err`.
 /// The outcome of an event for the decision `decision`.
 const fn outcome_of(decision: pent_profile::Decision) -> Outcome {
     match decision {
@@ -1465,6 +1480,7 @@ fn notif_id_valid(listener: &OwnedFd, id: u64) -> bool {
     unsafe { libc::ioctl(listener.as_raw_fd(), NOTIF_ID_VALID, &raw const id) == 0 }
 }
 
+/// The response that fails the call with `err`.
 const fn fail_resp(id: u64, err: i32) -> libc::seccomp_notif_resp {
     libc::seccomp_notif_resp {
         id,
@@ -2156,24 +2172,20 @@ impl Supervisor {
                 return;
             }
             self.answer = match &decision {
-                UnixDecision::Perform(path) => {
-                    match crate::linux_unixconn::connect_for_child(
-                        tid,
-                        sockfd,
-                        socket.kind(),
-                        path,
-                        flags,
-                        crate::linux_unixconn::CONNECT_LIMIT,
-                    ) {
-                        Ok(fd) => Answer::Give {
-                            fd,
-                            at: sockfd,
-                            cloexec: flags.cloexec,
-                            error: 0,
-                        },
-                        Err(err) => Answer::Fail(err),
-                    }
-                }
+                UnixDecision::Perform(path) => Answer::connected(
+                    crate::linux_unixconn::PinnedSocket::open(path).and_then(|pinned| {
+                        crate::linux_unixconn::connect_for_child(
+                            tid,
+                            sockfd,
+                            socket.kind(),
+                            &pinned,
+                            flags,
+                            crate::linux_unixconn::CONNECT_LIMIT,
+                        )
+                    }),
+                    sockfd,
+                    flags.cloexec,
+                ),
                 // An abstract name: the supervisor cannot reach it with a
                 // socket of its own, because the name belongs to the
                 // network namespace of the socket of the child.
@@ -2195,14 +2207,23 @@ impl Supervisor {
     /// A rule, a flag or an answer of this run decides at once, in this
     /// thread: an "allow" makes the connection, and a "deny" gives
     /// `EACCES`. The chain sees the canonical path and the path as the
-    /// program wrote it; a deny of either form wins. Else a worker thread
-    /// asks, with the canonical path, and answers after the decision; it
-    /// checks the notification again before it connects. The event names
-    /// the canonical path, also without `--trace`.
+    /// program wrote it. A deny of either form wins, but only the canonical
+    /// form can allow: the program controls the link that it wrote, and a
+    /// rule for the link must not open the socket that the link reaches
+    /// now. Else a worker thread asks, with the canonical path, and answers
+    /// after the decision; it checks the notification again before it
+    /// connects. The event names the canonical path, also without
+    /// `--trace`.
+    ///
+    /// The supervisor pins the socket before the decision (see
+    /// [`crate::linux_unixconn::PinnedSocket`]), so the connection goes to
+    /// the socket that the question named, also when the program changes
+    /// the path while the question waits.
     ///
     /// Return false, and do nothing, when no decider is set, the path may
     /// not be asked about (see [`crate::linux_unixconn::UnixPolicy::askable`]),
-    /// or no worker can start: the refusal then stays.
+    /// the socket cannot be pinned, or no worker can start: the refusal
+    /// then stays.
     fn ask_unix(
         &mut self,
         id: u64,
@@ -2244,8 +2265,11 @@ impl Supervisor {
         let known = known
             .iter()
             .find(|(_, d)| *d == Decision::Deny)
-            .or_else(|| known.first())
+            .or_else(|| known.iter().find(|(p, _)| **p == canonical))
             .map(|(p, d)| (p.as_path().to_string_lossy().into_owned(), *d));
+        let Ok(pinned) = crate::linux_unixconn::PinnedSocket::open(&path) else {
+            return false;
+        };
         let process = self.procs.get(tid);
         let display = path.to_string_lossy().into_owned();
         let connect = move || {
@@ -2253,7 +2277,7 @@ impl Supervisor {
                 tid,
                 sockfd,
                 kind,
-                &path,
+                &pinned,
                 flags,
                 crate::linux_unixconn::CONNECT_LIMIT,
             )
@@ -2261,15 +2285,7 @@ impl Supervisor {
         match known {
             Some((form, decision)) => {
                 self.answer = match decision {
-                    Decision::Allow => match connect() {
-                        Ok(fd) => Answer::Give {
-                            fd,
-                            at: sockfd,
-                            cloexec: flags.cloexec,
-                            error: 0,
-                        },
-                        Err(err) => Answer::Fail(err),
-                    },
+                    Decision::Allow => Answer::connected(connect(), sockfd, flags.cloexec),
                     Decision::Deny => Answer::Fail(libc::EACCES),
                 };
                 self.out.push(WatchEvent::UnixConnect {

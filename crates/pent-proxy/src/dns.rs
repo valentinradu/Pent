@@ -180,6 +180,14 @@ pub struct DnsServerConfig {
     /// time. One slow upstream query does not block the other queries.
     /// Default: 256
     pub max_concurrent_queries: usize,
+
+    /// Maximum number of queries that wait for a question at the same
+    /// time. A query above the limit gets `SERVFAIL` at once, with no
+    /// question, so the waiting queries never hold all the slots of
+    /// `max_concurrent_queries`, and a name with a rule still gets its
+    /// answer. The C library tries again later.
+    /// Default: 64
+    pub max_waiting_questions: usize,
 }
 
 impl Default for DnsServerConfig {
@@ -193,6 +201,7 @@ impl Default for DnsServerConfig {
             min_ttl: Duration::from_secs(30),
             resolve_timeout: Duration::from_secs(5),
             max_concurrent_queries: 256,
+            max_waiting_questions: 64,
         }
     }
 }
@@ -542,6 +551,10 @@ pub struct DnsServer {
 
     /// The upstream servers, read once at creation.
     upstreams: Arc<[SocketAddr]>,
+
+    /// The slots of the queries that wait for a question (see
+    /// [`DnsServerConfig::max_waiting_questions`]).
+    questions: Arc<tokio::sync::Semaphore>,
 }
 
 impl DnsServer {
@@ -558,10 +571,12 @@ impl DnsServer {
     /// is present for forward compatibility.
     pub fn new(config: DnsServerConfig, state: Arc<SharedState>) -> Result<Self> {
         let upstreams = config.get_upstream().into();
+        let questions = Arc::new(tokio::sync::Semaphore::new(config.max_waiting_questions));
         Ok(Self {
             config,
             state,
             upstreams,
+            questions,
         })
     }
 
@@ -604,6 +619,7 @@ impl DnsServer {
             config: self.config.clone(),
             state: Arc::clone(&self.state),
             upstreams: Arc::clone(&self.upstreams),
+            questions: Arc::clone(&self.questions),
         });
         let limit = Arc::new(tokio::sync::Semaphore::new(
             self.config.max_concurrent_queries.max(1),
@@ -677,6 +693,7 @@ impl DnsServer {
             config: self.config.clone(),
             state: Arc::clone(&self.state),
             upstreams: Arc::clone(&self.upstreams),
+            questions: Arc::clone(&self.questions),
         });
         let limit = Arc::new(tokio::sync::Semaphore::new(
             self.config.max_concurrent_queries.max(1),
@@ -836,6 +853,23 @@ impl DnsServer {
                 self.emit_dns(raw, type_name, Outcome::Denied);
                 return Ok(respond(rcode::REFUSED));
             }
+        };
+        // A query that waits for a question takes a slot of its own limit,
+        // so that the waiting queries never hold all the slots of the
+        // server. The slot goes free when the query ends.
+        let _question = if self.state.needs_question(&name) {
+            if let Ok(slot) = Arc::clone(&self.questions).try_acquire_owned() {
+                Some(slot)
+            } else {
+                self.state.report_violation(format!(
+                    "network: DNS query for \"{name}\" ({type_name}) blocked: \
+                     too many questions wait"
+                ));
+                self.emit_dns(name, type_name, Outcome::Denied);
+                return Ok(respond(rcode::SERVFAIL));
+            }
+        } else {
+            None
         };
         match self
             .state
@@ -1956,6 +1990,73 @@ mod tests {
                 .push((name.to_string(), deadline));
             Box::pin(std::future::ready(self.verdict))
         }
+    }
+
+    /// A decider that knows nothing and holds each question until its
+    /// deadline, as a human who does not answer.
+    #[derive(Debug)]
+    struct SilentDecider {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl crate::DomainDecider for SilentDecider {
+        fn known(&self, _name: &pent_profile::DomainName) -> Option<crate::DomainVerdict> {
+            None
+        }
+
+        fn decide<'a>(
+            &'a self,
+            _name: &'a pent_profile::DomainName,
+            deadline: Duration,
+        ) -> crate::DecisionFuture<'a> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move {
+                tokio::time::sleep(deadline).await;
+                crate::DomainVerdict::Deadline
+            })
+        }
+    }
+
+    /// The queries that wait for a question have their own limit: a query
+    /// above it gets SERVFAIL at once and asks nothing. A name of the
+    /// allowlist needs no slot.
+    #[tokio::test]
+    async fn the_waiting_questions_have_their_own_limit() {
+        use std::sync::atomic::Ordering;
+        let (upstream, _count) = counting_upstream().await;
+        let decider = Arc::new(SilentDecider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let shared: Arc<dyn crate::DomainDecider> = Arc::clone(&decider) as _;
+        let state =
+            Arc::new(SharedState::new(vec!["example.com".to_string()]).with_decider(Some(shared)));
+        let config = DnsServerConfig {
+            upstream: Some(vec![upstream]),
+            resolve_timeout: Duration::from_secs(3),
+            max_waiting_questions: 1,
+            ..Default::default()
+        };
+        let server = Arc::new(DnsServer::new(config, state).unwrap());
+        let first = {
+            let server = Arc::clone(&server);
+            tokio::spawn(async move {
+                let query = build_test_dns_query("first.example", rtype::A);
+                server.handle_query(&query).await
+            })
+        };
+        while decider.calls.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let begin = std::time::Instant::now();
+        let second = build_test_dns_query("second.example", rtype::A);
+        let response = server.handle_query(&second).await.unwrap();
+        assert_eq!(rcode_of(&response), rcode::SERVFAIL);
+        assert!(begin.elapsed() < Duration::from_secs(1), "the query waited");
+        assert_eq!(decider.calls.load(Ordering::SeqCst), 1, "the query asked");
+        let allowed = build_test_dns_query("example.com", rtype::A);
+        let response = server.handle_query(&allowed).await.unwrap();
+        assert_eq!(rcode_of(&response), rcode::NOERROR);
+        first.abort();
     }
 
     /// A fake upstream that answers each query and counts them.

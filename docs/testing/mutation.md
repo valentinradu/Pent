@@ -156,11 +156,24 @@ makes one mutation by hand. The test must fail on the mutant. No
 | 4.1 | The machine identifier is the same in each run. | `test_machine_id_is_random_for_each_run` |
 | 4.1 | The stage of the machine identifier stays. | `test_machine_id_is_random_for_each_run` |
 | 4.1 | Each directory of `PATH` is in the base. | `test_a_path_dir_outside_the_system_paths_is_not_in_the_base`, `a_path_directory_below_a_private_directory_stays_hidden` |
+| 4.1 (review) | An allow of the path as the program wrote it opens the canonical target. | `an_allow_of_a_link_does_not_open_its_target` |
+| 4.1 (review) | The pin does not check that its descriptor leads back to the path. | `linux_unixconn::tests::a_pin_refuses_a_link_in_the_path_and_a_file_that_is_no_socket` |
+| 4.1 (review) | The supervisor connects through the path, not through the descriptor. | `linux_unixconn::tests::a_pinned_socket_keeps_its_target_after_a_swap_of_the_path` |
+| 4.1 (review) | A wide deny answer does not name a sensitive access. | `decide::tests::a_wide_deny_answer_decides_a_sensitive_access` |
+| 4.1 (review) | A DNS query that waits for a question takes no slot of its own limit. | `dns::tests::the_waiting_questions_have_their_own_limit` |
+| 4.1 (review) | `DecidedBy::decision` gives the opposite decision. | `protocol::tests::only_a_deny_a_deadline_and_a_hidden_file_are_refusals` |
+| 4.1 (review) | The mask of the machine identifier binds one file two times. | `linux::tests::the_machine_id_mask_covers_each_copy_one_time` |
+| 4.1 (review) | The forbidden directories keep only the form of the caller. | `linux_unixconn::tests::a_question_asks_only_for_an_existing_path_outside_pent` |
 
 One mutant of step 4.1 survives, and it is equivalent: a bind of the
 machine identifier with no read-only remount. Landlock gives `/etc` no
 write right, and the file has the mode `0444`, so the write of the child
 fails on both forms. The read-only remount is a second layer.
+
+The first form of `a_pinned_socket_keeps_its_target_after_a_swap_of_the_path`
+did not stop on its mutant: the connection went to the other socket, which
+never writes, and the read waited for ever. The test now checks the other
+socket first, and the read has a time limit of 5 s.
 
 The check of the notification after a question (`notif_id_valid` in the
 workers of `ask_unix` and `ask_port`) has no test: it needs a task that

@@ -641,6 +641,20 @@ impl SharedState {
         decider.known(&name) == Some(DomainVerdict::Allow)
     }
 
+    /// Return true if the decision for `domain`, a normalized name, needs a
+    /// question: the policy does not permit it, a decider is set, and the
+    /// decider does not know the answer yet.
+    pub fn needs_question(&self, domain: &str) -> bool {
+        if self.is_permitted(domain) {
+            return false;
+        }
+        let (Some(decider), Ok(name)) = (&self.decider, domain.parse::<pent_profile::DomainName>())
+        else {
+            return false;
+        };
+        decider.known(&name).is_none()
+    }
+
     /// Return true if a decider decides the domains off the allowlist. A
     /// refusal then comes from a rule, an answer, a deadline or a missing
     /// pentd, not from the allowlist alone.

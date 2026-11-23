@@ -472,6 +472,17 @@ impl DecidedBy {
             Self::Deadline { .. } | Self::Hidden => true,
         }
     }
+
+    /// The decision that the access got: a refusal of each kind (also a
+    /// deadline) is a deny.
+    #[must_use]
+    pub const fn decision(self) -> Decision {
+        if self.is_refusal() {
+            Decision::Deny
+        } else {
+            Decision::Allow
+        }
+    }
 }
 
 /// A decision of `pent run`.
@@ -1128,6 +1139,12 @@ mod tests {
             (DecidedBy::Hidden, true),
         ] {
             assert_eq!(decided_by.is_refusal(), refusal, "{decided_by:?}");
+            let decision = if refusal {
+                Decision::Deny
+            } else {
+                Decision::Allow
+            };
+            assert_eq!(decided_by.decision(), decision, "{decided_by:?}");
         }
     }
 

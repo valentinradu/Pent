@@ -981,6 +981,53 @@ fn a_known_decision_of_a_socket_asks_no_question() -> TestResult {
     Ok(())
 }
 
+/// An allow rule for the path that the program wrote does not open the
+/// socket that the path reaches: the program controls the link. The
+/// connection asks for the canonical target, and a "deny" refuses it.
+#[test]
+fn an_allow_of_a_link_does_not_open_its_target() -> TestResult {
+    let test = "an_allow_of_a_link_does_not_open_its_target";
+    if !have_tools(test, &["python3"]) || !sandbox_ready(test) {
+        return Ok(());
+    }
+    let rt = Runtime::new()?;
+    let _pentd = Reap(rt.pent(&["daemon"]).spawn()?);
+    assert!(rt.wait_for_socket());
+    let env = TestEnv::new()?;
+    let path = env.root.join("service.sock");
+    HostServer::Unix(std::os::unix::net::UnixListener::bind(&path)?).serve();
+    let target = path.to_str().ok_or("the path is not UTF-8")?;
+    // The rule names a path in the workspace that does not exist at the
+    // start. The program makes it a link to the socket of the host.
+    let link = env.ws.join("app.sock");
+    let link = link.to_str().ok_or("the path is not UTF-8")?;
+    env.install_rules("probe", &[&format!("unix-socket {link}")])?;
+    let script = format!(
+        "import os, socket\nos.symlink({target:?}, {link:?})\ntry:\n    \
+         s = socket.socket(socket.AF_UNIX)\n    s.connect({link:?})\n    \
+         print('GOT', s.recv(5).decode())\nexcept OSError as e:\n    \
+         print('ERR', type(e).__name__)\n"
+    );
+    let run = env
+        .command(&["run", "--key", "probe", "--", "python3", "-c", &script])
+        .env("XDG_RUNTIME_DIR", rt.xdg())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let code = match question_for(&rt, &format!("unix-socket {target}")) {
+        Ok(code) => code,
+        Err(e) => {
+            let out = run.wait_with_output()?;
+            return Err(format!("{e}; the run gave {out:?}").into());
+        }
+    };
+    let answer = rt.pent(&["deny", &code]).output()?;
+    assert!(answer.status.success(), "{answer:?}");
+    let out = run.wait_with_output()?;
+    assert!(stdout(&out).contains("ERR PermissionError"), "{out:?}");
+    Ok(())
+}
+
 /// `--network blocked` refuses a Unix socket, a port and a name off the
 /// lists with no question.
 #[test]

@@ -21,7 +21,7 @@ message when the sandbox or `python3` is not available.
 | LS-2 | Low | The child reads and changes host files under `/tmp`. | Fixed | `test_tmp_not_shared_with_host` |
 | LS-3 | Medium | The child reads the command line of a host process. | Fixed on a host; absent in a container, with a warning | `test_proc_cmdline_of_host_process_denied` |
 | LS-4 | Low | The child reads and changes the shared memory of the host in `/dev/shm`, when a rule gives `/dev/shm`. | Fixed (step 4.1) | `test_dev_shm_is_private` |
-| LS-5 | Low | The child reads `/etc/machine-id`, a fixed identifier of the machine. | Fixed (step 4.1) | `test_machine_id_is_random_for_each_run` |
+| LS-5 | Low | The child reads `/etc/machine-id`, a fixed identifier of the machine (and its copy in `/var/lib/dbus`, when a rule gives it). | Fixed (step 4.1) | `test_machine_id_is_random_for_each_run` |
 | LS-6 | Medium | The child reads and runs the programs of each directory of `PATH`, also `~/.local/bin`, `~/.cargo/bin` and a directory below `/tmp`. | Fixed (step 4.1) | `test_a_path_dir_outside_the_system_paths_is_not_in_the_base` |
 
 ### LS-1 — Path Unix socket connect bypasses the file allowlist
@@ -391,22 +391,28 @@ host), `test_python_multiprocessing_works`, and the unit tests
 
 **The attack.** `/etc` is in the base for read. `machine-id` is a fixed
 identifier of the machine: a program can send it out and link each run on
-this machine.
+this machine. Some distributions keep a copy in
+`/var/lib/dbus/machine-id`. `/var` is not in the base, but a rule for
+`/var/lib/dbus` would show the copy.
 
 **The fix.** The child sees a random identifier for each run, in the format
 of systemd (32 lowercase hexadecimal digits, version 4). A D-Bus client or a
 library of systemd keeps working. The parent takes 16 bytes from
 `getrandom(2)`. The child mounts a small tmpfs on a stage inside its private
 `/tmp`, writes the file, binds it read-only over the canonical path of
-`/etc/machine-id`, then detaches the tmpfs and removes the stage. The bind
+`/etc/machine-id` and of the copy of D-Bus when it is a separate file
+(`MACHINE_ID_PATHS`), then detaches the tmpfs and removes the stage. D-Bus
+thus sees one identifier. The bind
 keeps the file alive. When the child cannot write a random identifier (no
 private tmpfs, or no random bytes), it binds `/dev/null` over the file, so
 the mask never goes away in silence.
 
 **The evidence.** `test_machine_id_is_random_for_each_run` (the identifier
 differs from the host and between two runs, the write fails, and no stage
-stays), `a_machine_id_has_the_form_of_systemd` and
-`two_plans_give_two_machine_ids`.
+stays), `a_machine_id_has_the_form_of_systemd`,
+`two_plans_give_two_machine_ids` and
+`the_machine_id_mask_covers_each_copy_one_time`. The host of the tests
+has no copy of D-Bus, so only the unit test covers the second target.
 
 ### LS-6 — the directories of `PATH`
 

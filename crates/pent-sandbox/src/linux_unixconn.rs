@@ -209,6 +209,14 @@ impl UnixPolicy {
         abstract_names: AbstractNames,
         forbidden: &[PathBuf],
     ) -> Self {
+        // The compares use canonical paths, so the policy keeps each
+        // forbidden directory in both forms, one time.
+        let mut forbidden: Vec<PathBuf> = forbidden
+            .iter()
+            .flat_map(|f| std::iter::once(f.clone()).chain(std::fs::canonicalize(f).ok()))
+            .collect();
+        forbidden.sort();
+        forbidden.dedup();
         let mut allowed: Vec<PathBuf> = paths
             .iter()
             .filter_map(|p| std::fs::canonicalize(p).ok())
@@ -228,7 +236,7 @@ impl UnixPolicy {
         Self {
             allowed,
             abstract_names,
-            forbidden: forbidden.to_vec(),
+            forbidden,
             never_ask: Vec::new(),
         }
     }
@@ -254,9 +262,7 @@ impl UnixPolicy {
             return None;
         };
         let real = std::fs::canonicalize(path).ok()?;
-        let forbidden = self.forbidden.iter().any(|f| {
-            real.starts_with(f) || std::fs::canonicalize(f).is_ok_and(|f| real.starts_with(f))
-        });
+        let forbidden = self.forbidden.iter().any(|f| real.starts_with(f));
         (!forbidden && !self.never_ask.contains(&real)).then_some(real)
     }
 
@@ -606,8 +612,72 @@ fn connect_once(
     }
 }
 
+/// A socket file that the supervisor holds with an `O_PATH` descriptor.
+///
+/// The supervisor opens the canonical path at the time of the decision and
+/// connects later through `/proc/self/fd/<n>`, as systemd does for a long
+/// path. The kernel follows the descriptor to the inode of the socket, so a
+/// change of the path after the decision (a directory that the program
+/// swaps for a symbolic link while a question waits) has no effect: the
+/// connection goes to the socket that the decision named.
+#[derive(Debug)]
+pub(crate) struct PinnedSocket {
+    /// The `O_PATH` descriptor of the socket file.
+    fd: OwnedFd,
+}
+
+impl PinnedSocket {
+    /// Open the canonical path `path` of a socket file.
+    ///
+    /// The open does not follow a symbolic link at the last component, and
+    /// the descriptor must lead back to `path` itself, so a change of a
+    /// directory between the canonical form and the open is refused.
+    ///
+    /// # Errors
+    /// Returns the error number for the child: the error of `open(2)`,
+    /// `ECONNREFUSED` when the file is not a socket, and `EACCES` when the
+    /// descriptor does not lead back to `path`.
+    pub(crate) fn open(path: &Path) -> Result<Self, i32> {
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::FileTypeExt as _;
+        let c_path =
+            std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| libc::EINVAL)?;
+        // SAFETY: open(2) with a NUL-terminated string. `O_PATH` opens the
+        // inode only; it reads nothing and connects to nothing.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let raw = unsafe {
+            libc::open(
+                c_path.as_ptr(),
+                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if raw < 0 {
+            return Err(errno());
+        }
+        // SAFETY: `raw` is a new descriptor that nothing else owns.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let pinned = Self {
+            fd: unsafe { OwnedFd::from_raw_fd(raw) },
+        };
+        let here = pinned.proc_path();
+        if std::fs::read_link(&here).ok().as_deref() != Some(path) {
+            return Err(libc::EACCES);
+        }
+        let is_socket = std::fs::metadata(&here).is_ok_and(|m| m.file_type().is_socket());
+        if !is_socket {
+            return Err(libc::ECONNREFUSED);
+        }
+        Ok(pinned)
+    }
+
+    /// The path that reaches the pinned socket in this process.
+    fn proc_path(&self) -> PathBuf {
+        PathBuf::from(format!("/proc/self/fd/{}", self.fd.as_raw_fd()))
+    }
+}
+
 /// Make a socket of the same kind as the socket `fd` of the process `tid`,
-/// connect it to `path`, and return it.
+/// connect it to the socket `target`, and return it.
 ///
 /// # Errors
 /// Returns the error number for the child: `EACCES` if the kind of the
@@ -618,14 +688,14 @@ pub(crate) fn connect_for_child(
     tid: u32,
     fd: RawFd,
     kind: Option<libc::c_int>,
-    path: &Path,
+    target: &PinnedSocket,
     flags: FdFlags,
     limit: Duration,
 ) -> Result<OwnedFd, i32> {
     // Without the kind of the socket of the child, a new socket would have
     // the wrong semantics. Refuse instead of guessing.
     let kind = kind.or_else(|| socket_kind(tid, fd)).ok_or(libc::EACCES)?;
-    let (addr, len) = sockaddr_un(path)?;
+    let (addr, len) = sockaddr_un(&target.proc_path())?;
     let sock = make_socket(kind)?;
     connect_once(
         &sock,
@@ -976,6 +1046,20 @@ mod tests {
         assert_eq!(ask(&inside), None);
         assert_eq!(ask(&dir.join("missing.sock")), None);
         assert_eq!(policy.askable(&UnixAddr::Abstract("own".into())), None);
+
+        // A forbidden directory named through a link covers its target:
+        // the policy compares canonical paths.
+        std::os::unix::fs::symlink(&runtime, dir.join("runtime-link"))?;
+        let linked = UnixPolicy::new(
+            std::slice::from_ref(&inside),
+            AbstractNames::Private,
+            &[dir.join("runtime-link")],
+        );
+        assert_eq!(linked.askable(&UnixAddr::Path(inside.clone())), None);
+        assert_eq!(
+            linked.decide(&UnixAddr::Path(inside.clone())),
+            UnixDecision::Refuse
+        );
         Ok(())
     }
 
@@ -1071,11 +1155,15 @@ mod tests {
         // child: only its kind matters.
         let client = UnixListener::bind(tmp.path().join("client"))?;
         let flags = FdFlags::default();
+        let pinned = match PinnedSocket::open(&path) {
+            Ok(pinned) => pinned,
+            Err(e) => return Err(format!("the pin failed with {e}").into()),
+        };
         let fd = connect_for_child(
             std::process::id(),
             client.as_raw_fd(),
             None,
-            &path,
+            &pinned,
             flags,
             CONNECT_LIMIT,
         );
@@ -1088,6 +1176,84 @@ mod tests {
         stream.read_exact(&mut buf)?;
         assert_eq!(&buf, b"HELLO");
         server.join().map_err(|_| "the server thread failed")?;
+        Ok(())
+    }
+
+    /// Serve one client of `listener` with `reply` in a thread.
+    fn serve_once(listener: UnixListener, reply: &'static [u8]) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                // The client reads the reply; a client that went away is
+                // the failure of the test, not of the server.
+                let _ = stream.write_all(reply);
+            }
+        })
+    }
+
+    /// The pin holds the socket that the decision named: a directory that
+    /// becomes a link to another socket after the pin changes nothing.
+    #[test]
+    fn a_pinned_socket_keeps_its_target_after_a_swap_of_the_path() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        let root = std::fs::canonicalize(tmp.path())?;
+        std::fs::create_dir(root.join("d"))?;
+        std::fs::create_dir(root.join("evil"))?;
+        let path = root.join("d/s");
+        let good = serve_once(UnixListener::bind(&path)?, b"GOOD!");
+        let evil = UnixListener::bind(root.join("evil/s"))?;
+        evil.set_nonblocking(true)?;
+        let pinned = match PinnedSocket::open(&path) {
+            Ok(pinned) => pinned,
+            Err(e) => return Err(format!("the pin failed with {e}").into()),
+        };
+        // The swap while the question waits.
+        std::fs::rename(root.join("d"), root.join("d.old"))?;
+        std::os::unix::fs::symlink(root.join("evil"), root.join("d"))?;
+        let client = UnixListener::bind(root.join("client"))?;
+        let fd = connect_for_child(
+            std::process::id(),
+            client.as_raw_fd(),
+            None,
+            &pinned,
+            FdFlags::default(),
+            CONNECT_LIMIT,
+        );
+        let Ok(fd) = fd else {
+            return Err(format!("connect failed with {fd:?}").into());
+        };
+        assert!(evil.accept().is_err(), "the swap reached the other socket");
+        let mut stream = std::os::unix::net::UnixStream::from(fd);
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        let mut buf = [0u8; 5];
+        stream.read_exact(&mut buf)?;
+        assert_eq!(&buf, b"GOOD!");
+        good.join().map_err(|_| "the server thread failed")?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_pin_refuses_a_link_in_the_path_and_a_file_that_is_no_socket() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        let root = std::fs::canonicalize(tmp.path())?;
+        std::fs::create_dir(root.join("real"))?;
+        let _listener = UnixListener::bind(root.join("real/s"))?;
+        std::os::unix::fs::symlink(root.join("real"), root.join("link"))?;
+        std::os::unix::fs::symlink(root.join("real/s"), root.join("s-link"))?;
+        std::fs::write(root.join("file"), "x")?;
+        assert!(PinnedSocket::open(&root.join("real/s")).is_ok());
+        assert_eq!(
+            PinnedSocket::open(&root.join("link/s")).err(),
+            Some(libc::EACCES)
+        );
+        // `O_PATH | O_NOFOLLOW` opens the link itself, which is no socket.
+        assert_eq!(
+            PinnedSocket::open(&root.join("s-link")).err(),
+            Some(libc::ECONNREFUSED)
+        );
+        assert_eq!(
+            PinnedSocket::open(&root.join("file")).err(),
+            Some(libc::ECONNREFUSED)
+        );
         Ok(())
     }
 

@@ -159,14 +159,15 @@ impl Decider {
         }
         let decision = decide_in(&answers.rules, &access, sensitive)?;
         // The event names one answer that alone gives the same decision.
-        // For a sensitive access, only an exact answer counts.
+        // For a sensitive access, only an exact answer allows, but a deny
+        // of any width refuses (see `decide_in`).
         answers
             .rules
             .rules
             .iter()
             .zip(&answers.questions)
             .find(|(rule, _)| {
-                (!sensitive || is_exact(&rule.target))
+                (decision == Decision::Deny || !sensitive || is_exact(&rule.target))
                     && answers
                         .rules
                         .decide_where(&access, |r| std::ptr::eq(r, *rule))
@@ -328,12 +329,9 @@ impl pent_proxy::DomainDecider for ProxyDecider {
     fn known(&self, name: &pent_profile::DomainName) -> Option<pent_proxy::DomainVerdict> {
         self.0
             .known(&Request::Domain(name.clone()))
-            .map(|decided_by| {
-                if decided_by.is_refusal() {
-                    pent_proxy::DomainVerdict::Deny
-                } else {
-                    pent_proxy::DomainVerdict::Allow
-                }
+            .map(|decided_by| match decided_by.decision() {
+                Decision::Allow => pent_proxy::DomainVerdict::Allow,
+                Decision::Deny => pent_proxy::DomainVerdict::Deny,
             })
     }
 
@@ -350,8 +348,10 @@ impl pent_proxy::DomainDecider for ProxyDecider {
                 .await;
             match decided_by {
                 DecidedBy::Deadline { .. } => pent_proxy::DomainVerdict::Deadline,
-                d if d.is_refusal() => pent_proxy::DomainVerdict::Deny,
-                _ => pent_proxy::DomainVerdict::Allow,
+                d => match d.decision() {
+                    Decision::Allow => pent_proxy::DomainVerdict::Allow,
+                    Decision::Deny => pent_proxy::DomainVerdict::Deny,
+                },
             }
         })
     }
@@ -377,24 +377,13 @@ impl std::fmt::Debug for SandboxDecider {
 
 impl pent_sandbox::AccessDecider for SandboxDecider {
     fn known(&self, request: &Request) -> Option<Decision> {
-        self.decider.known(request).map(|decided_by| {
-            if decided_by.is_refusal() {
-                Decision::Deny
-            } else {
-                Decision::Allow
-            }
-        })
+        self.decider.known(request).map(DecidedBy::decision)
     }
 
     fn decide(&self, program: &str, request: Request, deadline: Duration) -> Decision {
-        let decided_by = self
-            .runtime
-            .block_on(self.decider.decide(program, request, deadline));
-        if decided_by.is_refusal() {
-            Decision::Deny
-        } else {
-            Decision::Allow
-        }
+        self.runtime
+            .block_on(self.decider.decide(program, request, deadline))
+            .decision()
     }
 }
 
@@ -1008,6 +997,29 @@ mod tests {
             Some(DecidedBy::Answer {
                 question: QuestionId(3),
                 decision: Decision::Allow
+            })
+        );
+    }
+
+    /// A deny answer of any width refuses a sensitive access at once and
+    /// names its question: the user refused it already.
+    #[test]
+    fn a_wide_deny_answer_decides_a_sensitive_access() {
+        let chain = Decider::new(set(vec![]), set(vec![]), classes(), None);
+        {
+            let mut answers = chain.answers.lock().unwrap();
+            answers.rules.rules.push(file(
+                FileKind::Read,
+                PathWidth::Subtree(path("/home/u/.ssh")),
+                Decision::Deny,
+            ));
+            answers.questions.push(QuestionId(7));
+        }
+        assert_eq!(
+            chain.known(&read("/home/u/.ssh/id_ed25519")),
+            Some(DecidedBy::Answer {
+                question: QuestionId(7),
+                decision: Decision::Deny
             })
         );
     }
