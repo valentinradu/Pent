@@ -1,6 +1,6 @@
 # Plan: the new pent
 
-**Cursor: step 2.5.** Steps with `[x]` are done. Work on the branch `next`,
+**Cursor: step 3.1.** Steps with `[x]` are done. Work on the branch `next`,
 one commit for each step, and move this cursor when a step is done.
 
 **The way of work.** One commit for each step. Then the user runs
@@ -103,11 +103,11 @@ ready for users.
     `Denials`, `Denial`, `Forget`, `Forgotten` and `End` in the protocol.
   - Done: end-to-end tests against a pentd in a temporary
     `XDG_RUNTIME_DIR`; CC-1 to CC-7 in `docs/security/pentd.md`.
-- [ ] **2.5 `pent monitor`.** A terminal screen: the questions grouped by
+- [x] **2.5 `pent monitor`.** A terminal screen: the questions grouped by
   root program and by width, the keys allow, deny, width, scope and
   details, and the warning of a sensitive question.
   - Done: tests of the model of the screen; a manual check on a real
-    terminal.
+    terminal (2026-11-23, with few questions: no real run asks yet).
   - Files: `pent/src/monitor/` (model, view, loop); the event stream in
     `daemon/hub.rs` and `daemon/denials.rs`; the messages `Session` and
     `EventsDropped`; ES-1 to ES-5 and MO-1 to MO-6 in
