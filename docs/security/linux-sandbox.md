@@ -23,6 +23,7 @@ message when the sandbox or `python3` is not available.
 | LS-4 | Low | The child reads and changes the shared memory of the host in `/dev/shm`, when a rule gives `/dev/shm`. | Fixed (step 4.1) | `test_dev_shm_is_private` |
 | LS-5 | Low | The child reads `/etc/machine-id`, a fixed identifier of the machine (and its copy in `/var/lib/dbus`, when a rule gives it). | Fixed (step 4.1) | `test_machine_id_is_random_for_each_run` |
 | LS-7 | Medium | The child reads and writes the working directory with no flag and no rule. | Fixed (step 4.2) | `test_the_workspace_is_in_the_base_only_with_the_flag` |
+| LS-8 | High | A flag on a parent of the directories of pent (`-w=~`) lets the child read and change its rules and `pent.toml`. | Fixed (review of step 4.2) | `test_a_flag_over_a_parent_does_not_open_the_files_of_pent` |
 | LS-6 | Medium | The child reads and runs the programs of each directory of `PATH`, also `~/.local/bin`, `~/.cargo/bin` and a directory below `/tmp`. | Fixed (step 4.1) | `test_a_path_dir_outside_the_system_paths_is_not_in_the_base` |
 
 ### LS-1 — Path Unix socket connect bypasses the file allowlist
@@ -456,6 +457,26 @@ a second read-write directory with no question.
 `-w=DIR`), `test_a_workspace_that_is_not_a_directory_stops_the_run` and
 `a_run_with_no_workspace_gives_the_cwd_no_right`.
 
+### LS-8 — the files of pent under a flag
+
+**The attack.** A rule on a parent of the directories of pent stays out of
+Landlock (RN-5), but a flag did not: `-w=~` or `--write ~/.local` gave the
+child the rules of its key and `pent.toml`. The child could write an allow
+rule for its next run.
+
+**The fix.** The sandbox hides the config and the state directory of pent
+(`pent_file_dirs`) with an empty, read-only tmpfs in each enforced run,
+as it hides the runtime directory. A write there fails with EROFS. A
+directory that a private tmpfs or the overlay of the home directory hides
+already gets no mask: it is not there for the child. The
+pent class of the chain refuses each such access before the flags. `.pent`
+of the working directory and of the workspace stays read-only also under
+`--write`, because a run without `-w` can still get write access to the
+working directory.
+
+**The evidence.** `test_a_flag_over_a_parent_does_not_open_the_files_of_pent`
+and `test_dot_pent_of_the_cwd_stays_read_only_under_a_write_flag`.
+
 ### The CPU files and the limits of the cgroup
 
 A runtime sizes its thread pool from `/sys/devices/system/cpu` and from the
@@ -526,6 +547,7 @@ Each test below passes. It guards a defense that works.
 | The child reads the CPU files and the limits of its cgroup, not `cgroup.procs`. | `test_cpu_and_cgroup_limits_are_readable` |
 | A directory of `PATH` outside the system paths is not in the base. | `test_a_path_dir_outside_the_system_paths_is_not_in_the_base` |
 | The working directory is in the base only with `-w`. | `test_the_workspace_is_in_the_base_only_with_the_flag` |
+| A flag on a parent does not open the files of pent. | `test_a_flag_over_a_parent_does_not_open_the_files_of_pent` |
 
 ## The next step
 

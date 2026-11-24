@@ -1546,6 +1546,73 @@ fn send_resp(
 /// supervisor wait for the next one itself.
 const MAX_CONNECT_WORKERS: usize = 64;
 
+/// The most worker threads that wait for a question at one time. A
+/// question above the limit gets the refusal at once, with no question.
+const MAX_QUESTION_WORKERS: usize = 64;
+
+/// A pool of worker threads of the supervisor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pool {
+    /// Connections to the host, which end within `CONNECT_LIMIT`.
+    Connect,
+    /// Questions, which wait up to `FILE_DEADLINE` for a human.
+    Question,
+}
+
+impl Pool {
+    /// The most workers of the pool at one time.
+    const fn limit(self) -> usize {
+        match self {
+            Self::Connect => MAX_CONNECT_WORKERS,
+            Self::Question => MAX_QUESTION_WORKERS,
+        }
+    }
+
+    /// The name of a worker thread of the pool.
+    const fn thread_name(self) -> &'static str {
+        match self {
+            Self::Connect => "pent-connect",
+            Self::Question => "pent-ask",
+        }
+    }
+}
+
+/// The number of busy workers of each pool. The counts are separate, so
+/// the questions, which wait long, never take the slots of the short
+/// connections to the host: else the supervisor waits for each
+/// connection itself, and each process of the sandbox waits with it.
+#[derive(Debug, Default)]
+struct WorkerSlots {
+    connect: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    question: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl WorkerSlots {
+    /// Take a slot of `pool`, or `None` when the pool is full.
+    fn take(&self, pool: Pool) -> Option<Slot> {
+        use std::sync::atomic::Ordering;
+        let count = match pool {
+            Pool::Connect => &self.connect,
+            Pool::Question => &self.question,
+        };
+        if count.fetch_add(1, Ordering::SeqCst) >= pool.limit() {
+            count.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        Some(Slot(std::sync::Arc::clone(count)))
+    }
+}
+
+/// A busy slot of a worker pool. The drop gives the slot back.
+#[derive(Debug)]
+struct Slot(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 struct Supervisor {
     listener: OwnedFd,
     /// How the recorder decides the outcome of a filesystem event. `None`
@@ -1573,8 +1640,8 @@ struct Supervisor {
     errors: u32,
     /// The event channel, for the worker threads. `run` sets it.
     events: Option<mpsc::Sender<WatchEvent>>,
-    /// The number of worker threads that wait for a connection now.
-    workers: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// The busy worker threads of each pool.
+    workers: WorkerSlots,
     /// The decider of a Unix socket or a port that the lists do not hold.
     /// A worker thread asks it.
     decider: Option<std::sync::Arc<dyn crate::AccessDecider>>,
@@ -1630,7 +1697,7 @@ impl Supervisor {
             out: Vec::new(),
             errors: 0,
             events: None,
-            workers: std::sync::Arc::default(),
+            workers: WorkerSlots::default(),
             decider: plan.decider,
             host_tables: crate::linux_loopback::HostTables::default(),
         }
@@ -2295,7 +2362,7 @@ impl Supervisor {
                 });
                 true
             }
-            None => self.defer_job(move |listener| {
+            None => self.defer_job(Pool::Question, move |listener| {
                 let decision = decider.decide(
                     &process.name,
                     Request::UnixSocket(canonical),
@@ -2323,32 +2390,29 @@ impl Supervisor {
         }
     }
 
-    /// Let a worker thread run `job` and send the answer that it gives to
-    /// its notification, so that a question does not stop the other
-    /// processes of the sandbox. The worker sends the event of the job.
+    /// Let a worker thread of `pool` run `job` and send the answer that it
+    /// gives to its notification, so that a question or a slow connection
+    /// does not stop the other processes of the sandbox. The worker sends
+    /// the event of the job.
     ///
-    /// Return false, and do nothing, when [`MAX_CONNECT_WORKERS`] threads
-    /// already wait or a copy of the listener fails.
-    fn defer_job<F>(&mut self, job: F) -> bool
+    /// Return false, and do nothing, when the pool is full (see
+    /// [`Pool::limit`]) or a copy of the listener fails.
+    fn defer_job<F>(&mut self, pool: Pool, job: F) -> bool
     where
         F: FnOnce(&OwnedFd) -> (libc::seccomp_notif_resp, Option<WatchEvent>) + Send + 'static,
     {
-        use std::sync::atomic::Ordering;
-
         let Some(events) = self.events.clone() else {
             return false;
         };
-        if self.workers.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECT_WORKERS {
-            self.workers.fetch_sub(1, Ordering::SeqCst);
-            return false;
-        }
-        let Ok(listener) = self.listener.try_clone() else {
-            self.workers.fetch_sub(1, Ordering::SeqCst);
+        let Some(slot) = self.workers.take(pool) else {
             return false;
         };
-        let workers = std::sync::Arc::clone(&self.workers);
+        let Ok(listener) = self.listener.try_clone() else {
+            return false;
+        };
         let mut buf = vec![0u64; self.resp.len()];
         let work = move || {
+            let _slot = slot;
             let (resp, event) = job(&listener);
             if let Err(err) = send_resp(&listener, &mut buf, resp) {
                 tracing::warn!("seccomp recorder: NOTIF_SEND of a worker: {err}");
@@ -2358,21 +2422,17 @@ impl Supervisor {
                 // matters, not the event.
                 let _ = events.send(event);
             }
-            workers.fetch_sub(1, Ordering::SeqCst);
         };
         match std::thread::Builder::new()
-            .name("pent-ask".to_string())
+            .name(pool.thread_name().to_string())
             .spawn(work)
         {
             Ok(_) => {
                 self.answer = Answer::Deferred;
                 true
             }
-            Err(_) => {
-                // The closure and its copies are gone with the error.
-                self.workers.fetch_sub(1, Ordering::SeqCst);
-                false
-            }
+            // The closure, its copies and the slot are gone with the error.
+            Err(_) => false,
         }
     }
 
@@ -2569,7 +2629,7 @@ impl Supervisor {
         }
         let process = self.procs.get(tid);
         let flags = crate::linux_unixconn::fd_flags(tid, sockfd);
-        self.defer_job(move |listener| {
+        self.defer_job(Pool::Question, move |listener| {
             let decision = decider.decide(
                 &process.name,
                 pent_profile::Request::Localhost(port),
@@ -2623,7 +2683,7 @@ impl Supervisor {
     ///
     /// The worker takes a copy of the socket and of the listener. It sends
     /// `event` when the connection completes. Return false, and do nothing,
-    /// when [`MAX_CONNECT_WORKERS`] threads already wait or a copy fails:
+    /// when the pool of connections is full or a copy fails:
     /// the supervisor then waits itself.
     fn defer_connect(
         &mut self,
@@ -2633,63 +2693,27 @@ impl Supervisor {
         conn: &crate::linux_loopback::HostConnection,
         event: Option<WatchEvent>,
     ) -> bool {
-        use std::sync::atomic::Ordering;
-
-        let Some(events) = self.events.clone() else {
+        let Ok(fd) = conn.fd.try_clone() else {
             return false;
         };
-        if self.workers.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECT_WORKERS {
-            self.workers.fetch_sub(1, Ordering::SeqCst);
-            return false;
-        }
-        let (Ok(listener), Ok(fd)) = (self.listener.try_clone(), conn.fd.try_clone()) else {
-            self.workers.fetch_sub(1, Ordering::SeqCst);
-            return false;
-        };
-        let workers = std::sync::Arc::clone(&self.workers);
-        let mut buf = vec![0u64; self.resp.len()];
-        let job = move || {
+        self.defer_job(Pool::Connect, move |listener| {
             let conn = crate::linux_loopback::HostConnection {
                 fd,
                 in_progress: true,
             };
-            let (resp, done) = match crate::linux_loopback::finish_on_host(
+            match crate::linux_loopback::finish_on_host(
                 conn,
                 flags,
                 crate::linux_unixconn::CONNECT_LIMIT,
             ) {
+                // The event goes only with a connection that completes.
                 Ok(conn) => (
-                    give_resp(&listener, id, &conn.fd, at, flags.cloexec, 0),
-                    true,
+                    give_resp(listener, id, &conn.fd, at, flags.cloexec, 0),
+                    event,
                 ),
-                Err(err) => (fail_resp(id, err), false),
-            };
-            if let Err(err) = send_resp(&listener, &mut buf, resp) {
-                tracing::warn!("seccomp recorder: NOTIF_SEND of a worker: {err}");
+                Err(err) => (fail_resp(id, err), None),
             }
-            if done {
-                if let Some(event) = event {
-                    // The caller can drop the receiver; the answer above
-                    // matters, not the event.
-                    let _ = events.send(event);
-                }
-            }
-            workers.fetch_sub(1, Ordering::SeqCst);
-        };
-        match std::thread::Builder::new()
-            .name("pent-connect".to_string())
-            .spawn(job)
-        {
-            Ok(_) => {
-                self.answer = Answer::Deferred;
-                true
-            }
-            Err(_) => {
-                // The closure and its copies are gone with the error.
-                self.workers.fetch_sub(1, Ordering::SeqCst);
-                false
-            }
-        }
+        })
     }
 
     /// Connect the socket of the child itself to the address that the
@@ -3152,6 +3176,26 @@ pub(crate) fn spawn_watched(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The questions and the connections have their own slots: a full
+    /// pool of questions leaves each slot of the connections free, and a
+    /// slot goes back when its worker ends.
+    #[test]
+    fn the_questions_never_take_the_slots_of_the_connections() {
+        let slots = WorkerSlots::default();
+        let questions: Vec<Slot> = (0..MAX_QUESTION_WORKERS)
+            .filter_map(|_| slots.take(Pool::Question))
+            .collect();
+        assert_eq!(questions.len(), MAX_QUESTION_WORKERS);
+        assert!(slots.take(Pool::Question).is_none(), "the pool has a limit");
+        let connects: Vec<Slot> = (0..MAX_CONNECT_WORKERS)
+            .filter_map(|_| slots.take(Pool::Connect))
+            .collect();
+        assert_eq!(connects.len(), MAX_CONNECT_WORKERS);
+        assert!(slots.take(Pool::Connect).is_none());
+        drop(questions);
+        assert!(slots.take(Pool::Question).is_some(), "a slot goes back");
+    }
     use pent_profile::GuardClass;
     use serial_test::serial;
     use std::time::{Duration, Instant};

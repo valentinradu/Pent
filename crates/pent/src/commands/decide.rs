@@ -380,6 +380,9 @@ impl pent_sandbox::AccessDecider for SandboxDecider {
         self.decider.known(request).map(DecidedBy::decision)
     }
 
+    /// A runtime that stops while the question waits (an error path of
+    /// `pent run`) ends the task of the session, and the question ends
+    /// with a deny.
     fn decide(&self, program: &str, request: Request, deadline: Duration) -> Decision {
         self.runtime
             .block_on(self.decider.decide(program, request, deadline))
@@ -484,8 +487,8 @@ fn request_of(event: &WatchEvent, key: &RuleKey) -> Option<(String, Request, Dec
 /// directory. A flag that is not a valid target stays out of the chain;
 /// the static layer still gets it.
 pub(crate) struct FlagLists<'a> {
-    /// The workspace of `-w`, canonical: list, read, write and exec in its
-    /// subtree. Exec goes when phase 5 makes exec ask.
+    /// The workspace of `-w`, as the user wrote it: list, read, write and
+    /// exec in its subtree. Exec goes when phase 5 makes exec ask.
     pub workspace: Option<&'a Path>,
     /// `--read`.
     pub read: &'a [PathBuf],
@@ -502,7 +505,12 @@ pub(crate) struct FlagLists<'a> {
 }
 
 impl FlagLists<'_> {
-    /// The rules of the flags for the key `key`.
+    /// The rules of the flags for the key `key`. A relative path resolves
+    /// against `workspace`.
+    ///
+    /// Each path gives a rule for the path as the user wrote it, and one
+    /// more for its canonical form when the two differ, so a request in
+    /// either form finds the flag (a link such as `/home` to `/var/home`).
     pub(crate) fn rules(&self, key: RuleKey, workspace: &Path) -> RuleSet {
         let now = SystemTime::now();
         let rule = |target| Rule {
@@ -511,20 +519,23 @@ impl FlagLists<'_> {
             source: Source::Human,
             created: now,
         };
-        let path = |p: &Path| {
+        let paths = |p: &Path| -> Vec<RulePath> {
             let p = pent_settings::expand_home(p);
-            RulePath::new(if p.is_absolute() {
+            let written = if p.is_absolute() {
                 p
             } else {
                 workspace.join(p)
-            })
-            .ok()
+            };
+            let real = std::fs::canonicalize(&written)
+                .ok()
+                .filter(|real| *real != written);
+            std::iter::once(written)
+                .chain(real)
+                .filter_map(|p| RulePath::new(p).ok())
+                .collect()
         };
         let mut rules = Vec::new();
-        if let Some(dir) = self
-            .workspace
-            .and_then(|w| RulePath::new(w.to_path_buf()).ok())
-        {
+        for dir in self.workspace.map(paths).unwrap_or_default() {
             rules.extend(
                 [
                     FileKind::List,
@@ -545,7 +556,7 @@ impl FlagLists<'_> {
             (FileKind::Write, self.write),
             (FileKind::Exec, self.execute),
         ] {
-            rules.extend(list.iter().filter_map(|p| path(p)).map(|p| {
+            rules.extend(list.iter().flat_map(|p| paths(p)).map(|p| {
                 rule(Target::File {
                     kind,
                     width: PathWidth::Subtree(p),
@@ -561,7 +572,7 @@ impl FlagLists<'_> {
         rules.extend(
             self.unix_sockets
                 .iter()
-                .filter_map(|p| path(p))
+                .flat_map(|p| paths(p))
                 .map(|p| rule(Target::UnixSocket(p))),
         );
         rules.extend(
@@ -622,6 +633,37 @@ impl HeldBack {
             }
         }
     }
+}
+
+/// The warnings of the flags `flags`: each flag on a subtree that covers a
+/// sensitive location or a location of the guard list. Such a flag still
+/// applies, because the user gives it for this run, but the user must know.
+/// A flag that covers the files of pent gets a note: they stay hidden (the
+/// pent class comes first in the chain, and the sandbox masks them).
+pub(crate) fn flag_warnings(flags: &RuleSet, classes: &Classes) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    for rule in &flags.rules {
+        let Target::File { kind, width } = &rule.target else {
+            continue;
+        };
+        let (PathWidth::Exact(base) | PathWidth::Subtree(base)) = width;
+        // One line for each path: `-w` gives four kinds on one path.
+        let text = base.as_path().to_string_lossy();
+        let shown = pent_profile::safe(&text);
+        let line = match file_held_back(flags, *kind, width, Some(classes), Path::is_dir) {
+            Some(HeldBack::Sensitive) => {
+                format!("a flag gives {shown} for this run, and a sensitive location is inside it")
+            }
+            Some(HeldBack::PentFiles) => {
+                format!("a flag gives {shown}, but the files of pent there stay hidden")
+            }
+            _ => continue,
+        };
+        if !lines.contains(&line) {
+            lines.push(line);
+        }
+    }
+    lines
 }
 
 impl Grants {
@@ -1020,6 +1062,47 @@ mod tests {
         );
     }
 
+    /// A question of the supervisor gets a deny, not a panic, when the
+    /// runtime of `pent run` stops while the question waits.
+    #[test]
+    fn a_question_of_the_supervisor_ends_with_a_deny_when_the_runtime_stops() {
+        use pent_sandbox::AccessDecider as _;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        // A pentd that takes the question and never answers.
+        let (session, theirs) = runtime.block_on(async {
+            let (ours, theirs) = UnixStream::pair().unwrap();
+            (Session::over_stream(ours), theirs)
+        });
+        let sandbox = SandboxDecider {
+            decider: std::sync::Arc::new(Decider::new(
+                set(vec![]),
+                set(vec![]),
+                classes(),
+                Some(session),
+            )),
+            runtime: runtime.handle().clone(),
+        };
+        let worker = std::thread::spawn(move || {
+            sandbox.decide(
+                "cargo",
+                Request::UnixSocket(path("/run/x.sock")),
+                Duration::from_secs(60),
+            )
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        runtime.shutdown_timeout(Duration::from_secs(1));
+        let decision = worker.join();
+        drop(theirs);
+        assert!(
+            matches!(decision, Ok(Decision::Deny)),
+            "the worker must end with a deny: {decision:?}"
+        );
+    }
+
     /// A deny answer of any width refuses a sensitive access at once and
     /// names its question: the user refused it already.
     #[test]
@@ -1118,6 +1201,68 @@ mod tests {
             Some(DecidedBy::Flag(Decision::Allow))
         );
         assert_eq!(chain.known(&read("/srv/other")), None);
+    }
+
+    /// A flag path that goes through a link gives a rule for each form, so
+    /// a request in either form finds the flag.
+    #[test]
+    fn a_flag_through_a_link_gives_both_forms() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        std::fs::create_dir(root.join("real")).unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();
+        let read = [root.join("link")];
+        let flags = FlagLists {
+            workspace: Some(&root.join("link")),
+            read: &read,
+            write: &[],
+            execute: &[],
+            allow: &[],
+            unix_sockets: &[],
+            localhost: &[],
+        }
+        .rules(key(), &root);
+        let texts: Vec<String> = flags.rules.iter().map(|r| r.target.to_string()).collect();
+        for form in ["link", "real"] {
+            let want = format!("read {}/**", root.join(form).display());
+            assert_eq!(
+                texts.iter().filter(|t| **t == want).count(),
+                2,
+                "{want}: {texts:?}"
+            );
+            let want = format!("write {}/**", root.join(form).display());
+            assert!(texts.contains(&want), "{want}: {texts:?}");
+        }
+    }
+
+    /// A flag over a sensitive location applies, with a warning; a flag
+    /// over the files of pent gets a note that they stay hidden.
+    #[test]
+    fn a_flag_over_a_guard_location_gives_a_warning() {
+        let classes = Classes::new(
+            Path::new("/home/u"),
+            &[PathBuf::from("/home/u/.config/pent")],
+        );
+        let lines = |write: &[PathBuf]| {
+            let flags = FlagLists {
+                workspace: None,
+                read: &[],
+                write,
+                execute: &[],
+                allow: &[],
+                unix_sockets: &[],
+                localhost: &[],
+            }
+            .rules(key(), Path::new("/home/u"));
+            flag_warnings(&flags, &classes)
+        };
+        let config = lines(&[PathBuf::from("/home/u/.config")]);
+        assert_eq!(config.len(), 1, "{config:?}");
+        assert!(config[0].contains("a sensitive location"), "{config:?}");
+        let pent = lines(&[PathBuf::from("/home/u/.config/pent")]);
+        assert_eq!(pent.len(), 1, "{pent:?}");
+        assert!(pent[0].contains("stay hidden"), "{pent:?}");
+        assert!(lines(&[PathBuf::from("/home/u/src/app")]).is_empty());
     }
 
     #[test]

@@ -1187,3 +1187,107 @@ fn test_a_workspace_that_is_not_a_directory_stops_the_run() -> TestResult {
     assert!(!marker.exists(), "the command started");
     Ok(())
 }
+
+/// LS-8: a flag that gives a parent of the directories of pent (`-w` on a
+/// parent of `XDG_CONFIG_HOME` and `XDG_STATE_HOME`) does not open them:
+/// a mask hides each one, so the program cannot read or change its rules.
+#[test]
+fn test_a_flag_over_a_parent_does_not_open_the_files_of_pent() -> TestResult {
+    if skip_without_sandbox() {
+        return Ok(());
+    }
+    let h = Harness::new("sh")?;
+    let config = h.config.join("pent");
+    let state = h.state.join("pent");
+    std::fs::create_dir_all(&config)?;
+    std::fs::create_dir_all(&state)?;
+    std::fs::write(config.join("pent.toml"), "# PENT_CONFIG_DATA\n")?;
+    let probe = h.script(
+        "probe.sh",
+        &format!(
+            "echo PENT_CHILD_RAN\ncat '{c}/pent.toml'\necho x > '{s}/planted' && echo PLANTED\n\
+             echo y > '{w}/made' && echo BASE_WRITE_OK\n",
+            c = config.display(),
+            s = state.display(),
+            w = h.outside.display()
+        ),
+    )?;
+    let flag = format!("-w={}", h.base.display());
+    let out = h
+        .command(&[
+            PENT,
+            "run",
+            "--key",
+            h.key,
+            &flag,
+            "--",
+            "sh",
+            probe.to_str().unwrap(),
+        ])
+        .output()?;
+    let text = combined(&out);
+    assert_child_ran(&text);
+    assert!(
+        text.contains("BASE_WRITE_OK"),
+        "-w on the parent gives no write:\n{text}"
+    );
+    assert!(
+        !text.contains("PENT_CONFIG_DATA"),
+        "LS-8: the child read pent.toml:\n{text}"
+    );
+    assert!(
+        !text.contains("PLANTED"),
+        "LS-8: the child wrote in the state of pent:\n{text}"
+    );
+    assert!(!state.join("planted").exists());
+    Ok(())
+}
+
+/// `.pent` of the working directory stays read-only, also when a flag gives
+/// write access to the working directory with no `-w`.
+#[test]
+fn test_dot_pent_of_the_cwd_stays_read_only_under_a_write_flag() -> TestResult {
+    if skip_without_sandbox() {
+        return Ok(());
+    }
+    let h = Harness::new("sh")?;
+    let dot_pent = h.workspace.join(".pent");
+    std::fs::create_dir_all(&dot_pent)?;
+    std::fs::write(dot_pent.join("pent.toml"), "OLD\n")?;
+    let probe = h.outside.join("probe.sh");
+    std::fs::write(
+        &probe,
+        "echo PENT_CHILD_RAN\necho NEW >> .pent/pent.toml && echo DOT_PENT_CHANGED\n\
+         echo y > made && echo CWD_WRITE_OK\n",
+    )?;
+    let write = format!("--write={}", h.workspace.display());
+    let read = format!("--read={}", h.outside.display());
+    let out = h
+        .command(&[
+            PENT,
+            "run",
+            "--key",
+            h.key,
+            &write,
+            &read,
+            "--",
+            "sh",
+            probe.to_str().unwrap(),
+        ])
+        .output()?;
+    let text = combined(&out);
+    assert_child_ran(&text);
+    assert!(
+        text.contains("CWD_WRITE_OK"),
+        "--write gives no write:\n{text}"
+    );
+    assert!(
+        !text.contains("DOT_PENT_CHANGED"),
+        "the child changed .pent:\n{text}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dot_pent.join("pent.toml"))?,
+        "OLD\n"
+    );
+    Ok(())
+}

@@ -180,14 +180,6 @@ pub struct DnsServerConfig {
     /// time. One slow upstream query does not block the other queries.
     /// Default: 256
     pub max_concurrent_queries: usize,
-
-    /// Maximum number of queries that wait for a question at the same
-    /// time. A query above the limit gets `SERVFAIL` at once, with no
-    /// question, so the waiting queries never hold all the slots of
-    /// `max_concurrent_queries`, and a name with a rule still gets its
-    /// answer. The C library tries again later.
-    /// Default: 64
-    pub max_waiting_questions: usize,
 }
 
 impl Default for DnsServerConfig {
@@ -201,7 +193,6 @@ impl Default for DnsServerConfig {
             min_ttl: Duration::from_secs(30),
             resolve_timeout: Duration::from_secs(5),
             max_concurrent_queries: 256,
-            max_waiting_questions: 64,
         }
     }
 }
@@ -551,10 +542,6 @@ pub struct DnsServer {
 
     /// The upstream servers, read once at creation.
     upstreams: Arc<[SocketAddr]>,
-
-    /// The slots of the queries that wait for a question (see
-    /// [`DnsServerConfig::max_waiting_questions`]).
-    questions: Arc<tokio::sync::Semaphore>,
 }
 
 impl DnsServer {
@@ -567,16 +554,15 @@ impl DnsServer {
     /// * `state` - Shared state containing domain filter and cache
     ///
     /// # Errors
-    /// Currently infallible; always returns `Ok`. The `Result` return type
-    /// is present for forward compatibility.
+    /// `ProxyError::Config` when the question limit of `state` is not below
+    /// `max_concurrent_queries` (see [`SharedState::question_limit`]).
     pub fn new(config: DnsServerConfig, state: Arc<SharedState>) -> Result<Self> {
+        state.check_question_limit("DNS queries", config.max_concurrent_queries)?;
         let upstreams = config.get_upstream().into();
-        let questions = Arc::new(tokio::sync::Semaphore::new(config.max_waiting_questions));
         Ok(Self {
             config,
             state,
             upstreams,
-            questions,
         })
     }
 
@@ -619,7 +605,6 @@ impl DnsServer {
             config: self.config.clone(),
             state: Arc::clone(&self.state),
             upstreams: Arc::clone(&self.upstreams),
-            questions: Arc::clone(&self.questions),
         });
         let limit = Arc::new(tokio::sync::Semaphore::new(
             self.config.max_concurrent_queries.max(1),
@@ -693,7 +678,6 @@ impl DnsServer {
             config: self.config.clone(),
             state: Arc::clone(&self.state),
             upstreams: Arc::clone(&self.upstreams),
-            questions: Arc::clone(&self.questions),
         });
         let limit = Arc::new(tokio::sync::Semaphore::new(
             self.config.max_concurrent_queries.max(1),
@@ -854,23 +838,6 @@ impl DnsServer {
                 return Ok(respond(rcode::REFUSED));
             }
         };
-        // A query that waits for a question takes a slot of its own limit,
-        // so that the waiting queries never hold all the slots of the
-        // server. The slot goes free when the query ends.
-        let _question = if self.state.needs_question(&name) {
-            if let Ok(slot) = Arc::clone(&self.questions).try_acquire_owned() {
-                Some(slot)
-            } else {
-                self.state.report_violation(format!(
-                    "network: DNS query for \"{name}\" ({type_name}) blocked: \
-                     too many questions wait"
-                ));
-                self.emit_dns(name, type_name, Outcome::Denied);
-                return Ok(respond(rcode::SERVFAIL));
-            }
-        } else {
-            None
-        };
         match self
             .state
             .decide_domain(&name, pent_profile::DNS_DEADLINE)
@@ -889,6 +856,15 @@ impl DnsServer {
                 self.state.report_violation(format!(
                     "network: DNS query for \"{name}\" ({type_name}) blocked: \
                      no answer came in time, and the question stays open"
+                ));
+                self.emit_dns(name, type_name, Outcome::Denied);
+                return Ok(respond(rcode::SERVFAIL));
+            }
+            // "Cannot answer now": the C library tries again later.
+            crate::DomainVerdict::Busy => {
+                self.state.report_violation(format!(
+                    "network: DNS query for \"{name}\" ({type_name}) blocked: \
+                     too many questions wait"
                 ));
                 self.emit_dns(name, type_name, Outcome::Denied);
                 return Ok(respond(rcode::SERVFAIL));
@@ -2028,12 +2004,14 @@ mod tests {
             calls: std::sync::atomic::AtomicUsize::new(0),
         });
         let shared: Arc<dyn crate::DomainDecider> = Arc::clone(&decider) as _;
-        let state =
-            Arc::new(SharedState::new(vec!["example.com".to_string()]).with_decider(Some(shared)));
+        let state = Arc::new(
+            SharedState::new(vec!["example.com".to_string()])
+                .with_decider(Some(shared))
+                .with_question_limit(1),
+        );
         let config = DnsServerConfig {
             upstream: Some(vec![upstream]),
             resolve_timeout: Duration::from_secs(3),
-            max_waiting_questions: 1,
             ..Default::default()
         };
         let server = Arc::new(DnsServer::new(config, state).unwrap());
@@ -2941,7 +2919,8 @@ mod tests {
             return;
         };
         use crate::SharedState;
-        let state = Arc::new(SharedState::new(vec!["example.com".to_string()]));
+        let state =
+            Arc::new(SharedState::new(vec!["example.com".to_string()]).with_question_limit(0));
         let config = DnsServerConfig {
             upstream: Some(vec![upstream]),
             // One connection at a time.
@@ -3279,7 +3258,8 @@ mod tests {
             crate::test_support::skip("this machine gives no address for a TCP listener");
             return;
         };
-        let state = Arc::new(SharedState::new(vec!["allowed.com".to_string()]));
+        let state =
+            Arc::new(SharedState::new(vec!["allowed.com".to_string()]).with_question_limit(0));
         let config = DnsServerConfig {
             max_concurrent_queries: 1,
             ..Default::default()

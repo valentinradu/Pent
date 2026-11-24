@@ -414,9 +414,10 @@ impl TcpProxy {
     /// * `state` - Shared state containing resolution cache
     ///
     /// # Errors
-    /// Currently infallible; always returns `Ok`. The `Result` return type
-    /// is present for forward compatibility.
+    /// `ProxyError::Config` when the question limit of `state` is not below
+    /// `max_connections` (see [`SharedState::question_limit`]).
     pub fn new(config: TcpProxyConfig, state: Arc<SharedState>) -> Result<Self> {
+        state.check_question_limit("proxy connections", config.max_connections)?;
         Ok(Self {
             config,
             state,
@@ -2700,7 +2701,7 @@ mod tests {
         use crate::SharedState;
         use tokio::io::AsyncReadExt;
 
-        let state = Arc::new(SharedState::new(vec![]));
+        let state = Arc::new(SharedState::new(vec![]).with_question_limit(0));
         let Some(bind_addr) = get_free_port().await else {
             return;
         };

@@ -115,7 +115,15 @@ pub enum DomainVerdict {
     /// The deadline came first. The access gets the error of a refusal,
     /// and the question stays open, so a later try can get the answer.
     Deadline,
+    /// Too many questions wait already (see
+    /// [`SharedState::question_limit`]). The access gets the error of a
+    /// refusal at once, and no question goes to pentd.
+    Busy,
 }
+
+/// The default number of questions of the proxy and of DNS that wait at one
+/// time (see [`SharedState::question_limit`]).
+pub const MAX_WAITING_QUESTIONS: usize = 64;
 
 /// The future of a decision of a [`DomainDecider`].
 pub type DecisionFuture<'a> =
@@ -505,6 +513,13 @@ pub struct SharedState {
     /// mode. Without it, the allowlist alone decides.
     decider: Option<Arc<dyn DomainDecider>>,
 
+    /// The slots of the questions that wait, for DNS and the proxy
+    /// together (see [`SharedState::question_limit`]).
+    questions: Arc<tokio::sync::Semaphore>,
+
+    /// The number of slots of `questions`.
+    question_limit: usize,
+
     /// The number of trace events and watch events that the proxy could not
     /// send, because the receiver was closed.
     dropped_events: AtomicU64,
@@ -567,6 +582,8 @@ impl SharedState {
             policy: ProxyPolicy::Enforce,
             event_tx: None,
             decider: None,
+            questions: Arc::new(tokio::sync::Semaphore::new(MAX_WAITING_QUESTIONS)),
+            question_limit: MAX_WAITING_QUESTIONS,
             dropped_events: AtomicU64::new(0),
             connections_accepted: Arc::new(AtomicU64::new(0)),
         }
@@ -597,6 +614,46 @@ impl SharedState {
         self
     }
 
+    /// Set the number of questions that wait at one time (the default is
+    /// [`MAX_WAITING_QUESTIONS`]).
+    #[must_use]
+    pub fn with_question_limit(mut self, limit: usize) -> Self {
+        self.questions = Arc::new(tokio::sync::Semaphore::new(limit));
+        self.question_limit = limit;
+        self
+    }
+
+    /// The number of DNS queries and proxy connections that can wait for a
+    /// question at one time. An access above it gets
+    /// [`DomainVerdict::Busy`] at once, so the waiting accesses never hold
+    /// each slot of a server, and a name with a rule still gets its
+    /// answer. Each server checks at its start that the limit is below its
+    /// own number of slots.
+    #[must_use]
+    pub const fn question_limit(&self) -> usize {
+        self.question_limit
+    }
+
+    /// Check that the question limit is below `slots`, the number of
+    /// slots of `server`.
+    ///
+    /// # Errors
+    /// `ConfigError::QuestionLimit` when the limit is not below `slots`.
+    pub fn check_question_limit(
+        &self,
+        server: &'static str,
+        slots: usize,
+    ) -> std::result::Result<(), crate::server::ConfigError> {
+        if self.question_limit < slots {
+            return Ok(());
+        }
+        Err(crate::server::ConfigError::QuestionLimit {
+            questions: self.question_limit,
+            server,
+            slots,
+        })
+    }
+
     /// Decide whether the policy permits a connection to `domain`, a
     /// normalized name, within [`pent_profile::PROXY_DEADLINE`]. See
     /// [`SharedState::decide_domain`].
@@ -624,6 +681,14 @@ impl SharedState {
         let Ok(name) = domain.parse::<pent_profile::DomainName>() else {
             return DomainVerdict::Deny;
         };
+        if let Some(verdict) = decider.known(&name) {
+            return verdict;
+        }
+        // The access waits for a question: it takes a slot of the shared
+        // limit, which goes free when the decision comes.
+        let Ok(_slot) = Arc::clone(&self.questions).try_acquire_owned() else {
+            return DomainVerdict::Busy;
+        };
         decider.decide(&name, deadline).await
     }
 
@@ -639,20 +704,6 @@ impl SharedState {
             return false;
         };
         decider.known(&name) == Some(DomainVerdict::Allow)
-    }
-
-    /// Return true if the decision for `domain`, a normalized name, needs a
-    /// question: the policy does not permit it, a decider is set, and the
-    /// decider does not know the answer yet.
-    pub fn needs_question(&self, domain: &str) -> bool {
-        if self.is_permitted(domain) {
-            return false;
-        }
-        let (Some(decider), Ok(name)) = (&self.decider, domain.parse::<pent_profile::DomainName>())
-        else {
-            return false;
-        };
-        decider.known(&name).is_none()
     }
 
     /// Return true if a decider decides the domains off the allowlist. A
@@ -769,6 +820,88 @@ impl SharedState {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // test infrastructure: parse on known-good literals
 mod tests {
     use super::*;
+
+    /// A decider that knows nothing and never answers.
+    #[derive(Debug)]
+    struct NeverDecider;
+
+    impl DomainDecider for NeverDecider {
+        fn known(&self, name: &pent_profile::DomainName) -> Option<DomainVerdict> {
+            (name.to_string() == "known.example").then_some(DomainVerdict::Deny)
+        }
+
+        fn decide<'a>(
+            &'a self,
+            _name: &'a pent_profile::DomainName,
+            _deadline: std::time::Duration,
+        ) -> DecisionFuture<'a> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    /// DNS and the proxy share one limit of questions that wait. An access
+    /// above it is `Busy` at once; a known verdict and the allowlist need
+    /// no slot.
+    #[tokio::test]
+    async fn the_questions_that_wait_have_one_shared_limit() {
+        let state = Arc::new(
+            SharedState::new(vec!["listed.example".to_string()])
+                .with_decider(Some(Arc::new(NeverDecider)))
+                .with_question_limit(1),
+        );
+        let waiting = {
+            let state = Arc::clone(&state);
+            tokio::spawn(async move { state.permits_connection("first.example").await })
+        };
+        let started = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while state.questions.available_permits() > 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(started.is_ok(), "the first access took no slot");
+        let second = state
+            .decide_domain("second.example", std::time::Duration::from_secs(60))
+            .await;
+        assert_eq!(second, DomainVerdict::Busy);
+        assert!(!state.permits_connection("third.example").await);
+        let known = state
+            .decide_domain("known.example", std::time::Duration::from_secs(60))
+            .await;
+        assert_eq!(known, DomainVerdict::Deny);
+        assert!(state.permits_connection("listed.example").await);
+        waiting.abort();
+        // The aborted access gives its slot back.
+        let _ = waiting.await;
+        assert_eq!(state.questions.available_permits(), 1);
+    }
+
+    #[test]
+    fn a_server_needs_more_slots_than_the_questions() {
+        let state = SharedState::new(Vec::new());
+        assert_eq!(state.question_limit(), MAX_WAITING_QUESTIONS);
+        assert!(state
+            .check_question_limit("DNS queries", MAX_WAITING_QUESTIONS + 1)
+            .is_ok());
+        assert!(matches!(
+            state.check_question_limit("DNS queries", MAX_WAITING_QUESTIONS),
+            Err(crate::server::ConfigError::QuestionLimit { .. })
+        ));
+        let config = crate::dns::DnsServerConfig {
+            max_concurrent_queries: MAX_WAITING_QUESTIONS,
+            ..Default::default()
+        };
+        assert!(
+            crate::dns::DnsServer::new(config, Arc::new(SharedState::new(Vec::new()))).is_err()
+        );
+        let config = crate::proxy::TcpProxyConfig {
+            max_connections: MAX_WAITING_QUESTIONS,
+            ..Default::default()
+        };
+        assert!(
+            crate::proxy::TcpProxy::new(config, Arc::new(SharedState::new(Vec::new()))).is_err()
+        );
+    }
 
     // ========================================================================
     // ResolutionCache Tests

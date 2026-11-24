@@ -2054,8 +2054,9 @@ struct MountPlan {
     mask_files: Vec<CString>,
     /// The random identifier over `/etc/machine-id`.
     machine_id: Option<MachineIdMask>,
-    /// Directories that the watch guard hides with an empty, read-only
-    /// tmpfs.
+    /// Directories to hide with an empty, read-only tmpfs: the masks of
+    /// the watch guard, and the config and the state directory of pent. A
+    /// write there fails with EROFS.
     guard_dirs: Vec<CString>,
     /// Files that the watch guard hides with a read-only bind mount of
     /// `/dev/null`. A write fails with EROFS, so that the program does not
@@ -2102,8 +2103,8 @@ fn configured_paths(config: &SandboxConfig) -> Vec<PathBuf> {
 /// Return the paths that pent binds back into a private tmpfs.
 ///
 /// The list holds each path that the configuration names itself: the read,
-/// the execute and the read-write paths, each mount, the workspace, the data
-/// directory and the working directory.
+/// the execute and the read-write paths, each mount, the workspace (only
+/// with `pent run -w`) and the working directory.
 ///
 /// The traversal paths are **not** in the list. The CLI puts each parent
 /// directory of a rule in the traversal list, so that the program can
@@ -2503,6 +2504,18 @@ fn mask_targets(config: &SandboxConfig, uid: libc::uid_t) -> (Vec<PathBuf>, Vec<
         }
     }
     (dirs, files)
+}
+
+/// Return the config and the state directory of pent that exist, in their
+/// canonical form.
+fn pent_file_dirs() -> Vec<PathBuf> {
+    pent_settings::PentDirs::from_env().map_or_else(Vec::new, |dirs| {
+        [dirs.config, dirs.state]
+            .into_iter()
+            .filter_map(|p| std::fs::canonicalize(p).ok())
+            .filter(|p| p.is_dir())
+            .collect()
+    })
 }
 
 /// Return the home directory of the child.
@@ -3465,17 +3478,38 @@ pub(crate) fn spawn_linux(
         }
     }
     if enforce {
-        // Without a workspace the child cannot write there anyway.
-        let dot_pent = config.workspace.as_ref().map(|w| w.join(".pent"));
-        if let Some(dot_pent) = dot_pent.filter(|p| p.exists()) {
-            mounts.readonly.extend(to_cstring(&dot_pent));
-        }
+        // `.pent` of the working directory and of the workspace is
+        // read-only, also when a flag or a rule gives write access to its
+        // parent.
+        let mut dot_pents: Vec<PathBuf> = std::iter::once(&config.cwd)
+            .chain(&config.workspace)
+            .map(|dir| dir.join(".pent"))
+            .filter(|p| p.exists())
+            .collect();
+        dot_pents.dedup();
+        mounts
+            .readonly
+            .extend(dot_pents.iter().filter_map(|p| to_cstring(p)));
         mounts
             .mask_dirs
             .extend(mask_dirs.iter().filter_map(|p| to_cstring(p)));
         mounts
             .mask_files
             .extend(mask_files.iter().filter_map(|p| to_cstring(p)));
+        // The config and the state directory of pent (the rules,
+        // `pent.toml`) are the pent class: no flag and no rule opens them,
+        // also when a flag gives a parent (`-w=~`). A mask hides each one.
+        // A directory that a private tmpfs or an overlay hides already is
+        // not there for the child, and a mount on it would fail.
+        let mut overlay_view = AccessPolicy::default();
+        overlay_view.set_overlay(&overlay_dirs, &accessible);
+        for dir in pent_file_dirs() {
+            let covered = mask_dirs.iter().any(|d| dir.starts_with(d))
+                || runtime_mask.as_ref().is_some_and(|r| dir.starts_with(r));
+            if !covered && !private.hides(&dir) && !overlay_view.hidden(&dir) {
+                mounts.guard_dirs.extend(to_cstring(&dir));
+            }
+        }
         match plan_machine_id(&private) {
             Some(Ok(mask)) => mounts.machine_id = Some(mask),
             Some(Err(paths)) => mounts

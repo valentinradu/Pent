@@ -170,11 +170,29 @@ makes one mutation by hand. The test must fail on the mutant. No
 | 4.2 | `-w=DIR` gives the working directory instead of DIR. | `test_the_workspace_is_in_the_base_only_with_the_flag` |
 | 4.2 | The flag layer has no rule for the workspace. | `decide::tests::the_workspace_flag_gives_each_kind_in_its_subtree` |
 | 4.2 | A workspace that is a file does not stop the run. | `test_a_workspace_that_is_not_a_directory_stops_the_run` |
+| 4.2 (review) | The questions take the slots of the connections. | `linux_watch::tests::the_questions_never_take_the_slots_of_the_connections` |
+| 4.2 (review) | A domain question takes no slot of the shared limit. | `lib::tests::the_questions_that_wait_have_one_shared_limit` |
+| 4.2 (review) | A server starts with a question limit that is not below its slots. | `lib::tests::a_server_needs_more_slots_than_the_questions` |
+| 4.2 (review) | Only `.pent` of the workspace is read-only. | `test_dot_pent_of_the_cwd_stays_read_only_under_a_write_flag` |
+| 4.2 (review) | The directories of pent get no mask. | `test_a_flag_over_a_parent_does_not_open_the_files_of_pent` |
+| 4.2 (review) | The mask of the directories of pent is writable. | `test_a_flag_over_a_parent_does_not_open_the_files_of_pent` |
+| 4.2 (review) | A flag gives only the path as written. | `decide::tests::a_flag_through_a_link_gives_both_forms` |
+| 4.2 (review) | A flag over a guard location gives no warning. | `decide::tests::a_flag_over_a_guard_location_gives_a_warning` |
 
 One mutant of step 4.1 survives, and it is equivalent: a bind of the
 machine identifier with no read-only remount. Landlock gives `/etc` no
 write right, and the file has the mode `0444`, so the write of the child
 fails on both forms. The read-only remount is a second layer.
+
+Finding 6 of the review of step 4.2 (a panic of a worker when the runtime
+stops during a question) did not happen in a test. With tokio 1.49 the
+stop of the runtime ends the task of the session, the channel of the
+question closes, and `block_on` returns a deny. The code keeps `block_on`,
+and `a_question_of_the_supervisor_ends_with_a_deny_when_the_runtime_stops`
+guards the behaviour: it passes on both forms. The first form of
+`the_questions_that_wait_have_one_shared_limit` did not stop on its
+mutant: it waited for a slot with no time limit. The wait now has a limit
+of 5 s.
 
 The first form of `a_pinned_socket_keeps_its_target_after_a_swap_of_the_path`
 did not stop on its mutant: the connection went to the other socket, which

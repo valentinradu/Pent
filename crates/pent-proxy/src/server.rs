@@ -621,6 +621,19 @@ pub enum ConfigError {
         #[source]
         source: std::net::AddrParseError,
     },
+    /// The limit of the questions that wait is not below the limit of the
+    /// slots of a server, so the questions could hold each slot.
+    #[error(
+        "the limit of the questions that wait ({questions}) must be below the limit of the {server} ({slots})"
+    )]
+    QuestionLimit {
+        /// The limit of the questions (see `SharedState::question_limit`).
+        questions: usize,
+        /// The server: "DNS queries" or "proxy connections".
+        server: &'static str,
+        /// The limit of the slots of the server.
+        slots: usize,
+    },
 }
 
 /// Convert a `ProxySettings` fragment (from `pent-settings`) into a `ProxyConfig`.

@@ -20,7 +20,9 @@ use pent_sandbox::{
 use pent_settings::{ConfigLoader, ProfileStore, RuleStore};
 
 use crate::cli::{NetworkModeArg, RunArgs};
-use crate::commands::decide::{Decider, FlagLists, Grants, ProxyDecider, SandboxDecider};
+use crate::commands::decide::{
+    flag_warnings, Decider, FlagLists, Grants, ProxyDecider, SandboxDecider,
+};
 use crate::commands::session::{
     drain, exit_like_child, forward_std, forward_tokio, is_broad_workspace, start_proxy,
     wait_child, ForwardStop, ProxyChannels, SessionCleanup, SignalRelay,
@@ -116,10 +118,16 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
         crate::daemon::classes::Classes::new(&home, &crate::daemon::server::pent_dirs())
     });
     let grants = Grants::of(&rules, classes.as_ref(), Path::is_dir);
+    // The flag layer takes the workspace as the user wrote it, and the
+    // canonical form too (see `FlagLists::rules`).
+    let written_workspace = args
+        .workspace
+        .as_deref()
+        .map(|dir| cwd.join(pent_settings::expand_home(dir)));
     let decider = std::sync::Arc::new(make_decider(
         &args,
         &cwd,
-        workspace.as_deref(),
+        written_workspace.as_deref(),
         classes,
         rules,
         hold_pentd(&key, &args.command),
@@ -376,6 +384,11 @@ fn make_decider(
         localhost: &args.localhost,
     }
     .rules(rules.key.clone(), cwd);
+    if let Some(classes) = &classes {
+        for line in flag_warnings(&flags, classes) {
+            ui::warn(line);
+        }
+    }
     Decider::new(flags, rules, classes, session)
 }
 
