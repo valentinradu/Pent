@@ -51,7 +51,9 @@ const KEY: &str = "probe";
 
 /// Run `pent run` with the key `probe` and the python script `script`.
 fn run_sandboxed(env: &TestEnv, script: &str) -> std::io::Result<std::process::Output> {
-    env.pent(&["run", "--key", KEY, "--", "python3", "-I", "-c", script])
+    env.pent(&[
+        "run", "-w", "--key", KEY, "--", "python3", "-I", "-c", script,
+    ])
 }
 
 /// The output of pent and of the child, as one text.
@@ -547,7 +549,7 @@ fn a_listed_localhost_port_reaches_the_host_and_no_other_port() -> TestResult {
     ];
     for (case, rules, flags) in cases {
         env.install_rules(KEY, &rules)?;
-        let mut args: Vec<&str> = vec!["run", "--key", KEY];
+        let mut args: Vec<&str> = vec!["run", "-w", "--key", KEY];
         args.extend(flags.iter().map(String::as_str));
         args.extend(["--", "python3", "-I", "-c", &script]);
         let out = env.pent(&args)?;
@@ -593,6 +595,7 @@ fn a_listed_localhost_port_reaches_the_host_and_no_other_port() -> TestResult {
     env.install_rules(KEY, &[&port_rule])?;
     let out = env.pent(&[
         "run",
+        "-w",
         "--network",
         "blocked",
         "--key",
@@ -641,7 +644,7 @@ except OSError as e:
 "#
     );
     let out = env.pent(&[
-        "run", "--trace", "--key", KEY, "--", "python3", "-I", "-c", &script,
+        "run", "-w", "--trace", "--key", KEY, "--", "python3", "-I", "-c", &script,
     ])?;
     let text = out_text(&out);
     assert!(text.contains("CLOSED BLOCKED"), "{text}");
@@ -826,7 +829,9 @@ print("OPEN AFTER %.2f" % (time.monotonic() - start), data)
 t.join()
 "#
     );
-    let out = env.pent(&["run", "--key", KEY, "--", "python3", "-I", "-c", &script])?;
+    let out = env.pent(&[
+        "run", "-w", "--key", KEY, "--", "python3", "-I", "-c", &script,
+    ])?;
     let text = out_text(&out);
     let after: f64 = text
         .lines()
@@ -1014,6 +1019,7 @@ except OSError as e:
     );
     let out = env.pent(&[
         "run",
+        "-w",
         "--key",
         KEY,
         "--network",

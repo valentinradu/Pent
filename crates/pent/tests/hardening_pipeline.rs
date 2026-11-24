@@ -313,7 +313,7 @@ fn p5_cli_run_refuses_a_rule_file_that_is_not_valid() -> TestResult {
         ),
     ] {
         common::write_rule_file(&env.state, "tool", &bad)?;
-        let out = env.pent(&["run", "--", "tool"])?;
+        let out = env.pent(&["run", "-w", "--", "tool"])?;
         assert!(!out.status.success(), "{bad}\n{}", stderr(&out));
         assert!(
             stderr(&out).contains(&path.display().to_string()),
@@ -328,7 +328,7 @@ fn p5_cli_run_refuses_a_rule_file_that_is_not_valid() -> TestResult {
     fs::write(&target, &valid)?;
     fs::remove_file(&path)?;
     std::os::unix::fs::symlink(&target, &path)?;
-    let out = env.pent(&["run", "--", "tool"])?;
+    let out = env.pent(&["run", "-w", "--", "tool"])?;
     assert!(!out.status.success(), "{}", stderr(&out));
     assert!(
         stderr(&out).contains(&path.display().to_string()),

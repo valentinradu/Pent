@@ -104,7 +104,7 @@ impl Harness {
 
     /// Run `pent run --key <key> -- <argv>` and return the output.
     fn run(&self, argv: &[&str]) -> std::io::Result<Output> {
-        let mut full = vec![PENT, "run", "--key", self.key, "--"];
+        let mut full = vec![PENT, "run", "-w", "--key", self.key, "--"];
         full.extend_from_slice(argv);
         self.command(&full).output()
     }
@@ -615,6 +615,7 @@ fn test_workspace_under_tmp_still_works() -> TestResult {
     let mut cmd = h.command(&[
         PENT,
         "run",
+        "-w",
         "--",
         "sh",
         "-c",
@@ -1073,6 +1074,7 @@ fn test_a_path_dir_outside_the_system_paths_is_not_in_the_base() -> TestResult {
         .command(&[
             PENT,
             "run",
+            "-w",
             "--key",
             h.key,
             "--",
@@ -1091,5 +1093,97 @@ fn test_a_path_dir_outside_the_system_paths_is_not_in_the_base() -> TestResult {
         !text.contains("TOOL_READ"),
         "LS-6: the child read a file of a PATH directory outside the base:\n{text}"
     );
+    Ok(())
+}
+
+// ============================================================================
+// The workspace flag (step 4.2)
+// ============================================================================
+
+/// LS-7: without `-w` the workspace is not in the base: the child cannot
+/// read or write the working directory. `-w=DIR` gives DIR, and not the
+/// working directory.
+#[test]
+fn test_the_workspace_is_in_the_base_only_with_the_flag() -> TestResult {
+    if skip_without_sandbox() {
+        return Ok(());
+    }
+    let h = Harness::new("sh")?;
+    std::fs::write(h.workspace.join("secret"), "WORKSPACE_DATA")?;
+    let other = h.base.join("other");
+    std::fs::create_dir_all(&other)?;
+    // The probe goes in `outside`: without `-w` the child cannot read a
+    // script in the workspace.
+    let probe = h.outside.join("probe.sh");
+    std::fs::write(
+        &probe,
+        format!(
+            "echo PENT_CHILD_RAN\ncat secret\necho X > made && echo WS_WRITE_OK\n\
+             echo Y > '{o}/made' && echo OTHER_WRITE_OK\n",
+            o = other.display()
+        ),
+    )?;
+    let probe = probe.to_str().unwrap();
+    let read_probe = format!("--read={}", h.outside.display());
+    let run = |flags: &[&str]| {
+        let mut argv = vec![PENT, "run", "--key", h.key];
+        argv.extend_from_slice(flags);
+        argv.extend_from_slice(&["--", "sh", probe]);
+        h.command(&argv).output()
+    };
+
+    let bare = combined(&run(&[&read_probe])?);
+    assert_child_ran(&bare);
+    assert!(
+        !bare.contains("WORKSPACE_DATA"),
+        "LS-7: the child read the workspace:\n{bare}"
+    );
+    assert!(
+        !bare.contains("WS_WRITE_OK"),
+        "LS-7: the child wrote the workspace:\n{bare}"
+    );
+    assert!(!h.workspace.join("made").exists());
+
+    let with = combined(&run(&["-w", &read_probe])?);
+    assert!(with.contains("WORKSPACE_DATA"), "-w gives no read:\n{with}");
+    assert!(with.contains("WS_WRITE_OK"), "-w gives no write:\n{with}");
+    assert!(
+        !with.contains("OTHER_WRITE_OK"),
+        "-w gave another directory:\n{with}"
+    );
+    std::fs::remove_file(h.workspace.join("made"))?;
+
+    let flag = format!("-w={}", other.display());
+    let elsewhere = combined(&run(&[&flag, &read_probe])?);
+    assert!(
+        elsewhere.contains("OTHER_WRITE_OK"),
+        "-w=DIR gives no write:\n{elsewhere}"
+    );
+    assert!(
+        !elsewhere.contains("WS_WRITE_OK") && !elsewhere.contains("WORKSPACE_DATA"),
+        "-w=DIR also gave the working directory:\n{elsewhere}"
+    );
+    Ok(())
+}
+
+/// `-w=DIR` with a path that is not a directory stops the run before the
+/// command starts, and the message names the path.
+#[test]
+fn test_a_workspace_that_is_not_a_directory_stops_the_run() -> TestResult {
+    let h = Harness::new("sh")?;
+    let file = h.outside.join("file");
+    std::fs::write(&file, "x")?;
+    let flag = format!("-w={}", file.display());
+    let marker = h.outside.join("ran");
+    let script = format!("touch '{}'", marker.display());
+    let out = h
+        .command(&[
+            PENT, "run", "--key", h.key, &flag, "--", "sh", "-c", &script,
+        ])
+        .output()?;
+    assert!(!out.status.success());
+    let text = combined(&out);
+    assert!(text.contains(&file.display().to_string()), "{text}");
+    assert!(!marker.exists(), "the command started");
     Ok(())
 }

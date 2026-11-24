@@ -88,7 +88,7 @@ fn test_run_with_a_bad_rule_file_names_the_file() -> TestResult {
         "claude",
         "version = 1\n[[rule]]\nkind = \"nothing\"\n",
     )?;
-    let out = pent(&xdg, &["run", "--", "claude"])?;
+    let out = pent(&xdg, &["run", "-w", "--", "claude"])?;
     expect_failure(&out);
     let err = stderr(&out);
     assert!(err.contains(&path.display().to_string()), "{err}");
@@ -105,7 +105,7 @@ fn test_run_with_key_flag_has_no_generic_warning() -> TestResult {
     let path = write_rules(&xdg, "train", "not toml [\n")?;
     let out = pent(
         &xdg,
-        &["run", "--key", "train", "--", "python3", "train.py"],
+        &["run", "-w", "--key", "train", "--", "python3", "train.py"],
     )?;
     expect_failure(&out);
     let err = stderr(&out);
@@ -122,7 +122,7 @@ fn test_run_generic_command_warns() -> TestResult {
     let xdg = Xdg::new()?;
     // The warning comes before the sandbox starts, thus the test does not
     // check the status of the run: it depends on the sandbox of the host.
-    let out = pent(&xdg, &["run", "--", "bash", "-c", "true"])?;
+    let out = pent(&xdg, &["run", "-w", "--", "bash", "-c", "true"])?;
     let err = stderr(&out);
     assert!(
         err.contains("the key \"bash\" comes from a generic command"),
@@ -138,7 +138,7 @@ fn test_run_generic_command_warns() -> TestResult {
 #[test]
 fn test_run_invalid_key_fails() -> TestResult {
     let xdg = Xdg::new()?;
-    let out = pent(&xdg, &["run", "--key", "../x", "--", "true"])?;
+    let out = pent(&xdg, &["run", "-w", "--key", "../x", "--", "true"])?;
     expect_failure(&out);
     assert!(
         stderr(&out).contains("give a key with --key NAME"),
@@ -146,7 +146,7 @@ fn test_run_invalid_key_fails() -> TestResult {
         stderr(&out)
     );
     // A command whose file name is not a valid key needs --key too.
-    let out = pent(&xdg, &["run", "--", "/tmp/a b"])?;
+    let out = pent(&xdg, &["run", "-w", "--", "/tmp/a b"])?;
     expect_failure(&out);
     assert!(
         stderr(&out).contains("give a key with --key NAME"),
@@ -460,7 +460,7 @@ fn test_config_init_show_and_old_keys() -> TestResult {
     }
 
     // `pent run` reads the global settings too.
-    let out = pent(&xdg, &["run", "--", "claude"])?;
+    let out = pent(&xdg, &["run", "-w", "--", "claude"])?;
     expect_failure(&out);
     assert!(
         stderr(&out).contains("`profiles` was removed"),
@@ -478,8 +478,8 @@ fn test_removed_commands_fail() -> TestResult {
         &["config", "rm", "@npm"][..],
         &["config", "trust", "--yes"][..],
         &["config", "untrust"][..],
-        &["run", "--no-config", "--", "true"][..],
-        &["run", "--profile", "claude", "--", "true"][..],
+        &["run", "-w", "--no-config", "--", "true"][..],
+        &["run", "-w", "--profile", "claude", "--", "true"][..],
     ] {
         let out = pent(&xdg, args)?;
         expect_failure(&out);

@@ -196,7 +196,7 @@ pub(crate) async fn watch(args: WatchArgs, cwd: PathBuf) -> Result<(), CliError>
     let mut sandbox_cfg = SandboxConfig::from_sandbox_settings(
         settings.sandbox,
         SandboxPaths::default(),
-        cwd.clone(),
+        Some(cwd.clone()),
         cwd.clone(),
     )
     .with_network(network)

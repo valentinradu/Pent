@@ -47,8 +47,7 @@
 //! ```text
 //! Ruleset (deny-all baseline)
 //!   |
-//!   +-- Allow workspace (rw)
-//!   +-- Allow data_dir (rw)
+//!   +-- Allow workspace (rw), only with `pent run -w`
 //!   +-- Allow mounts (per config)
 //!   +-- Allow PATH dirs inside a system path (read+exec)
 //!   +-- Allow execute paths (exec, no read)
@@ -275,8 +274,7 @@ pub fn compute_accessible_set(
     {
         accessible.insert(p.clone());
     }
-    accessible.insert(config.workspace.clone());
-    accessible.insert(config.data_dir.clone());
+    accessible.extend(config.workspace.iter().cloned());
     for mount in &config.mounts {
         accessible.insert(mount.path.clone());
     }
@@ -960,8 +958,11 @@ fn add_ruleset_rules(
     overlay_dirs: &HashSet<PathBuf>,
     resolv_target: Option<&Path>,
 ) {
-    ruleset.add_rule(&config.workspace, access::ALL);
-    ruleset.add_rule(&config.data_dir, access::ALL);
+    // The workspace of `pent run -w`. Without the flag it is not in the
+    // base. It keeps exec until phase 5, where exec asks.
+    if let Some(workspace) = &config.workspace {
+        ruleset.add_rule(workspace, access::ALL);
+    }
     for mount in &config.mounts {
         let a = if mount.readonly {
             access::READ
@@ -1009,8 +1010,7 @@ fn add_ruleset_rules(
         .filter(|path| {
             !write_set.iter().any(|w| w.starts_with(path))
                 && !rw.iter().any(|(w, _)| w.starts_with(path))
-                && *path != &config.workspace
-                && *path != &config.data_dir
+                && config.workspace.as_ref() != Some(*path)
         })
         .collect();
     for dir in overlay_dirs {
@@ -2094,8 +2094,7 @@ fn configured_paths(config: &SandboxConfig) -> Vec<PathBuf> {
         .collect();
     v.extend(config.mounts.iter().map(|m| m.path.clone()));
     v.extend(config.unix_sockets.iter().cloned());
-    v.push(config.workspace.clone());
-    v.push(config.data_dir.clone());
+    v.extend(config.workspace.iter().cloned());
     v.push(config.cwd.clone());
     v
 }
@@ -2124,8 +2123,7 @@ fn bind_back_paths(config: &SandboxConfig) -> Vec<PathBuf> {
     // The Unix socket list is not here. A socket below a private
     // directory stays hidden, and the supervisor connects to it from the
     // host, where the tmpfs of the child does not apply.
-    v.push(config.workspace.clone());
-    v.push(config.data_dir.clone());
+    v.extend(config.workspace.iter().cloned());
     v.push(config.cwd.clone());
     v
 }
@@ -3243,10 +3241,9 @@ pub(crate) fn spawn_linux(
             }
         })
         .collect();
-    // The workspace and data_dir are always flushed back: they may fall inside
-    // an overlayfs mount (e.g. the home-dir overlay).
-    rw_dirs.insert(config.workspace.clone());
-    rw_dirs.insert(config.data_dir.clone());
+    // The workspace is always flushed back: it may fall inside an
+    // overlayfs mount (e.g. the home-dir overlay).
+    rw_dirs.extend(config.workspace.iter().cloned());
 
     // Build the set of paths the sandboxed process is allowed to read.
     // Traversal-only paths are intentionally excluded (ReadDir but not ReadFile).
@@ -3275,7 +3272,7 @@ pub(crate) fn spawn_linux(
 
     let home_dir: PathBuf = std::env::var("HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| config.workspace.clone());
+        .unwrap_or_else(|_| config.cwd.clone());
 
     let pid = std::process::id();
     let overlay_mounts = if enforce {
@@ -3468,8 +3465,9 @@ pub(crate) fn spawn_linux(
         }
     }
     if enforce {
-        let dot_pent = config.workspace.join(".pent");
-        if dot_pent.exists() {
+        // Without a workspace the child cannot write there anyway.
+        let dot_pent = config.workspace.as_ref().map(|w| w.join(".pent"));
+        if let Some(dot_pent) = dot_pent.filter(|p| p.exists()) {
             mounts.readonly.extend(to_cstring(&dot_pent));
         }
         mounts
@@ -3693,7 +3691,6 @@ mod tests {
 
     struct TestDirs {
         workspace: PathBuf,
-        data_dir: PathBuf,
         _temp: TempDir,
     }
 
@@ -3701,12 +3698,9 @@ mod tests {
         #[allow(clippy::unwrap_used)] // infra-only helper, no meaningful error recovery
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("workspace");
-        let data_dir = temp.path().join("data");
         std::fs::create_dir_all(&workspace).ok();
-        std::fs::create_dir_all(&data_dir).ok();
         TestDirs {
             workspace,
-            data_dir,
             _temp: temp,
         }
     }
@@ -3952,7 +3946,6 @@ mod tests {
             SandboxPaths::default(),
             PathBuf::from("/tmp/test-workspace"),
         )
-        .with_data_dir(PathBuf::from("/tmp/test-data"))
     }
 
     #[test]
@@ -4002,8 +3995,7 @@ mod tests {
             PathBuf::from("/nonexistent/workspace/12345"),
             SandboxPaths::default(),
             PathBuf::from("/tmp"),
-        )
-        .with_data_dir(PathBuf::from("/nonexistent/data/12345"));
+        );
         let result = build_landlock_ruleset(&config, &[]);
         // Should not fail due to nonexistent paths - they're skipped
         if check_available().is_ok() {
@@ -4025,8 +4017,7 @@ mod tests {
             dirs.workspace.clone(),
             SandboxPaths::default(),
             dirs.workspace.clone(),
-        )
-        .with_data_dir(dirs.data_dir);
+        );
         let Some(true_bin) = which("true") else {
             return Ok(()); // skip: no `true` in PATH
         };
@@ -4066,8 +4057,7 @@ mod tests {
             dirs.workspace.clone(),
             SandboxPaths::default(),
             dirs.workspace.clone(),
-        )
-        .with_data_dir(dirs.data_dir);
+        );
         let Some(echo_bin) = which("echo") else {
             return Ok(()); // skip: no `echo` in PATH
         };
@@ -4112,8 +4102,7 @@ mod tests {
             dirs.workspace.clone(),
             SandboxPaths::default(),
             dirs.workspace.clone(),
-        )
-        .with_data_dir(dirs.data_dir);
+        );
         let env = HashMap::new();
 
         let result = spawn_with_landlock(&config, "/nonexistent/command/12345", &[], &env, &[]);
@@ -4287,7 +4276,6 @@ mod tests {
             .push(sentinel.to_str().unwrap().to_string());
 
         let config = SandboxConfig::new(workspace.to_path_buf(), paths, workspace.to_path_buf())
-            .with_data_dir(workspace.to_path_buf())
             .with_env(HashMap::new());
 
         let (test_env, path_dirs) = host_path_env();
@@ -4367,7 +4355,6 @@ mod tests {
         // workspace is intentionally NOT in read_write — it's the workspace arg.
 
         let config = SandboxConfig::new(workspace.clone(), paths, workspace.clone())
-            .with_data_dir(workspace)
             .with_env(HashMap::new());
 
         let (test_env, path_dirs) = host_path_env();
@@ -4780,7 +4767,6 @@ mod tests {
         // added to rw_dirs automatically and its files are flushed.
 
         let config = SandboxConfig::new(workspace.clone(), paths, workspace.clone())
-            .with_data_dir(workspace)
             .with_env(HashMap::new());
         let (test_env, path_dirs) = host_path_env();
 
@@ -4867,9 +4853,8 @@ mod tests {
             .read_write
             .push(target.to_str().unwrap_or("").to_string());
 
-        let config = SandboxConfig::new(workspace.clone(), paths, workspace)
-            .with_data_dir(temp.path().to_path_buf())
-            .with_env(HashMap::new());
+        let config =
+            SandboxConfig::new(workspace.clone(), paths, workspace).with_env(HashMap::new());
 
         let (test_env, path_dirs) = host_path_env();
 
@@ -4973,7 +4958,7 @@ mod tests {
     /// `rw_files` are added to `read_write` (file-level entries, which trigger
     /// overlay mounts via the MCA algorithm).  `rw_dirs` are added as directory
     /// entries so their writes are flushed back.  The command's working
-    /// directory and data_dir are both `work_dir`.
+    /// directory and the workspace are both `work_dir`.
     #[allow(clippy::too_many_arguments)]
     fn spawn_with_fake_home(
         fake_home: &std::path::Path,
@@ -5004,7 +4989,6 @@ mod tests {
         }
 
         let config = SandboxConfig::new(work_dir.to_path_buf(), paths, work_dir.to_path_buf())
-            .with_data_dir(work_dir.to_path_buf())
             .with_env(HashMap::new());
 
         let (test_env, path_dirs) = host_path_env();
@@ -5764,7 +5748,6 @@ mod tests {
             SandboxPaths::default(),
             workspace.to_path_buf(),
         )
-        .with_data_dir(workspace.join("data"))
     }
 
     #[test]
@@ -6174,7 +6157,6 @@ mod tests {
             SandboxPaths::default(),
             dirs.workspace.clone(),
         )
-        .with_data_dir(dirs.data_dir)
         .with_network(NetworkMode::LocalhostOnly);
         let mut path_dirs = test_path_dirs(&sh);
         path_dirs.extend(test_path_dirs(&id_bin));
@@ -6216,7 +6198,6 @@ mod tests {
             SandboxPaths::default(),
             dirs.workspace.clone(),
         )
-        .with_data_dir(dirs.data_dir)
         .with_network(NetworkMode::ProxyOnly {
             proxy_addr: crate::linux_proxynet::child_proxy_addr(),
             dns_port: crate::linux_proxynet::CHILD_DNS_PORT,
@@ -6307,11 +6288,46 @@ mod tests {
         v
     }
 
+    /// Without `pent run -w` the workspace is not in the base: no rule
+    /// gives the working directory a right.
+    #[test]
+    fn a_run_with_no_workspace_gives_the_cwd_no_right() -> TestResult {
+        use pent_profile::{FsOp, Outcome};
+        // A directory outside each base path: a test directory below
+        // `/tmp` would get the right of the temporary directory. The policy
+        // keeps a rule only for a path that exists.
+        let temp = tempfile::Builder::new()
+            .prefix(".pent-test-ws-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))?;
+        let ws = std::fs::canonicalize(temp.path())?;
+        let config = SandboxConfig::new(ws.clone(), SandboxPaths::default(), ws.clone());
+        let file = ws.join("a.txt");
+        let predict = |config: &SandboxConfig, op| {
+            let mut policy = AccessPolicy::default();
+            add_ruleset_rules(
+                &mut policy,
+                config,
+                &[],
+                &[],
+                &HashSet::new(),
+                &HashSet::new(),
+                None,
+            );
+            policy.predict(op, &file, false)
+        };
+        assert_eq!(predict(&config, FsOp::Write), Outcome::Allowed);
+        let bare = config.with_workspace(None);
+        assert_eq!(predict(&bare, FsOp::Read), Outcome::Denied);
+        assert_eq!(predict(&bare, FsOp::Write), Outcome::Denied);
+        assert!(!compute_accessible_set(&bare, &[], &[]).contains(&ws));
+        Ok(())
+    }
+
     #[test]
     fn access_policy_predicts_landlock() -> TestResult {
         use pent_profile::{FsOp, Outcome};
         let dirs = make_test_dirs();
-        let mut config = SandboxConfig::new(
+        let config = SandboxConfig::new(
             dirs.workspace.clone(),
             SandboxPaths {
                 traversal: vec!["/".to_string()],
@@ -6321,7 +6337,6 @@ mod tests {
             },
             dirs.workspace.clone(),
         );
-        config.data_dir = dirs.data_dir.clone();
         let mut policy = AccessPolicy::default();
         add_ruleset_rules(
             &mut policy,

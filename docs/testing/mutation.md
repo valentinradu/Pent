@@ -164,6 +164,12 @@ makes one mutation by hand. The test must fail on the mutant. No
 | 4.1 (review) | `DecidedBy::decision` gives the opposite decision. | `protocol::tests::only_a_deny_a_deadline_and_a_hidden_file_are_refusals` |
 | 4.1 (review) | The mask of the machine identifier binds one file two times. | `linux::tests::the_machine_id_mask_covers_each_copy_one_time` |
 | 4.1 (review) | The forbidden directories keep only the form of the caller. | `linux_unixconn::tests::a_question_asks_only_for_an_existing_path_outside_pent` |
+| 4.2 | `-w` takes the next word as its directory. | `cli::tests::the_workspace_flag_takes_its_directory_only_after_an_equals_sign` |
+| 4.2 | Landlock gives the working directory a right without `-w`. | `test_the_workspace_is_in_the_base_only_with_the_flag` |
+| 4.2 | The sandbox ignores the workspace of the CLI. | `test_the_workspace_is_in_the_base_only_with_the_flag` |
+| 4.2 | `-w=DIR` gives the working directory instead of DIR. | `test_the_workspace_is_in_the_base_only_with_the_flag` |
+| 4.2 | The flag layer has no rule for the workspace. | `decide::tests::the_workspace_flag_gives_each_kind_in_its_subtree` |
+| 4.2 | A workspace that is a file does not stop the run. | `test_a_workspace_that_is_not_a_directory_stops_the_run` |
 
 One mutant of step 4.1 survives, and it is equivalent: a bind of the
 machine identifier with no read-only remount. Landlock gives `/etc` no

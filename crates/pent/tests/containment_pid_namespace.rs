@@ -191,7 +191,7 @@ fn the_child_sees_only_the_processes_of_the_sandbox() -> TestResult {
         v = victim.pid
     );
     let out = env.pent(&[
-        "run", "--key", "python3", "--", "python3", "-I", "-c", &script,
+        "run", "-w", "--key", "python3", "--", "python3", "-I", "-c", &script,
     ])?;
     let all = assert_ran(&out);
     // The positive control: the child sees itself, and the victim still
@@ -244,6 +244,7 @@ fn the_exit_code_of_the_command_reaches_the_caller() -> TestResult {
     for code in [0, 1, 7, 42, 127, 255] {
         let out = env.pent(&[
             "run",
+            "-w",
             "--key",
             "sh",
             "--",
@@ -333,7 +334,7 @@ fn kill_self_under_pent(env: &TestEnv, sig: libc::c_int) -> std::io::Result<Outp
          time.sleep(5)\n"
     );
     env.pent(&[
-        "run", "--key", "python3", "--", "python3", "-I", "-c", &script,
+        "run", "-w", "--key", "python3", "--", "python3", "-I", "-c", &script,
     ])
 }
 
@@ -352,7 +353,7 @@ fn the_exit_code_passes_while_a_grandchild_still_runs() -> TestResult {
     let env = TestEnv::new()?;
     let script = format!("echo {RAN}; ( sleep 60 ) & setsid sh -c 'sleep 60' & exit 7");
     let start = Instant::now();
-    let out = env.pent(&["run", "--key", "sh", "--", "sh", "-c", &script])?;
+    let out = env.pent(&["run", "-w", "--key", "sh", "--", "sh", "-c", &script])?;
     let took = start.elapsed();
     let all = assert_ran(&out);
     assert_eq!(
@@ -378,7 +379,7 @@ fn the_signal_passes_while_a_grandchild_still_runs() -> TestResult {
     }
     let env = TestEnv::new()?;
     let script = format!("echo {RAN}; setsid sh -c 'sleep 60' & kill -TERM $$; sleep 10");
-    let out = env.pent(&["run", "--key", "sh", "--", "sh", "-c", &script])?;
+    let out = env.pent(&["run", "-w", "--key", "sh", "--", "sh", "-c", &script])?;
     let all = assert_ran(&out);
     assert_eq!(
         out.status.signal(),
@@ -414,7 +415,7 @@ fn no_process_of_the_session_survives_the_run() -> TestResult {
             "echo {RAN}; {start} sleep 0.5; exit 0",
             start = body.replace("BEAT", &format!("'{}'", beat_script.display()))
         );
-        let out = env.pent(&["run", "--key", "sh", "--", "sh", "-c", &script])?;
+        let out = env.pent(&["run", "-w", "--key", "sh", "--", "sh", "-c", &script])?;
         let all = assert_ran(&out);
         // The positive control: the background process really started.
         assert!(
@@ -466,7 +467,7 @@ fn a_grandchild_does_not_outlive_a_command_that_exits_at_once() -> TestResult {
         b = beat_script.display(),
         beat = beat.display()
     );
-    let out = env.pent(&["run", "--key", "sh", "--", "sh", "-c", &script])?;
+    let out = env.pent(&["run", "-w", "--key", "sh", "--", "sh", "-c", &script])?;
     let all = assert_ran(&out);
     assert!(
         beat.exists(),
@@ -512,7 +513,7 @@ fn a_process_of_the_sandbox_cannot_signal_a_process_of_the_host() -> TestResult 
         v = victim.pid
     );
     let out = env.pent(&[
-        "run", "--key", "python3", "--", "python3", "-I", "-c", &script,
+        "run", "-w", "--key", "python3", "--", "python3", "-I", "-c", &script,
     ])?;
     let all = assert_ran(&out);
     assert!(
@@ -552,7 +553,7 @@ fn pent_forwards_its_signals_to_the_command() -> TestResult {
             r = ready_file.display()
         );
         let child = env
-            .command(&["run", "--key", "sh", "--", "sh", "-c", &script])
+            .command(&["run", "-w", "--key", "sh", "--", "sh", "-c", &script])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;

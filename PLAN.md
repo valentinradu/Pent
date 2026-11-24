@@ -1,6 +1,6 @@
 # Plan: the new pent
 
-**Cursor: step 4.2.** Steps with `[x]` are done. Work on the branch `next`,
+**Cursor: step 5.1.** Steps with `[x]` are done. Work on the branch `next`,
 one commit for each step, and move this cursor when a step is done.
 
 **The way of work.** One commit for each step. Then the user runs
@@ -247,11 +247,26 @@ not their structure.
       `cgroup.procs` stays closed.
     - The directory of the command itself (`binary_grant_dirs`) stays in
       the base until phase 5 makes exec ask.
-- [ ] **4.2 The flags.** `--workspace` / `-w [DIR]` gives read-write access
+- [x] **4.2 The flags.** `--workspace` / `-w [DIR]` gives read-write access
   to the directory for one run. Without it, the workspace is not in the
   base. `--read`, `--write`, `--execute`, `--allow`, `--unix-socket` and
   `--localhost` are answers in advance for one run and do not become
   rules. `--key NAME` replaces `--profile`.
+  - Files: `pent/src/cli.rs`, `commands/run.rs` (`resolve_workspace`),
+    `commands/decide.rs` (`FlagLists::workspace`), `error.rs`;
+    `SandboxConfig::workspace` in `pent-sandbox/src/config.rs` and its uses
+    in `linux.rs`; RN-27, RN-28 in `docs/security/run.md`, LS-7 in
+    `docs/security/linux-sandbox.md`.
+  - The other flags were answers in advance already (step 3.1), and
+    `--key` came in step 3.1.
+  - Decisions (2026-11-24):
+    - `-w` takes its directory only after `=` (`-w=DIR`,
+      `--workspace=DIR`), so `pent run -w cargo build` runs `cargo`.
+    - `-w` gives list, read, write and exec. Exec goes when phase 5 makes
+      exec ask.
+    - `--data-dir` and `--traverse` are gone. `SandboxConfig` has no
+      `data_dir`, and `workspace` is an `Option`.
+    - The tests of `pent run` take `-w`, so they keep their meaning.
 
 ## Phase 5: files, with FUSE and grafts
 

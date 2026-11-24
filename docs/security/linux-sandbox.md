@@ -22,6 +22,7 @@ message when the sandbox or `python3` is not available.
 | LS-3 | Medium | The child reads the command line of a host process. | Fixed on a host; absent in a container, with a warning | `test_proc_cmdline_of_host_process_denied` |
 | LS-4 | Low | The child reads and changes the shared memory of the host in `/dev/shm`, when a rule gives `/dev/shm`. | Fixed (step 4.1) | `test_dev_shm_is_private` |
 | LS-5 | Low | The child reads `/etc/machine-id`, a fixed identifier of the machine (and its copy in `/var/lib/dbus`, when a rule gives it). | Fixed (step 4.1) | `test_machine_id_is_random_for_each_run` |
+| LS-7 | Medium | The child reads and writes the working directory with no flag and no rule. | Fixed (step 4.2) | `test_the_workspace_is_in_the_base_only_with_the_flag` |
 | LS-6 | Medium | The child reads and runs the programs of each directory of `PATH`, also `~/.local/bin`, `~/.cargo/bin` and a directory below `/tmp`. | Fixed (step 4.1) | `test_a_path_dir_outside_the_system_paths_is_not_in_the_base` |
 
 ### LS-1 — Path Unix socket connect bypasses the file allowlist
@@ -138,8 +139,9 @@ outside the sandbox.
 
 Pent binds back only what the session needs:
 
-- the workspace, the `data_dir` and the `cwd` (a scratch workspace under
-  `/tmp` keeps working);
+- the workspace of `pent run -w` and the `cwd` (a scratch workspace under
+  `/tmp` keeps working; without `-w` the `cwd` is visible, but Landlock
+  gives it no right, see LS-7);
 - every configured path (read, read-write, execute, traversal, mounts);
 - each directory of `PATH` whose canonical target is inside a system path
   (LS-6);
@@ -436,6 +438,24 @@ removes this grant, when the exec of a file asks.
 `a_path_directory_below_a_private_directory_stays_hidden` and
 `the_base_holds_a_path_dir_only_inside_a_system_path`.
 
+### LS-7 — the workspace (step 4.2)
+
+**The attack.** Landlock gave the working directory all rights in each
+run. A program started in a directory that it should only read (a clone
+of an unknown repository, the home directory) changed each file below it.
+
+**The fix.** The workspace is in the base only with `pent run -w`, or
+`-w=DIR` for another directory. `SandboxConfig::workspace` is `None`
+without the flag, so no Landlock rule names the working directory. The
+flag gives list, read, write and exec (exec goes in phase 5), and it is an
+answer in advance for this run, never a rule. `--data-dir` is gone: it gave
+a second read-write directory with no question.
+
+**The evidence.** `test_the_workspace_is_in_the_base_only_with_the_flag`
+(no read and no write without the flag, both with `-w`, and only DIR with
+`-w=DIR`), `test_a_workspace_that_is_not_a_directory_stops_the_run` and
+`a_run_with_no_workspace_gives_the_cwd_no_right`.
+
 ### The CPU files and the limits of the cgroup
 
 A runtime sizes its thread pool from `/sys/devices/system/cpu` and from the
@@ -505,6 +525,7 @@ Each test below passes. It guards a defense that works.
 | The child sees a random `machine-id` for each run, read-only. | `test_machine_id_is_random_for_each_run` |
 | The child reads the CPU files and the limits of its cgroup, not `cgroup.procs`. | `test_cpu_and_cgroup_limits_are_readable` |
 | A directory of `PATH` outside the system paths is not in the base. | `test_a_path_dir_outside_the_system_paths_is_not_in_the_base` |
+| The working directory is in the base only with `-w`. | `test_the_workspace_is_in_the_base_only_with_the_flag` |
 
 ## The next step
 

@@ -30,6 +30,12 @@ pub(crate) enum CliError {
     #[error("{0}")]
     Daemon(#[from] crate::daemon::DaemonError),
 
+    #[error("the workspace {} is not usable: {source}", path.display())]
+    Workspace {
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
+
     #[error("{0}")]
     Other(String),
 }

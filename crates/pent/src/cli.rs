@@ -122,6 +122,20 @@ pub(crate) struct RunArgs {
     #[arg(long, value_name = "NAME")]
     pub key: Option<String>,
 
+    /// Give the workspace read, write and exec access for this run: the
+    /// current directory, or DIR with -w=DIR. Without this flag the
+    /// workspace is not in the base, and pent does not keep the flag as a
+    /// rule
+    #[arg(
+        short = 'w',
+        long,
+        value_name = "DIR",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "."
+    )]
+    pub workspace: Option<PathBuf>,
+
     /// Network containment mode. Without it, DNS, the proxy, the Unix
     /// sockets and the ports ask a question for each access that no rule
     /// answers. `blocked` refuses each such access with no question, and
@@ -147,10 +161,6 @@ pub(crate) struct RunArgs {
     #[arg(long = "execute", value_name = "PATH")]
     pub execute: Vec<PathBuf>,
 
-    /// Add a traversal-only filesystem path for this run (repeatable)
-    #[arg(long = "traverse", value_name = "PATH")]
-    pub traverse: Vec<PathBuf>,
-
     /// Let the command connect to this Unix socket for this run. The rule
     /// is strong: a program that reaches the socket of an agent can use the
     /// key of that agent (repeatable)
@@ -166,10 +176,6 @@ pub(crate) struct RunArgs {
     /// Allow or set an environment variable (KEY or KEY=VALUE; repeatable)
     #[arg(long = "env", value_name = "KEY[=VALUE]")]
     pub env: Vec<String>,
-
-    /// Override the sandbox data directory
-    #[arg(long, value_name = "PATH")]
-    pub data_dir: Option<PathBuf>,
 
     /// Write sandbox and proxy events to ~/.local/state/pent/trace/NAME.log,
     /// and record the
@@ -292,4 +298,46 @@ pub(crate) enum ConfigSubcommand {
 pub(crate) enum OutputFormat {
     Toml,
     Json,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The run arguments of `argv`, or `None` when clap refuses them.
+    fn run_args(argv: &[&str]) -> Option<RunArgs> {
+        match Cli::try_parse_from(argv).ok()?.command {
+            Command::Run(args) => Some(args),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn the_workspace_flag_takes_its_directory_only_after_an_equals_sign() {
+        let plain = run_args(&["pent", "run", "-w", "cargo", "build"]);
+        assert_eq!(
+            plain
+                .as_ref()
+                .map(|a| (a.workspace.clone(), a.command.clone())),
+            Some((
+                Some(PathBuf::from(".")),
+                vec!["cargo".to_string(), "build".to_string()]
+            ))
+        );
+        let other = run_args(&["pent", "run", "-w=../x", "--", "make"]);
+        assert_eq!(other.and_then(|a| a.workspace), Some(PathBuf::from("../x")));
+        let long = run_args(&["pent", "run", "--workspace=/srv/a", "true"]);
+        assert_eq!(
+            long.and_then(|a| a.workspace),
+            Some(PathBuf::from("/srv/a"))
+        );
+        let none = run_args(&["pent", "run", "true"]);
+        assert_eq!(none.map(|a| a.workspace), Some(None));
+    }
+
+    #[test]
+    fn the_old_flags_of_run_are_gone() {
+        assert!(run_args(&["pent", "run", "--data-dir", "/x", "true"]).is_none());
+        assert!(run_args(&["pent", "run", "--traverse", "/x", "true"]).is_none());
+    }
 }

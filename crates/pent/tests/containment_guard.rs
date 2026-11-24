@@ -370,6 +370,7 @@ fn an_inherited_descriptor_does_not_reach_the_command() -> TestResult {
     let raw = file.as_raw_fd();
     let mut cmd = env.command(&[
         "run",
+        "-w",
         "--key",
         "sh",
         "--",

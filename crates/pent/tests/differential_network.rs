@@ -92,6 +92,7 @@ printf 'CODE=%s\n' "$code"
         install_domain_rules(&env, case.domains, case.host)?;
         let out = env.pent(&[
             "run",
+            "-w",
             "--key",
             KEY,
             "--trace",
@@ -220,6 +221,7 @@ printf 'CODE=%s\n' "$code"
         install_domain_rules(&env, &["www.iana.org", "10-0-0-1.sslip.io"], "example.com")?;
         let out = env.pent(&[
             "run",
+            "-w",
             "--key",
             KEY,
             "--trace",

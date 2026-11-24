@@ -1,6 +1,6 @@
 # The rules in `pent run`
 
-Status: the branch `next`, phase 3 of `PLAN.md` (steps 3.1 to 3.5, 2026-11-23). This report
+Status: the branch `next`, phase 3 and step 4.2 of `PLAN.md` (steps 3.1 to 3.5, 2026-11-23; step 4.2, 2026-11-24). This report
 lists the security properties of the rules in `pent run`: the key, the
 chain of deciders, the grants that the rules give to the static layers,
 and the events of a run. It gives the test of each property, and the
@@ -91,13 +91,15 @@ cargo test -p pent --test pentd pent_denials_shows_the_refusals_of_a_real_run
 | RN-24 | `--network blocked` refuses a Unix socket, a port and a name off the lists with no question. It starts no proxy and no DNS server. | `network_blocked_asks_no_question_for_a_socket` |
 | RN-26 | Without `--network`, a run is in proxy mode, with or without a domain rule, so DNS, the proxy, the Unix sockets and the ports ask. `--network` takes only `blocked` and `unrestricted`; `unrestricted` gives the network of the host and asks nothing for the network. | `run::tests::the_default_is_the_proxy_which_asks`, `network_flag_wins_over_everything`, `a_proxy_question_waits_for_a_deny`, `a_dns_question_waits_for_a_deny` |
 | RN-25 | The supervisor sends the event of each question also without `--trace`, so `pent denials` shows the refusal and names the answer. | `a_unix_socket_question_decides_the_connection` |
+| RN-27 | Without `-w` the workspace is not in the base: the program cannot read or write the working directory, and an access there needs a rule or a flag. `-w` gives the working directory, and `-w=DIR` gives DIR and not the working directory: list, read, write and exec in the subtree, in Landlock and in the flag layer of the chain. Exec goes when phase 5 makes exec ask. `-w` takes DIR only after `=`, so `pent run -w cargo build` runs `cargo`. A DIR that does not exist or is not a directory stops the run before the command starts, and the message names it. | `test_the_workspace_is_in_the_base_only_with_the_flag`, `test_a_workspace_that_is_not_a_directory_stops_the_run`, `linux::tests::a_run_with_no_workspace_gives_the_cwd_no_right`, `decide::tests::the_workspace_flag_gives_each_kind_in_its_subtree`, `cli::tests::the_workspace_flag_takes_its_directory_only_after_an_equals_sign`, `run::tests::the_workspace_resolves_against_the_cwd_and_must_be_a_directory` |
+| RN-28 | The flags (`-w`, `--read`, `--write`, `--execute`, `--allow`, `--unix-socket`, `--localhost`) are answers in advance for one run: they go into the flag layer of the chain and into the static layers, and pent never writes them to a rule file. `--data-dir` and `--traverse` are gone. | `decide::tests::the_flags_become_rules_of_the_flag_layer`, `cli::tests::the_old_flags_of_run_are_gone` |
 
 ## The limits
 
 - **A deny rule and the base.** The static layers cannot refuse a path that
   the base gives. A deny rule for a path in `/usr` or `/etc` has no effect
-  until phase 5. A deny rule inside the workspace has no effect until
-  step 4.2 makes the workspace a flag.
+  until phase 5. A deny rule inside the workspace of `-w` has no effect:
+  the flag wins over the rule (see the next point).
 - **A flag wins over a rule.** The user gives a flag for this run, so a flag
   wins over a deny rule, and a flag allows a sensitive path. Pent does not
   check a flag against the pent class or the guard list.

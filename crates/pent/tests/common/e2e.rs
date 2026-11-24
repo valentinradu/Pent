@@ -468,7 +468,7 @@ pub fn sandbox_ready(test: &str) -> bool {
             }
             let outside = env.root.join("outside");
             let script = format!("echo probe > '{}'", outside.display());
-            let out = env.pent(&["run", "--key", "probe", "--", "sh", "-c", &script])?;
+            let out = env.pent(&["run", "-w", "--key", "probe", "--", "sh", "-c", &script])?;
             if outside.exists() {
                 return Ok(Err("the sandbox does not enforce its rules".to_string()));
             }

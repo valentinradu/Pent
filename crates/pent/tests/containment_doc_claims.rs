@@ -82,7 +82,7 @@ fn the_filter_blocks_tiocsti_and_tioclinux() -> TestResult {
          \x20   print(tag, r, ctypes.get_errno())\n"
     );
     let out = env.pent(&[
-        "run", "--key", "python3", "--", "python3", "-I", "-c", &script,
+        "run", "-w", "--key", "python3", "--", "python3", "-I", "-c", &script,
     ])?;
     let all = assert_ran(&out);
     // The positive control: an ioctl that the filter does not trap still
@@ -120,7 +120,7 @@ fn the_dot_pent_directory_of_the_workspace_is_read_only() -> TestResult {
          echo EVIL > .pent/keep 2>&1; echo OVER rc=$?; \
          echo OK > plain.txt; echo PLAIN rc=$?"
     );
-    let out = env.pent(&["run", "--key", "sh", "--", "sh", "-c", &script])?;
+    let out = env.pent(&["run", "-w", "--key", "sh", "--", "sh", "-c", &script])?;
     let all = assert_ran(&out);
     // The positive control: the workspace itself is read-write.
     assert!(
@@ -175,7 +175,7 @@ fn the_rules_cover_the_full_process_tree() -> TestResult {
         format!("cat allowed.txt\npython3 -I '{d}'\n", d = deep.display()),
     )?;
     let script = format!("echo {RAN}; sh -c \"sh '{i}'\"", i = inner.display());
-    let out = env.pent(&["run", "--key", "sh", "--", "sh", "-c", &script])?;
+    let out = env.pent(&["run", "-w", "--key", "sh", "--", "sh", "-c", &script])?;
     let all = assert_ran(&out);
     assert!(
         all.contains("PENT_ALLOWED_DATA"),
@@ -215,7 +215,7 @@ fn pent_ignores_sigint_and_lets_the_command_see_it() -> TestResult {
         r = ready_file.display()
     );
     let child = env
-        .command(&["run", "--key", "sh", "--", "sh", "-c", &script])
+        .command(&["run", "-w", "--key", "sh", "--", "sh", "-c", &script])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
@@ -258,6 +258,7 @@ fn the_private_directories_keep_their_modes() -> TestResult {
     let env = TestEnv::new()?;
     let out = env.pent(&[
         "run",
+        "-w",
         "--key",
         "sh",
         "--",
@@ -310,6 +311,7 @@ fn a_path_directory_below_a_private_directory_stays_hidden() -> TestResult {
     let out = env
         .command(&[
             "run",
+            "-w",
             "--key",
             "sh",
             "--",
@@ -361,6 +363,7 @@ fn a_named_agent_socket_still_works_behind_the_mask() -> TestResult {
     );
     let out = env.pent(&[
         "run",
+        "-w",
         "--key",
         "python3",
         "--unix-socket",
@@ -454,7 +457,7 @@ fn kind_of(env: &TestEnv, path: &Path, extra: &[&str]) -> std::io::Result<Output
          print('KIND', stat.S_IFMT(os.stat({p:?}).st_mode) == stat.S_IFSOCK)\n",
         p = path.display().to_string()
     );
-    let mut args = vec!["run", "--key", "python3"];
+    let mut args = vec!["run", "-w", "--key", "python3"];
     args.extend_from_slice(extra);
     args.extend_from_slice(&["--", "python3", "-I", "-c", &script]);
     env.pent(&args)

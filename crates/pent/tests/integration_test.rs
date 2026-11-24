@@ -79,7 +79,12 @@ fn expect_failure(out: &Output) {
 #[allow(clippy::panic)] // infrastructure helper: setup failure is a hard test setup error
 fn sandboxed_run(workspace: &Path, extra_args: &[String], cmd_args: &[&str]) -> Output {
     let xdg = Xdg::new().unwrap_or_else(|e| panic!("cannot make the XDG directories: {e}"));
-    let mut args: Vec<String> = vec!["run".into(), "--key".into(), TEST_PROFILE.into()];
+    let mut args: Vec<String> = vec![
+        "run".into(),
+        "-w".into(),
+        "--key".into(),
+        TEST_PROFILE.into(),
+    ];
     args.extend_from_slice(extra_args);
     args.push("--".into());
     for a in cmd_args {
@@ -386,7 +391,7 @@ mod no_hang {
         let (ok, stderr) = pent_timeout(
             dir.path(),
             home.path(),
-            &["run", "--key", TEST_PROFILE, "--", "true"],
+            &["run", "-w", "--key", TEST_PROFILE, "--", "true"],
             2,
         );
         assert!(ok, "pent run -- true timed out (2s)\nstderr:\n{stderr}");
@@ -403,6 +408,7 @@ mod no_hang {
             home.path(),
             &[
                 "run",
+                "-w",
                 "--key",
                 TEST_PROFILE,
                 "--network",
@@ -431,7 +437,15 @@ mod no_hang {
         let (ok, stderr) = pent_timeout(
             dir.path(),
             home.path(),
-            &["run", "--key", TEST_PROFILE, "--", "curl", "--version"],
+            &[
+                "run",
+                "-w",
+                "--key",
+                TEST_PROFILE,
+                "--",
+                "curl",
+                "--version",
+            ],
             2,
         );
         assert!(
@@ -464,7 +478,7 @@ mod no_hang {
         let (ok, stderr) = pent_timeout(
             dir.path(),
             home.path(),
-            &["run", "--key", TEST_PROFILE, "--", bin_s, "--version"],
+            &["run", "-w", "--key", TEST_PROFILE, "--", bin_s, "--version"],
             5,
         );
         assert!(
@@ -496,7 +510,7 @@ mod no_hang {
         let (ok, stderr) = pent_timeout(
             dir.path(),
             home.path(),
-            &["run", "--key", TEST_PROFILE, "--", bin_s, "--version"],
+            &["run", "-w", "--key", TEST_PROFILE, "--", bin_s, "--version"],
             5, // the proxy setup takes much less than 1s; allow 5s total
         );
         assert!(
@@ -785,7 +799,7 @@ mod no_hang {
         let dir = TempDir::new().unwrap();
         // Write the rules; keep TempDir alive so the rule file persists.
         let (agent_home, flags) = setup_agent_config(agent);
-        let mut args = vec!["run", "--key", agent, "--network", "unrestricted"];
+        let mut args = vec!["run", "-w", "--key", agent, "--network", "unrestricted"];
         args.extend(flags.iter().map(String::as_str));
         args.extend(["--", bin_s]);
 

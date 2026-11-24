@@ -127,7 +127,7 @@ printf 'rc=%s\n' "$?"
     /// The arguments of `pent run` with the key of this file. `extra`
     /// comes before `--`, and `command` after it.
     fn run_args<'a>(extra: &[&'a str], command: &[&'a str]) -> Vec<&'a str> {
-        let mut args = vec!["run", "--key", KEY];
+        let mut args = vec!["run", "-w", "--key", KEY];
         args.extend_from_slice(extra);
         args.push("--");
         args.extend_from_slice(command);

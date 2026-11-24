@@ -103,6 +103,11 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
     if let Some(warning) = generic_key_warning(&key, args.key.as_deref()) {
         ui::warn(warning);
     }
+    let workspace = args
+        .workspace
+        .as_deref()
+        .map(|dir| resolve_workspace(dir, &cwd))
+        .transpose()?;
     let rules = RuleStore::open_default()?.load(&key)?;
     let settings = ConfigLoader::load(&cwd, pent_settings::PentDirs::from_env().as_ref())?;
     // After the settings and the rules: a run that fails on them starts no
@@ -114,6 +119,7 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
     let decider = std::sync::Arc::new(make_decider(
         &args,
         &cwd,
+        workspace.as_deref(),
         classes,
         rules,
         hold_pentd(&key, &args.command),
@@ -201,17 +207,20 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
         .as_ref()
         .map_or_else(|| base_network_mode(decision.choice), |p| p.network.clone());
 
-    // The workspace is always read-write. If it is `/` or the home directory,
-    // the sandbox gives write access to almost all user files.
-    if !args.no_sandbox && is_broad_workspace(&cwd) {
+    // `-w` gives the workspace read-write access. If it is `/` or the home
+    // directory, the sandbox gives write access to almost all user files.
+    if let Some(dir) = workspace
+        .as_deref()
+        .filter(|d| !args.no_sandbox && is_broad_workspace(d))
+    {
         ui::warn(format!(
             "the workspace is {}; the sandboxed process can change all files below it",
-            cwd.display()
+            dir.display()
         ));
     }
 
     let mut sandbox_cfg =
-        SandboxConfig::from_sandbox_settings(settings.sandbox, paths, cwd.clone(), cwd.clone())
+        SandboxConfig::from_sandbox_settings(settings.sandbox, paths, workspace, cwd.clone())
             .with_network(resolved_network)
             .with_env(env_map);
     sandbox_cfg.record_events = args.trace;
@@ -225,10 +234,6 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
             decider: std::sync::Arc::clone(&decider),
             runtime: tokio::runtime::Handle::current(),
         }));
-    }
-
-    if let Some(data_dir) = args.data_dir {
-        sandbox_cfg = sandbox_cfg.with_data_dir(data_dir);
     }
 
     if args.no_sandbox {
@@ -330,17 +335,39 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
     exit_like_child(exit_status)
 }
 
-/// The chain of deciders of the run: the flags, the rules `rules`, the
-/// classes of the user and the hold on pentd.
+/// The canonical path of the workspace of `-w=DIR`. A relative `dir`
+/// resolves against `cwd`.
+///
+/// # Errors
+/// `CliError::Workspace` when the path does not exist or is not a
+/// directory.
+fn resolve_workspace(dir: &Path, cwd: &Path) -> Result<PathBuf, CliError> {
+    let path = cwd.join(pent_settings::expand_home(dir));
+    let fail = |source| CliError::Workspace {
+        path: path.clone(),
+        source,
+    };
+    let real = std::fs::canonicalize(&path).map_err(fail)?;
+    if !real.is_dir() {
+        return Err(fail(std::io::Error::from(
+            std::io::ErrorKind::NotADirectory,
+        )));
+    }
+    Ok(real)
+}
+
+/// The chain of deciders of the run: the flags (with the workspace of
+/// `-w`), the rules `rules`, the classes of the user and the hold on pentd.
 fn make_decider(
     args: &RunArgs,
     cwd: &Path,
+    workspace: Option<&Path>,
     classes: Option<crate::daemon::classes::Classes>,
     rules: RuleSet,
     session: Option<crate::daemon::client::Session>,
 ) -> Decider {
     let flags = FlagLists {
-        traverse: &args.traverse,
+        workspace,
         read: &args.read,
         write: &args.write,
         execute: &args.execute,
@@ -359,7 +386,6 @@ fn add_cli_paths(paths: &mut pent_settings::SandboxPaths, args: &RunArgs) {
             .map(|p| p.to_string_lossy().into_owned())
             .collect()
     };
-    paths.traversal.extend(strings(&args.traverse));
     paths.read.extend(strings(&args.read));
     paths.read_write.extend(strings(&args.write));
     paths.execute.extend(strings(&args.execute));
@@ -794,6 +820,34 @@ fn proxy_violation_fix(violation: &str) -> String {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    // ── resolve_workspace ────────────────────────────────────────────────────
+
+    #[test]
+    fn the_workspace_resolves_against_the_cwd_and_must_be_a_directory(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let root = std::fs::canonicalize(temp.path())?;
+        assert!(std::fs::create_dir(root.join("ws")).is_ok());
+        assert!(std::fs::write(root.join("file"), "x").is_ok());
+        assert_eq!(
+            resolve_workspace(Path::new("."), &root.join("ws")).ok(),
+            Some(root.join("ws"))
+        );
+        assert_eq!(
+            resolve_workspace(Path::new("../ws"), &root.join("ws")).ok(),
+            Some(root.join("ws"))
+        );
+        assert!(matches!(
+            resolve_workspace(Path::new("missing"), &root),
+            Err(CliError::Workspace { .. })
+        ));
+        assert!(matches!(
+            resolve_workspace(Path::new("file"), &root),
+            Err(CliError::Workspace { .. })
+        ));
+        Ok(())
+    }
 
     // ── resolve_network ──────────────────────────────────────────────────────
 

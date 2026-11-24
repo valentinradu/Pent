@@ -179,7 +179,7 @@ mod linux {
         let env = TestEnv::new()?;
         let flags = install_agent_rules(&env, agent)?;
         let run = |script: &str| {
-            let mut args = vec!["run", "--key", agent, "--network", "unrestricted"];
+            let mut args = vec!["run", "-w", "--key", agent, "--network", "unrestricted"];
             args.extend(flags.iter().map(String::as_str));
             args.extend(["--", "sh", "-c", script]);
             env.pent(&args)
@@ -227,7 +227,7 @@ mod linux {
         let env = TestEnv::new()?;
         let flags = install_agent_rules(&env, agent)?;
         let curl = |url: &str| {
-            let mut args = vec!["run", "--key", agent];
+            let mut args = vec!["run", "-w", "--key", agent];
             args.extend(flags.iter().map(String::as_str));
             args.extend([
                 "--",
@@ -293,7 +293,7 @@ mod linux {
         let foorc = foorc.to_str().ok_or("the path is not UTF-8")?;
         let marker = env.ws.join("ran");
         let script = format!("touch ran; cat '{foorc}' 2>/dev/null || echo HIDDEN");
-        let run = || env.pent(&["run", "--key", "m", "--", "sh", "-c", &script]);
+        let run = || env.pent(&["run", "-w", "--key", "m", "--", "sh", "-c", &script]);
 
         let out = run()?;
         assert!(out.status.success(), "{}", stderr(&out));
@@ -400,6 +400,7 @@ mod linux {
 
         let out = env.pent(&[
             "run",
+            "-w",
             "--key",
             "t",
             "--",
@@ -730,7 +731,7 @@ mod linux {
         // refuses example.org at once.
         env.install_rules("net", &["domain example.com", "deny domain example.org"])?;
         let run = |args: &[String]| {
-            let mut all = vec!["run", "--key", "net", "--"];
+            let mut all = vec!["run", "-w", "--key", "net", "--"];
             all.extend(args.iter().map(String::as_str));
             env.pent(&all)
         };
@@ -794,7 +795,9 @@ mod linux {
             "cat '{}'; curl -sS -o /dev/null --max-time 10 https://denied.example; true",
             outside.display()
         );
-        let out = env.pent(&["run", "--key", "tr", "--trace", "--", "sh", "-c", &script])?;
+        let out = env.pent(&[
+            "run", "-w", "--key", "tr", "--trace", "--", "sh", "-c", &script,
+        ])?;
         assert!(out.status.success(), "{}", stderr(&out));
         assert!(!stdout(&out).contains("secret"), "the read was not denied");
 
@@ -848,7 +851,7 @@ mod linux {
         let nap = format!("300.{}", std::process::id());
         let script = format!("touch started; exec sleep {nap}");
         let mut child = env
-            .command(&["run", "--key", "sig", "--", "sh", "-c", &script])
+            .command(&["run", "-w", "--key", "sig", "--", "sh", "-c", &script])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()?;

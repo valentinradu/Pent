@@ -117,7 +117,7 @@ fn only_the_named_path_under_tmp_comes_back() -> TestResult {
         s = sibling.display(),
         r = env.runtime.display()
     );
-    let out = env.pent(&["run", "--key", "sh", "--", "sh", "-c", &script])?;
+    let out = env.pent(&["run", "-w", "--key", "sh", "--", "sh", "-c", &script])?;
     let all = assert_ran(&out);
     let _ = std::fs::remove_dir_all(&named);
     let _ = std::fs::remove_dir_all(&sibling);
@@ -173,7 +173,7 @@ fn a_workspace_under_tmp_works_and_hides_the_rest() -> TestResult {
         "echo {RAN}; cat input; echo OUT > output; cat '{v}' 2>&1",
         v = victim.display()
     );
-    let mut cmd = env.command(&["run", "--key", "sh", "--", "sh", "-c", &script]);
+    let mut cmd = env.command(&["run", "-w", "--key", "sh", "--", "sh", "-c", &script]);
     cmd.current_dir(&ws);
     let out = cmd.output()?;
     let all = assert_ran(&out);
@@ -216,7 +216,7 @@ fn no_setting_shares_tmp_with_the_host() -> TestResult {
         v = victim.display()
     );
     let out = env.pent(&[
-        "run", "--key", "sh", "--write", "/tmp", "--", "sh", "-c", &script,
+        "run", "-w", "--key", "sh", "--write", "/tmp", "--", "sh", "-c", &script,
     ])?;
     let all = assert_ran(&out);
     let _ = std::fs::remove_file(&victim);
@@ -252,7 +252,7 @@ fn the_runtime_dir_is_empty_and_tmpdir_follows_the_rule() -> TestResult {
         "echo {RAN}; echo INSIDE $(ls -a \"$TMPDIR\" | tr '\\n' ' '); cat \"$TMPDIR/leak\" 2>&1",
     );
     let out = env
-        .command(&["run", "--key", "sh", "--", "sh", "-c", &script])
+        .command(&["run", "-w", "--key", "sh", "--", "sh", "-c", &script])
         .env("TMPDIR", &inside)
         .output()?;
     let all = assert_ran(&out);
@@ -277,7 +277,7 @@ fn the_runtime_dir_is_empty_and_tmpdir_follows_the_rule() -> TestResult {
 
     let script = format!("echo {RAN}; cat \"$TMPDIR/keep\"");
     let out = env
-        .command(&["run", "--key", "sh", "--", "sh", "-c", &script])
+        .command(&["run", "-w", "--key", "sh", "--", "sh", "-c", &script])
         .env("TMPDIR", &outside)
         .output()?;
     let all = assert_ran(&out);
@@ -299,7 +299,7 @@ fn the_runtime_dir_is_empty_and_tmpdir_follows_the_rule() -> TestResult {
         "echo {RAN}; echo RT $(ls -a '{r}' | tr '\\n' ' '); echo W > '{r}/probe'; echo rc=$?",
         r = runtime.display()
     );
-    let out = env.pent(&["run", "--key", "sh", "--", "sh", "-c", &script])?;
+    let out = env.pent(&["run", "-w", "--key", "sh", "--", "sh", "-c", &script])?;
     let all = assert_ran(&out);
     let _ = std::fs::remove_dir_all(&inside);
     let line = all
@@ -333,6 +333,7 @@ fn each_private_directory_is_nosuid_and_nodev() -> TestResult {
     let env = TestEnv::new()?;
     let out = env.pent(&[
         "run",
+        "-w",
         "--key",
         "sh",
         "--",
@@ -391,7 +392,7 @@ fn the_child_cannot_reach_the_staging_directory_of_the_overlay() -> TestResult {
         a = allowed.display(),
         s = env.home_path("data/secret.txt").display()
     );
-    let out = env.pent(&["run", "--key", "sh", "--", "sh", "-c", &script])?;
+    let out = env.pent(&["run", "-w", "--key", "sh", "--", "sh", "-c", &script])?;
     let all = assert_ran(&out);
     assert_allowed(&all, "PENT_ALLOWED_DATA", "the read-write file");
     assert_allowed(&all, "rc=0", "the write to the read-write file");
@@ -441,7 +442,7 @@ fn the_child_cannot_read_or_change_the_store_of_pent() -> TestResult {
         o = own.display(),
         c = settings.display()
     );
-    let out = env.pent(&["run", "--key", "sh", "--", "sh", "-c", &script])?;
+    let out = env.pent(&["run", "-w", "--key", "sh", "--", "sh", "-c", &script])?;
     let all = assert_ran(&out);
     assert_allowed(&all, "PENT_ALLOWED_DATA", "the read-write file");
     assert_absent(
@@ -505,6 +506,7 @@ fn an_agent_socket_of_the_home_directory_is_covered() -> TestResult {
     );
     let out = env.pent(&[
         "run",
+        "-w",
         "--key",
         "python3",
         "--read",
@@ -558,7 +560,7 @@ fn a_symbolic_link_in_a_bound_path_does_not_lead_outside() -> TestResult {
          echo UP $(ls '{n}/up' 2>&1 | tr '\\n' ' ')",
         n = named.display()
     );
-    let out = env.pent(&["run", "--key", "sh", "--", "sh", "-c", &script])?;
+    let out = env.pent(&["run", "-w", "--key", "sh", "--", "sh", "-c", &script])?;
     let all = assert_ran(&out);
     let _ = std::fs::remove_dir_all(&named);
     let _ = std::fs::remove_file(&host_tmp_victim);
@@ -619,7 +621,7 @@ fn the_child_cannot_undo_a_mount() -> TestResult {
         v = victim.display().to_string()
     );
     let out = env.pent(&[
-        "run", "--key", "python3", "--", "python3", "-I", "-c", &script,
+        "run", "-w", "--key", "python3", "--", "python3", "-I", "-c", &script,
     ])?;
     let all = assert_ran(&out);
     let _ = std::fs::remove_file(&victim);
@@ -681,7 +683,7 @@ fn a_nested_user_namespace_does_not_remove_the_private_directories() -> TestResu
         v = victim.display().to_string()
     );
     let out = env.pent(&[
-        "run", "--key", "python3", "--", "python3", "-I", "-c", &script,
+        "run", "-w", "--key", "python3", "--", "python3", "-I", "-c", &script,
     ])?;
     let all = assert_ran(&out);
     let _ = std::fs::remove_file(&victim);

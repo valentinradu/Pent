@@ -77,7 +77,7 @@ command = ["sh", "-c", "notify-send -A open=Open pent \"$PENT_PENDING programs n
 
 | Command | Description |
 |---|---|
-| `pent run [-w [DIR]] -- CMD` | Run a command. `--read`, `--write`, `--allow DOMAIN` and the other flags answer in advance for one run. |
+| `pent run [-w[=DIR]] -- CMD` | Run a command. `--read`, `--write`, `--allow DOMAIN` and the other flags answer in advance for one run. |
 | `pent monitor` | Answer the questions. |
 | `pent rules list` / `show KEY` / `forget KEY` | Read and change your rules. |
 | `pent judge download NAME` | Download a tested model. |

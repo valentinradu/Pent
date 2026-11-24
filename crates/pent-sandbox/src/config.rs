@@ -90,16 +90,14 @@ pub fn system_default_paths() -> SandboxPaths {
 /// Specifies filesystem access, network mode, environment, and working directory.
 #[derive(Debug, Clone)]
 pub struct SandboxConfig {
-    /// Workspace directory — always granted read-write access.
-    pub workspace: PathBuf,
+    /// The workspace: read, write and exec for this run (`pent run -w`).
+    /// `None` when the user gives no `-w`: the workspace is then not in the
+    /// base, and an access to it needs a rule or a flag.
+    pub workspace: Option<PathBuf>,
 
     /// Sandbox filesystem paths (traversal, read, execute, `read_write`).
     /// Applied by the Linux Landlock ruleset.
     pub paths: SandboxPaths,
-
-    /// Application data directory (e.g. `~/.myapp`) — read-write inside sandbox.
-    /// Used by the Linux Landlock ruleset.
-    pub data_dir: PathBuf,
 
     /// Additional mount points exposed inside the sandbox.
     /// Used by the Linux Landlock ruleset.
@@ -172,14 +170,14 @@ impl SandboxConfig {
     /// Create a new sandbox config with default network mode (`Blocked`).
     ///
     /// # Arguments
-    /// * `workspace` - Workspace directory (read-write)
+    /// * `workspace` - Workspace directory (read-write). Use
+    ///   [`SandboxConfig::with_workspace`] for a run with no workspace.
     /// * `paths` - Sandbox filesystem paths
     /// * `cwd` - Working directory
     #[must_use]
     pub fn new(workspace: PathBuf, paths: SandboxPaths, cwd: PathBuf) -> Self {
         Self {
-            data_dir: workspace.clone(),
-            workspace,
+            workspace: Some(workspace),
             paths,
             mounts: Vec::new(),
             env: HashMap::new(),
@@ -207,10 +205,10 @@ impl SandboxConfig {
         self
     }
 
-    /// Set the application data directory (used by Linux Landlock).
+    /// Set the workspace, or `None` for a run with no workspace.
     #[must_use]
-    pub fn with_data_dir(mut self, data_dir: PathBuf) -> Self {
-        self.data_dir = data_dir;
+    pub fn with_workspace(mut self, workspace: Option<PathBuf>) -> Self {
+        self.workspace = workspace;
         self
     }
 
@@ -230,16 +228,17 @@ impl SandboxConfig {
 
     /// Build a `SandboxConfig` from the global `SandboxSettings` (the
     /// mounts) and the paths of a profile. The profile paths merge on top of
-    /// [`system_default_paths()`].
+    /// [`system_default_paths()`]. `workspace` is `None` for a run with no
+    /// workspace.
     #[must_use]
     pub fn from_sandbox_settings(
         settings: SandboxSettings,
         profile_paths: SandboxPaths,
-        workspace: PathBuf,
+        workspace: Option<PathBuf>,
         cwd: PathBuf,
     ) -> Self {
         let paths = system_default_paths().merge(profile_paths);
-        let mut cfg = Self::new(workspace, paths, cwd);
+        let mut cfg = Self::new(cwd.clone(), paths, cwd).with_workspace(workspace);
         for mount in settings.mounts {
             cfg.mounts.push(mount);
         }
@@ -259,7 +258,7 @@ mod tests {
             PathBuf::from("/workspace"),
         );
 
-        assert_eq!(config.workspace, PathBuf::from("/workspace"));
+        assert_eq!(config.workspace, Some(PathBuf::from("/workspace")));
         assert_eq!(config.network, NetworkMode::Blocked);
     }
 
@@ -286,18 +285,6 @@ mod tests {
         assert_eq!(config.network, NetworkMode::LocalhostOnly);
         assert!(config.env.contains_key("PATH"));
         assert_eq!(config.paths.traversal, vec!["/"]);
-    }
-
-    #[test]
-    fn test_sandbox_config_with_data_dir() {
-        let config = SandboxConfig::new(
-            PathBuf::from("/workspace"),
-            SandboxPaths::default(),
-            PathBuf::from("/workspace"),
-        )
-        .with_data_dir(PathBuf::from("/home/user/.myapp"));
-
-        assert_eq!(config.data_dir, PathBuf::from("/home/user/.myapp"));
     }
 
     #[test]

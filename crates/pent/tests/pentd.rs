@@ -386,7 +386,7 @@ fn pent_run_starts_pentd_and_holds_it_for_the_run() -> TestResult {
     }
     let rt = Runtime::new()?;
     let env = TestEnv::new()?;
-    let mut run = env.command(&["run", "--", "sh", "-c", "sleep 2"]);
+    let mut run = env.command(&["run", "-w", "--", "sh", "-c", "sleep 2"]);
     run.env("XDG_RUNTIME_DIR", rt.xdg())
         .env("PENTD_LINGER_MS", LINGER_MS)
         .stdout(Stdio::null())
@@ -439,7 +439,7 @@ fn the_program_cannot_see_the_socket_of_pentd() -> TestResult {
         dir = rt.pent_dir().display()
     );
     let out = env
-        .command(&["run", "--", "sh", "-c", &script])
+        .command(&["run", "-w", "--", "sh", "-c", &script])
         .env("XDG_RUNTIME_DIR", rt.xdg())
         .env("PENTD_LINGER_MS", LINGER_MS)
         .output()?;
@@ -477,6 +477,7 @@ fn pent_denials_shows_the_refusals_of_a_real_run() -> TestResult {
     let out = env
         .command(&[
             "run",
+            "-w",
             "--trace",
             "--allow",
             "good.example",
@@ -532,6 +533,7 @@ fn answer_a_proxy_question(
     let run = env
         .command(&[
             "run",
+            "-w",
             "--key",
             "fetch",
             "--",
@@ -645,7 +647,7 @@ fn a_proxy_question_waits_for_an_allow() -> TestResult {
 /// Start a run of `script` with no rule for the key `dns`, and give it the
 /// runtime directory of `rt`.
 fn spawn_dns_run(rt: &Runtime, env: &TestEnv, script: &str) -> std::io::Result<Child> {
-    env.command(&["run", "--key", "dns", "--", "sh", "-c", script])
+    env.command(&["run", "-w", "--key", "dns", "--", "sh", "-c", script])
         .env("XDG_RUNTIME_DIR", rt.xdg())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -780,6 +782,7 @@ fn answer_a_socket_question(
     let run = env
         .command(&[
             "run",
+            "-w",
             "--key",
             "probe",
             "--",
@@ -888,6 +891,7 @@ fn a_port_that_the_host_does_not_serve_asks_no_question() -> TestResult {
     let out = env
         .command(&[
             "run",
+            "-w",
             "--key",
             "probe",
             "--",
@@ -936,6 +940,7 @@ fn a_known_decision_of_a_socket_asks_no_question() -> TestResult {
     let out = env
         .command(&[
             "run",
+            "-w",
             "--key",
             "probe",
             "--",
@@ -963,7 +968,7 @@ fn a_known_decision_of_a_socket_asks_no_question() -> TestResult {
          s.connect({target:?})\n    print('GOT', s.recv(5).decode())\n"
     );
     let run = env
-        .command(&["run", "--key", "probe", "--", "python3", "-c", &twice])
+        .command(&["run", "-w", "--key", "probe", "--", "python3", "-c", &twice])
         .env("XDG_RUNTIME_DIR", rt.xdg())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1009,7 +1014,9 @@ fn an_allow_of_a_link_does_not_open_its_target() -> TestResult {
          print('ERR', type(e).__name__)\n"
     );
     let run = env
-        .command(&["run", "--key", "probe", "--", "python3", "-c", &script])
+        .command(&[
+            "run", "-w", "--key", "probe", "--", "python3", "-c", &script,
+        ])
         .env("XDG_RUNTIME_DIR", rt.xdg())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1047,6 +1054,7 @@ fn network_blocked_asks_no_question_for_a_socket() -> TestResult {
     let out = env
         .command(&[
             "run",
+            "-w",
             "--network",
             "blocked",
             "--key",
@@ -1065,6 +1073,7 @@ fn network_blocked_asks_no_question_for_a_socket() -> TestResult {
     let out = env
         .command(&[
             "run",
+            "-w",
             "--network",
             "blocked",
             "--key",
@@ -1126,7 +1135,7 @@ t.join()
 "#;
     let run = env
         .command(&[
-            "run", "--key", "probe", "--", "python3", "-c", script, asked, listed,
+            "run", "-w", "--key", "probe", "--", "python3", "-c", script, asked, listed,
         ])
         .env("XDG_RUNTIME_DIR", rt.xdg())
         .stdout(Stdio::piped())
@@ -1298,7 +1307,7 @@ fn pent_run_does_not_wait_for_a_pentd_that_cannot_start() -> TestResult {
     let env = TestEnv::new()?;
     let begin = Instant::now();
     let out = env
-        .command(&["run", "--", "sh", "-c", "exit 0"])
+        .command(&["run", "-w", "--", "sh", "-c", "exit 0"])
         .env("XDG_RUNTIME_DIR", rt.xdg())
         .output()?;
     let took = begin.elapsed();
@@ -2619,7 +2628,7 @@ fn a_flag_that_names_a_parent_does_not_bring_back_the_socket_of_pentd() -> TestR
     // sandbox (`HeldBack::PentFiles`), so the test names the directory with
     // the flag.
     let out = env
-        .command(&["run", "--read", &runtime, "--", "sh", "-c", &script])
+        .command(&["run", "-w", "--read", &runtime, "--", "sh", "-c", &script])
         .output()?;
     let text = String::from_utf8_lossy(&out.stdout);
     // The positive control: the flag brought the directory back.

@@ -484,8 +484,9 @@ fn request_of(event: &WatchEvent, key: &RuleKey) -> Option<(String, Request, Dec
 /// directory. A flag that is not a valid target stays out of the chain;
 /// the static layer still gets it.
 pub(crate) struct FlagLists<'a> {
-    /// `--traverse`.
-    pub traverse: &'a [PathBuf],
+    /// The workspace of `-w`, canonical: list, read, write and exec in its
+    /// subtree. Exec goes when phase 5 makes exec ask.
+    pub workspace: Option<&'a Path>,
     /// `--read`.
     pub read: &'a [PathBuf],
     /// `--write`.
@@ -520,8 +521,26 @@ impl FlagLists<'_> {
             .ok()
         };
         let mut rules = Vec::new();
+        if let Some(dir) = self
+            .workspace
+            .and_then(|w| RulePath::new(w.to_path_buf()).ok())
+        {
+            rules.extend(
+                [
+                    FileKind::List,
+                    FileKind::Read,
+                    FileKind::Write,
+                    FileKind::Exec,
+                ]
+                .map(|kind| {
+                    rule(Target::File {
+                        kind,
+                        width: PathWidth::Subtree(dir.clone()),
+                    })
+                }),
+            );
+        }
         for (kind, list) in [
-            (FileKind::List, self.traverse),
             (FileKind::Read, self.read),
             (FileKind::Write, self.write),
             (FileKind::Exec, self.execute),
@@ -1069,13 +1088,45 @@ mod tests {
         );
     }
 
+    /// `-w` is an answer in advance for the whole workspace: list, read,
+    /// write and exec in its subtree, for this run only.
+    #[test]
+    fn the_workspace_flag_gives_each_kind_in_its_subtree() {
+        let flags = FlagLists {
+            workspace: Some(Path::new("/srv/ws")),
+            read: &[],
+            write: &[],
+            execute: &[],
+            allow: &[],
+            unix_sockets: &[],
+            localhost: &[],
+        }
+        .rules(key(), Path::new("/home/u"));
+        let texts: Vec<String> = flags.rules.iter().map(|r| r.target.to_string()).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "list /srv/ws/**",
+                "read /srv/ws/**",
+                "write /srv/ws/**",
+                "exec /srv/ws/**",
+            ]
+        );
+        let chain = Decider::new(flags, set(vec![]), classes(), None);
+        assert_eq!(
+            chain.known(&read("/srv/ws/src/main.rs")),
+            Some(DecidedBy::Flag(Decision::Allow))
+        );
+        assert_eq!(chain.known(&read("/srv/other")), None);
+    }
+
     #[test]
     fn the_flags_become_rules_of_the_flag_layer() {
         let read = [PathBuf::from("data"), PathBuf::from("/etc/x")];
         let allow = ["api.example.com".to_string(), "*.com".to_string()];
         let port = [NonZeroU16::new(8080).unwrap()];
         let flags = FlagLists {
-            traverse: &[],
+            workspace: None,
             read: &read,
             write: &[],
             execute: &[],

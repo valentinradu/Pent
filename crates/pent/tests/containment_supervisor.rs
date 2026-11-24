@@ -164,6 +164,7 @@ fn install_socket_rules(env: &TestEnv, sockets: &[&Path]) -> TestResult {
 fn run(env: &TestEnv, script: &str) -> std::io::Result<Output> {
     env.pent(&[
         "run",
+        "-w",
         "--network",
         "blocked",
         "--key",

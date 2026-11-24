@@ -163,6 +163,7 @@ fn run_accepts_the_unix_socket_flag() -> TestResult {
     let socket = socket.to_string_lossy().into_owned();
     let out = env.pent(&[
         "run",
+        "-w",
         "--unix-socket",
         &socket,
         "--unix-socket",
@@ -190,7 +191,7 @@ fn run_accepts_a_socket_rule_of_the_key() -> TestResult {
     let env = Env::new()?;
     let socket = env.home.join(".gnupg/S.gpg-agent");
     env.install_rules("true", &[&format!("unix-socket {}", socket.display())])?;
-    let out = env.pent(&["run", "--", "true"])?;
+    let out = env.pent(&["run", "-w", "--", "true"])?;
     let err = stderr(&out);
     assert!(!err.contains("invalid"), "{err}");
     assert!(!err.contains("does not apply the rule"), "{err}");

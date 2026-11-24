@@ -85,7 +85,7 @@ holds only content that is public, or private to the sandbox.
 These areas are **not** in the base, and each access asks:
 
 - **the workspace.** `pent run --workspace` (`-w`) gives the current
-  directory read-write access for this run. `-w DIR` gives another
+  directory read-write access for this run. `-w=DIR` gives another
   directory. Without the flag, pent asks one time for each program.
 - **the home directory,** also the toolchains in it (`~/.rustup`, `~/.cargo`,
   `~/.nvm`);
@@ -387,7 +387,7 @@ command = ["sh", "-c", "notify-send -A open=Open pent \"$PENT_PENDING programs n
 
 | Command | Description |
 |---|---|
-| `pent run [-w [DIR]] [FLAGS] -- CMD` | Run a command. The flags are answers in advance for this run. |
+| `pent run [-w[=DIR]] [FLAGS] -- CMD` | Run a command. The flags are answers in advance for this run. |
 | `pent monitor` | Answer the questions. |
 | `pent allow ID`, `pent deny ID` | Answer one question from a script. `ID` is a code of 6 characters, for example `k3m9tx`. `--width N` names the target in the menu (the default 0 is the exact target), and `--remember` keeps the answer as a rule. |
 | `pent questions` | List the open questions with their menus (`--json` for a script). |
