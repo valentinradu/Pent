@@ -1223,7 +1223,7 @@ fn write_all_fd(fd: libc::c_int, mut buf: &[u8]) -> std::io::Result<()> {
 }
 
 /// Open `path` for writing and write all of `buf` to it. Async-signal-safe.
-fn write_proc_file(path: &std::ffi::CStr, buf: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_proc_file(path: &std::ffi::CStr, buf: &[u8]) -> std::io::Result<()> {
     // SAFETY: `path` is a valid NUL-terminated string.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let fd = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };

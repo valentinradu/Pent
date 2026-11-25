@@ -14,6 +14,7 @@ result.
 | [protocol.md](protocol.md) | The messages and the codec of `pentd.sock` (branch `next`) |
 | [pentd.md](pentd.md) | The daemon, its socket, its lock and its holds (branch `next`) |
 | [run.md](run.md) | The rules in `pent run`: the key, the chain of deciders, the grants and the events (branch `next`) |
+| [fuse.md](fuse.md) | The FUSE server of the files (branch `next`) |
 | [fuzzing.md](fuzzing.md) | The parsers that read bytes which an attacker chooses: the fuzz run and its findings |
 
 ## The state of the branch `next`
@@ -29,6 +30,8 @@ code of the branch:
   in `pent run`. `pent run` reads the rules of its key and sends its events
   to pentd, but no hook asks a question yet (steps 3.2 to 3.4, and phase 5
   for the files).
+- [fuse.md](fuse.md) describes the FUSE server of phase 5. `pent run` does
+  not use it yet.
 - `pent run` no longer reads profiles or the trust store. The other reports
   still describe the sandbox, the proxy and the supervisor of `pent run`,
   and the flow of version 0.2.x (`pent watch`, `pent trust`). This flow

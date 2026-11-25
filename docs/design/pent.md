@@ -434,6 +434,12 @@ privilege) showed:
   one;
 - a program in a nested user namespace cannot remove a graft (`EPERM`).
 
+**The FUSE server in Rust** (step 5.1, 2026-11-25) showed one more fact:
+the kernel makes the root inode of a FUSE mount with UID 0. In a user
+namespace that maps only the real user, UID 0 has no map, so the kernel
+refuses each write in the root until its first `GETATTR` of the root. The
+helper thus does one `stat` of each mount root after the server runs.
+
 ## 15. Limits
 
 - **The clock does not stop.** A question during the run waits on the real

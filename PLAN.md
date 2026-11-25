@@ -1,6 +1,6 @@
 # Plan: the new pent
 
-**Cursor: step 5.1.** Steps with `[x]` are done. Work on the branch `next`,
+**Cursor: step 5.2.** Steps with `[x]` are done. Work on the branch `next`,
 one commit for each step, and move this cursor when a step is done.
 
 **The way of work.** One commit for each step. Then the user runs
@@ -274,17 +274,35 @@ This is the largest phase. The prototypes are in `docs/design/prototypes/`
 (`fuse_graft.py`, `fuse_writes_exec.py`; run them with `python3 -I`), and
 section 14 of the design has their results.
 
-- [ ] **5.1 The FUSE server.** In Rust, in `pent-sandbox`, mounted by the
+- [x] **5.1 The FUSE server.** In Rust, in `pent-sandbox`, mounted by the
   helper in the user namespace of the session. It answers `INIT` with
   `FUSE_PARALLEL_DIROPS`, handles each request in its own task, and
   implements lookup, getattr, open, read, create, write, rename, mkdir,
   unlink, rmdir, setattr, readdir and release. First decide: our own
   protocol code, or the `fuser` crate with a mount that pent makes itself.
   - Done: tests of each operation against a temporary tree.
+  - Files: `pent-sandbox/src/linux_fuse.rs` (`mount_fuse`, `serve`,
+    `FuseTree`, `Tree`); `write_proc_file` in `linux.rs` is now
+    `pub(crate)`; `--device /dev/fuse` in `.github/workflows/ci.yml` and
+    `e2e/Dockerfile`; FU-1 to FU-8 in `docs/security/fuse.md`.
+  - The server also implements readlink, access, statfs, fsync, flush,
+    opendir and releasedir, because programs use them on each tree.
+  - Decisions (2026-11-25):
+    - The crate `fuser` 0.19 with `Session::from_fd`. Pent makes the mount
+      itself (`mount_fuse`), with no `fusermount` and no libfuse. Pent has
+      no FUSE parser of its own, so no fuzz target.
+    - The child mounts in its user namespace and sends the `/dev/fuse`
+      descriptor to the parent with `SCM_RIGHTS`. The parent serves it,
+      with one thread for each request.
+  - A fact for step 5.2: the kernel makes the root inode with UID 0, so it
+    refuses each write in the root until the first `GETATTR` of the root
+    (FU-8). The helper must `stat` the mount root after the parent serves.
 - [ ] **5.2 The graft helper.** It keeps the capabilities of the session.
   It opens an `O_PATH` descriptor of each area before FUSE covers it, and
   it makes a graft with `open_tree`, `mount_setattr` and `move_mount`. The
-  program runs in a nested user namespace.
+  program runs in a nested user namespace. It mounts each FUSE tree with
+  `mount_fuse` and does one `stat` of each mount root after the parent
+  serves it (FU-8).
   - Done: a graft during a run; the program cannot remove it (`EPERM`).
 - [ ] **5.3 Landlock and the areas.** FUSE covers each area outside the
   base: the home directory, `/usr/local`, `/opt`, and the other directories

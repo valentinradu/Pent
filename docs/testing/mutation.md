@@ -178,6 +178,19 @@ makes one mutation by hand. The test must fail on the mutant. No
 | 4.2 (review) | The mask of the directories of pent is writable. | `test_a_flag_over_a_parent_does_not_open_the_files_of_pent` |
 | 4.2 (review) | A flag gives only the path as written. | `decide::tests::a_flag_through_a_link_gives_both_forms` |
 | 4.2 (review) | A flag over a guard location gives no warning. | `decide::tests::a_flag_over_a_guard_location_gives_a_warning` |
+| 5.1 | The mount options give the numbers in base 10 only. | `linux_fuse::tests::option_text_has_the_numbers` |
+| 5.1 | The mount options fill the last byte, which must stay NUL. | `linux_fuse::tests::option_text_is_cut_and_keeps_the_nul` |
+| 5.1 | A name `..` passes the check of one component. | `linux_fuse::tests::component_refuses_names_that_leave_the_directory` |
+| 5.1 | A time before 1970 keeps its nanoseconds as they are. | `linux_fuse::tests::negative_times_survive` |
+| 5.1 | A create does not set the mode of the request. | `linux_fuse::tests::create_write_and_modes` |
+| 5.1 | `rmdir` removes with the flags of `unlink`. | `linux_fuse::tests::rename_unlink_mkdir_and_rmdir` |
+| 5.1 | `setattr` ignores the size. | `linux_fuse::tests::setattr_mode_size_and_times` |
+| 5.1 | The next offset of a listing is the offset of the entry itself. | `linux_fuse::tests::readdir_lists_all_names` (the listing never ends; the time limit of the test stops it) |
+| 5.1 | `access` always allows. | `linux_fuse::tests::symlink_exec_access_and_statfs` |
+| 5.1 | A known inode gets a new node. | `linux_fuse::tests::a_node_follows_its_inode_after_a_host_rename` |
+| 5.1 | The answer to `INIT` has no `FUSE_PARALLEL_DIROPS`. | `linux_fuse::tests::a_slow_lookup_blocks_no_other_lookup_in_its_directory` |
+| 5.1 | The server waits for each request thread. | `linux_fuse::tests::a_slow_lookup_blocks_no_other_lookup_in_its_directory` |
+| 5.1 | The mount has no `MS_NOSUID`. | `linux_fuse::tests::the_mount_has_nosuid_and_nodev` |
 
 One mutant of step 4.1 survives, and it is equivalent: a bind of the
 machine identifier with no read-only remount. Landlock gives `/etc` no

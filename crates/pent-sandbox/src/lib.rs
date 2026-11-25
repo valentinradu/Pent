@@ -55,6 +55,12 @@ mod linux_unixconn;
 #[cfg(target_os = "linux")]
 mod linux_loopback;
 
+// Step 5.2 (the graft helper) mounts and serves the FUSE tree; until then
+// only the tests use the module.
+#[cfg(target_os = "linux")]
+#[cfg_attr(not(test), allow(dead_code))]
+mod linux_fuse;
+
 pub use config::{system_default_paths, AccessDecider, LocalhostPorts, SandboxConfig};
 pub use env::{build_env, resolve_path_directories, resolve_path_dirs_from};
 #[cfg(target_os = "linux")]

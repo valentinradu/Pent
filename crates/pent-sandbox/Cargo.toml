@@ -13,6 +13,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 dirs = "5"
 libc = "0.2"
+fuser = { version = "0.19", default-features = false }
 
 [dev-dependencies]
 serial_test = "3"

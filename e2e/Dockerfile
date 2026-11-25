@@ -10,7 +10,7 @@
 # Run the tests:
 #   docker run --rm --security-opt seccomp=unconfined \
 #     --security-opt apparmor=unconfined \
-#     --tmpfs /tmp:exec,mode=1777 pent-test
+#     --tmpfs /tmp:exec,mode=1777 --device /dev/fuse pent-test
 #
 # Pent needs no capability. It needs unprivileged user namespaces, and the
 # default seccomp and AppArmor profiles of Docker block unshare(2). Pent
