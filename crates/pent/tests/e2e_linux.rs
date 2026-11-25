@@ -835,9 +835,8 @@ mod linux {
 
     // ── signals ──────────────────────────────────────────────────────────────
 
-    /// SIGTERM to pent ends the child. Pent removes its overlay staging
-    /// directories and exits like the child: killed by SIGTERM (status 143
-    /// in a shell).
+    /// SIGTERM to pent ends the child, no staging directory stays, and pent
+    /// exits like the child: killed by SIGTERM (status 143 in a shell).
     #[test]
     fn sigterm_ends_the_child_and_cleans_up() -> TestResult {
         if !ready("sigterm", &["sh", "sleep"]) {
@@ -870,10 +869,9 @@ mod linux {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert!(
-            !staging_dirs(&env, pid).is_empty(),
-            "the run has no overlay staging directory"
-        );
+        // FUSE covers the home directory (step 5.3), so the write-listed
+        // file needs no overlay, and the run makes no staging directory.
+        assert_eq!(staging_dirs(&env, pid), Vec::<std::path::PathBuf>::new());
         let sleepers = || sleep_processes(&nap);
         let deadline = std::time::Instant::now() + TIMEOUT;
         while sleepers().is_empty() && std::time::Instant::now() < deadline {

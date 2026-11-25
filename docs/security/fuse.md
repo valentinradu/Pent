@@ -1,13 +1,14 @@
 # The FUSE server and the grafts
 
-Status: the branch `next`, steps 5.1 and 5.2 of `PLAN.md` (2026-11-25).
-This report lists the security properties of the FUSE server of pent and
-of the graft helper, the test of each property, and the properties that
-later steps must add.
+Status: the branch `next`, steps 5.1 to 5.3 of `PLAN.md` (2026-11-25).
+This report lists the security properties of the FUSE server of pent, of
+the graft helper and of the FUSE areas, the test of each property, and the
+properties that later steps must add.
 
-The server and the helper work in a sandbox with FUSE areas
-(`SandboxConfig::file_areas`), but `pent run` gives no area yet: step 5.3
-puts FUSE over the areas outside the base, and step 5.4 asks for the
+`pent run` covers each directory outside the base with FUSE
+(`FuseAreas::OutsideBase`), and the server applies the grants of the run:
+the rules, the flags and `-w`. It refuses each other access with `EACCES`
+and asks no question yet: step 5.4 adds the questions and asks for the
 grafts.
 
 ## Scope
@@ -17,6 +18,9 @@ grafts.
 - `crates/pent-sandbox/src/linux_graft.rs`: the areas of a session
   (`FileAreasSetup`, `FileAreasChild::mount_all`), the graft requests of
   pent (`FileAreas::graft`) and the helper (`serve_grafts`).
+- In `crates/pent-sandbox/src/linux.rs`: the areas (`fuse_areas_in`,
+  `default_fuse_areas`), the rule on each FUSE root, and the policy of the
+  server (`AccessPolicy::for_fuse`, `rights_except`), in `spawn_linux`.
 - In `crates/pent-sandbox/src/linux.rs`: the helper in the stub of the PID
   namespace (`fork_pid_namespace`, `supervise_outer`) or in one more fork
   (`fork_graft_helper`), and the nested user namespace of the program
@@ -81,6 +85,19 @@ makes the skip a failure. The container runs of the pipeline give
 | GR-8 | When the session ends, the helper ends, and a graft request gives `HelperGone`. | `linux_graft::tests::a_graft_during_a_run_holds_and_the_program_cannot_remove_it` |
 | GR-9 | The server reads the real tree through the source descriptor that the child opened, so it sees the mounts of the session: a read-only `.pent` stays read-only through FUSE too, and so does a mask of pent. | `linux_graft::tests::a_graft_during_a_run_holds_and_the_program_cannot_remove_it` |
 
+## The areas (step 5.3)
+
+| ID | Property | Test |
+|---|---|---|
+| AR-1 | The areas are each directory below `/` that the base does not name and that holds no path of the base (`/home`, `/root`, `/opt`, `/srv`, `/mnt`, `/boot`, `/usr/local`, `/var/lib`, ...), and the home directory when no area holds it. The walk never enters the base or a private directory. A file or a symbolic link at those levels gets no area, and Landlock refuses it as before. A home directory below a private directory (the tests) becomes an area, and the child binds it back before FUSE covers it. | `linux::tests::the_areas_are_the_directories_outside_the_base` |
+| AR-2 | Landlock gives all rights on each FUSE root. The child opens the path after the FUSE mounts, so the rule binds to the FUSE root, and it covers each graft below it: a graft that no grant names is readable. | `linux_graft::tests::an_area_of_the_host_applies_the_grants_and_its_rule_covers_a_graft` |
+| AR-3 | The server applies the grants. It computes the Landlock rights of the same rules (without the rules of the FUSE roots) at the path of the node, and it checks the right of the operation: `READ_FILE`, `WRITE_FILE` or `EXECUTE` (an open for `execve` has `__FMODE_EXEC`) for an open, `TRUNCATE` for a new size, `READ_DIR` for a listing, a `MAKE_*` or `REMOVE_*` right at the path of a new or removed entry, and `REFER` at both ends of a move to another directory. An access with no right gets `EACCES`. A test of a path gives the truth. | `linux_graft::tests::the_home_area_applies_the_grants_and_its_rule_covers_a_graft`, `an_area_of_the_host_applies_the_grants_and_its_rule_covers_a_graft`, `differential_profile_kernel::fs_table::the_rules_and_the_kernel_agree`, `diff_1_a_test_of_a_path_gives_the_truth_and_no_denial` |
+| AR-4 | A rule on a path that does not exist yet applies: `write ~/made/**` lets the program make `~/made`. Landlock skips such a rule, so before this step only the overlay gave it. | the two tests of AR-3, the row `made-in-the-run-write` of `the_rules_and_the_kernel_agree` |
+| AR-5 | A rule on a file holds after a rename puts a new inode at its path (an atomic replace): the server checks paths, not inodes. | the two tests of AR-3 (the file `cfg`) |
+| AR-6 | The rules of a private directory above an area (all rights on the empty tmpfs of `/tmp`) do not reach into the area. | `linux_graft::tests::the_home_area_applies_the_grants_and_its_rule_covers_a_graft` |
+| AR-7 | A run with FUSE areas has no overlay and no staging directory: the server writes each file in place. | `e2e_linux::linux::sigterm_ends_the_child_and_cleans_up` |
+| AR-8 | A symbolic link, a named pipe and a Unix socket need `MAKE_SYM`, `MAKE_FIFO` and `MAKE_SOCK` at their path. A device node gets `EPERM`. A hard link gets `EPERM` (not implemented). | the two tests of AR-3 (`ln -s`, `mkfifo`); the device and the hard link: no test |
+
 Each test of the operations also checks that the session ends cleanly when
 the mount namespace goes: `lookup_getattr_and_read`, `create_write_and_modes`,
 `rename_unlink_mkdir_and_rmdir`, `setattr_mode_size_and_times`,
@@ -88,10 +105,20 @@ the mount namespace goes: `lookup_getattr_and_read`, `create_write_and_modes`,
 
 ## For the later steps
 
-- **Step 5.3.** The Landlock step of the hook opens each path of its rules
-  in the child, after the FUSE mounts. A rule on an area thus binds to the
-  FUSE root, and its open sends a `GETATTR` to pent; this works only
-  because pent serves the areas during the spawn.
+- **The Landlock rules in an area.** The Landlock step of the hook opens
+  each path of its rules in the child, after the FUSE mounts. A rule in an
+  area thus binds to a FUSE node, and its open sends requests to pent;
+  this works only because pent serves the areas during the spawn.
+- **Step 5.4.** A temporary sibling of a file rule (`~/.claude.json.tmp`)
+  gets `EACCES` until step 5.4 gives it the answer of its target, so an
+  atomic write of one file in a directory with no rule fails. A listing is
+  allowed wherever the traversal rule on `/` of the default paths reaches,
+  as with Landlock before; step 5.4 makes a listing ask. An
+  execute-only grant runs a binary, not a script: the interpreter needs a
+  read, as with Landlock.
+- **The speed.** Each spawn mounts one FUSE area for each directory
+  outside the base (12 on the machine of the tests), and each access in an
+  area goes through FUSE until step 5.6 grafts the grants at the start.
 - **The validity of a graft.** An entry stays valid for 1 s. When the
   kernel checks the entry under a graft again and the host has removed or
   renamed the real directory, the kernel drops the entry and the graft

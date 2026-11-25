@@ -1,6 +1,6 @@
 # Plan: the new pent
 
-**Cursor: step 5.3.** Steps with `[x]` are done. Work on the branch `next`,
+**Cursor: step 5.4.** Steps with `[x]` are done. Work on the branch `next`,
 one commit for each step, and move this cursor when a step is done.
 
 **The way of work.** One commit for each step. Then the user runs
@@ -326,11 +326,28 @@ section 14 of the design has their results.
     the child after the FUSE mounts, so a rule on an area binds to the FUSE
     root. A working directory in an area needs the `chdir` after the FUSE
     mounts (GR-6).
-- [ ] **5.3 Landlock and the areas.** FUSE covers each area outside the
+- [x] **5.3 Landlock and the areas.** FUSE covers each area outside the
   base: the home directory, `/usr/local`, `/opt`, and the other directories
   of the root that the base does not name. Landlock gets one rule on each
   FUSE root.
   - Done: the rule covers a graft and a new inode after a rename.
+  - Files: `fuse_areas_in`, `default_fuse_areas`, the rules of the FUSE
+    roots and `AccessPolicy::for_fuse` in `pent-sandbox/src/linux.rs`;
+    `AreaPolicy`, the path of each node, `symlink`, `mknod`, the xattr
+    calls, `fallocate` and `lseek` in `linux_fuse.rs`; `FuseAreas` in
+    `config.rs`; `fuser=error` in `pent/src/main.rs`; AR-1 to AR-8 in
+    `docs/security/fuse.md`.
+  - Decisions (2026-11-25):
+    - The server applies the grants (the rules, the flags, `-w`), else
+      `EACCES` with no question. The answers stay those of Landlock, so
+      the security tests stay true; step 5.4 turns a refusal into a
+      question.
+    - The areas are the complement of the base, and the home directory.
+    - The grants at the start go through FUSE; step 5.6 grafts them.
+    - A run with FUSE areas has no overlay; phase 8 removes its code.
+  - Facts for step 5.4: a listing is allowed wherever the traversal rule
+    on `/` reaches; a temporary sibling of a file rule is refused; a
+    device node gets `EPERM`, a hard link `EPERM`.
 - [ ] **5.4 The five kinds and the three classes.** See is free and true.
   List, read, write and exec ask. A refusal or a deadline gives `EACCES`.
   The files of pent give `ENOENT`. A sensitive location is served by FUSE

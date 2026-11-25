@@ -122,6 +122,14 @@ test `diff_1_a_test_of_a_hidden_path_is_a_recorded_denial` uses the test
 of the shell (`[ -e ]`), so it does not depend on the `cat` of the
 machine.
 
+**Since step 5.3** (2026-11-25). FUSE covers the home directory, and a run
+with FUSE areas has no overlay. A test of a path gives the truth ("see" is
+free, section 5.2 of `docs/design/pent.md`), so the second form has no
+hidden path any more. The test is now
+`diff_1_a_test_of_a_path_gives_the_truth_and_no_denial`: the program gets
+`PRESENT`, and pent records no denial for it. A read of the path is still a
+refusal of the FUSE server (AR-3 in `fuse.md`).
+
 **Since step 3.1.** `pent run` writes no denied log, and `pent trust
 --review` does not read the refusals of a run. The refusal goes to the
 trace log of the run and to pentd, and `pent denials` shows it. The two

@@ -199,6 +199,13 @@ makes one mutation by hand. The test must fail on the mutant. No
 | 5.2 | The helper stays dumpable. | `linux_graft::tests::a_graft_during_a_run_holds_and_the_program_cannot_remove_it` |
 | 5.2 | The server opens the area on the host, not through the source of the child. | `linux_graft::tests::a_graft_during_a_run_holds_and_the_program_cannot_remove_it` |
 | 5.2 | The hook changes to the working directory before the FUSE mounts. | `linux_graft::tests::a_graft_during_a_run_holds_and_the_program_cannot_remove_it` |
+| 5.3 | No Landlock rule on the FUSE roots. | `linux_graft::tests::an_area_of_the_host_applies_the_grants_and_its_rule_covers_a_graft` (with the home below `/tmp` the rule on `/tmp` hides this mutant) |
+| 5.3 | The rules of a private directory reach into an area. | `linux_graft::tests::the_home_area_applies_the_grants_and_its_rule_covers_a_graft` |
+| 5.3 | An open for `execve` counts as a read. | `linux_graft::tests::the_home_area_applies_the_grants_and_its_rule_covers_a_graft` |
+| 5.3 | A create needs no right. | `linux_graft::tests::the_home_area_applies_the_grants_and_its_rule_covers_a_graft` |
+| 5.3 | A rename checks only its target. | `linux_graft::tests::an_area_of_the_host_applies_the_grants_and_its_rule_covers_a_graft` (the move of a read-only file) |
+| 5.3 | The FUSE policy drops the rule of a missing path. | `linux_graft::tests::the_home_area_applies_the_grants_and_its_rule_covers_a_graft` |
+| 5.3 | An area below a private directory is not bound back. | `linux_graft::tests::the_home_area_applies_the_grants_and_its_rule_covers_a_graft` |
 
 One mutant of step 4.1 survives, and it is equivalent: a bind of the
 machine identifier with no read-only remount. Landlock gives `/etc` no

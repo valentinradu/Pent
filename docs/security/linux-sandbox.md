@@ -369,6 +369,13 @@ and the same tests run and pass outside a container.
 
 ## The base (step 4.1)
 
+Since step 5.3 the base has a second half: each directory outside it is a
+FUSE area. Landlock gives all rights on each FUSE root, and the FUSE server
+applies the same grants (`fuse.md`, AR-1 to AR-8). A run with FUSE areas
+has no overlay, so the overlay claims of this report hold only for a run
+with no area (`FuseAreas::Listed` with an empty list). Phase 8 removes the
+overlay.
+
 The base is what each run gets with no rule and no question (section 4 of
 `docs/design/pent.md`). Step 4.1 adds three items and removes one.
 

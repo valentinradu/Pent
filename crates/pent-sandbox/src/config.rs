@@ -56,6 +56,21 @@ impl LocalhostPorts {
     }
 }
 
+/// The directories that the FUSE server of pent covers in a sandbox with
+/// enforcement.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum FuseAreas {
+    /// Each directory outside the base: each directory below `/` that the
+    /// base does not name and that holds no path of the base (`/home`,
+    /// `/opt`, `/usr/local`, `/var/lib`, ...), and the home directory when
+    /// no other area holds it. The default of `pent run`.
+    #[default]
+    OutsideBase,
+    /// Only the directories of the list. Each one must exist. An empty
+    /// list covers nothing.
+    Listed(Vec<PathBuf>),
+}
+
 /// Platform-appropriate system-wide sandbox path defaults.
 ///
 /// Provides sensible baseline access (system binaries, libraries, temp dirs)
@@ -142,12 +157,12 @@ pub struct SandboxConfig {
     /// Without it, such a connection gets the refusal at once.
     pub decider: Option<std::sync::Arc<dyn AccessDecider>>,
 
-    /// The directories that the FUSE server of pent covers. Each one must
-    /// exist, and the child must see it (a Landlock rule and, below a
-    /// private directory, a bind back). With an area, the program runs in
-    /// a nested user namespace, and a helper grafts the real subtrees.
-    /// Only `pent run` with enforcement uses them.
-    pub file_areas: Vec<PathBuf>,
+    /// The directories that the FUSE server of pent covers. Landlock gives
+    /// all rights on each one, and the server refuses each access that the
+    /// grants of this config do not give. With an area, the program runs
+    /// in a nested user namespace, and a helper grafts the real subtrees.
+    /// Only a sandbox with enforcement uses them.
+    pub file_areas: FuseAreas,
 }
 
 /// Decides a connection that the lists of the sandbox do not hold: a Unix
@@ -195,7 +210,7 @@ impl SandboxConfig {
             unix_sockets: Vec::new(),
             localhost: LocalhostPorts::default(),
             decider: None,
-            file_areas: Vec::new(),
+            file_areas: FuseAreas::default(),
         }
     }
 

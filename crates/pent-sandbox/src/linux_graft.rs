@@ -27,7 +27,7 @@ use std::ffi::CString;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 
 use thiserror::Error;
@@ -225,7 +225,10 @@ impl FileAreasSetup {
     /// # Errors
     /// Returns `SpawnFailed` if a socket pair or the thread fails, and
     /// `InvalidConfig` for a path with a NUL byte.
-    pub(crate) fn new(areas: &[PathBuf]) -> Result<(Self, FileAreasChild), SandboxError> {
+    pub(crate) fn new(
+        areas: &[PathBuf],
+        policy: Option<Arc<crate::linux::AccessPolicy>>,
+    ) -> Result<(Self, FileAreasChild), SandboxError> {
         let paths: Vec<CString> = areas
             .iter()
             .map(|p| {
@@ -239,7 +242,7 @@ impl FileAreasSetup {
         let owned: Vec<PathBuf> = areas.to_vec();
         let receiver = std::thread::Builder::new()
             .name("pent-fuse-areas".to_string())
-            .spawn(move || receive_areas(&fuse_parent, owned))
+            .spawn(move || receive_areas(&fuse_parent, owned, policy.as_ref()))
             .map_err(SandboxError::SpawnFailed)?;
         let child = FileAreasChild {
             fuse_sock: child_fuse.as_raw_fd(),
@@ -274,8 +277,12 @@ impl FileAreasSetup {
 }
 
 /// Receive the three descriptors of each area and serve its FUSE
-/// connection.
-fn receive_areas(sock: &OwnedFd, paths: Vec<PathBuf>) -> Result<Vec<FuseArea>, SandboxError> {
+/// connection, with the policy of the grants when there is one.
+fn receive_areas(
+    sock: &OwnedFd,
+    paths: Vec<PathBuf>,
+    policy: Option<&Arc<crate::linux::AccessPolicy>>,
+) -> Result<Vec<FuseArea>, SandboxError> {
     let lost = |what: &str| SandboxError::SpawnFailed(std::io::Error::other(what.to_string()));
     let mut areas = Vec::with_capacity(paths.len());
     for path in paths {
@@ -286,7 +293,15 @@ fn receive_areas(sock: &OwnedFd, paths: Vec<PathBuf>) -> Result<Vec<FuseArea>, S
             .try_into()
             .map_err(|_| lost("a FUSE area needs three descriptors"))?;
         let root = source.try_clone().map_err(SandboxError::SpawnFailed)?;
-        let server = linux_fuse::serve(dev, root)
+        let area_policy = policy.map(|grants| linux_fuse::AreaPolicy {
+            area: path.clone(),
+            grants: Arc::clone(grants),
+            private_above: crate::linux::private_roots()
+                .into_iter()
+                .filter(|p| path.starts_with(p) && path != *p)
+                .collect(),
+        });
+        let server = linux_fuse::serve(dev, root, area_policy)
             .map_err(|e| SandboxError::SpawnFailed(std::io::Error::other(e.to_string())))?;
         areas.push(FuseArea {
             path,
@@ -757,7 +772,7 @@ ls /proc/self/fd | tr '\n' ' '
                 .read_write
                 .push(dir.to_string_lossy().into_owned());
         }
-        config.file_areas = vec![area.clone(), area2.clone()];
+        config.file_areas = crate::FuseAreas::Listed(vec![area.clone(), area2.clone()]);
         let args = vec!["-c".to_string(), SCRIPT.to_string()];
         let path_dirs = crate::resolve_path_directories();
         let spawned = crate::linux::spawn_linux(
@@ -838,6 +853,163 @@ ls /proc/self/fd | tr '\n' ' '
             files.graft(0, Path::new("sub"), GraftAccess::ReadOnly),
             Err(GraftError::HelperGone)
         ));
+        Ok(())
+    }
+
+    /// The program in the home area. Each line names the result of one
+    /// access; see the expected text in the test.
+    const HOME_SCRIPT: &str = r#"set -e
+exec > "$T/out" 2>&1
+: pent-home-area-test-marker
+cat "$H/open.txt"
+(cat "$H/secret.txt") 2>/dev/null || echo read-refused
+[ -e "$H/secret.txt" ] && echo see-free
+("$H/bin/run.sh") 2>/dev/null || echo exec-refused
+"$H/xbin/run.sh"
+(echo x > "$H/new.txt") 2>/dev/null || echo create-refused
+echo a > "$H/w/tmp"
+mv "$H/w/tmp" "$H/w/target"
+mkdir "$H/w/d"
+mv "$H/w/target" "$H/w/d/t"
+cat "$H/w/d/t"
+echo new > "$H/w/next"
+mv "$H/w/next" "$H/cfg"
+echo again >> "$H/cfg"
+mkdir "$H/made"
+echo m > "$H/made/f"
+ln -s d/t "$H/w/link"
+readlink "$H/w/link"
+mkfifo "$H/w/fifo"
+[ -p "$H/w/fifo" ] && echo fifo
+(mv "$H/w/d/t" "$H/stolen") 2>/dev/null || echo move-out-refused
+(mv "$H/open.txt" "$H/w/taken") 2>/dev/null || echo remove-refused
+: > "$T/ready"
+i=0
+while [ ! -e "$T/grafted" ] && [ $i -lt 600 ]; do sleep 0.05; i=$((i+1)); done
+cat "$H/graft/file"
+"#;
+
+    /// A home directory below `/tmp`: the home is its own area, which the
+    /// child binds back, and the rules on `/tmp` do not reach into it.
+    #[test]
+    fn the_home_area_applies_the_grants_and_its_rule_covers_a_graft() -> TestResult {
+        if !ready() {
+            return Ok(());
+        }
+        let tmp = tempfile::tempdir()?;
+        home_area_run(&std::fs::canonicalize(tmp.path())?)
+    }
+
+    /// A home directory next to the test binary, below `/home` on each
+    /// machine of the tests: the home is inside an area of the host, and
+    /// only the rule on that FUSE root gives Landlock rights there.
+    #[test]
+    fn an_area_of_the_host_applies_the_grants_and_its_rule_covers_a_graft() -> TestResult {
+        if !ready() {
+            return Ok(());
+        }
+        let exe = std::env::current_exe()?;
+        let dir = exe.parent().ok_or("the test binary has no directory")?;
+        let tmp = tempfile::tempdir_in(dir)?;
+        let base = std::fs::canonicalize(tmp.path())?;
+        let areas = crate::linux::default_fuse_areas(None);
+        if !areas.iter().any(|a| base.starts_with(a)) {
+            let reason = "the directory of the test binary is in no area of the host";
+            assert!(
+                std::env::var_os("PENT_REQUIRE_ALL_TESTS").is_none(),
+                "the test does not run, and PENT_REQUIRE_ALL_TESTS is set: {reason}"
+            );
+            eprintln!("skip: {reason}");
+            return Ok(());
+        }
+        home_area_run(&base)
+    }
+
+    /// Run [`HOME_SCRIPT`] with a home directory below `base`.
+    fn home_area_run(base: &Path) -> TestResult {
+        let (ws, home) = (base.join("ws"), base.join("home"));
+        for dir in ["bin", "xbin", "w", "graft"] {
+            std::fs::create_dir_all(home.join(dir))?;
+        }
+        std::fs::create_dir(&ws)?;
+        std::fs::write(home.join("open.txt"), "open\n")?;
+        std::fs::write(home.join("secret.txt"), "SECRET\n")?;
+        std::fs::write(home.join("cfg"), "old\n")?;
+        std::fs::write(home.join("graft/file"), "grafted\n")?;
+        for dir in ["bin", "xbin"] {
+            let script = home.join(dir).join("run.sh");
+            std::fs::write(&script, format!("#!/bin/sh\necho ran-{dir}\n"))?;
+            std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
+        }
+
+        let text = |p: &Path| p.to_string_lossy().into_owned();
+        let mut env = crate::build_env(&[]);
+        env.insert("T".to_string(), text(&ws));
+        env.insert("H".to_string(), text(&home));
+        env.insert("HOME".to_string(), text(&home));
+        let mut config =
+            crate::SandboxConfig::new(ws.clone(), crate::system_default_paths(), ws.clone())
+                .with_env(env.clone())
+                .with_network(crate::NetworkMode::LocalhostOnly);
+        config.file_areas = crate::FuseAreas::OutsideBase;
+        config.paths.read.push(text(&home.join("open.txt")));
+        config.paths.read.push(text(&home.join("bin")));
+        // A script needs a read by its interpreter too; an execute-only
+        // grant is for a binary.
+        config.paths.execute.push(text(&home.join("xbin")));
+        config.paths.read.push(text(&home.join("xbin")));
+        // A directory, a file and a directory that does not exist yet.
+        for p in ["w", "cfg", "made"] {
+            config.paths.read_write.push(text(&home.join(p)));
+        }
+        let args = vec!["-c".to_string(), HOME_SCRIPT.to_string()];
+        let path_dirs = crate::resolve_path_directories();
+        let spawned = crate::linux::spawn_linux(
+            &config,
+            "sh",
+            &args,
+            &env,
+            &path_dirs,
+            crate::linux::SpawnMode::Sandbox,
+        )?;
+        let mut child = spawned.child;
+        let files = spawned.files.ok_or("the spawn gave no FUSE areas")?;
+        let result = (|| -> TestResult {
+            wait_for(&ws.join("ready"))?;
+            let index = files
+                .areas()
+                .iter()
+                .position(|a| home.starts_with(&a.path))
+                .ok_or("no area holds the home directory")?;
+            let area = files.areas().get(index).ok_or("no area")?;
+            let graft = home.strip_prefix(&area.path)?.join("graft");
+            // Only the rule on the FUSE root covers this graft: no grant
+            // names it.
+            files.graft(index, &graft, GraftAccess::ReadOnly)?;
+            std::fs::write(ws.join("grafted"), "")?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::write(ws.join("grafted"), "");
+            let _ = child.kill();
+        }
+        let status = child.wait()?;
+        let out = std::fs::read_to_string(ws.join("out")).unwrap_or_default();
+        if let Err(e) = result {
+            return Err(format!("{e}; the program wrote:\n{out}").into());
+        }
+        assert!(status.success(), "the program failed: {status}\n{out}");
+        assert_eq!(
+            out,
+            "open\nread-refused\nsee-free\nexec-refused\nran-xbin\n\
+             create-refused\na\nd/t\nfifo\nmove-out-refused\nremove-refused\ngrafted\n"
+        );
+        // The renames went to the real tree, and the file rule still holds
+        // after the rename put a new inode at its path.
+        assert_eq!(std::fs::read_to_string(home.join("cfg"))?, "new\nagain\n");
+        assert_eq!(std::fs::read_to_string(home.join("made/f"))?, "m\n");
+        assert!(home.join("w/d/t").exists());
+        assert!(!home.join("new.txt").exists() && !home.join("stolen").exists());
         Ok(())
     }
 }

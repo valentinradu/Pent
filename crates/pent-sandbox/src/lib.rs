@@ -64,7 +64,7 @@ mod linux_fuse;
 #[cfg_attr(not(test), allow(dead_code))]
 mod linux_graft;
 
-pub use config::{system_default_paths, AccessDecider, LocalhostPorts, SandboxConfig};
+pub use config::{system_default_paths, AccessDecider, FuseAreas, LocalhostPorts, SandboxConfig};
 pub use env::{build_env, resolve_path_directories, resolve_path_dirs_from};
 #[cfg(target_os = "linux")]
 pub use linux::check_user_namespaces;

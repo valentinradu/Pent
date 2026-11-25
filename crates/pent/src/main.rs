@@ -81,7 +81,16 @@ fn setup_tracing(verbose: u8, quiet: Quiet) {
         _ => "trace",
     };
 
-    let filter = std::env::var("PENT_LOG").unwrap_or_else(|_| level.to_string());
+    // The FUSE crate warns for each operation that the server of pent does
+    // not implement; such a request gets an error, and the warning means
+    // nothing to the user. `-v` shows it.
+    let filter = std::env::var("PENT_LOG").unwrap_or_else(|_| {
+        if verbose == 0 {
+            format!("{level},fuser=error")
+        } else {
+            level.to_string()
+        }
+    });
 
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new(filter))

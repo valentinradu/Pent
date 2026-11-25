@@ -649,10 +649,14 @@ printf 'rc=%s\n' "$?"
     /// DIFF-1, second form. A program can test a path before it opens it
     /// and stop there: uutils `cat`, the `cat` of Ubuntu 26.04, calls
     /// `statx` and never `open` for a file that is not there. The test of
-    /// the shell (`[ -e ]`) does the same with no `open`, so this test does
-    /// not depend on the `cat` of the machine.
+    /// the shell (`[ -e ]`) does the same with no `open`.
+    ///
+    /// Before step 5.3 the overlay hid the path, the program got `ENOENT`,
+    /// and pent had to record that as a denial. Now FUSE covers the home
+    /// directory, and "see" is free (design, section 5.2): the program
+    /// learns the truth, the access is no denial, and pent records none.
     #[test]
-    fn diff_1_a_test_of_a_hidden_path_is_a_recorded_denial() -> TestResult {
+    fn diff_1_a_test_of_a_path_gives_the_truth_and_no_denial() -> TestResult {
         let test = "fs_diff_1_hidden_test";
         if !ready(test) {
             return Ok(());
@@ -677,18 +681,15 @@ printf 'rc=%s\n' "$?"
         let combined = format!("{}{}", stdout(&out), stderr(&out));
         assert!(combined.contains(RAN), "the child did not run:\n{combined}");
         assert!(
-            combined.contains("MISSING"),
-            "the overlay did not hide the path, so this test proves nothing:\n{combined}"
+            combined.contains("PRESENT"),
+            "a test of a path in the home directory did not give the truth:\n{combined}"
         );
-        assert_recorded(
-            &env,
-            &trace_log(&env),
-            "secret.txt",
-            &format!(
-                "the program tested a hidden path and got ENOENT, but pent \
-                 recorded no denial:\n{combined}"
-            ),
-        )
+        let denials = denials(&env)?;
+        assert!(
+            !denials.contains("secret.txt"),
+            "a test of a path is no denial, but pent recorded one:\n{denials}"
+        );
+        Ok(())
     }
 
     /// DIFF-1. The kernel must tell pent about every access that it

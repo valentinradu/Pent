@@ -55,15 +55,27 @@ pub mod access {
     pub const READ_FILE: u64 = 1 << 2;
     /// Open a directory or list its content.
     pub const READ_DIR: u64 = 1 << 3;
-    // Bits 4 to 12 are REMOVE_DIR, REMOVE_FILE, MAKE_CHAR, MAKE_DIR,
-    // MAKE_REG, MAKE_SOCK, MAKE_FIFO, MAKE_BLOCK and MAKE_SYM. Pent grants
-    // them only together, through `ALL`.
-    /// Remove a file from a directory. Only the policy prediction of the
-    /// recorder uses this bit by itself.
+    // Pent grants bits 4 to 12 only together, through `ALL`. The policy
+    // prediction of the recorder and the FUSE server check them one by
+    // one.
+    /// Remove an empty directory from a directory.
+    pub const REMOVE_DIR: u64 = 1 << 4;
+    /// Remove a file from a directory.
     pub const REMOVE_FILE: u64 = 1 << 5;
-    /// Create a regular file in a directory. Only the policy prediction of
-    /// the recorder uses this bit by itself.
+    /// Create a character device in a directory.
+    pub const MAKE_CHAR: u64 = 1 << 6;
+    /// Create a directory in a directory.
+    pub const MAKE_DIR: u64 = 1 << 7;
+    /// Create a regular file in a directory.
     pub const MAKE_REG: u64 = 1 << 8;
+    /// Create a Unix socket in a directory.
+    pub const MAKE_SOCK: u64 = 1 << 9;
+    /// Create a named pipe in a directory.
+    pub const MAKE_FIFO: u64 = 1 << 10;
+    /// Create a block device in a directory.
+    pub const MAKE_BLOCK: u64 = 1 << 11;
+    /// Create a symbolic link in a directory.
+    pub const MAKE_SYM: u64 = 1 << 12;
     /// Link or rename a file from or to a different directory (ABI v2).
     pub const REFER: u64 = 1 << 13;
     /// Truncate a file (ABI v3).

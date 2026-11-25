@@ -251,6 +251,100 @@ const PRIVATE_KEEP: &[&str] = &[
     "/run/opengl-driver-32",
 ];
 
+/// The directories of the base, the private directories and the kernel
+/// filesystems: no FUSE area is in them. Each path comes as written and in
+/// its canonical form.
+fn base_roots() -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = SYSTEM_PATHS
+        .iter()
+        .chain(TEMP_PATHS)
+        .chain(PROC_PATHS)
+        .chain(PRIVATE_KEEP)
+        .chain(&["/sys", "/dev"])
+        .map(PathBuf::from)
+        .collect();
+    roots.extend(PRIVATE_DIRS.iter().map(|d| PathBuf::from(d.path)));
+    let real: Vec<PathBuf> = roots
+        .iter()
+        .filter_map(|p| std::fs::canonicalize(p).ok())
+        .collect();
+    roots.extend(real);
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+/// The private directories as written and in their canonical form.
+pub(crate) fn private_roots() -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = PRIVATE_DIRS.iter().map(|d| PathBuf::from(d.path)).collect();
+    let real: Vec<PathBuf> = roots
+        .iter()
+        .filter_map(|p| std::fs::canonicalize(p).ok())
+        .collect();
+    roots.extend(real);
+    roots
+}
+
+/// The FUSE areas of [`crate::FuseAreas::OutsideBase`] below `root`.
+///
+/// The walk starts at `root` and goes down through each directory that
+/// holds a path of `base`. Each other directory that it meets is an area.
+/// A file and a symbolic link get no area; Landlock refuses them, as
+/// before. The walk never enters a path of `base` or a private directory:
+/// the tmpfs of the child hides the content of the host there.
+///
+/// `home` becomes an area too when no area holds it and it is not in the
+/// base, or when it is below a private directory (the tests put it in
+/// `/tmp`); the child then binds it back before FUSE covers it.
+fn fuse_areas_in(
+    root: &Path,
+    base: &[PathBuf],
+    private: &[PathBuf],
+    home: Option<&Path>,
+) -> Vec<PathBuf> {
+    let in_base = |p: &Path| base.iter().any(|b| p.starts_with(b));
+    let mut walk: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
+    walk.insert(root.to_path_buf());
+    for b in base {
+        for a in b.ancestors().skip(1) {
+            if a.starts_with(root) && !in_base(a) {
+                walk.insert(a.to_path_buf());
+            }
+        }
+    }
+    let mut areas = Vec::new();
+    for dir in &walk {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if walk.contains(&path) || in_base(&path) {
+                continue;
+            }
+            if std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir()) {
+                areas.push(path);
+            }
+        }
+    }
+    if let Some(home) = home.and_then(|h| std::fs::canonicalize(h).ok()) {
+        let covered = areas.iter().any(|a| home.starts_with(a)) || walk.contains(&home);
+        let private_child = private
+            .iter()
+            .any(|p| home.starts_with(p) && home.as_path() != p.as_path());
+        if !covered && (private_child || !in_base(&home)) {
+            areas.push(home);
+        }
+    }
+    areas.sort();
+    areas
+}
+
+/// The FUSE areas of [`crate::FuseAreas::OutsideBase`] on this host.
+pub(crate) fn default_fuse_areas(home: Option<&Path>) -> Vec<PathBuf> {
+    fuse_areas_in(Path::new("/"), &base_roots(), &private_roots(), home)
+}
+
 /// Compute the set of paths the sandboxed process is allowed to read/execute.
 ///
 /// The set is a part of the accessible set that `spawn_with_landlock` gives
@@ -323,6 +417,10 @@ impl RuleSink for PreparedRuleset {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct AccessPolicy {
     rules: Vec<(PathBuf, u64)>,
+    /// Keep a rule for a path that does not exist. Landlock skips such a
+    /// rule, but the FUSE server applies it to the path (see
+    /// [`AccessPolicy::for_fuse`]).
+    keep_missing: bool,
     /// The mount point of each overlay.
     overlay_roots: Vec<PathBuf>,
     /// The paths that the overlay shows below a mount point.
@@ -333,6 +431,9 @@ impl RuleSink for AccessPolicy {
     fn add_rule(&mut self, path: &Path, access: u64) {
         // Landlock skips a rule for a path that does not exist.
         let Ok(real) = std::fs::canonicalize(path) else {
+            if self.keep_missing {
+                self.rules.push((path.to_path_buf(), access));
+            }
             return;
         };
         if real != path {
@@ -343,6 +444,16 @@ impl RuleSink for AccessPolicy {
 }
 
 impl AccessPolicy {
+    /// An empty policy for the FUSE server. It keeps the rules of the
+    /// paths that do not exist yet: the server checks paths, not inodes,
+    /// so a rule `write ~/made/**` lets the program make `~/made`.
+    pub(crate) fn for_fuse() -> Self {
+        Self {
+            keep_missing: true,
+            ..Self::default()
+        }
+    }
+
     /// Tell the policy which paths the overlay shows.
     ///
     /// `roots` are the mount points and `shown` is the accessible set that
@@ -400,10 +511,15 @@ impl AccessPolicy {
 
     /// Return the Landlock rights that the policy grants for `path`. Landlock
     /// adds the rights of all rules on the path and on its ancestors.
-    fn rights(&self, path: &Path) -> u64 {
+    pub(crate) fn rights(&self, path: &Path) -> u64 {
+        self.rights_except(path, &[])
+    }
+
+    /// [`AccessPolicy::rights`] without the rules on the paths of `skip`.
+    pub(crate) fn rights_except(&self, path: &Path, skip: &[PathBuf]) -> u64 {
         self.rules
             .iter()
-            .filter(|(p, _)| path.starts_with(p))
+            .filter(|(p, _)| path.starts_with(p) && !skip.contains(p))
             .fold(0, |acc, (_, a)| acc | a)
     }
 
@@ -3301,12 +3417,32 @@ pub(crate) fn spawn_linux(
     let enforce = !watch && !config.no_enforcement;
     let record = watch || config.record_events;
 
+    // The FUSE areas (step 5.3). Landlock gives all rights on each FUSE
+    // root, and the FUSE server applies the grants instead. A path in an
+    // area needs no overlay: the server writes each file in place.
+    let areas: Vec<PathBuf> = if enforce {
+        match &config.file_areas {
+            crate::FuseAreas::OutsideBase => {
+                let home = config
+                    .env
+                    .get("HOME")
+                    .map(PathBuf::from)
+                    .or_else(dirs::home_dir);
+                default_fuse_areas(home.as_deref())
+            }
+            crate::FuseAreas::Listed(list) => list.clone(),
+        }
+    } else {
+        Vec::new()
+    };
+
     // Identify write-listed file paths (as opposed to directories) and prepare
     // overlayfs staging directories for them. Directories use regular Landlock
     // write rules; files get inode-stable access via the overlayfs + inotify path.
     let (_, read_expanded, execute_expanded, rw_expanded) = config.paths.expand_paths();
     let overlay_file_paths: Vec<PathBuf> = rw_expanded
         .iter()
+        .filter(|_| areas.is_empty())
         .filter_map(|(path, _)| {
             // Include paths that are files, or don't exist yet but whose parent
             // directory exists (will be created as a file on first write).
@@ -3369,7 +3505,7 @@ pub(crate) fn spawn_linux(
         .unwrap_or_else(|_| config.cwd.clone());
 
     let pid = std::process::id();
-    let overlay_mounts = if enforce {
+    let overlay_mounts = if enforce && areas.is_empty() {
         super::linux_overlayfs::prepare_overlay_dirs(&accessible, &home_dir, pid)?
     } else {
         Vec::new()
@@ -3418,9 +3554,32 @@ pub(crate) fn spawn_linux(
             &overlay_dirs,
             resolv_dst.as_deref(),
         );
+        // One rule with all rights on each FUSE root. The child opens the
+        // path after the FUSE mounts, so the rule binds to the FUSE root
+        // and covers each graft and each new inode below it.
+        for area in &areas {
+            rs.add_rule(area, access::ALL);
+        }
         Some(rs)
     } else {
         None
+    };
+    // The grants that the FUSE server applies: the same rules, without the
+    // rules of the FUSE roots.
+    let fuse_policy = if areas.is_empty() {
+        None
+    } else {
+        let mut policy = AccessPolicy::for_fuse();
+        add_ruleset_rules(
+            &mut policy,
+            config,
+            path_dirs,
+            &read_files,
+            &write_set,
+            &overlay_dirs,
+            resolv_dst.as_deref(),
+        );
+        Some(std::sync::Arc::new(policy))
     };
 
     // Namespaces.
@@ -3475,6 +3634,9 @@ pub(crate) fn spawn_linux(
     // mount needs a target that exists.
     let mut keep_private: Vec<PathBuf> =
         overlay_mounts.iter().map(|m| m.real_dir.clone()).collect();
+    // An area below a private directory (the home directory of a test)
+    // comes back before FUSE covers it.
+    keep_private.extend(areas.iter().cloned());
     if let Some(plan) = guard {
         keep_private.extend(plan.ro_binds.iter().cloned());
     }
@@ -3701,11 +3863,11 @@ pub(crate) fn spawn_linux(
 
     // The FUSE areas. The receiver thread starts before the spawn: the
     // child waits for the first `GETATTR` of each root.
-    let (files, files_child) = if enforce && !config.file_areas.is_empty() {
-        let (setup, child) = crate::linux_graft::FileAreasSetup::new(&config.file_areas)?;
-        (Some(setup), Some(child))
-    } else {
+    let (files, files_child) = if areas.is_empty() {
         (None, None)
+    } else {
+        let (setup, child) = crate::linux_graft::FileAreasSetup::new(&areas, fuse_policy)?;
+        (Some(setup), Some(child))
     };
 
     let plan = ChildPlan {
@@ -3848,6 +4010,48 @@ mod tests {
     // ========================================================================
     // Constants tests
     // ========================================================================
+
+    #[test]
+    fn the_areas_are_the_directories_outside_the_base() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        let root = std::fs::canonicalize(tmp.path())?;
+        for dir in [
+            "usr/bin",
+            "usr/share",
+            "usr/local",
+            "etc/x",
+            "home/u",
+            "opt",
+            "tmp/h",
+            "srv",
+        ] {
+            std::fs::create_dir_all(root.join(dir))?;
+        }
+        std::fs::write(root.join("file"), "")?;
+        std::os::unix::fs::symlink("opt", root.join("link"))?;
+        let base: Vec<PathBuf> = ["usr/bin", "usr/share", "etc", "tmp"]
+            .iter()
+            .map(|p| root.join(p))
+            .collect();
+        let private = vec![root.join("tmp")];
+        let areas = |home: &str| fuse_areas_in(&root, &base, &private, Some(&root.join(home)));
+        // A directory beside the base is an area; a directory that holds a
+        // path of the base is walked; a file, a link and the base are not.
+        let expected: Vec<PathBuf> = ["home", "opt", "srv", "tmp/h", "usr/local"]
+            .iter()
+            .map(|p| root.join(p))
+            .collect();
+        assert_eq!(areas("tmp/h"), expected);
+        // A home directory in an area adds nothing, and one in the base is
+        // no area.
+        let without_home: Vec<PathBuf> = ["home", "opt", "srv", "usr/local"]
+            .iter()
+            .map(|p| root.join(p))
+            .collect();
+        assert_eq!(areas("home/u"), without_home);
+        assert_eq!(areas("etc/x"), without_home);
+        Ok(())
+    }
 
     #[test]
     fn test_min_landlock_abi() {

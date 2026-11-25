@@ -24,6 +24,19 @@
 //!   map, so the kernel refuses each write in the root until it reads the
 //!   attributes of the root. The process that mounts thus does one `stat`
 //!   of the mount root after the server runs.
+//! - **The policy of an area** (step 5.3). In a sandbox, Landlock gives
+//!   all rights on each FUSE root, and the server checks each access
+//!   instead: it computes the Landlock rights that the grants give at the
+//!   path ([`AreaPolicy`]), and it checks the right that Landlock would
+//!   check for the operation. A new or a removed entry is checked at the
+//!   path of the entry, where Landlock checks its directory: the rights at
+//!   a path hold the rights of each parent, so the two differ only for a
+//!   rule on the entry itself, and such a rule (`write ~/made/**`) means
+//!   that the program may make the entry. An access with no right gets
+//!   `EACCES`. A
+//!   lookup, `getattr`, `readlink`, `access` and `statfs` need no right, as
+//!   with Landlock. Each node keeps its parent and its name, so the server
+//!   knows the path of the node, also after a rename.
 //! - **The inode number** that `stat` gives is the number of the node,
 //!   because `fuser` uses the same number for both. A listing gives the
 //!   number of the node when the node exists, else the real inode number.
@@ -34,6 +47,7 @@ use std::fs::File;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirEntryExt, FileExt};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
@@ -223,15 +237,71 @@ impl FuseServer {
 /// Serve the real directory `root` on the FUSE connection `dev`.
 ///
 /// `dev` is the descriptor that [`mount_fuse`] returned, and `root` is a
-/// descriptor of the real directory (`O_PATH` is enough). The function does
-/// the `INIT` exchange, and then it serves the requests in a new thread.
+/// descriptor of the real directory (`O_PATH` is enough). With a `policy`,
+/// the server refuses each access that the policy does not give; without
+/// one it serves each access. The function does the `INIT` exchange, and
+/// then it serves the requests in a new thread.
 ///
 /// # Errors
 /// Returns [`FuseError::Root`] if `root` is not readable,
 /// [`FuseError::Handshake`] if the `INIT` exchange fails, or
 /// [`FuseError::Thread`] if the session thread does not start.
-pub(crate) fn serve(dev: OwnedFd, root: OwnedFd) -> Result<FuseServer, FuseError> {
-    serve_tree(dev, FuseTree::new(root).map_err(FuseError::Root)?)
+pub(crate) fn serve(
+    dev: OwnedFd,
+    root: OwnedFd,
+    policy: Option<AreaPolicy>,
+) -> Result<FuseServer, FuseError> {
+    serve_tree(dev, FuseTree::new(root, policy).map_err(FuseError::Root)?)
+}
+
+/// The policy of one area: the Landlock rights that the grants of the
+/// sandbox give at each path.
+pub(crate) struct AreaPolicy {
+    /// The path of the area: the root of the tree has this path.
+    pub(crate) area: PathBuf,
+    /// The grants, with the same rules as the Landlock ruleset, without
+    /// the rule on the FUSE root.
+    pub(crate) grants: Arc<crate::linux::AccessPolicy>,
+    /// The private directories above the area. Their rules (all rights on
+    /// an empty tmpfs) do not reach into an area that pent binds back
+    /// below them.
+    pub(crate) private_above: Vec<PathBuf>,
+}
+
+/// The flag of an open for `execve(2)` (`__FMODE_EXEC`): the kernel puts it
+/// in the flags of the `OPEN` request.
+const OPEN_FOR_EXEC: libc::c_int = 0x20;
+
+/// The Landlock rights that an open with `flags` needs.
+fn open_rights(flags: libc::c_int) -> u64 {
+    use crate::linux_landlock::access;
+    if flags & OPEN_FOR_EXEC != 0 {
+        return access::EXECUTE;
+    }
+    let mut rights = match flags & libc::O_ACCMODE {
+        libc::O_WRONLY => access::WRITE_FILE,
+        libc::O_RDWR => access::READ_FILE | access::WRITE_FILE,
+        _ => access::READ_FILE,
+    };
+    if flags & libc::O_TRUNC != 0 {
+        rights |= access::TRUNCATE;
+    }
+    rights
+}
+
+/// The Landlock rights that a new entry and a removed entry of the type of
+/// `mode` need on their directory.
+fn entry_rights(mode: u32) -> (u64, u64) {
+    use crate::linux_landlock::access;
+    match mode & libc::S_IFMT {
+        libc::S_IFDIR => (access::MAKE_DIR, access::REMOVE_DIR),
+        libc::S_IFLNK => (access::MAKE_SYM, access::REMOVE_FILE),
+        libc::S_IFIFO => (access::MAKE_FIFO, access::REMOVE_FILE),
+        libc::S_IFSOCK => (access::MAKE_SOCK, access::REMOVE_FILE),
+        libc::S_IFCHR => (access::MAKE_CHAR, access::REMOVE_FILE),
+        libc::S_IFBLK => (access::MAKE_BLOCK, access::REMOVE_FILE),
+        _ => (access::MAKE_REG, access::REMOVE_FILE),
+    }
 }
 
 fn serve_tree(dev: OwnedFd, tree: FuseTree) -> Result<FuseServer, FuseError> {
@@ -250,7 +320,14 @@ struct Node {
     key: InodeKey,
     /// The lookup count of the kernel. The node goes when it is 0.
     lookups: u64,
+    /// The directory and the name of the last lookup, a create or a
+    /// rename. The root has none.
+    parent: u64,
+    name: OsString,
 }
+
+/// The longest chain of parents that [`Tree::path`] follows.
+const MAX_DEPTH: usize = 4096;
 
 /// The real identity of an inode: `(st_dev, st_ino)`.
 type InodeKey = (u64, u64);
@@ -275,6 +352,8 @@ struct Tree {
     files: Mutex<HashMap<u64, Arc<File>>>,
     dirs: Mutex<HashMap<u64, Arc<Vec<DirItem>>>>,
     next_fh: AtomicU64,
+    /// The policy of the area, or `None` to serve each access.
+    policy: Option<AreaPolicy>,
     /// A test hook: a lookup of this name waits this long.
     #[cfg(test)]
     slow_lookup: Option<(OsString, Duration)>,
@@ -455,7 +534,7 @@ fn timespec_of(t: Option<TimeOrNow>) -> libc::timespec {
 }
 
 impl Tree {
-    fn new(root: OwnedFd) -> std::io::Result<Self> {
+    fn new(root: OwnedFd, policy: Option<AreaPolicy>) -> std::io::Result<Self> {
         let st = stat_fd(root.as_fd()).map_err(|e| std::io::Error::from_raw_os_error(e.code()))?;
         if st.st_mode & libc::S_IFMT != libc::S_IFDIR {
             return Err(std::io::Error::from_raw_os_error(libc::ENOTDIR));
@@ -469,6 +548,8 @@ impl Tree {
                 fd: Arc::new(root),
                 key,
                 lookups: 1,
+                parent: 0,
+                name: OsString::new(),
             },
         );
         let mut by_key = HashMap::new();
@@ -482,6 +563,7 @@ impl Tree {
             files: Mutex::new(HashMap::new()),
             dirs: Mutex::new(HashMap::new()),
             next_fh: AtomicU64::new(1),
+            policy,
             #[cfg(test)]
             slow_lookup: None,
         })
@@ -496,14 +578,25 @@ impl Tree {
             .ok_or(Errno::ESTALE)
     }
 
-    /// Add one lookup of the inode of `fd`, and return its node number. A
-    /// known inode keeps its node, and `fd` closes.
-    fn remember(&self, fd: OwnedFd, st: &libc::stat) -> Result<u64, Errno> {
+    /// Add one lookup of the inode of `fd`, the entry `name` of `parent`,
+    /// and return its node number. A known inode keeps its node, takes the
+    /// new name, and `fd` closes.
+    fn remember(
+        &self,
+        fd: OwnedFd,
+        st: &libc::stat,
+        parent: INodeNo,
+        name: &OsStr,
+    ) -> Result<u64, Errno> {
         let key = key_of(st);
         let mut inodes = lock(&self.inodes);
         if let Some(id) = inodes.by_key.get(&key).copied() {
             if let Some(node) = inodes.nodes.get_mut(&id) {
                 node.lookups = node.lookups.saturating_add(1);
+                if id != u64::from(INodeNo::ROOT) {
+                    node.parent = u64::from(parent);
+                    node.name = name.to_owned();
+                }
                 return Ok(id);
             }
         }
@@ -515,10 +608,62 @@ impl Tree {
                 fd: Arc::new(fd),
                 key,
                 lookups: 1,
+                parent: u64::from(parent),
+                name: name.to_owned(),
             },
         );
         inodes.by_key.insert(key, id);
         Ok(id)
+    }
+
+    /// The path of the node `ino` on the host, from its chain of parents.
+    fn path(&self, ino: INodeNo) -> Result<PathBuf, Errno> {
+        let Some(policy) = &self.policy else {
+            return Ok(PathBuf::new());
+        };
+        let inodes = lock(&self.inodes);
+        let mut names: Vec<&OsStr> = Vec::new();
+        let mut id = u64::from(ino);
+        while id != u64::from(INodeNo::ROOT) {
+            let node = inodes.nodes.get(&id).ok_or(Errno::ESTALE)?;
+            if names.len() >= MAX_DEPTH {
+                return Err(Errno::ELOOP);
+            }
+            names.push(&node.name);
+            id = node.parent;
+        }
+        let mut path = policy.area.clone();
+        path.extend(names.iter().rev());
+        Ok(path)
+    }
+
+    /// Refuse with `EACCES` unless the policy gives `needed` at the node
+    /// `ino`, or at its entry `child`. Without a policy each access passes.
+    fn require(&self, ino: INodeNo, child: Option<&OsStr>, needed: u64) -> Result<(), Errno> {
+        let Some(policy) = &self.policy else {
+            return Ok(());
+        };
+        let mut path = self.path(ino)?;
+        if let Some(child) = child {
+            path.push(child);
+        }
+        if policy.grants.rights_except(&path, &policy.private_above) & needed == needed {
+            Ok(())
+        } else {
+            Err(Errno::EACCES)
+        }
+    }
+
+    /// Give the node of the inode `key` the entry `newname` of `newparent`,
+    /// after a rename.
+    fn moved(&self, key: InodeKey, newparent: INodeNo, newname: &OsStr) {
+        let mut inodes = lock(&self.inodes);
+        if let Some(id) = inodes.by_key.get(&key).copied() {
+            if let Some(node) = inodes.nodes.get_mut(&id) {
+                node.parent = u64::from(newparent);
+                node.name = newname.to_owned();
+            }
+        }
     }
 
     /// Remove `count` lookups of the node `ino`. The root never goes.
@@ -551,16 +696,17 @@ impl Tree {
                 std::thread::sleep(*wait);
             }
         }
-        let name = component(name)?;
+        let cname = component(name)?;
         let dir = self.fd(parent)?;
-        let fd = open_path(dir.as_fd(), &name)?;
-        self.entry(fd)
+        let fd = open_path(dir.as_fd(), &cname)?;
+        self.entry(fd, parent, name)
     }
 
-    /// Remember the node of `fd` and give its attributes.
-    fn entry(&self, fd: OwnedFd) -> Result<FileAttr, Errno> {
+    /// Remember the node of `fd`, the entry `name` of `parent`, and give
+    /// its attributes.
+    fn entry(&self, fd: OwnedFd, parent: INodeNo, name: &OsStr) -> Result<FileAttr, Errno> {
         let st = stat_fd(fd.as_fd())?;
-        let id = self.remember(fd, &st)?;
+        let id = self.remember(fd, &st, parent, name)?;
         Ok(attr_of(id, &st))
     }
 
@@ -600,6 +746,11 @@ impl Tree {
         fh: Option<FileHandle>,
     ) -> Result<FileAttr, Errno> {
         let fd = self.fd(ino)?;
+        // Landlock controls only the truncation; the mode, the owner and
+        // the times stay free, as with Landlock.
+        if size.is_some() {
+            self.require(ino, None, crate::linux_landlock::access::TRUNCATE)?;
+        }
         if let Some(mode) = mode {
             chmod_fd(fd.as_fd(), mode)?;
         }
@@ -676,21 +827,106 @@ impl Tree {
         mode: u32,
         umask: u32,
     ) -> Result<FileAttr, Errno> {
-        let name = component(name)?;
+        self.require(parent, Some(name), crate::linux_landlock::access::MAKE_DIR)?;
+        let cname = component(name)?;
         let dir = self.fd(parent)?;
         let mode = mode & !umask & 0o7777;
-        // SAFETY: `name` is NUL-terminated.
+        // SAFETY: `cname` is NUL-terminated.
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-        if unsafe { libc::mkdirat(dir.as_raw_fd(), name.as_ptr(), mode) } != 0 {
+        if unsafe { libc::mkdirat(dir.as_raw_fd(), cname.as_ptr(), mode) } != 0 {
             return Err(last_errno());
         }
-        let fd = open_path(dir.as_fd(), &name)?;
+        let fd = open_path(dir.as_fd(), &cname)?;
         // The umask of pent also cut the mode; set the mode of the request.
         chmod_fd(fd.as_fd(), mode)?;
-        self.entry(fd)
+        self.entry(fd, parent, name)
+    }
+
+    fn symlink(&self, parent: INodeNo, name: &OsStr, target: &Path) -> Result<FileAttr, Errno> {
+        self.require(parent, Some(name), crate::linux_landlock::access::MAKE_SYM)?;
+        let cname = component(name)?;
+        let ctarget = CString::new(target.as_os_str().as_bytes()).map_err(|_| Errno::EINVAL)?;
+        let dir = self.fd(parent)?;
+        // SAFETY: both strings are NUL-terminated.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        if unsafe { libc::symlinkat(ctarget.as_ptr(), dir.as_raw_fd(), cname.as_ptr()) } != 0 {
+            return Err(last_errno());
+        }
+        let fd = open_path(dir.as_fd(), &cname)?;
+        self.entry(fd, parent, name)
+    }
+
+    /// Make a named pipe, a Unix socket or an empty regular file. A device
+    /// node gets `EPERM`.
+    fn mknod(
+        &self,
+        parent: INodeNo,
+        name: &OsStr,
+        mode: u32,
+        umask: u32,
+    ) -> Result<FileAttr, Errno> {
+        use crate::linux_landlock::access;
+        let needed = match mode & libc::S_IFMT {
+            libc::S_IFIFO => access::MAKE_FIFO,
+            libc::S_IFSOCK => access::MAKE_SOCK,
+            libc::S_IFREG | 0 => access::MAKE_REG,
+            _ => return Err(Errno::EPERM),
+        };
+        self.require(parent, Some(name), needed)?;
+        let cname = component(name)?;
+        let dir = self.fd(parent)?;
+        let perm = mode & !umask & 0o7777;
+        // SAFETY: `cname` is NUL-terminated; the rest are integers.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let ret = unsafe {
+            libc::mknodat(
+                dir.as_raw_fd(),
+                cname.as_ptr(),
+                (mode & libc::S_IFMT) | perm,
+                0,
+            )
+        };
+        if ret != 0 {
+            return Err(last_errno());
+        }
+        let fd = open_path(dir.as_fd(), &cname)?;
+        // The umask of pent also cut the mode; set the mode of the request.
+        chmod_fd(fd.as_fd(), perm)?;
+        self.entry(fd, parent, name)
+    }
+
+    fn fallocate(&self, fh: FileHandle, offset: u64, length: u64, mode: i32) -> Result<(), Errno> {
+        let file = self.file(fh)?;
+        let offset = libc::off_t::try_from(offset).map_err(|_| Errno::EINVAL)?;
+        let length = libc::off_t::try_from(length).map_err(|_| Errno::EINVAL)?;
+        // SAFETY: fallocate(2) on an open file with integer arguments.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        if unsafe { libc::fallocate(file.as_raw_fd(), mode, offset, length) } != 0 {
+            return Err(last_errno());
+        }
+        Ok(())
+    }
+
+    fn lseek(&self, fh: FileHandle, offset: i64, whence: i32) -> Result<i64, Errno> {
+        let file = self.file(fh)?;
+        // SAFETY: lseek(2) on an open file with integer arguments. The
+        // descriptor of the server has its own offset, so only `SEEK_DATA`
+        // and `SEEK_HOLE` matter here.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let at = unsafe { libc::lseek(file.as_raw_fd(), offset, whence) };
+        if at < 0 {
+            return Err(last_errno());
+        }
+        Ok(at)
     }
 
     fn unlink(&self, parent: INodeNo, name: &OsStr, flags: libc::c_int) -> Result<(), Errno> {
+        let needed = if flags & libc::AT_REMOVEDIR != 0 {
+            crate::linux_landlock::access::REMOVE_DIR
+        } else {
+            crate::linux_landlock::access::REMOVE_FILE
+        };
+        self.require(parent, Some(name), needed)?;
         let name = component(name)?;
         let dir = self.fd(parent)?;
         // SAFETY: `name` is NUL-terminated.
@@ -709,26 +945,55 @@ impl Tree {
         newname: &OsStr,
         flags: RenameFlags,
     ) -> Result<(), Errno> {
-        let (name, newname) = (component(name)?, component(newname)?);
+        let (cname, cnewname) = (component(name)?, component(newname)?);
         let (from, to) = (self.fd(parent)?, self.fd(newparent)?);
+        let source = stat_fd(open_path(from.as_fd(), &cname)?.as_fd())?;
+        let exchange = flags.contains(RenameFlags::RENAME_EXCHANGE);
+        let target = if exchange {
+            Some(stat_fd(open_path(to.as_fd(), &cnewname)?.as_fd())?)
+        } else {
+            None
+        };
+        if self.policy.is_some() {
+            use crate::linux_landlock::access;
+            let (make, remove) = entry_rights(source.st_mode);
+            let (mut on_from, mut on_to) = (remove, make);
+            if let Some(target) = &target {
+                let (make_back, remove_back) = entry_rights(target.st_mode);
+                on_from |= make_back;
+                on_to |= remove_back;
+            }
+            // Landlock needs `REFER` for a move to another directory.
+            if parent != newparent {
+                on_from |= access::REFER;
+                on_to |= access::REFER;
+            }
+            self.require(parent, Some(name), on_from)?;
+            self.require(newparent, Some(newname), on_to)?;
+        }
         // SAFETY: both names are NUL-terminated; the flags are integers.
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let ret = unsafe {
             libc::renameat2(
                 from.as_raw_fd(),
-                name.as_ptr(),
+                cname.as_ptr(),
                 to.as_raw_fd(),
-                newname.as_ptr(),
+                cnewname.as_ptr(),
                 flags.bits(),
             )
         };
         if ret != 0 {
             return Err(last_errno());
         }
+        self.moved(key_of(&source), newparent, newname);
+        if let Some(target) = &target {
+            self.moved(key_of(target), parent, name);
+        }
         Ok(())
     }
 
     fn open(&self, ino: INodeNo, flags: OpenFlags) -> Result<FileHandle, Errno> {
+        self.require(ino, None, open_rights(flags.0))?;
         let fd = self.fd(ino)?;
         let path = proc_path(fd.as_fd());
         let flags = (flags.0 & !REOPEN_STRIP) | libc::O_CLOEXEC;
@@ -746,7 +1011,12 @@ impl Tree {
         umask: u32,
         flags: i32,
     ) -> Result<(FileAttr, FileHandle), Errno> {
-        let name = component(name)?;
+        self.require(
+            parent,
+            Some(name),
+            crate::linux_landlock::access::MAKE_REG | open_rights(flags),
+        )?;
+        let cname = component(name)?;
         let dir = self.fd(parent)?;
         let mode = mode & !umask & 0o7777;
         let base = (flags & !(libc::O_CREAT | libc::O_EXCL | libc::O_NOCTTY))
@@ -757,7 +1027,7 @@ impl Tree {
         let made = owned(unsafe {
             libc::openat(
                 dir.as_raw_fd(),
-                name.as_ptr(),
+                cname.as_ptr(),
                 base | libc::O_CREAT | libc::O_EXCL,
                 mode,
             )
@@ -768,7 +1038,7 @@ impl Tree {
             Err(e) if e == Errno::EEXIST && flags & libc::O_EXCL == 0 => {
                 // SAFETY: `name` is NUL-terminated.
                 // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-                let file = owned(unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), base) })?;
+                let file = owned(unsafe { libc::openat(dir.as_raw_fd(), cname.as_ptr(), base) })?;
                 (file, false)
             }
             Err(e) => return Err(e),
@@ -778,8 +1048,8 @@ impl Tree {
             // request.
             chmod_fd(file.as_fd(), mode)?;
         }
-        let node = open_path(dir.as_fd(), &name)?;
-        let attr = self.entry(node)?;
+        let node = open_path(dir.as_fd(), &cname)?;
+        let attr = self.entry(node, parent, name)?;
         Ok((attr, self.add_file(File::from(file))))
     }
 
@@ -823,6 +1093,7 @@ impl Tree {
     /// Read the whole directory at `opendir`, so that the offsets of
     /// `readdir` stay valid while the directory changes.
     fn opendir(&self, ino: INodeNo) -> Result<FileHandle, Errno> {
+        self.require(ino, None, crate::linux_landlock::access::READ_DIR)?;
         let fd = self.fd(ino)?;
         let path = proc_path(fd.as_fd());
         let path = std::path::Path::new(OsStr::from_bytes(path.as_bytes()));
@@ -928,9 +1199,9 @@ impl Tree {
 }
 
 impl FuseTree {
-    fn new(root: OwnedFd) -> std::io::Result<Self> {
+    fn new(root: OwnedFd, policy: Option<AreaPolicy>) -> std::io::Result<Self> {
         Ok(Self {
-            tree: Arc::new(Tree::new(root)?),
+            tree: Arc::new(Tree::new(root, policy)?),
         })
     }
 
@@ -1053,6 +1324,100 @@ impl Filesystem for FuseTree {
     ) {
         let name = name.to_owned();
         self.spawn(move |t| reply_entry(reply, t.mkdir(parent, &name, mode, umask)));
+    }
+
+    fn symlink(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        link_name: &OsStr,
+        target: &Path,
+        _owner: fuser::Owner,
+        reply: ReplyEntry,
+    ) {
+        let (name, target) = (link_name.to_owned(), target.to_owned());
+        self.spawn(move |t| reply_entry(reply, t.symlink(parent, &name, &target)));
+    }
+
+    fn mknod(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        mode: u32,
+        umask: u32,
+        _rdev: u32,
+        _owner: fuser::Owner,
+        reply: ReplyEntry,
+    ) {
+        let name = name.to_owned();
+        self.spawn(move |t| reply_entry(reply, t.mknod(parent, &name, mode, umask)));
+    }
+
+    fn getxattr(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _name: &OsStr,
+        _size: u32,
+        reply: fuser::ReplyXattr,
+    ) {
+        // The tree shows no extended attribute.
+        reply.error(Errno::ENODATA);
+    }
+
+    fn listxattr(&self, _req: &Request, _ino: INodeNo, size: u32, reply: fuser::ReplyXattr) {
+        // The list is empty.
+        if size == 0 {
+            reply.size(0);
+        } else {
+            reply.data(&[]);
+        }
+    }
+
+    fn setxattr(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _name: &OsStr,
+        _value: &[u8],
+        _flags: i32,
+        _position: u32,
+        reply: ReplyEmpty,
+    ) {
+        reply.error(Errno::ENOTSUP);
+    }
+
+    fn removexattr(&self, _req: &Request, _ino: INodeNo, _name: &OsStr, reply: ReplyEmpty) {
+        reply.error(Errno::ENOTSUP);
+    }
+
+    fn fallocate(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
+        length: u64,
+        mode: i32,
+        reply: ReplyEmpty,
+    ) {
+        self.spawn(move |t| reply_empty(reply, t.fallocate(fh, offset, length, mode)));
+    }
+
+    fn lseek(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        offset: i64,
+        whence: i32,
+        reply: fuser::ReplyLseek,
+    ) {
+        self.spawn(move |t| match t.lseek(fh, offset, whence) {
+            Ok(at) => reply.offset(at),
+            Err(e) => reply.error(e),
+        });
     }
 
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
@@ -1378,9 +1743,9 @@ pub(crate) mod tests {
         };
         let dev = fds.pop().ok_or("no descriptor")?;
         let server = match &t.slow_lookup {
-            None => serve(dev, root)?,
+            None => serve(dev, root, None)?,
             Some(slow) => {
-                let mut tree = Tree::new(root)?;
+                let mut tree = Tree::new(root, None)?;
                 tree.slow_lookup = Some(slow.clone());
                 let tree = Arc::new(tree);
                 serve_tree(dev, FuseTree { tree })?
