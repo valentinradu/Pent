@@ -1,6 +1,6 @@
 # The FUSE server and the grafts
 
-Status: the branch `next`, steps 5.1 to 5.5 of `PLAN.md` (2026-11-25).
+Status: the branch `next`, steps 5.1 to 5.6 of `PLAN.md` (2026-11-25).
 This report lists the security properties of the FUSE server of pent, of
 the graft helper and of the FUSE areas, the test of each property, and the
 properties that later steps must add.
@@ -8,9 +8,8 @@ properties that later steps must add.
 `pent run` covers each directory outside the base with FUSE
 (`FuseAreas::OutsideBase`), and the server applies the grants of the run:
 the rules, the flags and `-w`. Since step 5.4 an access that no grant
-gives asks the chain of deciders, and a question goes to pentd. No answer
-makes a graft yet: step 5.6 grafts the rules at the start and the
-answers.
+gives asks the chain of deciders, and a question goes to pentd. Since step
+5.6 the grants at the start and the width of an answer become grafts.
 
 ## Scope
 
@@ -78,13 +77,23 @@ makes the skip a failure. The container runs of the pipeline give
 |---|---|---|
 | GR-1 | The helper is the outer supervisor of the session: the stub outside the PID namespace of the program, or one more fork without that namespace. It keeps the capabilities of the session, it never runs `exec`, and it is not dumpable, so a process of the same user cannot look into it through `ptrace` or `/proc`. | `linux_graft::tests::a_graft_during_a_run_holds_and_the_program_cannot_remove_it` |
 | GR-2 | The program runs in a nested user namespace. It has no capability over the mounts of the session: `umount2` of a graft and of a FUSE mount gives `EPERM`. | `linux_graft::tests::a_graft_during_a_run_holds_and_the_program_cannot_remove_it` |
-| GR-3 | The path of a graft is relative, with no empty, `.` or `..` component. Pent checks it, and the helper checks it again. The helper opens the source and the target with `openat2` and `RESOLVE_BENEATH \| RESOLVE_NO_SYMLINKS \| RESOLVE_NO_MAGICLINKS`, so a symbolic link never becomes a graft (`ELOOP`). | `linux_graft::tests::a_graft_path_is_relative_with_no_dot_component`, `a_graft_during_a_run_holds_and_the_program_cannot_remove_it` |
+| GR-3 | The path of a graft is relative, with no empty, `.` or `..` component, and the path of the area is absolute. Pent checks both, and the helper checks them again. The helper opens the root of the area with `openat2` and `RESOLVE_NO_SYMLINKS \| RESOLVE_NO_MAGICLINKS`, and the source and the target below it with `RESOLVE_BENEATH` too, so a symbolic link never becomes a graft (`ELOOP`). | `linux_graft::tests::a_graft_path_is_relative_with_no_dot_component`, `a_graft_during_a_run_holds_and_the_program_cannot_remove_it` |
 | GR-4 | A read grant is read-only on each mount of the graft (`MOUNT_ATTR_RDONLY` with `AT_RECURSIVE`). | `linux_graft::tests::a_graft_during_a_run_holds_and_the_program_cannot_remove_it` |
 | GR-5 | A graft keeps each mount below its subtree (`open_tree` with `AT_RECURSIVE`), so a read-only `.pent` or a mask of pent inside a read-write graft stays. | `linux_graft::tests::a_graft_during_a_run_holds_and_the_program_cannot_remove_it` |
 | GR-6 | A working directory in an area goes through FUSE: the hook changes to the working directory after the FUSE mounts. Before this step it changed earlier, and a working directory in an area then named the real directory below FUSE. | `linux_graft::tests::a_graft_during_a_run_holds_and_the_program_cannot_remove_it` |
 | GR-7 | The program gets no descriptor of pent: the sockets of the areas and of the helper have `O_CLOEXEC`, and PID 1 closes them. | `linux_graft::tests::a_graft_during_a_run_holds_and_the_program_cannot_remove_it` (the list of `/proc/self/fd`) |
 | GR-8 | When the session ends, the helper ends, and a graft request gives `HelperGone`. | `linux_graft::tests::a_graft_during_a_run_holds_and_the_program_cannot_remove_it` |
 | GR-9 | The server reads the real tree through the source descriptor that the child opened, so it sees the mounts of the session: a read-only `.pent` stays read-only through FUSE too, and so does a mask of pent. | `linux_graft::tests::a_graft_during_a_run_holds_and_the_program_cannot_remove_it` |
+
+## The grafts at the start and of the answers (step 5.6)
+
+| ID | Property | Test |
+|---|---|---|
+| GS-1 | Before the program starts, pent grafts each grant of a directory in an area (a rule, a flag, `-w`) that gives the right to read files and to list. The hook waits for one byte of pent after the grafts, so the program starts with the grafts in place; the end of the socket also lets it start, and FUSE then serves each width. | `linux_graft::tests::the_grants_and_an_answer_become_grafts` (the decider is slow, so a program that does not wait sees no graft) |
+| GS-2 | A graft has the access of its grant: `MOUNT_ATTR_RDONLY` and `MOUNT_ATTR_NOEXEC` for a read grant, `MOUNT_ATTR_NOEXEC` for a write grant with no exec, `MOUNT_ATTR_RDONLY` for an exec grant. The rule of the FUSE root gives all Landlock rights, so without these attributes a read graft would let the program run its files. An execute-only or a list-only grant stays with FUSE: a graft would give the content. | `linux_graft::tests::the_grants_and_an_answer_become_grafts` (`proj`, `xonly`) |
+| GS-3 | The decider must agree (`AccessDecider::may_graft`). The chain of `pent run` refuses a width with a deny rule of a flag, a rule or an answer inside it, with a sensitive location or a file of pent inside it, and an exact width; without the classes of the user, and without a decider, there is no graft. A graft gives each path below it with no question, so such a width stays with FUSE. | `decide::tests::a_graft_needs_a_clean_subtree`, `linux_graft::tests::the_grants_and_an_answer_become_grafts` (`nograft`, `keep`) |
+| GS-4 | An allow of a question grafts the width of the rule or the answer that gave it (`AccessDecider::decide_target`), in a new thread: the kernel can hold the lock of a directory that the graft must look up. The access itself goes through FUSE; a later access in the width asks nothing. A width gets one graft at most. | `linux_graft::tests::the_grants_and_an_answer_become_grafts` (`ans`), `decide::tests::the_target_of_a_decision_is_the_rule_that_allowed_it` |
+| GS-5 | The helper finds the target of a graft in its mount namespace, and pent holds only the source descriptors of the real directories. A descriptor of a FUSE root would keep the FUSE mount and the session of its server alive after the run. | No direct test: the tests of the events end when the run ends. |
 
 ## The negative cache (step 5.5)
 
@@ -132,32 +141,25 @@ the mount namespace goes: `lookup_getattr_and_read`, `create_write_and_modes`,
 
 ## For the later steps
 
+- **Step 5.7.** The measurement of the speed with the grafts. Each spawn
+  mounts one FUSE area for each directory outside the base (12 on the
+  machine of the tests), and an access in an area that no graft covers
+  goes through FUSE.
+- **The validity of a graft.** The entry under a graft lives 1 s, and the
+  kernel checks it again after that time. The server gives the same node,
+  so the graft stays. When the host removes or renames the real
+  directory, the kernel drops the entry and the graft with it.
 - **The Landlock rules in an area.** The Landlock step of the hook opens
   each path of its rules in the child, after the FUSE mounts. A rule in an
   area thus binds to a FUSE node, and its open sends requests to pent;
   this works only because pent serves the areas during the spawn.
-- **Step 5.6.** The rules at the start and the answers become grafts. A
-  width that holds a sensitive location must stay with FUSE. `FileAreas`
-  must drop when the child ends: its descriptors of the FUSE roots keep
-  the mounts, the sessions and their event senders alive.
 - **An execute-only grant** runs a binary, not a script: the interpreter
   needs a read, as with Landlock.
 - **A program outside `$HOME`.** A program can take the home directory
   from the password database (`curl` reads `~/.ssh/known_hosts` there).
   That path is in an area too, so it asks.
-- **The speed.** Each spawn mounts one FUSE area for each directory
-  outside the base (12 on the machine of the tests), and each access in an
-  area goes through FUSE until step 5.6 grafts the grants at the start.
-- **The validity of a graft.** An entry stays valid for 1 s. When the
-  kernel checks the entry under a graft again and the host has removed or
-  renamed the real directory, the kernel drops the entry and the graft
-  with it.
-- **Step 5.4.** The server answers each request now. The questions, the
-  refusals (`EACCES`) and the hidden files of pent (`ENOENT`) come in this
-  step.
-- **Step 5.5.** A lookup of a missing name gets no negative entry yet, and
-  an entry stays valid for 1 s. A name that the host removes can stay
-  visible for that time.
+- **A name that the host removes** stays visible for the validity time of
+  a positive entry (1 s).
 - **The inode number of a listing.** `stat` gives the number of the node,
   because `fuser` uses one number for both. A listing gives the number of
   the node when the node exists, else the real inode number, so `ls -i` can

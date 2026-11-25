@@ -198,6 +198,27 @@ pub trait AccessDecider: Send + Sync + std::fmt::Debug {
         let _ = path; // The default hides nothing, so it needs no path.
         false
     }
+
+    /// Return true if a graft may give `target`: a graft gives each path
+    /// below it with no question, so the width must hold no sensitive
+    /// location, no file of pent and no deny rule. The default allows no
+    /// graft; FUSE then serves each access.
+    fn may_graft(&self, target: &pent_profile::Target) -> bool {
+        let _ = target; // The default allows no graft, so it needs no target.
+        false
+    }
+
+    /// [`AccessDecider::decide`], and the target of the rule or the answer
+    /// that allowed the access, for a graft of its width. The default gives
+    /// no target.
+    fn decide_target(
+        &self,
+        program: &str,
+        request: pent_profile::Request,
+        deadline: std::time::Duration,
+    ) -> (pent_profile::Decision, Option<pent_profile::Target>) {
+        (self.decide(program, request, deadline), None)
+    }
 }
 
 impl SandboxConfig {

@@ -14,8 +14,11 @@
 //!   PID namespace, or one more fork when the session has no PID
 //!   namespace. It is in the user namespace and the mount namespace of the
 //!   session, it keeps its capabilities there, and it never runs `exec`.
-//!   It keeps no state: each request of pent carries the source and the
-//!   target of its area with `SCM_RIGHTS`, and a relative path.
+//!   It keeps no state: each request of pent carries the source of its
+//!   area with `SCM_RIGHTS`, the path of the area and a relative path. The
+//!   helper finds the target in its mount namespace, so pent holds no
+//!   descriptor of a FUSE root: such a descriptor would keep the FUSE
+//!   mount, and the session of its server, alive after the run.
 //! - **A graft** is `open_tree(OPEN_TREE_CLONE | AT_RECURSIVE)` of the real
 //!   subtree, `mount_setattr(MOUNT_ATTR_RDONLY)` for a read grant, and
 //!   `move_mount` over the FUSE directory. `AT_RECURSIVE` keeps each mount
@@ -24,7 +27,7 @@
 //!   capability over the mounts of the session.
 
 use std::ffi::CString;
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -46,6 +49,8 @@ const MOVE_MOUNT_F_EMPTY_PATH: libc::c_uint = 0x04;
 const MOVE_MOUNT_T_EMPTY_PATH: libc::c_uint = 0x40;
 /// `MOUNT_ATTR_RDONLY` of `mount_setattr(2)`.
 const MOUNT_ATTR_RDONLY: u64 = 1;
+/// `MOUNT_ATTR_NOEXEC` of `mount_setattr(2)`.
+const MOUNT_ATTR_NOEXEC: u64 = 8;
 
 /// `struct mount_attr` of `mount_setattr(2)`.
 #[repr(C)]
@@ -70,25 +75,71 @@ const MAX_GRAFT_PATH: usize = 4096;
 /// The access of a graft.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GraftAccess {
-    /// The graft is read-only (`MOUNT_ATTR_RDONLY` on each mount in it).
-    ReadOnly,
-    /// The graft keeps the access of the real filesystem.
-    ReadWrite,
+    /// Read and list (`MOUNT_ATTR_RDONLY` and `MOUNT_ATTR_NOEXEC`).
+    Read,
+    /// Read, list and run programs (`MOUNT_ATTR_RDONLY`).
+    ReadExec,
+    /// Read, list and write (`MOUNT_ATTR_NOEXEC`).
+    Write,
+    /// Each access of the real filesystem.
+    WriteExec,
 }
 
 impl GraftAccess {
     const fn byte(self) -> u8 {
         match self {
-            Self::ReadOnly => 0,
-            Self::ReadWrite => 1,
+            Self::Read => 0,
+            Self::ReadExec => 1,
+            Self::Write => 2,
+            Self::WriteExec => 3,
         }
     }
 
     const fn from_byte(b: u8) -> Option<Self> {
         match b {
-            0 => Some(Self::ReadOnly),
-            1 => Some(Self::ReadWrite),
+            0 => Some(Self::Read),
+            1 => Some(Self::ReadExec),
+            2 => Some(Self::Write),
+            3 => Some(Self::WriteExec),
             _ => None,
+        }
+    }
+
+    /// The attributes of `mount_setattr(2)` that the graft gets.
+    const fn attributes(self) -> u64 {
+        match self {
+            Self::Read => MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOEXEC,
+            Self::ReadExec => MOUNT_ATTR_RDONLY,
+            Self::Write => MOUNT_ATTR_NOEXEC,
+            Self::WriteExec => 0,
+        }
+    }
+
+    /// The access of a graft of `kind`, or `None` for a kind that a graft
+    /// cannot give alone: a listing would also give the content.
+    pub(crate) const fn of_kind(kind: pent_profile::FileKind) -> Option<Self> {
+        match kind {
+            pent_profile::FileKind::Read => Some(Self::Read),
+            pent_profile::FileKind::Exec => Some(Self::ReadExec),
+            pent_profile::FileKind::Write => Some(Self::Write),
+            pent_profile::FileKind::List => None,
+        }
+    }
+
+    /// Return true if this access gives each access of `other`.
+    const fn covers(self, other: Self) -> bool {
+        let (w, x) = self.parts();
+        let (ow, ox) = other.parts();
+        (w || !ow) && (x || !ox)
+    }
+
+    /// Write and exec.
+    const fn parts(self) -> (bool, bool) {
+        match self {
+            Self::Read => (false, false),
+            Self::ReadExec => (false, true),
+            Self::Write => (true, false),
+            Self::WriteExec => (true, true),
         }
     }
 }
@@ -133,52 +184,54 @@ pub(crate) struct FuseArea {
     pub(crate) path: PathBuf,
     /// An `O_PATH` descriptor of the real directory, from the child.
     source: OwnedFd,
-    /// An `O_PATH` descriptor of the FUSE root, from the child.
-    target: OwnedFd,
     /// The server of the area. The session ends with the mount namespace.
     _server: FuseServer,
 }
 
 /// The FUSE areas of a session and the channel to its graft helper.
-///
-/// Its descriptors of the FUSE roots keep the FUSE mounts alive, so the
-/// FUSE sessions, and the event senders in them, end only after this value
-/// drops. Drop it when the child ends.
 pub(crate) struct FileAreas {
     areas: Vec<FuseArea>,
+    grafter: Arc<Grafter>,
+}
+
+/// The channel to the graft helper of one sandbox.
+pub(crate) struct Grafter {
     ctl: Mutex<OwnedFd>,
 }
 
-impl FileAreas {
-    /// The areas, in the order of [`crate::SandboxConfig::file_areas`].
-    pub(crate) fn areas(&self) -> &[FuseArea] {
-        &self.areas
-    }
-
-    /// Graft `rel` of the area number `area` over its FUSE directory.
+impl Grafter {
+    /// Graft `rel` of the area `area`, whose real directory is `source`.
     ///
     /// # Errors
-    /// Returns [`GraftError::BadPath`] or [`GraftError::NoArea`] for a bad
-    /// request, [`GraftError::HelperGone`] when the session ended, and
+    /// Returns [`GraftError::BadPath`] for a bad path,
+    /// [`GraftError::HelperGone`] when the session ended, and
     /// [`GraftError::Failed`] with the error of the helper.
     pub(crate) fn graft(
         &self,
-        area: usize,
+        source: BorrowedFd<'_>,
+        area: &Path,
         rel: &Path,
         access: GraftAccess,
     ) -> Result<(), GraftError> {
         let bytes = rel.as_os_str().as_bytes();
-        if !valid_relative(bytes) {
+        let area_bytes = area.as_os_str().as_bytes();
+        if !valid_relative(bytes) || !valid_area(area_bytes) {
             return Err(GraftError::BadPath(rel.to_path_buf()));
         }
-        let area = self.areas.get(area).ok_or(GraftError::NoArea(area))?;
-        let mut msg = Vec::with_capacity(bytes.len().saturating_add(1));
+        let mut msg = Vec::with_capacity(
+            bytes
+                .len()
+                .saturating_add(area_bytes.len())
+                .saturating_add(2),
+        );
         msg.push(access.byte());
+        msg.extend_from_slice(area_bytes);
+        msg.push(0);
         msg.extend_from_slice(bytes);
         // One request at a time: the reply carries no number.
         let ctl = self.ctl.lock().unwrap_or_else(PoisonError::into_inner);
-        let fds = [area.source.as_raw_fd(), area.target.as_raw_fd()];
-        // SAFETY: the socket and both descriptors are open.
+        let fds = [source.as_raw_fd()];
+        // SAFETY: the socket and the descriptor are open.
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         match unsafe { linux_fdpass::send_with_fds(ctl.as_raw_fd(), &msg, &fds) } {
             Ok(()) => {}
@@ -200,6 +253,39 @@ impl FileAreas {
     }
 }
 
+/// Return true if `area` is an absolute path with no empty, `.` or `..`
+/// component and no NUL byte. Async-signal-safe.
+fn valid_area(area: &[u8]) -> bool {
+    match area.strip_prefix(b"/") {
+        Some(rest) => !rest.is_empty() && valid_relative(rest),
+        None => false,
+    }
+}
+
+impl FileAreas {
+    /// The areas, in the order of [`crate::SandboxConfig::file_areas`].
+    pub(crate) fn areas(&self) -> &[FuseArea] {
+        &self.areas
+    }
+
+    /// Graft `rel` of the area number `area` over its FUSE directory.
+    ///
+    /// # Errors
+    /// Returns [`GraftError::BadPath`] or [`GraftError::NoArea`] for a bad
+    /// request, [`GraftError::HelperGone`] when the session ended, and
+    /// [`GraftError::Failed`] with the error of the helper.
+    pub(crate) fn graft(
+        &self,
+        area: usize,
+        rel: &Path,
+        access: GraftAccess,
+    ) -> Result<(), GraftError> {
+        let area = self.areas.get(area).ok_or(GraftError::NoArea(area))?;
+        self.grafter
+            .graft(area.source.as_fd(), &area.path, rel, access)
+    }
+}
+
 /// The policy of the FUSE areas of one sandbox.
 pub(crate) struct FilePolicy {
     /// The grants, as Landlock rules without the rules of the FUSE roots.
@@ -216,7 +302,7 @@ pub(crate) struct FileAreasSetup {
     /// the receiver sees EOF if the child died before it sent the areas.
     child_fuse: OwnedFd,
     child_ctl: OwnedFd,
-    ctl: OwnedFd,
+    grafter: Arc<Grafter>,
     receiver: JoinHandle<Result<Vec<FuseArea>, SandboxError>>,
 }
 
@@ -253,10 +339,24 @@ impl FileAreasSetup {
             .collect::<Result<_, _>>()?;
         let (fuse_parent, child_fuse) = linux_fdpass::seqpacket_pair()?;
         let (ctl, child_ctl) = linux_fdpass::seqpacket_pair()?;
+        let grafter = Arc::new(Grafter {
+            ctl: Mutex::new(ctl),
+        });
         let owned: Vec<PathBuf> = areas.to_vec();
+        let theirs = Arc::clone(&grafter);
         let receiver = std::thread::Builder::new()
             .name("pent-fuse-areas".to_string())
-            .spawn(move || receive_areas(&fuse_parent, owned, policy))
+            .spawn(move || {
+                let areas = receive_areas(&fuse_parent, owned, policy, &theirs);
+                // The child waits for this byte before the program starts:
+                // after the grafts of the grants, or after a failure. A
+                // child that is gone gives an error here, which means
+                // nothing.
+                // SAFETY: the socket is open.
+                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+                let _ = unsafe { linux_fdpass::write_all(fuse_parent.as_raw_fd(), b"g") };
+                areas
+            })
             .map_err(SandboxError::SpawnFailed)?;
         let child = FileAreasChild {
             fuse_sock: child_fuse.as_raw_fd(),
@@ -266,7 +366,7 @@ impl FileAreasSetup {
         let setup = Self {
             child_fuse,
             child_ctl,
-            ctl,
+            grafter,
             receiver,
         };
         Ok((setup, child))
@@ -285,17 +385,19 @@ impl FileAreasSetup {
         })??;
         Ok(FileAreas {
             areas,
-            ctl: Mutex::new(self.ctl),
+            grafter: self.grafter,
         })
     }
 }
 
-/// Receive the three descriptors of each area and serve its FUSE
-/// connection, with the policy of the grants when there is one.
+/// Receive the two descriptors of each area and serve its FUSE
+/// connection, with the policy of the grants when there is one. Then graft
+/// the grants of the policy (see [`start_grafts`]).
 fn receive_areas(
     sock: &OwnedFd,
     paths: Vec<PathBuf>,
     policy: Option<FilePolicy>,
+    grafter: &Arc<Grafter>,
 ) -> Result<Vec<FuseArea>, SandboxError> {
     let lost = |what: &str| SandboxError::SpawnFailed(std::io::Error::other(what.to_string()));
     // The first message holds the `/proc` of the child.
@@ -310,6 +412,8 @@ fn receive_areas(
                 decider: p.decider,
                 events: p.events,
                 proc_dir,
+                grafter: Arc::clone(grafter),
+                grafted: Mutex::new(std::collections::HashSet::new()),
             }),
         )
     });
@@ -318,9 +422,9 @@ fn receive_areas(
         let Some(fds) = linux_fdpass::recv_fds(sock).map_err(SandboxError::SpawnFailed)? else {
             return Err(lost("the child sent no FUSE area"));
         };
-        let [dev, source, target]: [OwnedFd; 3] = fds
+        let [dev, source]: [OwnedFd; 2] = fds
             .try_into()
-            .map_err(|_| lost("a FUSE area needs three descriptors"))?;
+            .map_err(|_| lost("a FUSE area needs two descriptors"))?;
         let root = source.try_clone().map_err(SandboxError::SpawnFailed)?;
         let area_policy = shared
             .as_ref()
@@ -338,11 +442,100 @@ fn receive_areas(
         areas.push(FuseArea {
             path,
             source,
-            target,
             _server: server,
         });
     }
+    if let Some((grants, context)) = &shared {
+        start_grafts(&areas, grants, context);
+    }
     Ok(areas)
+}
+
+/// The access of a graft that the Landlock rights `rights` of a grant
+/// give, or `None` when a graft would give more: a graft needs the right to
+/// read files and to list.
+fn access_of_rights(rights: u64) -> Option<GraftAccess> {
+    use crate::linux_landlock::access;
+    if rights & access::READ != access::READ {
+        return None;
+    }
+    let write = rights & access::WRITE_FILE != 0;
+    let exec = rights & access::EXECUTE != 0;
+    Some(match (write, exec) {
+        (false, false) => GraftAccess::Read,
+        (false, true) => GraftAccess::ReadExec,
+        (true, false) => GraftAccess::Write,
+        (true, true) => GraftAccess::WriteExec,
+    })
+}
+
+/// The kind of a rule that a graft of `access` stands for.
+const fn kind_of_access(access: GraftAccess) -> pent_profile::FileKind {
+    match access {
+        GraftAccess::Read => pent_profile::FileKind::Read,
+        GraftAccess::ReadExec => pent_profile::FileKind::Exec,
+        GraftAccess::Write | GraftAccess::WriteExec => pent_profile::FileKind::Write,
+    }
+}
+
+/// Graft each grant that a graft can hold, before the program starts: a
+/// directory in an area, with the right to read files and to list. The
+/// decider must agree ([`crate::AccessDecider::may_graft`]): a width with a
+/// sensitive location, a file of pent or a deny rule inside it stays with
+/// FUSE. Without a decider there is no graft. A grant inside a graft that
+/// gives it already needs no graft of its own. A failed graft only means
+/// that FUSE serves the width.
+fn start_grafts(
+    areas: &[FuseArea],
+    grants: &crate::linux::AccessPolicy,
+    context: &linux_fuse::FileContext,
+) {
+    let Some(decider) = &context.decider else {
+        return;
+    };
+    // The rights of each path: Landlock joins the rules of one path.
+    let mut by_path: std::collections::BTreeMap<PathBuf, u64> = std::collections::BTreeMap::new();
+    for (path, rights) in grants.rules() {
+        *by_path.entry(path.clone()).or_default() |= *rights;
+    }
+    let mut done: Vec<(PathBuf, GraftAccess)> = Vec::new();
+    for (path, rights) in by_path {
+        let Some(area) = areas.iter().find(|a| path.starts_with(&a.path)) else {
+            continue;
+        };
+        let Some(access) = access_of_rights(rights) else {
+            continue;
+        };
+        if !std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir()) {
+            continue;
+        }
+        if done
+            .iter()
+            .any(|(p, a)| path.starts_with(p) && a.covers(access))
+        {
+            continue;
+        }
+        let Ok(base) = pent_profile::RulePath::new(path.clone()) else {
+            continue;
+        };
+        let target = pent_profile::Target::File {
+            kind: kind_of_access(access),
+            width: pent_profile::PathWidth::Subtree(base),
+        };
+        if !decider.may_graft(&target) {
+            continue;
+        }
+        let Ok(rel) = path.strip_prefix(&area.path) else {
+            continue;
+        };
+        match context
+            .grafter
+            .graft(area.source.as_fd(), &area.path, rel, access)
+        {
+            Ok(()) => done.push((path, access)),
+            Err(e) => tracing::debug!("no graft of {}: {e}", path.display()),
+        }
+    }
 }
 
 impl FileAreasChild {
@@ -387,22 +580,11 @@ impl FileAreasChild {
                     return Err(e);
                 }
             };
-            // The path now gives the root of the FUSE mount.
-            // SAFETY: `area` is NUL-terminated.
+            // SAFETY: the socket and the two descriptors are open.
             // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-            let target = unsafe { libc::open(area.as_ptr(), dir) };
-            let sent = if target < 0 {
-                Err(std::io::Error::last_os_error())
-            } else {
-                // SAFETY: the socket and the three descriptors are open.
-                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-                unsafe { linux_fdpass::send_fds(self.fuse_sock, &[dev, source, target]) }
-            };
+            let sent = unsafe { linux_fdpass::send_fds(self.fuse_sock, &[dev, source]) };
             close(dev);
             close(source);
-            if target >= 0 {
-                close(target);
-            }
             sent?;
         }
         for area in &self.areas {
@@ -417,6 +599,12 @@ impl FileAreasChild {
                 return Err(std::io::Error::last_os_error());
             }
         }
+        // Pent grafts the grants now, and then it sends one byte. The end of
+        // the socket also lets the program start: FUSE serves each width.
+        let mut go = [0u8; 1];
+        // SAFETY: the socket is open; `go` has one writable byte.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let _ = unsafe { linux_fdpass::read_message(self.fuse_sock, &mut go) };
         close(self.fuse_sock);
         Ok(())
     }
@@ -492,7 +680,8 @@ pub(crate) fn serve_grafts(ctl: RawFd, child: libc::pid_t) {
 /// Read one request from `ctl`, do it, and write the reply. Returns false
 /// when the channel is closed. Async-signal-safe.
 fn serve_one(ctl: RawFd) -> bool {
-    let mut buf = [0u8; MAX_GRAFT_PATH + 2];
+    // The access byte, the area, a NUL byte and the relative path.
+    let mut buf = [0u8; 2 * MAX_GRAFT_PATH + 3];
     let mut fds = [-1; MAX_FDS];
     // SAFETY: `ctl` is an open socket.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
@@ -502,9 +691,13 @@ fn serve_one(ctl: RawFd) -> bool {
         Err(e) => return reply(ctl, e.raw_os_error().unwrap_or(libc::EPROTO)),
     };
     let result = match (buf.get(..len), fds.get(..count)) {
-        (Some([access, path @ ..]), Some(&[source, target])) => {
-            match GraftAccess::from_byte(*access) {
-                Some(access) if valid_relative(path) => graft(source, target, path, access),
+        (Some([access, rest @ ..]), Some(&[source])) => {
+            let mut parts = rest.splitn(2, |b| *b == 0);
+            let (area, path) = (parts.next().unwrap_or_default(), parts.next());
+            match (GraftAccess::from_byte(*access), path) {
+                (Some(access), Some(path)) if valid_area(area) && valid_relative(path) => {
+                    graft(source, area, path, access)
+                }
                 _ => Err(libc::EINVAL),
             }
         }
@@ -527,6 +720,26 @@ fn reply(ctl: RawFd, errno: i32) -> bool {
 /// Open `rel` below `dir` with `O_PATH`, with no symbolic link and no step
 /// out of `dir`. Async-signal-safe.
 fn open_beneath(dir: RawFd, rel: &[u8]) -> Result<RawFd, i32> {
+    open_resolved(
+        dir,
+        rel,
+        libc::RESOLVE_BENEATH | libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_NO_MAGICLINKS,
+    )
+}
+
+/// Open the absolute path `area` with `O_PATH`, with no symbolic link.
+/// Async-signal-safe.
+fn open_area(area: &[u8]) -> Result<RawFd, i32> {
+    open_resolved(
+        libc::AT_FDCWD,
+        area,
+        libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_NO_MAGICLINKS,
+    )
+}
+
+/// `openat2(2)` of `rel` below `dir` with `O_PATH` and the resolve flags
+/// `resolve`. Async-signal-safe.
+fn open_resolved(dir: RawFd, rel: &[u8], resolve: u64) -> Result<RawFd, i32> {
     let mut path = [0u8; MAX_GRAFT_PATH + 2];
     let text: &[u8] = if rel.is_empty() { b"." } else { rel };
     let Some(slot) = path.get_mut(..text.len()) else {
@@ -536,7 +749,7 @@ fn open_beneath(dir: RawFd, rel: &[u8]) -> Result<RawFd, i32> {
     let how = OpenHow {
         flags: (libc::O_PATH | libc::O_CLOEXEC) as u64,
         mode: 0,
-        resolve: libc::RESOLVE_BENEATH | libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_NO_MAGICLINKS,
+        resolve,
     };
     // SAFETY: `path` is NUL-terminated (the buffer is longer than the
     // text), and `how` is a valid `open_how` of its own size.
@@ -563,13 +776,25 @@ fn errno() -> i32 {
         .unwrap_or(libc::EIO)
 }
 
-/// Graft `rel` of the real directory `source` over `rel` of the FUSE root
-/// `target`. Async-signal-safe.
-fn graft(source: RawFd, target: RawFd, rel: &[u8], access: GraftAccess) -> Result<(), i32> {
+/// Graft `rel` of the real directory `source` over `rel` of the area
+/// `area`, which the helper finds in its mount namespace.
+/// Async-signal-safe.
+fn graft(source: RawFd, area: &[u8], rel: &[u8], access: GraftAccess) -> Result<(), i32> {
     let src = open_beneath(source, rel)?;
+    // The root of the area in the mount namespace of the helper: the FUSE
+    // root, or a graft on it.
+    let root = match open_area(area) {
+        Ok(fd) => fd,
+        Err(e) => {
+            close(src);
+            return Err(e);
+        }
+    };
     // The lookup of the target goes through FUSE; pent answers it in
     // another thread.
-    let dst = match open_beneath(target, rel) {
+    let target = open_beneath(root, rel);
+    close(root);
+    let dst = match target {
         Ok(fd) => fd,
         Err(e) => {
             close(src);
@@ -598,9 +823,10 @@ fn move_tree(src: RawFd, dst: RawFd, access: GraftAccess) -> Result<(), i32> {
         Ok(fd) if fd >= 0 => fd,
         _ => return Err(errno()),
     };
-    if access == GraftAccess::ReadOnly {
+    let set = access.attributes();
+    if set != 0 {
         let attr = MountAttr {
-            attr_set: MOUNT_ATTR_RDONLY,
+            attr_set: set,
             attr_clr: 0,
             propagation: 0,
             userns_fd: 0,
@@ -662,10 +888,15 @@ mod tests {
 
     #[test]
     fn the_access_byte_survives_a_round_trip() {
-        for access in [GraftAccess::ReadOnly, GraftAccess::ReadWrite] {
+        for access in [
+            GraftAccess::Read,
+            GraftAccess::ReadExec,
+            GraftAccess::Write,
+            GraftAccess::WriteExec,
+        ] {
             assert_eq!(GraftAccess::from_byte(access.byte()), Some(access));
         }
-        assert_eq!(GraftAccess::from_byte(2), None);
+        assert_eq!(GraftAccess::from_byte(4), None);
     }
 
     // ── A graft during a run ───────────────────────────────────────────────
@@ -858,20 +1089,20 @@ ls /proc/self/fd | tr '\n' ' '
 
             // A symbolic link and a step out of the area never become a
             // graft.
-            match files.graft(0, Path::new("link"), GraftAccess::ReadOnly) {
+            match files.graft(0, Path::new("link"), GraftAccess::Read) {
                 Err(GraftError::Failed(e)) => assert_eq!(e.raw_os_error(), Some(libc::ELOOP)),
                 other => return Err(format!("a graft of a link: {other:?}").into()),
             }
             assert!(matches!(
-                files.graft(0, Path::new("../ws"), GraftAccess::ReadOnly),
+                files.graft(0, Path::new("../ws"), GraftAccess::Read),
                 Err(GraftError::BadPath(_))
             ));
             assert!(matches!(
-                files.graft(2, Path::new("sub"), GraftAccess::ReadOnly),
+                files.graft(2, Path::new("sub"), GraftAccess::Read),
                 Err(GraftError::NoArea(2))
             ));
-            files.graft(0, Path::new("sub"), GraftAccess::ReadWrite)?;
-            files.graft(0, Path::new("other"), GraftAccess::ReadOnly)?;
+            files.graft(0, Path::new("sub"), GraftAccess::Write)?;
+            files.graft(0, Path::new("other"), GraftAccess::Read)?;
             std::fs::write(ws.join("grafted"), "")?;
             Ok(())
         })();
@@ -895,7 +1126,7 @@ ls /proc/self/fd | tr '\n' ' '
         assert_eq!(std::fs::read_to_string(area.join("sub/file2"))?, "x\n");
         // The helper ended with the session.
         assert!(matches!(
-            files.graft(0, Path::new("sub"), GraftAccess::ReadOnly),
+            files.graft(0, Path::new("sub"), GraftAccess::Read),
             Err(GraftError::HelperGone)
         ));
         Ok(())
@@ -1030,7 +1261,7 @@ cat "$H/graft/file"
             let graft = home.strip_prefix(&area.path)?.join("graft");
             // Only the rule on the FUSE root covers this graft: no grant
             // names it.
-            files.graft(index, &graft, GraftAccess::ReadOnly)?;
+            files.graft(index, &graft, GraftAccess::Read)?;
             std::fs::write(ws.join("grafted"), "")?;
             Ok(())
         })();
@@ -1065,6 +1296,26 @@ cat "$H/graft/file"
         allow: Vec<pent_profile::Request>,
         pent: PathBuf,
         asked: std::sync::Mutex<Vec<(String, pent_profile::Request)>>,
+        /// The widths that a graft may give.
+        graftable: Vec<PathBuf>,
+        /// The target of an allowed request, for the graft of an answer.
+        targets: Vec<(pent_profile::Request, pent_profile::Target)>,
+        /// How long `may_graft` waits: a slow decider shows that the
+        /// program waits for the grafts at the start.
+        graft_delay: std::time::Duration,
+    }
+
+    impl FakeDecider {
+        fn new(allow: Vec<pent_profile::Request>, pent: PathBuf) -> Self {
+            Self {
+                allow,
+                pent,
+                asked: std::sync::Mutex::new(Vec::new()),
+                graftable: Vec::new(),
+                targets: Vec::new(),
+                graft_delay: std::time::Duration::ZERO,
+            }
+        }
     }
 
     impl crate::AccessDecider for FakeDecider {
@@ -1092,6 +1343,27 @@ cat "$H/graft/file"
 
         fn hidden(&self, path: &Path) -> bool {
             path.starts_with(&self.pent)
+        }
+
+        fn may_graft(&self, target: &pent_profile::Target) -> bool {
+            std::thread::sleep(self.graft_delay);
+            matches!(target, pent_profile::Target::File {
+                width: pent_profile::PathWidth::Subtree(base), ..
+            } if self.graftable.iter().any(|g| g == base.as_path()))
+        }
+
+        fn decide_target(
+            &self,
+            program: &str,
+            request: pent_profile::Request,
+            deadline: std::time::Duration,
+        ) -> (pent_profile::Decision, Option<pent_profile::Target>) {
+            let target = self
+                .targets
+                .iter()
+                .find(|(r, _)| *r == request)
+                .map(|(_, t)| t.clone());
+            (self.decide(program, request, deadline), target)
         }
     }
 
@@ -1160,8 +1432,8 @@ cat "$H/.claude.json"
             })
         };
         use pent_profile::FileKind::{Exec, List, Read, Write};
-        let decider = Arc::new(FakeDecider {
-            allow: vec![
+        let decider = Arc::new(FakeDecider::new(
+            vec![
                 file(List, &home.join("docs"))?,
                 file(List, &home.join(".config"))?,
                 file(Read, &home.join("notes.txt"))?,
@@ -1169,9 +1441,8 @@ cat "$H/.claude.json"
                 file(Read, &tool)?,
                 file(Exec, &tool)?,
             ],
-            pent: home.join(".config/pent"),
-            asked: std::sync::Mutex::new(Vec::new()),
-        });
+            home.join(".config/pent"),
+        ));
         let mut env = crate::build_env(&[]);
         env.insert("T".to_string(), text(&ws));
         env.insert("H".to_string(), text(&home));
@@ -1199,8 +1470,7 @@ cat "$H/.claude.json"
         )?;
         let mut child = spawned.child;
         let events = spawned.events.ok_or("the run has no event channel")?;
-        // The test grafts nothing: drop the descriptors of the FUSE roots,
-        // so the sessions and the event channel end with the child.
+        // The test grafts nothing itself.
         drop(spawned.files);
         let status = child.wait()?;
         let out = std::fs::read_to_string(ws.join("out")).unwrap_or_default();
@@ -1261,6 +1531,151 @@ cat "$H/.claude.json"
         // The question names the program that made the access.
         let other = ("cat".to_string(), file(Read, &home.join("other.txt"))?);
         assert!(asked.contains(&other), "{asked:?}");
+        Ok(())
+    }
+
+    /// The program of the test of the grafts. It reads the mounts first,
+    /// before any access to the home directory.
+    const GRAFT_SCRIPT: &str = r#"set -e
+exec > "$T/out" 2>&1
+: pent-graft-start-marker
+for d in proj ws2 nograft xonly ans keep; do
+  grep -q " $H/$d " /proc/self/mountinfo && echo "graft-$d" || true
+done
+cat "$H/proj/f"
+(echo x > "$H/proj/f") 2>/dev/null || echo proj-readonly
+("$H/proj/run.sh") 2>/dev/null || echo proj-noexec
+echo w > "$H/ws2/new"
+cat "$H/ans/one"
+i=0
+while ! grep -q " $H/ans " /proc/self/mountinfo && [ $i -lt 100 ]; do sleep 0.02; i=$((i+1)); done
+grep -q " $H/ans " /proc/self/mountinfo && echo graft-ans-later
+cat "$H/ans/two"
+cat "$H/keep/one"
+cat "$H/keep/two"
+"#;
+
+    /// The grants at the start and the width of an answer become grafts,
+    /// with the right attributes; the decider can keep a width with FUSE.
+    #[test]
+    fn the_grants_and_an_answer_become_grafts() -> TestResult {
+        if !ready() {
+            return Ok(());
+        }
+        let tmp = tempfile::tempdir()?;
+        let base = std::fs::canonicalize(tmp.path())?;
+        let (ws, home) = (base.join("ws"), base.join("home"));
+        for dir in ["proj", "ws2", "nograft", "xonly", "ans", "keep"] {
+            std::fs::create_dir_all(home.join(dir))?;
+        }
+        std::fs::create_dir(&ws)?;
+        for (file, text) in [
+            ("proj/f", "proj\n"),
+            ("ans/one", "one\n"),
+            ("ans/two", "two\n"),
+            ("keep/one", "kept1\n"),
+            ("keep/two", "kept2\n"),
+        ] {
+            std::fs::write(home.join(file), text)?;
+        }
+        let script = home.join("proj/run.sh");
+        std::fs::write(&script, "#!/bin/sh\necho ran\n")?;
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
+
+        let text = |p: &Path| p.to_string_lossy().into_owned();
+        let rule_path = |p: &Path| pent_profile::RulePath::new(p.to_path_buf());
+        let file = |kind, p: &Path| -> Result<pent_profile::Request, Box<dyn std::error::Error>> {
+            Ok(pent_profile::Request::File {
+                kind,
+                path: rule_path(p)?,
+            })
+        };
+        let subtree =
+            |kind, p: &Path| -> Result<pent_profile::Target, Box<dyn std::error::Error>> {
+                Ok(pent_profile::Target::File {
+                    kind,
+                    width: pent_profile::PathWidth::Subtree(rule_path(p)?),
+                })
+            };
+        use pent_profile::FileKind::Read;
+        let mut fake = FakeDecider::new(
+            vec![
+                file(Read, &home.join("ans/one"))?,
+                file(Read, &home.join("keep/one"))?,
+                file(Read, &home.join("keep/two"))?,
+            ],
+            home.join(".config/pent"),
+        );
+        // `nograft` and `keep` hold, say, a credential: no graft.
+        fake.graftable = ["proj", "ws2", "xonly", "ans"]
+            .iter()
+            .map(|d| home.join(d))
+            .collect();
+        fake.graft_delay = std::time::Duration::from_millis(300);
+        fake.targets = vec![
+            (
+                file(Read, &home.join("ans/one"))?,
+                subtree(Read, &home.join("ans"))?,
+            ),
+            (
+                file(Read, &home.join("keep/one"))?,
+                subtree(Read, &home.join("keep"))?,
+            ),
+        ];
+        let decider = Arc::new(fake);
+        let mut env = crate::build_env(&[]);
+        env.insert("T".to_string(), text(&ws));
+        env.insert("H".to_string(), text(&home));
+        env.insert("HOME".to_string(), text(&home));
+        let mut config =
+            crate::SandboxConfig::new(ws.clone(), crate::system_default_paths(), ws.clone())
+                .with_env(env.clone())
+                .with_network(crate::NetworkMode::LocalhostOnly);
+        config.file_areas = crate::FuseAreas::OutsideBase;
+        config.paths.read.push(text(&home.join("proj")));
+        config.paths.read.push(text(&home.join("nograft")));
+        config.paths.read_write.push(text(&home.join("ws2")));
+        // An execute-only grant gives no read, and a graft would.
+        config.paths.execute.push(text(&home.join("xonly")));
+        config.file_decider = Some(decider.clone());
+        let args = vec!["-c".to_string(), GRAFT_SCRIPT.to_string()];
+        let spawned = crate::linux::spawn_linux(
+            &config,
+            "sh",
+            &args,
+            &env,
+            &crate::resolve_path_directories(),
+            crate::linux::SpawnMode::Sandbox,
+        )?;
+        let mut child = spawned.child;
+        drop(spawned.files);
+        let status = child.wait()?;
+        let out = std::fs::read_to_string(ws.join("out")).unwrap_or_default();
+        assert!(status.success(), "the program failed: {status}\n{out}");
+        assert_eq!(
+            out,
+            "graft-proj\ngraft-ws2\nproj\nproj-readonly\nproj-noexec\none\ngraft-ans-later\ntwo\n\
+             kept1\nkept2\n"
+        );
+        assert_eq!(std::fs::read_to_string(home.join("ws2/new"))?, "w\n");
+        let asked = decider
+            .asked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let asked_for = |p: &str| -> Result<bool, Box<dyn std::error::Error>> {
+            let wanted = file(Read, &home.join(p))?;
+            Ok(asked.iter().any(|(_, r)| *r == wanted))
+        };
+        // The graft of the answer serves `ans/two` with no question; the
+        // width that the decider keeps with FUSE asks for each file.
+        assert!(asked_for("ans/one")? && !asked_for("ans/two")?, "{asked:?}");
+        assert!(
+            asked_for("keep/one")? && asked_for("keep/two")?,
+            "{asked:?}"
+        );
+        // The grants at the start ask nothing.
+        assert!(!asked_for("proj/f")?, "{asked:?}");
         Ok(())
     }
 }

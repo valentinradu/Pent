@@ -1,6 +1,6 @@
 # Plan: the new pent
 
-**Cursor: step 5.6.** Steps with `[x]` are done. Work on the branch `next`,
+**Cursor: step 5.7.** Steps with `[x]` are done. Work on the branch `next`,
 one commit for each step, and move this cursor when a step is done.
 
 **The way of work.** One commit for each step. Then the user runs
@@ -391,8 +391,22 @@ section 14 of the design has their results.
     while a watch of its directory holds. The server asks for
     `FUSE_HAS_EXPIRE_ONLY` and drops an entry with `expire_entry`, which
     keeps a graft below it; an old kernel gets `inval_entry`.
-- [ ] **5.6 The rules at the start.** `pent run` grafts each rule of its key
+- [x] **5.6 The rules at the start.** `pent run` grafts each rule of its key
   before the program starts.
+  - Files: `start_grafts`, `Grafter`, the four `GraftAccess` kinds and the
+    new message of the helper in `pent-sandbox/src/linux_graft.rs`;
+    `graft_answer` in `linux_fuse.rs`; `AccessDecider::may_graft` and
+    `decide_target` in `config.rs`; `Decider::may_graft` and `target_of`
+    in `pent/src/commands/decide.rs`; GS-1 to GS-5 in
+    `docs/security/fuse.md`.
+  - Decisions (2026-11-25):
+    - The flags and `-w` become grafts too, not only the rules: each
+      directory grant with the right to read files and to list.
+    - The width of an answer becomes a graft too (design, section 3).
+    - A graft has `MOUNT_ATTR_NOEXEC` unless its grant gives exec.
+    - Pent sends the path of the area, and the helper finds the target
+      itself: pent holds no descriptor of a FUSE root.
+    - Without a decider, or without the classes of the user, no graft.
 - [ ] **5.7 The measurement.** Repeat the benchmark of 2026-11-21 (a cold
   and an incremental `cargo build`, 12 processes with 360,000 opens). The
   result must stay near native speed after the first answers.

@@ -214,6 +214,15 @@ makes one mutation by hand. The test must fail on the mutant. No
 | 5.5 | A missing name gets no negative entry. | `linux_fuse::tests::a_missing_name_is_cached_until_the_host_makes_it` |
 | 5.5 | The events of the watch drop no entry. | `linux_fuse::tests::a_missing_name_is_cached_until_the_host_makes_it` |
 | 5.5 | No directory gets a watch. | `linux_fuse::tests::a_missing_name_is_cached_until_the_host_makes_it` |
+| 5.6 | No graft at the start. | `linux_graft::tests::the_grants_and_an_answer_become_grafts` |
+| 5.6 | A read graft has no `MOUNT_ATTR_NOEXEC`. | `linux_graft::tests::the_grants_and_an_answer_become_grafts` |
+| 5.6 | The grafts at the start do not ask `may_graft`. | `linux_graft::tests::the_grants_and_an_answer_become_grafts` |
+| 5.6 | An execute-only grant becomes a graft. | `linux_graft::tests::the_grants_and_an_answer_become_grafts` |
+| 5.6 | An allow grafts no answer. | `linux_graft::tests::the_grants_and_an_answer_become_grafts` |
+| 5.6 | The graft of an answer does not ask `may_graft`. | `linux_graft::tests::the_grants_and_an_answer_become_grafts` |
+| 5.6 | The hook does not wait for the grafts at the start. | `linux_graft::tests::the_grants_and_an_answer_become_grafts` (the decider waits 300 ms in `may_graft`; without it the grafts were too fast for the test) |
+| 5.6 | `may_graft` takes an exact width. | `decide::tests::a_graft_needs_a_clean_subtree` |
+| 5.6 | `may_graft` checks only the flags for a deny inside. | `decide::tests::a_graft_needs_a_clean_subtree` |
 | 5.4 | A traversal rule above an area gives a listing in it. | `linux_graft::tests::each_kind_asks_and_the_files_of_pent_are_hidden` |
 | 5.4 | The decision sends no event. | `linux_graft::tests::each_kind_asks_and_the_files_of_pent_are_hidden` |
 

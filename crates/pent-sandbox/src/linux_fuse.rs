@@ -295,6 +295,11 @@ pub(crate) struct FileContext {
     /// An `O_PATH` descriptor of the `/proc` of the child: the PID of a
     /// request is in the PID namespace of the child.
     pub(crate) proc_dir: Option<OwnedFd>,
+    /// The channel to the graft helper, for the graft of an answer.
+    pub(crate) grafter: Arc<crate::linux_graft::Grafter>,
+    /// The widths that an answer grafted, so that no width gets two
+    /// grafts.
+    pub(crate) grafted: Mutex<std::collections::HashSet<PathBuf>>,
 }
 
 impl FileContext {
@@ -908,9 +913,9 @@ impl Tree {
             path: rule_path,
         };
         let process = policy.shared.process(caller);
-        let decision = match decider.known(&request) {
-            Some(decision) => decision,
-            None => decider.decide(&process.name, request, pent_profile::FILE_DEADLINE),
+        let (decision, target) = match decider.known(&request) {
+            Some(decision) => (decision, None),
+            None => decider.decide_target(&process.name, request, pent_profile::FILE_DEADLINE),
         };
         if let Some(events) = &policy.shared.events {
             // The run can be at its end; then nobody reads the event.
@@ -927,10 +932,62 @@ impl Tree {
         match decision {
             pent_profile::Decision::Allow => {
                 self.keep_stand_in(&path, new);
+                if let Some(target) = target {
+                    self.graft_answer(policy, &target);
+                }
                 Ok(())
             }
             pent_profile::Decision::Deny => Err(Errno::EACCES),
         }
+    }
+
+    /// Graft the width of an answer in a new thread, when the decider lets
+    /// a graft give it. This access goes through FUSE; the later ones go to
+    /// the graft. A graft must not wait in the thread of a request: the
+    /// kernel can hold the lock of a directory that the graft must look up.
+    fn graft_answer(&self, policy: &AreaPolicy, target: &pent_profile::Target) {
+        let pent_profile::Target::File {
+            kind,
+            width: pent_profile::PathWidth::Subtree(base),
+        } = target
+        else {
+            return;
+        };
+        let Some(access) = crate::linux_graft::GraftAccess::of_kind(*kind) else {
+            return;
+        };
+        let base = base.as_path();
+        let Ok(rel) = base.strip_prefix(&policy.area) else {
+            return;
+        };
+        let may = policy
+            .shared
+            .decider
+            .as_ref()
+            .is_some_and(|d| d.may_graft(target));
+        if !may || !std::fs::symlink_metadata(base).is_ok_and(|m| m.is_dir()) {
+            return;
+        }
+        if !lock(&policy.shared.grafted).insert(base.to_path_buf()) {
+            return;
+        }
+        let Ok(root) = self
+            .fd(INodeNo::ROOT)
+            .and_then(|fd| fd.try_clone().map_err(Errno::from))
+        else {
+            return;
+        };
+        let grafter = Arc::clone(&policy.shared.grafter);
+        let (area, rel) = (policy.area.clone(), rel.to_path_buf());
+        let spawned = std::thread::Builder::new()
+            .name("pent-fuse-graft".to_string())
+            .spawn(move || {
+                if let Err(e) = grafter.graft(root.as_fd(), &area, &rel, access) {
+                    tracing::debug!("no graft of {}: {e}", area.join(&rel).display());
+                }
+            });
+        // Without the thread FUSE serves the width; that is still correct.
+        drop(spawned);
     }
 
     /// Return true if `path` is in the pent class.

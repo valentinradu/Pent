@@ -509,6 +509,11 @@ impl AccessPolicy {
             .any(|p| path.starts_with(p) || p.starts_with(path))
     }
 
+    /// The rules: each path with its rights.
+    pub(crate) fn rules(&self) -> &[(PathBuf, u64)] {
+        &self.rules
+    }
+
     /// Return the Landlock rights that the policy grants for `path`. Landlock
     /// adds the rights of all rules on the path and on its ancestors.
     pub(crate) fn rights(&self, path: &Path) -> u64 {

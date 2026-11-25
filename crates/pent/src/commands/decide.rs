@@ -307,6 +307,62 @@ impl Decider {
         }
     }
 
+    /// Return true if a graft may give `target` (see
+    /// `pent_sandbox::AccessDecider::may_graft`): a subtree of files with
+    /// no deny rule of a flag, a rule or an answer inside it, and with no
+    /// sensitive location and no file of pent inside it. Without the
+    /// classes of the user no graft is safe.
+    pub(crate) fn may_graft(&self, target: &Target) -> bool {
+        let Target::File { kind, width } = target else {
+            return false;
+        };
+        if !matches!(width, PathWidth::Subtree(_)) {
+            return false;
+        }
+        let Some(classes) = self.classes.as_ref() else {
+            return false;
+        };
+        let answers = self
+            .answers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        [&self.flags, &self.rules, &answers.rules]
+            .iter()
+            .all(|set| file_held_back(set, *kind, width, Some(classes), Path::is_dir).is_none())
+    }
+
+    /// The target of the flag, the rule or the answer that allowed
+    /// `request` with the cause `decided`, or `None` for another cause.
+    pub(crate) fn target_of(&self, request: &Request, decided: DecidedBy) -> Option<Target> {
+        let access = request.as_access();
+        let find = |set: &RuleSet| {
+            set.rules
+                .iter()
+                .find(|r| {
+                    r.decision == Decision::Allow
+                        && set.decide_where(&access, |x| std::ptr::eq(x, *r))
+                            == Some(Decision::Allow)
+                })
+                .map(|r| r.target.clone())
+        };
+        match decided {
+            DecidedBy::Flag(Decision::Allow) => find(&self.flags),
+            DecidedBy::Rule(Decision::Allow) => find(&self.rules),
+            DecidedBy::Answer {
+                question,
+                decision: Decision::Allow,
+            } => {
+                let answers = self
+                    .answers
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let at = answers.questions.iter().position(|q| *q == question)?;
+                answers.rules.rules.get(at).map(|r| r.target.clone())
+            }
+            _ => None,
+        }
+    }
+
     /// Return true if `path` is in the pent class: the FUSE server gives
     /// `ENOENT` for it.
     pub(crate) fn hidden(&self, path: &Path) -> bool {
@@ -417,17 +473,34 @@ impl pent_sandbox::AccessDecider for SandboxDecider {
     /// `pent run`) ends the task of the session, and the question ends
     /// with a deny.
     fn decide(&self, program: &str, request: Request, deadline: Duration) -> Decision {
-        let deadline = match request {
-            Request::File { .. } => deadline.min(self.file_deadline),
-            _ => deadline,
-        };
-        self.runtime
-            .block_on(self.decider.decide(program, request, deadline))
-            .decision()
+        self.decide_target(program, request, deadline).0
     }
 
     fn hidden(&self, path: &Path) -> bool {
         self.decider.hidden(path)
+    }
+
+    fn may_graft(&self, target: &Target) -> bool {
+        self.decider.may_graft(target)
+    }
+
+    fn decide_target(
+        &self,
+        program: &str,
+        request: Request,
+        deadline: Duration,
+    ) -> (Decision, Option<Target>) {
+        let deadline = match request {
+            Request::File { .. } => deadline.min(self.file_deadline),
+            _ => deadline,
+        };
+        let decided =
+            self.runtime
+                .block_on(self.decider.decide(program, request.clone(), deadline));
+        (
+            decided.decision(),
+            self.decider.target_of(&request, decided),
+        )
     }
 }
 
@@ -878,6 +951,71 @@ mod tests {
 
     fn classes() -> Option<Classes> {
         Some(Classes::new(Path::new("/home/u"), &[]))
+    }
+
+    #[test]
+    fn a_graft_needs_a_clean_subtree() {
+        let sub = |p: &str| PathWidth::Subtree(path(p));
+        let target = |p: &str| Target::File {
+            kind: FileKind::Read,
+            width: sub(p),
+        };
+        let rules = set(vec![
+            file(FileKind::Read, sub("/home/u/src"), Decision::Allow),
+            file(FileKind::Read, sub("/home/u/src/secret"), Decision::Deny),
+        ]);
+        let decider = Decider::new(set(vec![]), rules, classes(), None);
+        // A clean subtree may be a graft.
+        assert!(decider.may_graft(&target("/home/u/projects")));
+        // A deny rule inside, a sensitive location inside, an exact width.
+        assert!(!decider.may_graft(&target("/home/u/src")));
+        assert!(!decider.may_graft(&target("/home/u")));
+        assert!(!decider.may_graft(&target("/home/u/.ssh")));
+        assert!(!decider.may_graft(&Target::File {
+            kind: FileKind::Read,
+            width: PathWidth::Exact(path("/home/u/projects")),
+        }));
+        // Without the classes of the user no graft is safe.
+        let blind = Decider::new(set(vec![]), set(vec![]), None, None);
+        assert!(!blind.may_graft(&target("/home/u/projects")));
+    }
+
+    #[test]
+    fn the_target_of_a_decision_is_the_rule_that_allowed_it() {
+        let wide = file(
+            FileKind::Read,
+            PathWidth::Subtree(path("/home/u/projects")),
+            Decision::Allow,
+        );
+        let flag = file(
+            FileKind::Read,
+            PathWidth::Subtree(path("/home/u/notes")),
+            Decision::Allow,
+        );
+        let decider = Decider::new(
+            set(vec![flag.clone()]),
+            set(vec![wide.clone()]),
+            classes(),
+            None,
+        );
+        let request = read("/home/u/projects/a/b");
+        assert_eq!(
+            decider.target_of(&request, DecidedBy::Rule(Decision::Allow)),
+            Some(wide.target)
+        );
+        assert_eq!(
+            decider.target_of(&read("/home/u/notes/x"), DecidedBy::Flag(Decision::Allow)),
+            Some(flag.target)
+        );
+        // A refusal and the base have no target.
+        assert_eq!(
+            decider.target_of(&request, DecidedBy::Rule(Decision::Deny)),
+            None
+        );
+        assert_eq!(
+            decider.target_of(&request, DecidedBy::Base(Decision::Allow)),
+            None
+        );
     }
 
     #[test]
