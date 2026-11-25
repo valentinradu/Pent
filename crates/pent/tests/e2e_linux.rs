@@ -741,11 +741,12 @@ mod linux {
 
         let out = run(&curl_args(&["https://example.org"]))?;
         assert!(!out.status.success(), "example.org must be denied");
-        assert!(
-            stderr(&out).contains("1 access denied; see it: pent denials"),
-            "{}",
-            stderr(&out)
-        );
+        // Since step 5.4 a refused file in an area is a denial too: curl
+        // can read `~/.ssh/known_hosts` of the user of the host. So the
+        // count depends on the host, and the test looks for the domain.
+        assert!(stderr(&out).contains("pent denials"), "{}", stderr(&out));
+        let denials = stdout(&env.pent(&["denials"])?);
+        assert!(denials.contains("domain example.org"), "{denials}");
 
         let out = run(&curl_args(&["--noproxy", "*", "https://example.com"]))?;
         assert!(

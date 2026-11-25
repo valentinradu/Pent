@@ -121,6 +121,10 @@ order. `docs/security/rules.md` (RF-11) and
 to `Event` (`DecidedBy::Base`). The target reads the new form, but it did
 not run with it yet. Run it again before phase 3 ends.
 
+Step 5.4 adds the operation `list` to `FsOp`, which the events of
+`pentd.sock` carry. The target reads it, but it did not run with it yet:
+one more reason for the next run.
+
 ## The property tests
 
 Each test ran with `PENT_PROPERTY_ROUNDS=1000000`. The whole run took 196

@@ -71,18 +71,13 @@ mod fs_table {
     ///
     /// A static layer cannot give a subtree that covers a location of the
     /// guard list: a credential, a file that runs code later, or a file of
-    /// pent. `pent run` then does not apply the rule, and it warns. A
-    /// profile gave such a subtree. The rows of this list now prove that
-    /// the kernel gives nothing for the rule:
-    ///
-    /// - `~` covers the files of pent and the credentials.
-    ///
-    /// The check looks at the kind of the rule: the guard stops only a
-    /// write in `~/bin`, so a read or an exec rule on `~/bin` applies.
-    const HELD_BACK_ROWS: &[(&str, Verdict)] = &[
-        ("tilde-a-file-of-the-home-directory", Verdict::Deny),
-        ("tilde-does-not-reach-the-root", Verdict::Deny),
-    ];
+    /// pent. Before step 5.4 `pent run` then did not apply the rule, and it
+    /// warned; `~` was such a rule. Since step 5.4 the files of the table
+    /// are in a FUSE area, where the chain of deciders applies each file
+    /// rule with the limits of the classes, so no row of the table is held
+    /// back. `a_rule_on_the_whole_home_directory_gives_no_sensitive_file`
+    /// proves the limits.
+    const HELD_BACK_ROWS: &[(&str, Verdict)] = &[];
 
     /// The verdict of the rules for `case`.
     fn rule_verdict(case: &FsCase) -> Verdict {
@@ -767,42 +762,42 @@ printf 'rc=%s\n' "$?"
     }
 
     /// A rule on the whole home directory covers the files of pent and
-    /// the credentials, so `pent run` does not apply it and says so. The
-    /// profile `read = ["~"]` gave the whole home directory; the rule
-    /// gives nothing, and the kernel agrees.
+    /// the credentials. Before step 5.4 `pent run` did not apply it and
+    /// said so. Now the chain of deciders applies it in the FUSE area of
+    /// the home directory: it gives a normal file, with no warning, and it
+    /// does not give a credential inside it, which only an exact rule
+    /// gives.
     #[test]
-    fn a_rule_on_the_whole_home_directory_is_not_applied() -> TestResult {
+    fn a_rule_on_the_whole_home_directory_gives_no_sensitive_file() -> TestResult {
         let test = "fs_rule_on_the_home_directory";
         if !ready(test) {
             return Ok(());
         }
         let env = TestEnv::new()?;
-        // A socket with no rule would ask a question; without pentd it
-        // gets the refusal at once (RN-8).
+        // A question without pentd gets the refusal at once (RN-8).
         env.block_pentd()?;
         let file = env.home.join("data/one.txt");
         std::fs::create_dir_all(env.home.join("data"))?;
         std::fs::write(&file, format!("{MARKER}\n"))?;
-        // The positive control: a rule on a directory of the home
-        // directory gives the file.
-        let data = format!("read {}/**", path_text(&env.home.join("data"))?);
-        let (got, output) = read_with(&env, &[data], &file)?;
+        let key = env.home.join(".ssh/id_test");
+        std::fs::create_dir_all(env.home.join(".ssh"))?;
+        std::fs::write(&key, format!("{MARKER}\n"))?;
+        let home = format!("read {}/**", path_text(&env.home)?);
+        let (got, output) = read_with(&env, std::slice::from_ref(&home), &file)?;
+        assert!(
+            !output.contains(HELD_BACK),
+            "the chain applies the rule, but pent said that it does not:\n{output}"
+        );
         assert_eq!(
             got,
             Verdict::Allow,
-            "the positive control failed:\n{output}"
+            "the rule did not give the file:\n{output}"
         );
-        let home = format!("read {}/**", path_text(&env.home)?);
-        let (got, output) = read_with(&env, &[home], &file)?;
-        assert!(
-            output.contains(HELD_BACK),
-            "pent did not say that it does not apply the rule:\n{output}"
-        );
+        let (got, output) = read_with(&env, &[home], &key)?;
         assert_eq!(
             got,
             Verdict::Deny,
-            "pent said that it does not apply the rule, but the kernel gave \
-             the file:\n{output}"
+            "a rule on the home directory gave a credential:\n{output}"
         );
         Ok(())
     }
@@ -835,9 +830,11 @@ printf 'rc=%s\n' "$?"
         );
         let exact = format!("read {}", path_text(&dir)?);
         let (got, output) = read_with(&env, &[exact], &file)?;
+        // Since step 5.4 the chain applies the exact rule in the FUSE area
+        // of the home directory, so pent gives no warning.
         assert!(
-            output.contains(HELD_BACK),
-            "pent did not say that it does not apply the rule:\n{output}"
+            !output.contains(HELD_BACK),
+            "the chain applies the rule, but pent said that it does not:\n{output}"
         );
         assert_eq!(
             got,
@@ -847,9 +844,11 @@ printf 'rc=%s\n' "$?"
         Ok(())
     }
 
-    /// A deny rule inside the width of an allow rule wins: the kernel
-    /// cannot make a hole in a grant, so pent does not apply the allow
-    /// rule, and the denied path stays closed.
+    /// A deny rule inside the width of an allow rule wins. The kernel
+    /// cannot make a hole in a grant, so the allow rule goes into no static
+    /// layer; since step 5.4 the chain of deciders applies both rules in
+    /// the FUSE area of the home directory: the allow rule gives the other
+    /// files, and the denied path stays closed.
     #[test]
     fn a_deny_rule_inside_an_allow_rule_wins() -> TestResult {
         let test = "fs_deny_inside_an_allow";
@@ -874,10 +873,18 @@ printf 'rc=%s\n' "$?"
             Verdict::Allow,
             "the positive control failed:\n{output}"
         );
-        let (got, output) = read_with(&env, &[allow, deny], &secret)?;
+        std::fs::write(dir.join("open.txt"), format!("{MARKER}\n"))?;
+        let rules = [allow, deny];
+        let (got, output) = read_with(&env, &rules, &dir.join("open.txt"))?;
+        assert_eq!(
+            got,
+            Verdict::Allow,
+            "the allow rule did not give a file outside the deny rule:\n{output}"
+        );
+        let (got, output) = read_with(&env, &rules, &secret)?;
         assert!(
-            output.contains(HELD_BACK),
-            "pent did not say that it does not apply the allow rule:\n{output}"
+            !output.contains(HELD_BACK),
+            "the chain applies the rules, but pent said that it does not:\n{output}"
         );
         assert_eq!(
             got,

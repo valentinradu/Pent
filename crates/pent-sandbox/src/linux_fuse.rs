@@ -266,6 +266,104 @@ pub(crate) struct AreaPolicy {
     /// an empty tmpfs) do not reach into an area that pent binds back
     /// below them.
     pub(crate) private_above: Vec<PathBuf>,
+    /// What the areas of one sandbox share: the decider, the events and
+    /// the `/proc` of the child.
+    pub(crate) shared: Arc<FileContext>,
+}
+
+/// What the areas of one sandbox share.
+pub(crate) struct FileContext {
+    /// The decider of an access that the grants do not give, or `None` to
+    /// refuse such an access with `EACCES`.
+    pub(crate) decider: Option<Arc<dyn crate::AccessDecider>>,
+    /// The channel of the events of the run, or `None`.
+    pub(crate) events: Option<std::sync::mpsc::Sender<pent_profile::WatchEvent>>,
+    /// An `O_PATH` descriptor of the `/proc` of the child: the PID of a
+    /// request is in the PID namespace of the child.
+    pub(crate) proc_dir: Option<OwnedFd>,
+}
+
+impl FileContext {
+    /// The process of a request, for a question and its event.
+    fn process(&self, caller: Caller) -> pent_profile::ProcessInfo {
+        let name = self
+            .proc_dir
+            .as_ref()
+            .and_then(|dir| read_comm(dir.as_fd(), caller.0))
+            .unwrap_or_default();
+        pent_profile::ProcessInfo {
+            pid: caller.0,
+            name,
+        }
+    }
+}
+
+/// Read `<pid>/comm` below the `/proc` directory `dir`.
+fn read_comm(dir: BorrowedFd<'_>, pid: u32) -> Option<String> {
+    let name = CString::new(format!("{pid}/comm")).ok()?;
+    // SAFETY: `name` is NUL-terminated; `dir` is an open descriptor.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let fd = owned(unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    })
+    .ok()?;
+    let mut text = String::new();
+    std::io::Read::read_to_string(&mut File::from(fd), &mut text).ok()?;
+    Some(text.trim_end().to_string())
+}
+
+/// The process that made a request: its PID in the PID namespace of the
+/// child, as the kernel gives it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Caller(pub(crate) u32);
+
+/// The kind of file access that the Landlock rights `needed` stand for.
+fn file_kind_of(needed: u64) -> pent_profile::FileKind {
+    use crate::linux_landlock::access;
+    use pent_profile::FileKind;
+    if needed & access::EXECUTE != 0 {
+        FileKind::Exec
+    } else if needed & !(access::READ_FILE | access::READ_DIR) != 0 {
+        FileKind::Write
+    } else if needed & access::READ_FILE != 0 {
+        FileKind::Read
+    } else {
+        FileKind::List
+    }
+}
+
+/// The names that a temporary sibling `name` can stand for, the longest
+/// first: `.claude.json.tmp.123` stands for `.claude.json.tmp`,
+/// `.claude.json` and `.claude`; `notes.txt~` for `notes.txt`; the swap
+/// file `.notes.txt.swp` also for `notes.txt` and `notes`.
+fn sibling_candidates(name: &[u8]) -> Vec<&[u8]> {
+    let mut out: Vec<&[u8]> = Vec::new();
+    dot_prefixes(name, &mut out);
+    if let Some(rest) = name.strip_suffix(b"~") {
+        out.push(rest);
+    }
+    if let Some(rest) = name.strip_prefix(b".") {
+        dot_prefixes(rest, &mut out);
+    }
+    out.retain(|c| !c.is_empty() && *c != name && *c != b".");
+    out.sort_by_key(|c| std::cmp::Reverse(c.len()));
+    out.dedup();
+    out
+}
+
+/// Push each part of `text` before a `.` that is not the first byte.
+fn dot_prefixes<'a>(text: &'a [u8], out: &mut Vec<&'a [u8]>) {
+    for (i, b) in text.iter().enumerate() {
+        if *b == b'.' && i > 0 {
+            if let Some(prefix) = text.get(..i) {
+                out.push(prefix);
+            }
+        }
+    }
 }
 
 /// The flag of an open for `execve(2)` (`__FMODE_EXEC`): the kernel puts it
@@ -354,6 +452,9 @@ struct Tree {
     next_fh: AtomicU64,
     /// The policy of the area, or `None` to serve each access.
     policy: Option<AreaPolicy>,
+    /// The temporary siblings that the program made in this run, with the
+    /// path of the file whose answer each one gets.
+    stand_ins: Mutex<HashMap<PathBuf, PathBuf>>,
     /// A test hook: a lookup of this name waits this long.
     #[cfg(test)]
     slow_lookup: Option<(OsString, Duration)>,
@@ -564,6 +665,7 @@ impl Tree {
             dirs: Mutex::new(HashMap::new()),
             next_fh: AtomicU64::new(1),
             policy,
+            stand_ins: Mutex::new(HashMap::new()),
             #[cfg(test)]
             slow_lookup: None,
         })
@@ -637,9 +739,22 @@ impl Tree {
         Ok(path)
     }
 
-    /// Refuse with `EACCES` unless the policy gives `needed` at the node
-    /// `ino`, or at its entry `child`. Without a policy each access passes.
-    fn require(&self, ino: INodeNo, child: Option<&OsStr>, needed: u64) -> Result<(), Errno> {
+    /// Decide the operation `op`, which needs the Landlock rights
+    /// `needed`, of `caller` on the node `ino`, or on its entry `child`.
+    /// Without a policy each access passes.
+    ///
+    /// The order: the pent class gives `ENOENT`; then the grants; then the
+    /// target of a temporary sibling; then the decider, which asks when no
+    /// rule, flag or answer knows the access. A deny or the deadline gives
+    /// `EACCES`.
+    fn require(
+        &self,
+        caller: Caller,
+        ino: INodeNo,
+        child: Option<&OsStr>,
+        needed: u64,
+        op: pent_profile::FsOp,
+    ) -> Result<(), Errno> {
         let Some(policy) = &self.policy else {
             return Ok(());
         };
@@ -647,11 +762,123 @@ impl Tree {
         if let Some(child) = child {
             path.push(child);
         }
-        if policy.grants.rights_except(&path, &policy.private_above) & needed == needed {
-            Ok(())
-        } else {
-            Err(Errno::EACCES)
+        if self.hidden(&path) {
+            return Err(Errno::ENOENT);
         }
+        let grants = |p: &Path| {
+            policy
+                .grants
+                .rights_in_area(p, &policy.area, &policy.private_above)
+                & needed
+                == needed
+        };
+        if grants(&path) {
+            return Ok(());
+        }
+        // A temporary sibling gets the answer of its target. Only a name
+        // that the program makes in this run becomes one, so a file of the
+        // host never takes the answer of another name.
+        let known = lock(&self.stand_ins).get(&path).cloned();
+        let new = match (&known, op, child) {
+            (None, pent_profile::FsOp::Create, Some(name)) => self.sibling_target(ino, name),
+            _ => None,
+        };
+        let subject = known
+            .clone()
+            .or_else(|| new.clone())
+            .unwrap_or_else(|| path.clone());
+        if subject != path {
+            if self.hidden(&subject) {
+                return Err(Errno::EACCES);
+            }
+            if grants(&subject) {
+                self.keep_stand_in(&path, new);
+                return Ok(());
+            }
+        }
+        let Some(decider) = &policy.shared.decider else {
+            return Err(Errno::EACCES);
+        };
+        let Ok(rule_path) = pent_profile::RulePath::new(subject.clone()) else {
+            return Err(Errno::EACCES);
+        };
+        let request = pent_profile::Request::File {
+            kind: file_kind_of(needed),
+            path: rule_path,
+        };
+        let process = policy.shared.process(caller);
+        let decision = match decider.known(&request) {
+            Some(decision) => decision,
+            None => decider.decide(&process.name, request, pent_profile::FILE_DEADLINE),
+        };
+        if let Some(events) = &policy.shared.events {
+            // The run can be at its end; then nobody reads the event.
+            let _ = events.send(pent_profile::WatchEvent::Fs {
+                op,
+                path: subject,
+                process,
+                outcome: match decision {
+                    pent_profile::Decision::Allow => pent_profile::Outcome::Allowed,
+                    pent_profile::Decision::Deny => pent_profile::Outcome::Denied,
+                },
+            });
+        }
+        match decision {
+            pent_profile::Decision::Allow => {
+                self.keep_stand_in(&path, new);
+                Ok(())
+            }
+            pent_profile::Decision::Deny => Err(Errno::EACCES),
+        }
+    }
+
+    /// Return true if `path` is in the pent class.
+    fn hidden(&self, path: &Path) -> bool {
+        self.policy
+            .as_ref()
+            .and_then(|p| p.shared.decider.as_ref())
+            .is_some_and(|d| d.hidden(path))
+    }
+
+    /// Remember the new temporary sibling `path` of `target`.
+    fn keep_stand_in(&self, path: &Path, target: Option<PathBuf>) {
+        if let Some(target) = target {
+            lock(&self.stand_ins).insert(path.to_path_buf(), target);
+        }
+    }
+
+    /// Forget the temporary sibling `path`: it was renamed or removed.
+    fn drop_stand_in(&self, path: &Path) {
+        lock(&self.stand_ins).remove(path);
+    }
+
+    /// The file whose answer the new name `name` in the directory `dir`
+    /// gets: the longest candidate (see [`sibling_candidates`]) that is a
+    /// regular file in the directory, or that a grant lets the program
+    /// write.
+    fn sibling_target(&self, dir: INodeNo, name: &OsStr) -> Option<PathBuf> {
+        let policy = self.policy.as_ref()?;
+        let dir_path = self.path(dir).ok()?;
+        let dir_fd = self.fd(dir).ok()?;
+        for candidate in sibling_candidates(name.as_bytes()) {
+            let candidate = OsStr::from_bytes(candidate);
+            let target = dir_path.join(candidate);
+            let is_file = component(candidate)
+                .ok()
+                .and_then(|c| open_path(dir_fd.as_fd(), &c).ok())
+                .and_then(|fd| stat_fd(fd.as_fd()).ok())
+                .is_some_and(|st| st.st_mode & libc::S_IFMT == libc::S_IFREG);
+            let writable =
+                policy
+                    .grants
+                    .rights_in_area(&target, &policy.area, &policy.private_above)
+                    & crate::linux_landlock::access::WRITE_FILE
+                    != 0;
+            if is_file || writable {
+                return Some(target);
+            }
+        }
+        None
     }
 
     /// Give the node of the inode `key` the entry `newname` of `newparent`,
@@ -697,6 +924,9 @@ impl Tree {
             }
         }
         let cname = component(name)?;
+        if self.policy.is_some() && self.hidden(&self.path(parent)?.join(name)) {
+            return Err(Errno::ENOENT);
+        }
         let dir = self.fd(parent)?;
         let fd = open_path(dir.as_fd(), &cname)?;
         self.entry(fd, parent, name)
@@ -736,6 +966,7 @@ impl Tree {
     #[allow(clippy::too_many_arguments)] // The arguments of the FUSE request.
     fn setattr(
         &self,
+        caller: Caller,
         ino: INodeNo,
         mode: Option<u32>,
         uid: Option<u32>,
@@ -749,7 +980,13 @@ impl Tree {
         // Landlock controls only the truncation; the mode, the owner and
         // the times stay free, as with Landlock.
         if size.is_some() {
-            self.require(ino, None, crate::linux_landlock::access::TRUNCATE)?;
+            self.require(
+                caller,
+                ino,
+                None,
+                crate::linux_landlock::access::TRUNCATE,
+                pent_profile::FsOp::Write,
+            )?;
         }
         if let Some(mode) = mode {
             chmod_fd(fd.as_fd(), mode)?;
@@ -822,12 +1059,19 @@ impl Tree {
 
     fn mkdir(
         &self,
+        caller: Caller,
         parent: INodeNo,
         name: &OsStr,
         mode: u32,
         umask: u32,
     ) -> Result<FileAttr, Errno> {
-        self.require(parent, Some(name), crate::linux_landlock::access::MAKE_DIR)?;
+        self.require(
+            caller,
+            parent,
+            Some(name),
+            crate::linux_landlock::access::MAKE_DIR,
+            pent_profile::FsOp::Create,
+        )?;
         let cname = component(name)?;
         let dir = self.fd(parent)?;
         let mode = mode & !umask & 0o7777;
@@ -842,8 +1086,20 @@ impl Tree {
         self.entry(fd, parent, name)
     }
 
-    fn symlink(&self, parent: INodeNo, name: &OsStr, target: &Path) -> Result<FileAttr, Errno> {
-        self.require(parent, Some(name), crate::linux_landlock::access::MAKE_SYM)?;
+    fn symlink(
+        &self,
+        caller: Caller,
+        parent: INodeNo,
+        name: &OsStr,
+        target: &Path,
+    ) -> Result<FileAttr, Errno> {
+        self.require(
+            caller,
+            parent,
+            Some(name),
+            crate::linux_landlock::access::MAKE_SYM,
+            pent_profile::FsOp::Create,
+        )?;
         let cname = component(name)?;
         let ctarget = CString::new(target.as_os_str().as_bytes()).map_err(|_| Errno::EINVAL)?;
         let dir = self.fd(parent)?;
@@ -860,6 +1116,7 @@ impl Tree {
     /// node gets `EPERM`.
     fn mknod(
         &self,
+        caller: Caller,
         parent: INodeNo,
         name: &OsStr,
         mode: u32,
@@ -872,7 +1129,13 @@ impl Tree {
             libc::S_IFREG | 0 => access::MAKE_REG,
             _ => return Err(Errno::EPERM),
         };
-        self.require(parent, Some(name), needed)?;
+        self.require(
+            caller,
+            parent,
+            Some(name),
+            needed,
+            pent_profile::FsOp::Create,
+        )?;
         let cname = component(name)?;
         let dir = self.fd(parent)?;
         let perm = mode & !umask & 0o7777;
@@ -920,25 +1183,43 @@ impl Tree {
         Ok(at)
     }
 
-    fn unlink(&self, parent: INodeNo, name: &OsStr, flags: libc::c_int) -> Result<(), Errno> {
+    fn unlink(
+        &self,
+        caller: Caller,
+        parent: INodeNo,
+        name: &OsStr,
+        flags: libc::c_int,
+    ) -> Result<(), Errno> {
         let needed = if flags & libc::AT_REMOVEDIR != 0 {
             crate::linux_landlock::access::REMOVE_DIR
         } else {
             crate::linux_landlock::access::REMOVE_FILE
         };
-        self.require(parent, Some(name), needed)?;
-        let name = component(name)?;
+        self.require(
+            caller,
+            parent,
+            Some(name),
+            needed,
+            pent_profile::FsOp::Delete,
+        )?;
+        let cname = component(name)?;
         let dir = self.fd(parent)?;
-        // SAFETY: `name` is NUL-terminated.
+        // SAFETY: `cname` is NUL-terminated.
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-        if unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), flags) } != 0 {
+        if unsafe { libc::unlinkat(dir.as_raw_fd(), cname.as_ptr(), flags) } != 0 {
             return Err(last_errno());
+        }
+        if self.policy.is_some() {
+            if let Ok(dir_path) = self.path(parent) {
+                self.drop_stand_in(&dir_path.join(name));
+            }
         }
         Ok(())
     }
 
     fn rename(
         &self,
+        caller: Caller,
         parent: INodeNo,
         name: &OsStr,
         newparent: INodeNo,
@@ -968,8 +1249,20 @@ impl Tree {
                 on_from |= access::REFER;
                 on_to |= access::REFER;
             }
-            self.require(parent, Some(name), on_from)?;
-            self.require(newparent, Some(newname), on_to)?;
+            self.require(
+                caller,
+                parent,
+                Some(name),
+                on_from,
+                pent_profile::FsOp::Delete,
+            )?;
+            self.require(
+                caller,
+                newparent,
+                Some(newname),
+                on_to,
+                pent_profile::FsOp::Create,
+            )?;
         }
         // SAFETY: both names are NUL-terminated; the flags are integers.
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
@@ -985,6 +1278,11 @@ impl Tree {
         if ret != 0 {
             return Err(last_errno());
         }
+        if self.policy.is_some() {
+            if let Ok(dir_path) = self.path(parent) {
+                self.drop_stand_in(&dir_path.join(name));
+            }
+        }
         self.moved(key_of(&source), newparent, newname);
         if let Some(target) = &target {
             self.moved(key_of(target), parent, name);
@@ -992,8 +1290,14 @@ impl Tree {
         Ok(())
     }
 
-    fn open(&self, ino: INodeNo, flags: OpenFlags) -> Result<FileHandle, Errno> {
-        self.require(ino, None, open_rights(flags.0))?;
+    fn open(&self, caller: Caller, ino: INodeNo, flags: OpenFlags) -> Result<FileHandle, Errno> {
+        let needed = open_rights(flags.0);
+        let op = match file_kind_of(needed) {
+            pent_profile::FileKind::Exec => pent_profile::FsOp::Exec,
+            pent_profile::FileKind::Write => pent_profile::FsOp::Write,
+            pent_profile::FileKind::Read | pent_profile::FileKind::List => pent_profile::FsOp::Read,
+        };
+        self.require(caller, ino, None, needed, op)?;
         let fd = self.fd(ino)?;
         let path = proc_path(fd.as_fd());
         let flags = (flags.0 & !REOPEN_STRIP) | libc::O_CLOEXEC;
@@ -1005,6 +1309,7 @@ impl Tree {
 
     fn create(
         &self,
+        caller: Caller,
         parent: INodeNo,
         name: &OsStr,
         mode: u32,
@@ -1012,9 +1317,11 @@ impl Tree {
         flags: i32,
     ) -> Result<(FileAttr, FileHandle), Errno> {
         self.require(
+            caller,
             parent,
             Some(name),
             crate::linux_landlock::access::MAKE_REG | open_rights(flags),
+            pent_profile::FsOp::Create,
         )?;
         let cname = component(name)?;
         let dir = self.fd(parent)?;
@@ -1092,8 +1399,20 @@ impl Tree {
 
     /// Read the whole directory at `opendir`, so that the offsets of
     /// `readdir` stay valid while the directory changes.
-    fn opendir(&self, ino: INodeNo) -> Result<FileHandle, Errno> {
-        self.require(ino, None, crate::linux_landlock::access::READ_DIR)?;
+    fn opendir(&self, caller: Caller, ino: INodeNo) -> Result<FileHandle, Errno> {
+        self.require(
+            caller,
+            ino,
+            None,
+            crate::linux_landlock::access::READ_DIR,
+            pent_profile::FsOp::List,
+        )?;
+        // The names of the pent class are not in a listing.
+        let dir_path = if self.policy.is_some() {
+            Some(self.path(ino)?)
+        } else {
+            None
+        };
         let fd = self.fd(ino)?;
         let path = proc_path(fd.as_fd());
         let path = std::path::Path::new(OsStr::from_bytes(path.as_bytes()));
@@ -1117,6 +1436,12 @@ impl Tree {
                 .ok()
                 .and_then(FileType::from_std)
                 .unwrap_or(FileType::RegularFile);
+            if dir_path
+                .as_ref()
+                .is_some_and(|d| self.hidden(&d.join(entry.file_name())))
+            {
+                continue;
+            }
             let real = entry.ino();
             // A mount point below has another device; the real number is
             // then only a hint.
@@ -1280,7 +1605,7 @@ impl Filesystem for FuseTree {
 
     fn setattr(
         &self,
-        _req: &Request,
+        req: &Request,
         ino: INodeNo,
         mode: Option<u32>,
         uid: Option<u32>,
@@ -1297,10 +1622,11 @@ impl Filesystem for FuseTree {
         _kill_suid_gid: bool,
         reply: ReplyAttr,
     ) {
+        let caller = Caller(req.pid());
         self.spawn(move |t| {
             reply_attr(
                 reply,
-                t.setattr(ino, mode, uid, gid, size, atime, mtime, fh),
+                t.setattr(caller, ino, mode, uid, gid, size, atime, mtime, fh),
             );
         });
     }
@@ -1314,7 +1640,7 @@ impl Filesystem for FuseTree {
 
     fn mkdir(
         &self,
-        _req: &Request,
+        req: &Request,
         parent: INodeNo,
         name: &OsStr,
         mode: u32,
@@ -1322,26 +1648,28 @@ impl Filesystem for FuseTree {
         _owner: fuser::Owner,
         reply: ReplyEntry,
     ) {
+        let caller = Caller(req.pid());
         let name = name.to_owned();
-        self.spawn(move |t| reply_entry(reply, t.mkdir(parent, &name, mode, umask)));
+        self.spawn(move |t| reply_entry(reply, t.mkdir(caller, parent, &name, mode, umask)));
     }
 
     fn symlink(
         &self,
-        _req: &Request,
+        req: &Request,
         parent: INodeNo,
         link_name: &OsStr,
         target: &Path,
         _owner: fuser::Owner,
         reply: ReplyEntry,
     ) {
+        let caller = Caller(req.pid());
         let (name, target) = (link_name.to_owned(), target.to_owned());
-        self.spawn(move |t| reply_entry(reply, t.symlink(parent, &name, &target)));
+        self.spawn(move |t| reply_entry(reply, t.symlink(caller, parent, &name, &target)));
     }
 
     fn mknod(
         &self,
-        _req: &Request,
+        req: &Request,
         parent: INodeNo,
         name: &OsStr,
         mode: u32,
@@ -1350,8 +1678,9 @@ impl Filesystem for FuseTree {
         _owner: fuser::Owner,
         reply: ReplyEntry,
     ) {
+        let caller = Caller(req.pid());
         let name = name.to_owned();
-        self.spawn(move |t| reply_entry(reply, t.mknod(parent, &name, mode, umask)));
+        self.spawn(move |t| reply_entry(reply, t.mknod(caller, parent, &name, mode, umask)));
     }
 
     fn getxattr(
@@ -1420,19 +1749,23 @@ impl Filesystem for FuseTree {
         });
     }
 
-    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+    fn unlink(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let caller = Caller(req.pid());
         let name = name.to_owned();
-        self.spawn(move |t| reply_empty(reply, t.unlink(parent, &name, 0)));
+        self.spawn(move |t| reply_empty(reply, t.unlink(caller, parent, &name, 0)));
     }
 
-    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+    fn rmdir(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let caller = Caller(req.pid());
         let name = name.to_owned();
-        self.spawn(move |t| reply_empty(reply, t.unlink(parent, &name, libc::AT_REMOVEDIR)));
+        self.spawn(move |t| {
+            reply_empty(reply, t.unlink(caller, parent, &name, libc::AT_REMOVEDIR))
+        });
     }
 
     fn rename(
         &self,
-        _req: &Request,
+        req: &Request,
         parent: INodeNo,
         name: &OsStr,
         newparent: INodeNo,
@@ -1441,21 +1774,26 @@ impl Filesystem for FuseTree {
         _owner: Option<fuser::Owner>,
         reply: ReplyEmpty,
     ) {
+        let caller = Caller(req.pid());
         let (name, newname) = (name.to_owned(), newname.to_owned());
         self.spawn(move |t| {
-            reply_empty(reply, t.rename(parent, &name, newparent, &newname, flags));
+            reply_empty(
+                reply,
+                t.rename(caller, parent, &name, newparent, &newname, flags),
+            );
         });
     }
 
     fn open(
         &self,
-        _req: &Request,
+        req: &Request,
         ino: INodeNo,
         flags: OpenFlags,
         _kill_suid_gid: bool,
         reply: ReplyOpen,
     ) {
-        self.spawn(move |t| reply_open(reply, t.open(ino, flags)));
+        let caller = Caller(req.pid());
+        self.spawn(move |t| reply_open(reply, t.open(caller, ino, flags)));
     }
 
     fn read(
@@ -1533,8 +1871,9 @@ impl Filesystem for FuseTree {
         self.spawn(move |t| reply_empty(reply, t.fsync(fh, datasync)));
     }
 
-    fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
-        self.spawn(move |t| reply_open(reply, t.opendir(ino)));
+    fn opendir(&self, req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        let caller = Caller(req.pid());
+        self.spawn(move |t| reply_open(reply, t.opendir(caller, ino)));
     }
 
     fn readdir(
@@ -1572,7 +1911,7 @@ impl Filesystem for FuseTree {
 
     fn create(
         &self,
-        _req: &Request,
+        req: &Request,
         parent: INodeNo,
         name: &OsStr,
         mode: u32,
@@ -1582,11 +1921,14 @@ impl Filesystem for FuseTree {
         _owner: fuser::Owner,
         reply: ReplyCreate,
     ) {
+        let caller = Caller(req.pid());
         let name = name.to_owned();
-        self.spawn(move |t| match t.create(parent, &name, mode, umask, flags) {
-            Ok((attr, fh)) => reply.created(&TTL, &attr, GENERATION, fh, FopenFlags::empty()),
-            Err(e) => reply.error(e),
-        });
+        self.spawn(
+            move |t| match t.create(caller, parent, &name, mode, umask, flags) {
+                Ok((attr, fh)) => reply.created(&TTL, &attr, GENERATION, fh, FopenFlags::empty()),
+                Err(e) => reply.error(e),
+            },
+        );
     }
 }
 

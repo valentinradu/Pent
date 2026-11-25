@@ -88,6 +88,7 @@ impl Harness {
         cmd.args(&argv[1..])
             .env("XDG_CONFIG_HOME", &self.config)
             .env("XDG_STATE_HOME", &self.state)
+            .env("PENT_FILE_DEADLINE_MS", "300")
             .env("HOME", &self.home)
             .env_remove("PENT_LOG")
             .current_dir(&self.workspace)

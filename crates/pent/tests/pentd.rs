@@ -1035,6 +1035,63 @@ fn an_allow_of_a_link_does_not_open_its_target() -> TestResult {
     Ok(())
 }
 
+/// A file in the home directory that no rule gives asks through the FUSE
+/// server (step 5.4). An "allow" serves the read. The question of a key
+/// in `~/.ssh` has the sensitive class, and its "deny" gives `EACCES`.
+#[test]
+fn a_file_in_the_home_asks_and_the_answer_decides() -> TestResult {
+    let test = "a_file_in_the_home_asks_and_the_answer_decides";
+    if !have_tools(test, &["sh", "cat"]) || !sandbox_ready(test) {
+        return Ok(());
+    }
+    let rt = Runtime::new()?;
+    let env = TestEnv::new()?;
+    // pentd computes the class with its own home directory.
+    let _pentd = Reap(rt.pent(&["daemon"]).env("HOME", &env.home).spawn()?);
+    assert!(rt.wait_for_socket());
+    let notes = env.write_home("notes.txt", "NOTES\n")?;
+    let key = env.write_home(".ssh/id_test", "KEY\n")?;
+    let notes = notes.to_str().ok_or("the path is not UTF-8")?;
+    let key = key.to_str().ok_or("the path is not UTF-8")?;
+    let script = format!("cat '{notes}'; (cat '{key}') 2>/dev/null || echo key-refused");
+    let run = env
+        .command(&["run", "-w", "--key", "files", "--", "sh", "-c", &script])
+        .env("XDG_RUNTIME_DIR", rt.xdg())
+        // The test answers, so the question must wait for it.
+        .env("PENT_FILE_DEADLINE_MS", "60000")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let answered = (|| -> TestResult {
+        let code = question_for(&rt, &format!("read {notes}"))?;
+        let answer = rt.pent(&["allow", &code]).output()?;
+        assert!(answer.status.success(), "{answer:?}");
+        let code = question_for(&rt, &format!("read {key}"))?;
+        let out = rt
+            .pent(&["questions", "--json"])
+            .stdout(Stdio::piped())
+            .output()?;
+        let question = stdout(&out)
+            .lines()
+            .filter_map(|line| serde_json::from_str::<pent_profile::Question>(line).ok())
+            .find(|q| q.id.to_string() == code)
+            .ok_or("the question of the key is gone")?;
+        assert!(
+            matches!(question.ask.class, pent_profile::Class::Sensitive(_)),
+            "{question:?}"
+        );
+        let answer = rt.pent(&["deny", &code]).output()?;
+        assert!(answer.status.success(), "{answer:?}");
+        Ok(())
+    })();
+    let out = run.wait_with_output()?;
+    if let Err(e) = answered {
+        return Err(format!("{e}; the run gave {out:?}").into());
+    }
+    assert_eq!(stdout(&out), "NOTES\nkey-refused\n", "{out:?}");
+    Ok(())
+}
+
 /// `--network blocked` refuses a Unix socket, a port and a name off the
 /// lists with no question.
 #[test]
@@ -1880,6 +1937,7 @@ mod clients {
     fn pent(rt: &Runtime, state: &Path, args: &[&str]) -> std::io::Result<Output> {
         rt.pent(args)
             .env("XDG_STATE_HOME", state)
+            .env("PENT_FILE_DEADLINE_MS", "300")
             .env("HOME", state)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -2321,6 +2379,7 @@ created = 2026-11-22T12:00:01Z
         let output = rt
             .pent(&["questions"])
             .env("XDG_STATE_HOME", state.path())
+            .env("PENT_FILE_DEADLINE_MS", "300")
             .env("HOME", state.path())
             .env("PENT_REPLY_WAIT_MS", "200")
             .stderr(Stdio::piped())
@@ -2465,6 +2524,7 @@ mod notify {
                         .env("HOME", home.path())
                         .env("XDG_CONFIG_HOME", home.path().join("config"))
                         .env("XDG_STATE_HOME", home.path().join("state"))
+                        .env("PENT_FILE_DEADLINE_MS", "300")
                         .env("PENT_TEST_MARK", "inherited")
                         .spawn()?,
                 ),
@@ -2823,7 +2883,8 @@ mod hook_fds {
         rt.apply(&mut cmd)
             .env("HOME", home.path())
             .env("XDG_CONFIG_HOME", home.path().join("config"))
-            .env("XDG_STATE_HOME", home.path().join("state"));
+            .env("XDG_STATE_HOME", home.path().join("state"))
+            .env("PENT_FILE_DEADLINE_MS", "300");
         // SAFETY: the hook runs in the child after the fork and calls only
         // `dup2` and `fcntl`, which are async-signal-safe.
         unsafe {

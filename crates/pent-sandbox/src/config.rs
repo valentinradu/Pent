@@ -163,6 +163,11 @@ pub struct SandboxConfig {
     /// in a nested user namespace, and a helper grafts the real subtrees.
     /// Only a sandbox with enforcement uses them.
     pub file_areas: FuseAreas,
+
+    /// The decider of a file access in a FUSE area that the grants of this
+    /// config do not give. The FUSE server asks it in the thread of the
+    /// request. Without it, such an access gets `EACCES`.
+    pub file_decider: Option<std::sync::Arc<dyn AccessDecider>>,
 }
 
 /// Decides a connection that the lists of the sandbox do not hold: a Unix
@@ -186,6 +191,13 @@ pub trait AccessDecider: Send + Sync + std::fmt::Debug {
         request: pent_profile::Request,
         deadline: std::time::Duration,
     ) -> pent_profile::Decision;
+
+    /// Return true if `path` is in the pent class: the program gets
+    /// `ENOENT` for it, and no answer opens it. The default hides nothing.
+    fn hidden(&self, path: &std::path::Path) -> bool {
+        let _ = path; // The default hides nothing, so it needs no path.
+        false
+    }
 }
 
 impl SandboxConfig {
@@ -211,6 +223,7 @@ impl SandboxConfig {
             localhost: LocalhostPorts::default(),
             decider: None,
             file_areas: FuseAreas::default(),
+            file_decider: None,
         }
     }
 

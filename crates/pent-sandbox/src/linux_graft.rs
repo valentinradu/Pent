@@ -140,6 +140,10 @@ pub(crate) struct FuseArea {
 }
 
 /// The FUSE areas of a session and the channel to its graft helper.
+///
+/// Its descriptors of the FUSE roots keep the FUSE mounts alive, so the
+/// FUSE sessions, and the event senders in them, end only after this value
+/// drops. Drop it when the child ends.
 pub(crate) struct FileAreas {
     areas: Vec<FuseArea>,
     ctl: Mutex<OwnedFd>,
@@ -196,6 +200,16 @@ impl FileAreas {
     }
 }
 
+/// The policy of the FUSE areas of one sandbox.
+pub(crate) struct FilePolicy {
+    /// The grants, as Landlock rules without the rules of the FUSE roots.
+    pub(crate) grants: Arc<crate::linux::AccessPolicy>,
+    /// The decider of an access that the grants do not give.
+    pub(crate) decider: Option<Arc<dyn crate::AccessDecider>>,
+    /// The channel of the events of the run.
+    pub(crate) events: Option<std::sync::mpsc::Sender<pent_profile::WatchEvent>>,
+}
+
 /// The parent side of the FUSE areas before and during the spawn.
 pub(crate) struct FileAreasSetup {
     /// The ends of the child: the parent drops them after the spawn, so
@@ -227,7 +241,7 @@ impl FileAreasSetup {
     /// `InvalidConfig` for a path with a NUL byte.
     pub(crate) fn new(
         areas: &[PathBuf],
-        policy: Option<Arc<crate::linux::AccessPolicy>>,
+        policy: Option<FilePolicy>,
     ) -> Result<(Self, FileAreasChild), SandboxError> {
         let paths: Vec<CString> = areas
             .iter()
@@ -242,7 +256,7 @@ impl FileAreasSetup {
         let owned: Vec<PathBuf> = areas.to_vec();
         let receiver = std::thread::Builder::new()
             .name("pent-fuse-areas".to_string())
-            .spawn(move || receive_areas(&fuse_parent, owned, policy.as_ref()))
+            .spawn(move || receive_areas(&fuse_parent, owned, policy))
             .map_err(SandboxError::SpawnFailed)?;
         let child = FileAreasChild {
             fuse_sock: child_fuse.as_raw_fd(),
@@ -281,9 +295,24 @@ impl FileAreasSetup {
 fn receive_areas(
     sock: &OwnedFd,
     paths: Vec<PathBuf>,
-    policy: Option<&Arc<crate::linux::AccessPolicy>>,
+    policy: Option<FilePolicy>,
 ) -> Result<Vec<FuseArea>, SandboxError> {
     let lost = |what: &str| SandboxError::SpawnFailed(std::io::Error::other(what.to_string()));
+    // The first message holds the `/proc` of the child.
+    let Some(mut first) = linux_fdpass::recv_fds(sock).map_err(SandboxError::SpawnFailed)? else {
+        return Err(lost("the child sent no /proc"));
+    };
+    let proc_dir = first.pop();
+    let shared = policy.map(|p| {
+        (
+            p.grants,
+            Arc::new(linux_fuse::FileContext {
+                decider: p.decider,
+                events: p.events,
+                proc_dir,
+            }),
+        )
+    });
     let mut areas = Vec::with_capacity(paths.len());
     for path in paths {
         let Some(fds) = linux_fdpass::recv_fds(sock).map_err(SandboxError::SpawnFailed)? else {
@@ -293,14 +322,17 @@ fn receive_areas(
             .try_into()
             .map_err(|_| lost("a FUSE area needs three descriptors"))?;
         let root = source.try_clone().map_err(SandboxError::SpawnFailed)?;
-        let area_policy = policy.map(|grants| linux_fuse::AreaPolicy {
-            area: path.clone(),
-            grants: Arc::clone(grants),
-            private_above: crate::linux::private_roots()
-                .into_iter()
-                .filter(|p| path.starts_with(p) && path != *p)
-                .collect(),
-        });
+        let area_policy = shared
+            .as_ref()
+            .map(|(grants, context)| linux_fuse::AreaPolicy {
+                area: path.clone(),
+                grants: Arc::clone(grants),
+                private_above: crate::linux::private_roots()
+                    .into_iter()
+                    .filter(|p| path.starts_with(p) && path != *p)
+                    .collect(),
+                shared: Arc::clone(context),
+            });
         let server = linux_fuse::serve(dev, root, area_policy)
             .map_err(|e| SandboxError::SpawnFailed(std::io::Error::other(e.to_string())))?;
         areas.push(FuseArea {
@@ -326,6 +358,19 @@ impl FileAreasChild {
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
         let dir = libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        // The `/proc` of the child first: pent reads the name of the
+        // process of a request there.
+        // SAFETY: a static NUL-terminated path.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let proc_dir = unsafe { libc::open(c"/proc".as_ptr(), dir) };
+        if proc_dir < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: the socket and the descriptor are open.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let sent = unsafe { linux_fdpass::send_fds(self.fuse_sock, &[proc_dir]) };
+        close(proc_dir);
+        sent?;
         for area in &self.areas {
             // SAFETY: `area` is NUL-terminated.
             // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
@@ -1010,6 +1055,212 @@ cat "$H/graft/file"
         assert_eq!(std::fs::read_to_string(home.join("made/f"))?, "m\n");
         assert!(home.join("w/d/t").exists());
         assert!(!home.join("new.txt").exists() && !home.join("stolen").exists());
+        Ok(())
+    }
+
+    /// A decider for the tests: it allows the listed requests, refuses the
+    /// rest, hides the paths below `pent`, and records each question.
+    #[derive(Debug)]
+    struct FakeDecider {
+        allow: Vec<pent_profile::Request>,
+        pent: PathBuf,
+        asked: std::sync::Mutex<Vec<(String, pent_profile::Request)>>,
+    }
+
+    impl crate::AccessDecider for FakeDecider {
+        fn known(&self, _request: &pent_profile::Request) -> Option<pent_profile::Decision> {
+            None
+        }
+
+        fn decide(
+            &self,
+            program: &str,
+            request: pent_profile::Request,
+            _deadline: std::time::Duration,
+        ) -> pent_profile::Decision {
+            let decision = if self.allow.contains(&request) {
+                pent_profile::Decision::Allow
+            } else {
+                pent_profile::Decision::Deny
+            };
+            self.asked
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((program.to_string(), request));
+            decision
+        }
+
+        fn hidden(&self, path: &Path) -> bool {
+            path.starts_with(&self.pent)
+        }
+    }
+
+    /// The program of the test of the kinds and the classes. Each line
+    /// names the result of one access.
+    const KINDS_SCRIPT: &str = r#"set -e
+exec > "$T/out" 2>&1
+: pent-kinds-test-marker
+[ -e "$H/notes.txt" ] && echo see
+ls "$H/docs" > /dev/null && echo listed
+(ls "$H/private") 2>/dev/null || echo list-refused
+cat "$H/notes.txt"
+(cat "$H/other.txt") 2>/dev/null || echo read-refused
+(cat "$H/notes.txt.secret") 2>/dev/null || echo old-sibling-refused
+(echo w > "$H/docs/new.txt") && echo wrote
+(echo x > "$H/unrelated") 2>/dev/null || echo create-refused
+(mkdir "$H/docs/dir") 2>/dev/null || echo mkdir-refused
+(rm "$H/docs/keep") 2>/dev/null || echo delete-refused
+"$H/bin/tool.sh"
+[ -e "$H/.config/pent" ] || echo pent-hidden
+(cat "$H/.config/pent/rules.toml") 2>&1 | grep -q "No such file" && echo pent-enoent
+ls -a "$H/.config" | grep -c pent || true
+echo new > "$H/.claude.json.tmp.1"
+mv "$H/.claude.json.tmp.1" "$H/.claude.json"
+cat "$H/.claude.json"
+(rm "$H/.claude.json.bak") 2>/dev/null || echo old-sibling-kept
+"#;
+
+    /// Each row of the tables of sections 5.2 and 5.3 of the design that
+    /// the FUSE server decides: "see" is free, list, read, write and exec
+    /// ask, a refusal gives `EACCES`, the files of pent give `ENOENT` and
+    /// are not in a listing, and an atomic write of one file in a
+    /// directory with no rule works through its temporary sibling.
+    #[test]
+    fn each_kind_asks_and_the_files_of_pent_are_hidden() -> TestResult {
+        if !ready() {
+            return Ok(());
+        }
+        let tmp = tempfile::tempdir()?;
+        let base = std::fs::canonicalize(tmp.path())?;
+        let (ws, home) = (base.join("ws"), base.join("home"));
+        for dir in ["docs", "private", "bin", ".config/pent", ".config/app"] {
+            std::fs::create_dir_all(home.join(dir))?;
+        }
+        std::fs::create_dir(&ws)?;
+        for (file, text) in [
+            ("notes.txt", "notes\n"),
+            ("notes.txt.secret", "SECRET\n"),
+            ("other.txt", "other\n"),
+            ("docs/keep", "keep\n"),
+            (".config/pent/rules.toml", "RULES\n"),
+            (".claude.json", "old\n"),
+            (".claude.json.bak", "backup\n"),
+        ] {
+            std::fs::write(home.join(file), text)?;
+        }
+        let tool = home.join("bin/tool.sh");
+        std::fs::write(&tool, "#!/bin/sh\necho ran-tool\n")?;
+        std::fs::set_permissions(&tool, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
+
+        let text = |p: &Path| p.to_string_lossy().into_owned();
+        let file = |kind, p: &Path| -> Result<pent_profile::Request, Box<dyn std::error::Error>> {
+            Ok(pent_profile::Request::File {
+                kind,
+                path: pent_profile::RulePath::new(p.to_path_buf())?,
+            })
+        };
+        use pent_profile::FileKind::{Exec, List, Read, Write};
+        let decider = Arc::new(FakeDecider {
+            allow: vec![
+                file(List, &home.join("docs"))?,
+                file(List, &home.join(".config"))?,
+                file(Read, &home.join("notes.txt"))?,
+                file(Write, &home.join("docs/new.txt"))?,
+                file(Read, &tool)?,
+                file(Exec, &tool)?,
+            ],
+            pent: home.join(".config/pent"),
+            asked: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut env = crate::build_env(&[]);
+        env.insert("T".to_string(), text(&ws));
+        env.insert("H".to_string(), text(&home));
+        env.insert("HOME".to_string(), text(&home));
+        let mut config =
+            crate::SandboxConfig::new(ws.clone(), crate::system_default_paths(), ws.clone())
+                .with_env(env.clone())
+                .with_network(crate::NetworkMode::LocalhostOnly);
+        config.file_areas = crate::FuseAreas::OutsideBase;
+        // The only grant in the home: one file, in a directory with no
+        // rule, so its atomic write goes through a temporary sibling.
+        config
+            .paths
+            .read_write
+            .push(text(&home.join(".claude.json")));
+        config.file_decider = Some(decider.clone());
+        let args = vec!["-c".to_string(), KINDS_SCRIPT.to_string()];
+        let spawned = crate::linux::spawn_linux(
+            &config,
+            "sh",
+            &args,
+            &env,
+            &crate::resolve_path_directories(),
+            crate::linux::SpawnMode::Sandbox,
+        )?;
+        let mut child = spawned.child;
+        let events = spawned.events.ok_or("the run has no event channel")?;
+        // The test grafts nothing: drop the descriptors of the FUSE roots,
+        // so the sessions and the event channel end with the child.
+        drop(spawned.files);
+        let status = child.wait()?;
+        let out = std::fs::read_to_string(ws.join("out")).unwrap_or_default();
+        assert!(status.success(), "the program failed: {status}\n{out}");
+        // Each decision of the decider is an event of the run.
+        let mut seen = Vec::new();
+        while let Ok(event) = events.recv_timeout(std::time::Duration::from_secs(5)) {
+            seen.push(event);
+        }
+        assert!(
+            seen.iter()
+                .any(|e| matches!(e, pent_profile::WatchEvent::Fs {
+                op: pent_profile::FsOp::List,
+                path,
+                outcome: pent_profile::Outcome::Denied,
+                ..
+            } if *path == home.join("private"))),
+            "{seen:?}"
+        );
+        assert_eq!(
+            out,
+            "see\nlisted\nlist-refused\nnotes\nread-refused\nold-sibling-refused\nwrote\n\
+             create-refused\nmkdir-refused\ndelete-refused\nran-tool\npent-hidden\n\
+             pent-enoent\n0\nnew\nold-sibling-kept\n"
+        );
+        assert_eq!(std::fs::read_to_string(home.join(".claude.json"))?, "new\n");
+        assert!(!home.join("unrelated").exists() && home.join("docs/keep").exists());
+        assert!(home.join(".claude.json.bak").exists());
+
+        let asked = decider
+            .asked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let requests: Vec<&pent_profile::Request> = asked.iter().map(|(_, r)| r).collect();
+        let asks_for = |p: PathBuf| {
+            requests
+                .iter()
+                .filter(|r| matches!(r, pent_profile::Request::File { path, .. } if path.as_path() == p))
+                .count()
+        };
+        // The files of pent ask nothing, and neither does the grant and
+        // its temporary sibling.
+        for p in [
+            ".config/pent",
+            ".config/pent/rules.toml",
+            ".claude.json",
+            ".claude.json.tmp.1",
+        ] {
+            assert_eq!(asks_for(home.join(p)), 0, "{p} asked: {requests:?}");
+        }
+        // "See" asks nothing: only the read of `notes.txt` asks.
+        assert_eq!(asks_for(home.join("notes.txt")), 1, "{requests:?}");
+        // An old file with a name like a sibling asks as itself.
+        assert!(requests.contains(&&file(Read, &home.join("notes.txt.secret"))?));
+        assert!(requests.contains(&&file(List, &home.join("private"))?));
+        assert!(requests.contains(&&file(Write, &home.join("unrelated"))?));
+        // The question names the program that made the access.
+        let other = ("cat".to_string(), file(Read, &home.join("other.txt"))?);
+        assert!(asked.contains(&other), "{asked:?}");
         Ok(())
     }
 }

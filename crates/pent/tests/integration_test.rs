@@ -42,6 +42,7 @@ fn run_pent(cwd: &Path, args: &[&str]) -> Output {
         .env_remove("PENT_LOG") // keep test output clean
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .env("XDG_STATE_HOME", home.join(".local/state"))
+        .env("PENT_FILE_DEADLINE_MS", "300")
         .output()
         .unwrap_or_else(|e| panic!("Failed to spawn pent binary: {e}"))
 }

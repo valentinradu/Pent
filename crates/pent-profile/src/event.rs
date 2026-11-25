@@ -22,6 +22,8 @@ pub struct ProcessInfo {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FsOp {
+    /// List the names of a directory (the FUSE server of `pent run`).
+    List,
     /// Open for reading, or read a directory.
     Read,
     /// Open an existing file for writing, truncate it, or change its mode.

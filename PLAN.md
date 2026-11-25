@@ -1,6 +1,6 @@
 # Plan: the new pent
 
-**Cursor: step 5.4.** Steps with `[x]` are done. Work on the branch `next`,
+**Cursor: step 5.5.** Steps with `[x]` are done. Work on the branch `next`,
 one commit for each step, and move this cursor when a step is done.
 
 **The way of work.** One commit for each step. Then the user runs
@@ -348,12 +348,37 @@ section 14 of the design has their results.
   - Facts for step 5.4: a listing is allowed wherever the traversal rule
     on `/` reaches; a temporary sibling of a file rule is refused; a
     device node gets `EPERM`, a hard link `EPERM`.
-- [ ] **5.4 The five kinds and the three classes.** See is free and true.
+- [x] **5.4 The five kinds and the three classes.** See is free and true.
   List, read, write and exec ask. A refusal or a deadline gives `EACCES`.
   The files of pent give `ENOENT`. A sensitive location is served by FUSE
   and never grafted. A temporary sibling gets the answer of its target.
   - Done: tests for each row of the tables in sections 5.2 and 5.3 of the
     design, and for an atomic write of one file in a hidden directory.
+  - Files: `Tree::require`, `sibling_candidates`, `FileContext` and the
+    hidden names in `pent-sandbox/src/linux_fuse.rs`; `FilePolicy` and the
+    `/proc` of the child in `linux_graft.rs`; `rights_in_area` in
+    `linux.rs`; `AccessDecider::hidden` and `SandboxConfig::file_decider`
+    in `config.rs`; `FsOp::List` in `pent-profile/src/event.rs`;
+    `file_deadline` (`PENT_FILE_DEADLINE_MS`) and `Decider::hidden` in
+    `pent/src/commands/decide.rs`; KC-1 to KC-9 in `docs/security/fuse.md`.
+  - Decisions (2026-11-25):
+    - The server asks the chain in the thread of the request. The file
+      decider is apart from the decider of the sockets and the ports, so
+      `--network blocked` does not stop the file questions.
+    - `FsOp::List` is new; the fuzz record of `protocol_line` is stale.
+    - Only a name that the program makes in this run is a temporary
+      sibling.
+    - A traversal-only rule above an area gives no listing in it.
+    - In an area the chain applies each file rule, so `pent run` warns
+      about a held-back file rule only outside the areas.
+    - No answer makes a graft yet: step 5.6 grafts the rules and the
+      answers together.
+    - The tests set `PENT_FILE_DEADLINE_MS=300`: a refused file asks now,
+      and nobody answers in most tests.
+  - Facts for the next steps: `FileAreas` keeps the FUSE mounts alive,
+    so it must drop when the child ends (5.6). A program can take the home
+    from the password database (`curl` and `~/.ssh/known_hosts`), and the
+    path asks.
 - [ ] **5.5 The negative cache.** A long validity time for a missing name,
   inotify on the real directories, and `FUSE_NOTIFY_INVAL_ENTRY` when a
   host process creates the file.

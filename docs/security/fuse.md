@@ -1,15 +1,16 @@
 # The FUSE server and the grafts
 
-Status: the branch `next`, steps 5.1 to 5.3 of `PLAN.md` (2026-11-25).
+Status: the branch `next`, steps 5.1 to 5.4 of `PLAN.md` (2026-11-25).
 This report lists the security properties of the FUSE server of pent, of
 the graft helper and of the FUSE areas, the test of each property, and the
 properties that later steps must add.
 
 `pent run` covers each directory outside the base with FUSE
 (`FuseAreas::OutsideBase`), and the server applies the grants of the run:
-the rules, the flags and `-w`. It refuses each other access with `EACCES`
-and asks no question yet: step 5.4 adds the questions and asks for the
-grafts.
+the rules, the flags and `-w`. Since step 5.4 an access that no grant
+gives asks the chain of deciders, and a question goes to pentd. No answer
+makes a graft yet: step 5.6 grafts the rules at the start and the
+answers.
 
 ## Scope
 
@@ -85,6 +86,20 @@ makes the skip a failure. The container runs of the pipeline give
 | GR-8 | When the session ends, the helper ends, and a graft request gives `HelperGone`. | `linux_graft::tests::a_graft_during_a_run_holds_and_the_program_cannot_remove_it` |
 | GR-9 | The server reads the real tree through the source descriptor that the child opened, so it sees the mounts of the session: a read-only `.pent` stays read-only through FUSE too, and so does a mask of pent. | `linux_graft::tests::a_graft_during_a_run_holds_and_the_program_cannot_remove_it` |
 
+## The kinds and the classes (step 5.4)
+
+| ID | Property | Test |
+|---|---|---|
+| KC-1 | "See" is free: a lookup, `getattr`, `readlink`, `access` and `statfs` ask nothing and give the truth. | `linux_graft::tests::each_kind_asks_and_the_files_of_pent_are_hidden` (the test of `notes.txt` asks nothing) |
+| KC-2 | List, read, write and exec ask when no grant gives the access. The server asks the chain of deciders of `pent run` (`SandboxConfig::file_decider`) in the thread of the request, with the deadline for a file (120 s). An allow serves the access; a deny or the deadline gives `EACCES`. `--network blocked` does not stop the file questions: the file decider is apart from the decider of the sockets and the ports. | `linux_graft::tests::each_kind_asks_and_the_files_of_pent_are_hidden`, `pentd::a_file_in_the_home_asks_and_the_answer_decides`, `client::tests::each_deadline_gives_a_refusal_at_its_time_and_not_before` (the deadline); `--network blocked`: no test |
+| KC-3 | The files of pent give `ENOENT` for each operation, a lookup too, and their names are not in a listing. The server checks this before the grants, so a flag on a parent (`-w=~`) does not open them. | `linux_graft::tests::each_kind_asks_and_the_files_of_pent_are_hidden`, `security_linux_sandbox::test_a_flag_over_a_parent_does_not_open_the_files_of_pent` |
+| KC-4 | pentd computes the class of each question (QU-16), so the question of a credential in an area is sensitive, and only the human answers it with the exact target. A sensitive location is never grafted: no answer makes a graft yet (step 5.6). | `pentd::a_file_in_the_home_asks_and_the_answer_decides` |
+| KC-5 | A temporary sibling gets the answer of its target. Only a name that the program creates in this run becomes one, so a file of the host never takes the answer of a similar name. The target is the longest candidate (`.claude.json.tmp.1` stands for `.claude.json`, `notes.txt~` for `notes.txt`, `.notes.txt.swp` for `notes.txt`) that is a regular file in the directory or that a grant lets the program write. The write, the rename and the removal of the sibling get the same answer, so an atomic write of one file in a directory with no rule works. | `linux_graft::tests::each_kind_asks_and_the_files_of_pent_are_hidden` (`.claude.json`, and `notes.txt.secret` asks as itself) |
+| KC-6 | Each decision of the decider is an event of the run, with the operation (`FsOp::List` is new), the path and the process: pent reads the name in the `/proc` of the child, because the PID of a request is in the PID namespace of the child. `pent denials` shows each refusal. | `linux_graft::tests::each_kind_asks_and_the_files_of_pent_are_hidden` (the event of the listing, the program `cat`) |
+| KC-7 | A rule that only lists (`TRAVERSAL`, the rule on `/` of the default paths) on a parent of an area gives no listing in the area: a listing there asks. | `linux_graft::tests::each_kind_asks_and_the_files_of_pent_are_hidden` (`private`) |
+| KC-8 | In an area the chain applies each file rule, also one that the static layers cannot hold (a deny inside its width, an exact directory, a sensitive path inside). `pent run` warns about such a rule only outside the areas. | `differential_profile_kernel::fs_table::a_rule_on_the_whole_home_directory_gives_no_sensitive_file`, `an_exact_rule_on_a_directory_gives_no_child`, `a_deny_rule_inside_an_allow_rule_wins` |
+| KC-9 | `PENT_FILE_DEADLINE_MS` can only shorten the deadline of a file question, never make it longer. The tests set 300 ms, so a probe of a refusal does not wait 120 s. | No test. |
+
 ## The areas (step 5.3)
 
 | ID | Property | Test |
@@ -109,13 +124,15 @@ the mount namespace goes: `lookup_getattr_and_read`, `create_write_and_modes`,
   each path of its rules in the child, after the FUSE mounts. A rule in an
   area thus binds to a FUSE node, and its open sends requests to pent;
   this works only because pent serves the areas during the spawn.
-- **Step 5.4.** A temporary sibling of a file rule (`~/.claude.json.tmp`)
-  gets `EACCES` until step 5.4 gives it the answer of its target, so an
-  atomic write of one file in a directory with no rule fails. A listing is
-  allowed wherever the traversal rule on `/` of the default paths reaches,
-  as with Landlock before; step 5.4 makes a listing ask. An
-  execute-only grant runs a binary, not a script: the interpreter needs a
-  read, as with Landlock.
+- **Step 5.6.** The rules at the start and the answers become grafts. A
+  width that holds a sensitive location must stay with FUSE. `FileAreas`
+  must drop when the child ends: its descriptors of the FUSE roots keep
+  the mounts, the sessions and their event senders alive.
+- **An execute-only grant** runs a binary, not a script: the interpreter
+  needs a read, as with Landlock.
+- **A program outside `$HOME`.** A program can take the home directory
+  from the password database (`curl` reads `~/.ssh/known_hosts` there).
+  That path is in an area too, so it asks.
 - **The speed.** Each spawn mounts one FUSE area for each directory
   outside the base (12 on the machine of the tests), and each access in an
   area goes through FUSE until step 5.6 grafts the grants at the start.

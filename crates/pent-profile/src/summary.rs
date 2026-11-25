@@ -597,7 +597,7 @@ impl Env {
     /// Return the guard class of an access, if a guard rule matches it.
     fn guard_class(&self, op: FsOp, path: &Path) -> Option<GuardClass> {
         let access = match op {
-            FsOp::Read => GuardAccess::Read,
+            FsOp::List | FsOp::Read => GuardAccess::Read,
             FsOp::Exec => GuardAccess::ExecName,
             FsOp::Write | FsOp::Create | FsOp::Delete => GuardAccess::Write,
         };
@@ -745,7 +745,8 @@ impl FsLog {
             self.repos.insert(root);
         }
         match op {
-            FsOp::Read => self.reads.entry(path).or_default().add(process),
+            // The old flow reads a listing as a read of the directory.
+            FsOp::List | FsOp::Read => self.reads.entry(path).or_default().add(process),
             FsOp::Write => self.writes.entry(path).or_default().add(process),
             FsOp::Exec => self.execs.entry(path).or_default().add(process),
             FsOp::Create => {
@@ -1045,7 +1046,7 @@ fn add_blocked(
         .then(|| path.file_name().and_then(OsStr::to_str).map(str::to_string))
         .flatten();
     let key = match op {
-        FsOp::Read => (FsAccess::Read, path),
+        FsOp::List | FsOp::Read => (FsAccess::Read, path),
         FsOp::Exec => (FsAccess::Execute, env.exec_dir(&path)),
         FsOp::Write | FsOp::Create | FsOp::Delete => (FsAccess::ReadWrite, path),
     };

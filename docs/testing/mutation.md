@@ -206,6 +206,13 @@ makes one mutation by hand. The test must fail on the mutant. No
 | 5.3 | A rename checks only its target. | `linux_graft::tests::an_area_of_the_host_applies_the_grants_and_its_rule_covers_a_graft` (the move of a read-only file) |
 | 5.3 | The FUSE policy drops the rule of a missing path. | `linux_graft::tests::the_home_area_applies_the_grants_and_its_rule_covers_a_graft` |
 | 5.3 | An area below a private directory is not bound back. | `linux_graft::tests::the_home_area_applies_the_grants_and_its_rule_covers_a_graft` |
+| 5.4 | A lookup does not hide the files of pent. | `linux_graft::tests::each_kind_asks_and_the_files_of_pent_are_hidden` |
+| 5.4 | A listing shows the names of the pent class. | `linux_graft::tests::each_kind_asks_and_the_files_of_pent_are_hidden` |
+| 5.4 | A new temporary sibling gets no target. | `linux_graft::tests::each_kind_asks_and_the_files_of_pent_are_hidden` |
+| 5.4 | Each entry operation, also on an old file, takes the answer of a similar name. | `linux_graft::tests::each_kind_asks_and_the_files_of_pent_are_hidden` (`rm .claude.json.bak`) |
+| 5.4 | `require` does not check the pent class. | none: equivalent in normal use. The lookup hides such a path first, so no operation reaches `require` with it; the check is a second layer. |
+| 5.4 | A traversal rule above an area gives a listing in it. | `linux_graft::tests::each_kind_asks_and_the_files_of_pent_are_hidden` |
+| 5.4 | The decision sends no event. | `linux_graft::tests::each_kind_asks_and_the_files_of_pent_are_hidden` |
 
 One mutant of step 4.1 survives, and it is equivalent: a bind of the
 machine identifier with no read-only remount. Landlock gives `/etc` no

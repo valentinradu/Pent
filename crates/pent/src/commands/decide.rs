@@ -307,6 +307,19 @@ impl Decider {
         }
     }
 
+    /// Return true if `path` is in the pent class: the FUSE server gives
+    /// `ENOENT` for it.
+    pub(crate) fn hidden(&self, path: &Path) -> bool {
+        let Ok(path) = RulePath::new(path.to_path_buf()) else {
+            return false;
+        };
+        let request = Request::File {
+            kind: FileKind::Read,
+            path,
+        };
+        self.class(&request) == Some(Class::Pent)
+    }
+
     /// The class of `request`, or `None` when the home directory is not
     /// known.
     fn class(&self, request: &Request) -> Option<Class> {
@@ -365,6 +378,26 @@ pub(crate) struct SandboxDecider {
     pub decider: std::sync::Arc<Decider>,
     /// The runtime of `pent run`, where the worker thread waits.
     pub runtime: tokio::runtime::Handle,
+    /// The longest wait of a file question (see [`file_deadline`]).
+    pub file_deadline: Duration,
+}
+
+/// The variable that shortens the deadline of a file question, in
+/// milliseconds. The tests set it: since step 5.4 a refused file asks, and
+/// a test that only probes a refusal must not wait 120 s for an answer that
+/// nobody gives.
+pub(crate) const FILE_DEADLINE_VAR: &str = "PENT_FILE_DEADLINE_MS";
+
+/// The longest wait of a file question: [`pent_profile::FILE_DEADLINE`],
+/// or a shorter time from [`FILE_DEADLINE_VAR`].
+pub(crate) fn file_deadline() -> Duration {
+    std::env::var(FILE_DEADLINE_VAR)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map(Duration::from_millis)
+        .map_or(pent_profile::FILE_DEADLINE, |d| {
+            d.min(pent_profile::FILE_DEADLINE)
+        })
 }
 
 impl std::fmt::Debug for SandboxDecider {
@@ -384,9 +417,17 @@ impl pent_sandbox::AccessDecider for SandboxDecider {
     /// `pent run`) ends the task of the session, and the question ends
     /// with a deny.
     fn decide(&self, program: &str, request: Request, deadline: Duration) -> Decision {
+        let deadline = match request {
+            Request::File { .. } => deadline.min(self.file_deadline),
+            _ => deadline,
+        };
         self.runtime
             .block_on(self.decider.decide(program, request, deadline))
             .decision()
+    }
+
+    fn hidden(&self, path: &Path) -> bool {
+        self.decider.hidden(path)
     }
 }
 
@@ -425,6 +466,7 @@ fn request_of(event: &WatchEvent, key: &RuleKey) -> Option<(String, Request, Dec
             outcome,
         } => {
             let kind = match op {
+                FsOp::List => FileKind::List,
                 FsOp::Read => FileKind::Read,
                 FsOp::Write | FsOp::Create | FsOp::Delete => FileKind::Write,
                 FsOp::Exec => FileKind::Exec,
@@ -1085,6 +1127,7 @@ mod tests {
                 Some(session),
             )),
             runtime: runtime.handle().clone(),
+            file_deadline: pent_profile::FILE_DEADLINE,
         };
         let worker = std::thread::spawn(move || {
             sandbox.decide(

@@ -523,6 +523,18 @@ impl AccessPolicy {
             .fold(0, |acc, (_, a)| acc | a)
     }
 
+    /// The rights at `path` in the FUSE area `area`: without the rules on
+    /// the paths of `skip`, and without a rule that only lists
+    /// ([`access::TRAVERSAL`]) on a parent of the area. The default paths
+    /// list each directory from `/`; in an area a listing asks instead.
+    pub(crate) fn rights_in_area(&self, path: &Path, area: &Path, skip: &[PathBuf]) -> u64 {
+        self.rules
+            .iter()
+            .filter(|(p, _)| path.starts_with(p) && !skip.contains(p))
+            .filter(|(p, a)| !(*a == access::TRAVERSAL && area.starts_with(p) && area != p))
+            .fold(0, |acc, (_, a)| acc | a)
+    }
+
     /// Predict the result of the operation `op` on `path`. `is_dir` tells
     /// whether the path is a directory (a read of a directory needs only
     /// `READ_DIR`).
@@ -543,6 +555,7 @@ impl AccessPolicy {
             return pent_profile::Outcome::Denied;
         }
         let (subject, needed) = match op {
+            FsOp::List => (path, access::READ_DIR),
             FsOp::Read if is_dir => (path, access::READ_DIR),
             FsOp::Read => (path, access::READ_FILE),
             FsOp::Write if is_dir => (path, access::MAKE_REG),
@@ -3866,7 +3879,14 @@ pub(crate) fn spawn_linux(
     let (files, files_child) = if areas.is_empty() {
         (None, None)
     } else {
-        let (setup, child) = crate::linux_graft::FileAreasSetup::new(&areas, fuse_policy)?;
+        let policy = fuse_policy.map(|grants| crate::linux_graft::FilePolicy {
+            grants,
+            decider: config.file_decider.clone(),
+            events: recorder
+                .as_ref()
+                .map(crate::linux_watch::RecorderSetup::sender),
+        });
+        let (setup, child) = crate::linux_graft::FileAreasSetup::new(&areas, policy)?;
         (Some(setup), Some(child))
     };
 
@@ -3927,7 +3947,7 @@ pub(crate) fn spawn_linux(
     // supervisor then sends into a closed channel and ignores the error.
     // A decider makes an event for each question, also without
     // `--trace`, so `pent denials` shows the refusals of the questions.
-    let events = if record || config.decider.is_some() {
+    let events = if record || config.decider.is_some() || config.file_decider.is_some() {
         events
     } else {
         None

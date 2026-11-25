@@ -1093,7 +1093,7 @@ impl Judge {
 /// The guard access that matches a filesystem operation.
 const fn guard_access(op: FsOp) -> GuardAccess {
     match op {
-        FsOp::Read => GuardAccess::Read,
+        FsOp::List | FsOp::Read => GuardAccess::Read,
         FsOp::Exec => GuardAccess::ExecName,
         FsOp::Write | FsOp::Create | FsOp::Delete => GuardAccess::Write,
     }
@@ -1106,9 +1106,17 @@ pub(crate) struct RecorderSetup {
     pub(crate) child: RecorderChild,
     child_sock: OwnedFd,
     events: mpsc::Receiver<WatchEvent>,
+    /// A sender of the same channel, for the FUSE server.
+    sender: mpsc::Sender<WatchEvent>,
 }
 
 impl RecorderSetup {
+    /// A sender of the event channel. The channel closes when the
+    /// recorder and each sender end.
+    pub(crate) fn sender(&self) -> mpsc::Sender<WatchEvent> {
+        self.sender.clone()
+    }
+
     /// Close the parent copy of the socket end of the child, and return the
     /// event channel. Call this after `spawn`.
     pub(crate) fn into_events(self) -> mpsc::Receiver<WatchEvent> {
@@ -1145,6 +1153,7 @@ pub(crate) fn start_recorder(plan: RecorderPlan) -> Result<RecorderSetup, Sandbo
     let filter = native_filter(scope)?;
     let (parent_sock, child_sock) = crate::linux_fdpass::seqpacket_pair()?;
     let (tx, rx) = mpsc::channel();
+    let sender = tx.clone();
     std::thread::Builder::new()
         .name("pent-recorder".to_string())
         .spawn(move || supervise(&parent_sock, plan, &tx))
@@ -1156,6 +1165,7 @@ pub(crate) fn start_recorder(plan: RecorderPlan) -> Result<RecorderSetup, Sandbo
         },
         child_sock,
         events: rx,
+        sender,
     })
 }
 

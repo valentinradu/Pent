@@ -68,6 +68,16 @@ pub use config::{system_default_paths, AccessDecider, FuseAreas, LocalhostPorts,
 pub use env::{build_env, resolve_path_directories, resolve_path_dirs_from};
 #[cfg(target_os = "linux")]
 pub use linux::check_user_namespaces;
+
+/// The FUSE areas of [`FuseAreas::OutsideBase`] on this host, for the home
+/// directory `home`: each directory outside the base, and the home
+/// directory when no other area holds it. In an area the FUSE server
+/// decides each access with the chain of deciders.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn default_fuse_areas(home: Option<&std::path::Path>) -> Vec<std::path::PathBuf> {
+    linux::default_fuse_areas(home)
+}
 #[cfg(target_os = "linux")]
 pub use linux::compute_accessible_set;
 #[cfg(target_os = "linux")]

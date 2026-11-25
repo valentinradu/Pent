@@ -291,7 +291,10 @@ impl TestEnv {
             .env("XDG_RUNTIME_DIR", &self.runtime)
             // `pent run` starts pentd when no pentd runs. A short linger
             // makes that pentd stop soon after the test.
-            .env("PENTD_LINGER_MS", "200");
+            .env("PENTD_LINGER_MS", "200")
+            // A refused file asks since step 5.4. Nobody answers in most
+            // tests, so the question ends soon with a refusal.
+            .env("PENT_FILE_DEADLINE_MS", "300");
         cmd
     }
 

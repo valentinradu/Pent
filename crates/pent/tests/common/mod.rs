@@ -157,6 +157,8 @@ impl Xdg {
             .env("XDG_CONFIG_HOME", &self.config)
             .env("XDG_STATE_HOME", &self.state)
             .env_remove("PENT_LOG")
+            // A refused file asks since step 5.4; see `e2e::TestEnv`.
+            .env("PENT_FILE_DEADLINE_MS", "300")
     }
 
     /// The draft file of `name`.

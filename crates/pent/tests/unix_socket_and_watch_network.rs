@@ -70,6 +70,7 @@ impl Env {
             .env("HOME", &self.home)
             .env("XDG_CONFIG_HOME", &self.config)
             .env("XDG_STATE_HOME", &self.state)
+            .env("PENT_FILE_DEADLINE_MS", "300")
             .env("CLICOLOR", "0")
             .env("NO_COLOR", "1")
             .env_remove("CLICOLOR_FORCE")

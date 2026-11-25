@@ -132,7 +132,22 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
         rules,
         hold_pentd(&key, &args.command),
     ));
-    for (target, why) in &grants.held_back {
+    // In a FUSE area the chain of deciders applies each file rule, also one
+    // that the static layers cannot hold, so such a rule needs no warning.
+    let areas = if args.no_sandbox {
+        Vec::new()
+    } else {
+        pent_sandbox::default_fuse_areas(dirs::home_dir().as_deref())
+    };
+    let in_area = |target: &pent_profile::Target| match target {
+        pent_profile::Target::File { width, .. } => {
+            let (pent_profile::PathWidth::Exact(base) | pent_profile::PathWidth::Subtree(base)) =
+                width;
+            areas.iter().any(|a| base.as_path().starts_with(a))
+        }
+        _ => false,
+    };
+    for (target, why) in grants.held_back.iter().filter(|(t, _)| !in_area(t)) {
         ui::warn(format!(
             "this run does not apply the rule \"{}\": {}",
             pent_profile::safe(&target.to_string()),
@@ -237,12 +252,17 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
     // A Unix socket or a port off the lists asks, except with
     // `--network blocked`: that flag refuses each such access with no
     // question.
+    let sandbox_decider = std::sync::Arc::new(SandboxDecider {
+        decider: std::sync::Arc::clone(&decider),
+        runtime: tokio::runtime::Handle::current(),
+        file_deadline: crate::commands::decide::file_deadline(),
+    });
     if !blocks_localhost(decision) {
-        sandbox_cfg.decider = Some(std::sync::Arc::new(SandboxDecider {
-            decider: std::sync::Arc::clone(&decider),
-            runtime: tokio::runtime::Handle::current(),
-        }));
+        sandbox_cfg.decider = Some(sandbox_decider.clone());
     }
+    // A file access in a FUSE area that no rule, flag or `-w` gives asks,
+    // also with `--network blocked`, which is about the network only.
+    sandbox_cfg.file_decider = Some(sandbox_decider);
 
     if args.no_sandbox {
         sandbox_cfg = sandbox_cfg.with_no_enforcement();
@@ -780,6 +800,8 @@ fn access_trace_line(event: &WatchEvent) -> Option<TraceLine> {
         return None;
     };
     let (verb, flag) = match op {
+        // A read grant covers the listings in its width.
+        pent_profile::FsOp::List => ("list", "--read"),
         pent_profile::FsOp::Read => ("read", "--read"),
         pent_profile::FsOp::Write => ("write", "--write"),
         pent_profile::FsOp::Create => ("create", "--write"),
