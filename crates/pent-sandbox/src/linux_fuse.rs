@@ -71,9 +71,11 @@ pub(crate) enum FuseError {
     #[error("cannot start the FUSE session thread: {0}")]
     Thread(#[source] std::io::Error),
     /// The session stopped with an error.
+    #[cfg(test)]
     #[error("the FUSE session failed: {0}")]
     Session(#[source] std::io::Error),
     /// The session thread panicked.
+    #[cfg(test)]
     #[error("the FUSE session thread panicked")]
     Panicked,
 }
@@ -193,7 +195,11 @@ impl OptionBuf {
 }
 
 /// A running FUSE server.
+///
+/// The session ends by itself when the mount namespace goes, so pent does
+/// not wait for it. Only the tests wait.
 pub(crate) struct FuseServer {
+    #[cfg_attr(not(test), allow(dead_code))] // Only the tests wait.
     thread: JoinHandle<std::io::Result<()>>,
 }
 
@@ -205,6 +211,7 @@ impl FuseServer {
     /// # Errors
     /// Returns [`FuseError::Session`] if the session failed, or
     /// [`FuseError::Panicked`] if its thread panicked.
+    #[cfg(test)]
     pub(crate) fn wait(self) -> Result<(), FuseError> {
         match self.thread.join() {
             Ok(result) => result.map_err(FuseError::Session),
@@ -1219,7 +1226,7 @@ impl Filesystem for FuseTree {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::CommandExt;
@@ -1251,7 +1258,7 @@ mod tests {
 
     /// Return true if this host lets an unprivileged process mount FUSE in
     /// a user namespace.
-    fn fuse_available() -> bool {
+    pub(crate) fn fuse_available() -> bool {
         static AVAILABLE: OnceLock<bool> = OnceLock::new();
         *AVAILABLE.get_or_init(|| {
             let Ok(dir) = tempfile::tempdir() else {

@@ -50,10 +50,29 @@ pub(crate) unsafe fn send_fds(sock: RawFd, fds: &[RawFd]) -> std::io::Result<()>
     }
     // The length check above makes the cast exact.
     #[allow(clippy::cast_possible_truncation)]
-    let mut byte = [fds.len() as u8];
+    let byte = [fds.len() as u8];
+    // SAFETY: the caller keeps `sock` and `fds` open.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    unsafe { send_with_fds(sock, &byte, fds) }
+}
+
+/// Send `data` and the descriptors `fds` over the Unix socket `sock` in
+/// one message with `SCM_RIGHTS`. Async-signal-safe.
+///
+/// # Safety
+/// `sock` and each entry of `fds` must be open file descriptors.
+///
+/// # Errors
+/// Returns `EINVAL` if `data` is empty, or if `fds` is empty or has more
+/// than [`MAX_FDS`] entries, or the OS error of `sendmsg`.
+pub(crate) unsafe fn send_with_fds(sock: RawFd, data: &[u8], fds: &[RawFd]) -> std::io::Result<()> {
+    if data.is_empty() || fds.is_empty() || fds.len() > MAX_FDS {
+        return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+    }
     let mut iov = libc::iovec {
-        iov_base: byte.as_mut_ptr().cast(),
-        iov_len: byte.len(),
+        // `sendmsg` only reads the buffer.
+        iov_base: data.as_ptr().cast_mut().cast(),
+        iov_len: data.len(),
     };
     // SAFETY: `FdsCmsg` and `msghdr` are plain C structs; all zero bytes is
     // a valid value for them.
@@ -162,6 +181,78 @@ pub(crate) fn recv_fds(sock: &OwnedFd) -> std::io::Result<Option<Vec<OwnedFd>>> 
         return Err(proto());
     }
     Ok(Some(fds))
+}
+
+/// Receive one message of data and descriptors from `sock` into `buf`
+/// and `fds`, with no allocation. Returns the number of data bytes and the
+/// number of descriptors, or `(0, 0)` at EOF. The new descriptors have
+/// `O_CLOEXEC`, and the caller owns them. Async-signal-safe.
+///
+/// # Safety
+/// `sock` must be an open socket.
+///
+/// # Errors
+/// Returns the OS error of `recvmsg`, or `EPROTO` if the data or the
+/// control message did not fit or is not `SCM_RIGHTS`. On an error the
+/// function closes each descriptor that it received.
+pub(crate) unsafe fn recv_with_fds(
+    sock: RawFd,
+    buf: &mut [u8],
+    fds: &mut [RawFd; MAX_FDS],
+) -> std::io::Result<(usize, usize)> {
+    let mut iov = libc::iovec {
+        iov_base: buf.as_mut_ptr().cast(),
+        iov_len: buf.len(),
+    };
+    // SAFETY: `FdsCmsg` and `msghdr` are plain C structs; all zero bytes is
+    // a valid value for them.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let (mut cmsg, mut msg) = unsafe {
+        (
+            std::mem::zeroed::<FdsCmsg>(),
+            std::mem::zeroed::<libc::msghdr>(),
+        )
+    };
+    msg.msg_iov = &raw mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = (&raw mut cmsg).cast();
+    msg.msg_controllen = std::mem::size_of::<FdsCmsg>() as _;
+    let n = loop {
+        // SAFETY: `msg` points to valid, writable buffers that live until
+        // the call returns.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let n = unsafe { libc::recvmsg(sock, &raw mut msg, libc::MSG_CMSG_CLOEXEC) };
+        if n >= 0 {
+            break n;
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    };
+    let mut count = 0usize;
+    if msg.msg_controllen != 0
+        && cmsg.hdr.cmsg_level == libc::SOL_SOCKET
+        && cmsg.hdr.cmsg_type == libc::SCM_RIGHTS
+    {
+        let header = std::mem::size_of::<libc::cmsghdr>();
+        #[allow(clippy::unnecessary_cast)] // `cmsg_len` is `usize` on glibc, `u32` on musl.
+        let data_len = (cmsg.hdr.cmsg_len as usize).saturating_sub(header);
+        count = (data_len / std::mem::size_of::<libc::c_int>()).min(MAX_FDS);
+    }
+    for (slot, fd) in fds.iter_mut().zip(cmsg.fds.iter()).take(count) {
+        *slot = *fd;
+    }
+    let truncated = msg.msg_flags & (libc::MSG_CTRUNC | libc::MSG_TRUNC) != 0;
+    if truncated || fds.iter().take(count).any(|fd| *fd < 0) {
+        for fd in fds.iter().take(count).filter(|fd| **fd >= 0) {
+            // SAFETY: the kernel installed this descriptor for this call.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            unsafe { libc::close(*fd) };
+        }
+        return Err(std::io::Error::from_raw_os_error(libc::EPROTO));
+    }
+    Ok((usize::try_from(n).unwrap_or(0), count))
 }
 
 /// Open a pidfd of the calling process.

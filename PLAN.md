@@ -1,6 +1,6 @@
 # Plan: the new pent
 
-**Cursor: step 5.2.** Steps with `[x]` are done. Work on the branch `next`,
+**Cursor: step 5.3.** Steps with `[x]` are done. Work on the branch `next`,
 one commit for each step, and move this cursor when a step is done.
 
 **The way of work.** One commit for each step. Then the user runs
@@ -297,13 +297,35 @@ section 14 of the design has their results.
   - A fact for step 5.2: the kernel makes the root inode with UID 0, so it
     refuses each write in the root until the first `GETATTR` of the root
     (FU-8). The helper must `stat` the mount root after the parent serves.
-- [ ] **5.2 The graft helper.** It keeps the capabilities of the session.
+- [x] **5.2 The graft helper.** It keeps the capabilities of the session.
   It opens an `O_PATH` descriptor of each area before FUSE covers it, and
   it makes a graft with `open_tree`, `mount_setattr` and `move_mount`. The
   program runs in a nested user namespace. It mounts each FUSE tree with
   `mount_fuse` and does one `stat` of each mount root after the parent
   serves it (FU-8).
   - Done: a graft during a run; the program cannot remove it (`EPERM`).
+  - Files: `pent-sandbox/src/linux_graft.rs` (`FileAreasSetup`,
+    `FileAreasChild::mount_all`, `FileAreas::graft`, `serve_grafts`);
+    in `linux.rs` `fork_pid_namespace`, `supervise_outer`,
+    `fork_graft_helper`, `enter_nested_userns`, the new place of the
+    `chdir`, and `Spawned::files`; `send_with_fds` and `recv_with_fds` in
+    `linux_fdpass.rs`; `SandboxConfig::file_areas`; GR-1 to GR-9 in
+    `docs/security/fuse.md`.
+  - Decisions (2026-11-25):
+    - The helper is the stub of the PID namespace (one more fork without
+      that namespace). It keeps no state: each request carries the source
+      and the target of its area with `SCM_RIGHTS`.
+    - The child sends the descriptors of each area to pent, which serves
+      them in a thread that starts before the spawn. Thus the hook does
+      the `stat` of FU-8 before `exec`, with no race.
+    - The server reads the real tree through the source descriptor of the
+      child, so it sees the mounts of the session (the masks of pent).
+    - The nested user namespace comes only with FUSE areas; step 5.3 gives
+      `pent run` its areas.
+  - Facts for step 5.3: the Landlock step opens each path of its rules in
+    the child after the FUSE mounts, so a rule on an area binds to the FUSE
+    root. A working directory in an area needs the `chdir` after the FUSE
+    mounts (GR-6).
 - [ ] **5.3 Landlock and the areas.** FUSE covers each area outside the
   base: the home directory, `/usr/local`, `/opt`, and the other directories
   of the root that the base does not name. Landlock gets one rule on each

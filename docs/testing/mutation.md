@@ -191,6 +191,14 @@ makes one mutation by hand. The test must fail on the mutant. No
 | 5.1 | The answer to `INIT` has no `FUSE_PARALLEL_DIROPS`. | `linux_fuse::tests::a_slow_lookup_blocks_no_other_lookup_in_its_directory` |
 | 5.1 | The server waits for each request thread. | `linux_fuse::tests::a_slow_lookup_blocks_no_other_lookup_in_its_directory` |
 | 5.1 | The mount has no `MS_NOSUID`. | `linux_fuse::tests::the_mount_has_nosuid_and_nodev` |
+| 5.2 | The program does not enter a nested user namespace. | `linux_graft::tests::a_graft_during_a_run_holds_and_the_program_cannot_remove_it` |
+| 5.2 | `openat2` follows a symbolic link. | `linux_graft::tests::a_graft_during_a_run_holds_and_the_program_cannot_remove_it` |
+| 5.2 | A read grant is not read-only. | `linux_graft::tests::a_graft_during_a_run_holds_and_the_program_cannot_remove_it` |
+| 5.2 | `open_tree` has no `AT_RECURSIVE`. | `linux_graft::tests::a_graft_during_a_run_holds_and_the_program_cannot_remove_it` |
+| 5.2 | The hook does no `stat` of the FUSE roots. | `linux_graft::tests::a_graft_during_a_run_holds_and_the_program_cannot_remove_it` (the rule of the second area is on its parent; a rule on the area itself opens it and hides this mutant) |
+| 5.2 | The helper stays dumpable. | `linux_graft::tests::a_graft_during_a_run_holds_and_the_program_cannot_remove_it` |
+| 5.2 | The server opens the area on the host, not through the source of the child. | `linux_graft::tests::a_graft_during_a_run_holds_and_the_program_cannot_remove_it` |
+| 5.2 | The hook changes to the working directory before the FUSE mounts. | `linux_graft::tests::a_graft_during_a_run_holds_and_the_program_cannot_remove_it` |
 
 One mutant of step 4.1 survives, and it is equivalent: a bind of the
 machine identifier with no read-only remount. Landlock gives `/etc` no

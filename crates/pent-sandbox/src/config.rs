@@ -141,6 +141,13 @@ pub struct SandboxConfig {
     /// worker thread, so one question does not stop the other calls.
     /// Without it, such a connection gets the refusal at once.
     pub decider: Option<std::sync::Arc<dyn AccessDecider>>,
+
+    /// The directories that the FUSE server of pent covers. Each one must
+    /// exist, and the child must see it (a Landlock rule and, below a
+    /// private directory, a bind back). With an area, the program runs in
+    /// a nested user namespace, and a helper grafts the real subtrees.
+    /// Only `pent run` with enforcement uses them.
+    pub file_areas: Vec<PathBuf>,
 }
 
 /// Decides a connection that the lists of the sandbox do not hold: a Unix
@@ -188,6 +195,7 @@ impl SandboxConfig {
             unix_sockets: Vec::new(),
             localhost: LocalhostPorts::default(),
             decider: None,
+            file_areas: Vec::new(),
         }
     }
 

@@ -1452,31 +1452,33 @@ fn install_signal_forwarders() {
 }
 
 /// Close every inherited descriptor above the standard three, except
-/// `keep`.
+/// the descriptors in `keep`, which must be in ascending order.
 ///
 /// A supervisor must not keep the error pipe of `Command::spawn` open: the
 /// parent reads that pipe until every copy of it is closed, and it holds
 /// the spawn until then. Async-signal-safe.
-fn close_inherited_fds(keep: libc::c_int) {
-    let ranges = [
-        (3, keep.saturating_sub(1)),
-        (keep.saturating_add(1), i32::MAX),
-    ];
+fn close_inherited_fds(keep: &[libc::c_int]) {
     let mut ok = true;
-    for (first, last) in ranges {
-        if first > last {
-            continue;
+    let mut first: libc::c_int = 3;
+    for last in keep
+        .iter()
+        .map(|k| k.saturating_sub(1))
+        .chain(std::iter::once(i32::MAX))
+    {
+        if first <= last {
+            // SAFETY: close_range(2) with integer arguments only.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            let ret =
+                unsafe { libc::syscall(libc::SYS_close_range, first as u32, last as u32, 0u32) };
+            ok = ok && ret == 0;
         }
-        // SAFETY: close_range(2) with integer arguments only.
-        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-        let ret = unsafe { libc::syscall(libc::SYS_close_range, first as u32, last as u32, 0u32) };
-        ok = ok && ret == 0;
+        first = last.saturating_add(2).max(first);
     }
     if ok {
         return;
     }
     for fd in 3..4096 {
-        if fd == keep {
+        if keep.contains(&fd) {
             continue;
         }
         // SAFETY: close(2) on a number; EBADF for a closed number is
@@ -1582,13 +1584,67 @@ fn read_all_fd(fd: libc::c_int, buf: &mut [u8]) -> usize {
 /// supervisor ends itself with that status.
 ///
 /// Async-signal-safe; it never returns.
-fn supervise_outer(init: libc::pid_t, status_fd: libc::c_int) -> ! {
+fn supervise_outer(init: libc::pid_t, status_fd: libc::c_int, grafts: Option<libc::c_int>) -> ! {
+    if let Some(ctl) = grafts {
+        serve_grafts_for(ctl, init);
+    }
     let status = wait_and_reap(init);
     let mut buf = [0u8; 4];
     if read_all_fd(status_fd, &mut buf) == buf.len() {
         exit_like(libc::c_int::from_ne_bytes(buf));
     }
     exit_like(status)
+}
+
+/// Serve the graft requests of pent until `child` ends; see
+/// `linux_graft.rs`. The signals of pent reach `child` meanwhile.
+/// Async-signal-safe.
+fn serve_grafts_for(ctl: libc::c_int, child: libc::pid_t) {
+    SUPERVISED_PID.store(child, Ordering::Relaxed);
+    install_signal_forwarders();
+    crate::linux_graft::serve_grafts(ctl, child);
+}
+
+/// Make the graft helper of a session with no PID namespace: the caller
+/// stays as the helper and the supervisor of the command, and only the
+/// command returns. Async-signal-safe.
+///
+/// # Errors
+/// Returns the OS error of `fork(2)` or of `prctl(2)`.
+fn fork_graft_helper(ctl: libc::c_int) -> std::io::Result<()> {
+    // SAFETY: fork(2) has no preconditions. The child uses only
+    // async-signal-safe calls.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let command = unsafe { libc::fork() };
+    if command < 0 {
+        return Err(last_err(b"pent: fork of the graft helper failed\n"));
+    }
+    if command > 0 {
+        close_inherited_fds(&[ctl]);
+        serve_grafts_for(ctl, command);
+        exit_like(wait_and_reap(command));
+    }
+    // SAFETY: prctl(2) with integer arguments only.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) } != 0 {
+        return Err(last_err(b"pent: prctl(PR_SET_PDEATHSIG) failed\n"));
+    }
+    Ok(())
+}
+
+/// Enter a nested user namespace with the same identity maps, so that the
+/// program has no capability over the mounts of the session.
+/// Async-signal-safe.
+///
+/// # Errors
+/// Returns the OS error of `unshare(2)` or of a write of the maps.
+fn enter_nested_userns(uid_map: &[u8], gid_map: &[u8]) -> std::io::Result<()> {
+    // SAFETY: unshare(2) with integer flags.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    if unsafe { libc::unshare(libc::CLONE_NEWUSER) } != 0 {
+        return Err(last_err(b"pent: the nested user namespace failed\n"));
+    }
+    setup_userns_mappings(uid_map, gid_map)
 }
 
 /// What PID 1 of the new namespace does with a process that outlives the
@@ -1668,7 +1724,8 @@ fn supervise_init(command: libc::pid_t, status_fd: libc::c_int, orphans: Orphans
 /// command. Thus pent forks twice:
 ///
 /// 1. the stub, in the old namespace: it is the direct child of pent, and
-///    it passes the status and the signals of PID 1;
+///    it passes the status and the signals of PID 1. With FUSE areas it is
+///    also the graft helper (`grafts`);
 /// 2. PID 1 of the new namespace: it reaps the orphans of the session and
 ///    passes the status and the signals of the command;
 /// 3. the command, PID 2.
@@ -1678,7 +1735,7 @@ fn supervise_init(command: libc::pid_t, status_fd: libc::c_int, orphans: Orphans
 ///
 /// # Errors
 /// Returns the OS error of `pipe2(2)`, of `fork(2)` or of `prctl(2)`.
-fn fork_pid_namespace(orphans: Orphans) -> std::io::Result<()> {
+fn fork_pid_namespace(orphans: Orphans, grafts: Option<libc::c_int>) -> std::io::Result<()> {
     // The pipe that carries the wait status of the command from PID 1 of
     // the namespace to the stub; see `supervise_outer`.
     let mut pipe_fds = [-1 as libc::c_int; 2];
@@ -1696,8 +1753,12 @@ fn fork_pid_namespace(orphans: Orphans) -> std::io::Result<()> {
         return Err(last_err(b"pent: fork for the PID namespace failed\n"));
     }
     if init > 0 {
-        close_inherited_fds(read_fd);
-        supervise_outer(init, read_fd);
+        // The stub is also the graft helper; see `linux_graft.rs`.
+        match grafts {
+            Some(ctl) => close_inherited_fds(&[read_fd.min(ctl), read_fd.max(ctl)]),
+            None => close_inherited_fds(&[read_fd]),
+        }
+        supervise_outer(init, read_fd, grafts);
     }
     // SAFETY: prctl(2) with integer arguments only. `fork` clears the
     // parent-death signal, so each step sets it again.
@@ -1712,7 +1773,7 @@ fn fork_pid_namespace(orphans: Orphans) -> std::io::Result<()> {
         return Err(last_err(b"pent: fork of the command failed\n"));
     }
     if command > 0 {
-        close_inherited_fds(write_fd);
+        close_inherited_fds(&[write_fd]);
         supervise_init(command, write_fd, orphans);
     }
     // The command keeps no end of the status pipe.
@@ -2970,6 +3031,8 @@ struct ChildPlan {
     ruleset: Option<PreparedRuleset>,
     /// The seccomp recorder (watch mode and `--trace`).
     recorder: Option<crate::linux_watch::RecorderChild>,
+    /// The FUSE areas and the socket of the graft helper.
+    files: Option<crate::linux_graft::FileAreasChild>,
 }
 
 impl ChildPlan {
@@ -3012,9 +3075,12 @@ impl ChildPlan {
             if self.unshare_flags & libc::CLONE_NEWUSER != 0 {
                 setup_userns_mappings(&self.uid_map, &self.gid_map)?;
             }
+            let grafts = self.files.as_ref().map(|f| f.ctl);
             if self.unshare_flags & libc::CLONE_NEWPID != 0 {
                 // Only the command returns here; see `fork_pid_namespace`.
-                fork_pid_namespace(self.orphans)?;
+                fork_pid_namespace(self.orphans, grafts)?;
+            } else if let Some(ctl) = grafts {
+                fork_graft_helper(ctl)?;
             }
         }
 
@@ -3032,17 +3098,6 @@ impl ChildPlan {
 
         self.mounts.apply()?;
 
-        // Re-chdir after the mounts: std calls chdir() before pre_exec hooks,
-        // so the CWD can point to an inode under a new mount. Landlock rules
-        // bind to the inodes that the new mounts show.
-        if let Some(cwd) = &self.cwd {
-            // SAFETY: `cwd` is a NUL-terminated string that the parent prepared.
-            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-            if unsafe { libc::chdir(cwd.as_ptr()) } != 0 {
-                return Err(last_err(b"pent: chdir to the working directory failed\n"));
-            }
-        }
-
         if self.bring_up_lo {
             bring_up_loopback()?;
         }
@@ -3052,6 +3107,29 @@ impl ChildPlan {
             // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe { proxy.create_and_send() }
                 .map_err(|_| last_err(b"pent: cannot make the proxy listeners\n"))?;
+        }
+        if let Some(files) = &self.files {
+            files
+                .mount_all()
+                .map_err(|_| last_err(b"pent: cannot cover the FUSE areas\n"))?;
+        }
+
+        // Re-chdir after the mounts: std calls chdir() before pre_exec hooks,
+        // so the CWD can point to an inode under a new mount. Landlock rules
+        // bind to the inodes that the new mounts show. A working directory
+        // in a FUSE area must go through FUSE, so this comes after the FUSE
+        // mounts.
+        if let Some(cwd) = &self.cwd {
+            // SAFETY: `cwd` is a NUL-terminated string that the parent prepared.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            if unsafe { libc::chdir(cwd.as_ptr()) } != 0 {
+                return Err(last_err(b"pent: chdir to the working directory failed\n"));
+            }
+        }
+
+        if self.files.is_some() {
+            // The last step with the capabilities of the session.
+            enter_nested_userns(&self.uid_map, &self.gid_map)?;
         }
 
         if self.no_new_privs {
@@ -3186,6 +3264,9 @@ pub(crate) struct Spawned {
     pub proxy_listeners: Option<super::linux_proxynet::ProxyListeners>,
     /// The events of the recorder, if it runs.
     pub events: Option<std::sync::mpsc::Receiver<pent_profile::WatchEvent>>,
+    /// The FUSE areas and the graft helper (with `config.file_areas`).
+    #[cfg_attr(not(test), allow(dead_code))] // Step 5.4 asks for the grafts.
+    pub files: Option<crate::linux_graft::FileAreas>,
 }
 
 /// Spawn `cmd` for the sandbox or for watch mode (see [`SpawnMode`]).
@@ -3618,6 +3699,15 @@ pub(crate) fn spawn_linux(
         None
     };
 
+    // The FUSE areas. The receiver thread starts before the spawn: the
+    // child waits for the first `GETATTR` of each root.
+    let (files, files_child) = if enforce && !config.file_areas.is_empty() {
+        let (setup, child) = crate::linux_graft::FileAreasSetup::new(&config.file_areas)?;
+        (Some(setup), Some(child))
+    } else {
+        (None, None)
+    };
+
     let plan = ChildPlan {
         // The PID fits in pid_t: the kernel limit is 2^22.
         #[allow(clippy::cast_possible_wrap)]
@@ -3639,6 +3729,7 @@ pub(crate) fn spawn_linux(
         no_new_privs: ruleset.is_some() || recorder.is_some(),
         ruleset,
         recorder: recorder.as_ref().map(|r| r.child.clone()),
+        files: files_child,
     };
 
     let effective_env = if is_proxy {
@@ -3694,6 +3785,20 @@ pub(crate) fn spawn_linux(
         }
     };
 
+    let files = match files
+        .map(crate::linux_graft::FileAreasSetup::finish)
+        .transpose()
+    {
+        Ok(files) => files,
+        Err(e) => {
+            // The child runs without its areas; stop it. A failure means
+            // that it has already exited.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e);
+        }
+    };
+
     // Start the inotify watcher now that the child is running.
     let overlay_handle = if overlay_mounts.is_empty() {
         None
@@ -3711,6 +3816,7 @@ pub(crate) fn spawn_linux(
         overlay: overlay_handle,
         proxy_listeners,
         events,
+        files,
     })
 }
 
