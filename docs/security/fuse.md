@@ -1,6 +1,6 @@
 # The FUSE server and the grafts
 
-Status: the branch `next`, steps 5.1 to 5.4 of `PLAN.md` (2026-11-25).
+Status: the branch `next`, steps 5.1 to 5.5 of `PLAN.md` (2026-11-25).
 This report lists the security properties of the FUSE server of pent, of
 the graft helper and of the FUSE areas, the test of each property, and the
 properties that later steps must add.
@@ -85,6 +85,18 @@ makes the skip a failure. The container runs of the pipeline give
 | GR-7 | The program gets no descriptor of pent: the sockets of the areas and of the helper have `O_CLOEXEC`, and PID 1 closes them. | `linux_graft::tests::a_graft_during_a_run_holds_and_the_program_cannot_remove_it` (the list of `/proc/self/fd`) |
 | GR-8 | When the session ends, the helper ends, and a graft request gives `HelperGone`. | `linux_graft::tests::a_graft_during_a_run_holds_and_the_program_cannot_remove_it` |
 | GR-9 | The server reads the real tree through the source descriptor that the child opened, so it sees the mounts of the session: a read-only `.pent` stays read-only through FUSE too, and so does a mask of pent. | `linux_graft::tests::a_graft_during_a_run_holds_and_the_program_cannot_remove_it` |
+
+## The negative cache (step 5.5)
+
+| ID | Property | Test |
+|---|---|---|
+| NC-1 | A lookup of a missing name gets a negative entry with a validity time of one hour, so a repeated probe makes no request. It gets one only while an inotify watch of its directory holds; at the limit of the watches, or without inotify, the server gives a plain `ENOENT`, which the kernel does not keep. | `linux_fuse::tests::a_missing_name_is_cached_until_the_host_makes_it` |
+| NC-2 | A name that a process of the host makes in a watched directory (a create or a move into it) becomes visible at once. A thread reads the events and drops the entry: with `expire_entry` when the kernel has `FUSE_HAS_EXPIRE_ONLY`, which keeps a mount below the entry, else with `inval_entry`. The answer is never stale for longer than the reading of one event. | `linux_fuse::tests::a_missing_name_is_cached_until_the_host_makes_it` |
+| NC-3 | A directory node that the kernel forgets loses its watch, so the watches do not grow without a limit. The thread ends when the tree goes. | No test. |
+
+The limits: a name that the host removes stays visible for the validity
+time of a positive entry (1 s). A name that the program makes through FUSE
+also makes an event, so the kernel looks it up one more time.
 
 ## The kinds and the classes (step 5.4)
 

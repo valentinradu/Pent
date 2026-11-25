@@ -37,6 +37,13 @@
 //!   lookup, `getattr`, `readlink`, `access` and `statfs` need no right, as
 //!   with Landlock. Each node keeps its parent and its name, so the server
 //!   knows the path of the node, also after a rename.
+//! - **The negative cache** (step 5.5). A lookup of a missing name gets a
+//!   negative entry with a long validity time ([`NEGATIVE_TTL`]), so a
+//!   repeated probe costs no request. The server watches the real
+//!   directory with inotify, and when a process of the host makes the name,
+//!   it tells the kernel to drop the entry (`FUSE_NOTIFY_INVAL_ENTRY`, or
+//!   the expiry of `FUSE_HAS_EXPIRE_ONLY`, which keeps a mount below the
+//!   entry). A directory that inotify cannot watch gets no negative entry.
 //! - **The inode number** that `stat` gives is the number of the node,
 //!   because `fuser` uses the same number for both. A listing gives the
 //!   number of the node when the node exists, else the real inode number.
@@ -63,6 +70,13 @@ use thiserror::Error;
 
 /// The validity time of an entry and of its attributes in the kernel.
 const TTL: Duration = Duration::from_secs(1);
+
+/// The validity time of a negative entry. The watch of its directory
+/// drops the entry when the name appears, so the time can be long.
+const NEGATIVE_TTL: Duration = Duration::from_secs(3600);
+
+/// The events of a watched directory that make a name appear.
+const APPEAR: u32 = libc::IN_CREATE | libc::IN_MOVED_TO;
 
 /// The generation of each node. A node number is never used two times in
 /// one session, so the generation stays 0.
@@ -403,13 +417,89 @@ fn entry_rights(mode: u32) -> (u64, u64) {
 }
 
 fn serve_tree(dev: OwnedFd, tree: FuseTree) -> Result<FuseServer, FuseError> {
+    let shared = Arc::clone(&tree.tree);
     let session = Session::from_fd(tree, dev, SessionACL::Owner, Config::default())
         .map_err(FuseError::Handshake)?;
+    // The negative cache needs the notifier, and the notifier needs the
+    // session; a second `set` cannot happen.
+    let _ = shared.notifier.set(session.notifier());
+    if let Some(watches) = &shared.watches {
+        let fd = Arc::clone(&watches.fd);
+        let tree = Arc::downgrade(&shared);
+        // Without the thread no entry is dropped: the tree then gives no
+        // negative entry (`Watches::running`).
+        if std::thread::Builder::new()
+            .name("pent-fuse-watch".to_string())
+            .spawn(move || watch_loop(&fd, &tree))
+            .is_ok()
+        {
+            watches.running.store(true, Ordering::Release);
+        }
+    }
     let thread = std::thread::Builder::new()
         .name("pent-fuse".to_string())
         .spawn(move || session.run())
         .map_err(FuseError::Thread)?;
     Ok(FuseServer { thread })
+}
+
+/// The inotify watches of the directories that hold a negative entry.
+struct Watches {
+    fd: Arc<OwnedFd>,
+    /// The watch of each directory, both ways.
+    maps: Mutex<WatchMaps>,
+    /// True when the thread that reads the events runs.
+    running: std::sync::atomic::AtomicBool,
+}
+
+#[derive(Default)]
+struct WatchMaps {
+    by_wd: HashMap<i32, u64>,
+    by_node: HashMap<u64, i32>,
+}
+
+impl Watches {
+    fn new() -> Option<Self> {
+        // SAFETY: inotify_init1(2) with integer flags.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let fd =
+            owned(unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) }).ok()?;
+        Some(Self {
+            fd: Arc::new(fd),
+            maps: Mutex::new(WatchMaps::default()),
+            running: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+}
+
+/// Read the events of `fd` until the tree goes, and drop the entry of each
+/// name that appears in a watched directory.
+fn watch_loop(fd: &OwnedFd, tree: &std::sync::Weak<Tree>) {
+    let mut buf = [0u8; 4096];
+    loop {
+        let mut poll = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one valid `pollfd`; the timeout lets the loop see the end
+        // of the tree.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let ready = unsafe { libc::poll(&raw mut poll, 1, 500) };
+        let Some(tree) = tree.upgrade() else {
+            return;
+        };
+        if ready <= 0 {
+            continue;
+        }
+        // SAFETY: `buf` has `buf.len()` writable bytes.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let n = unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+        let Ok(n) = usize::try_from(n) else {
+            continue;
+        };
+        tree.events(buf.get(..n).unwrap_or_default());
+    }
 }
 
 /// One node: an `O_PATH` descriptor of a real inode.
@@ -455,6 +545,13 @@ struct Tree {
     /// The temporary siblings that the program made in this run, with the
     /// path of the file whose answer each one gets.
     stand_ins: Mutex<HashMap<PathBuf, PathBuf>>,
+    /// The watches of the negative cache, or `None` without inotify.
+    watches: Option<Watches>,
+    /// The notifier of the session, to drop an entry.
+    notifier: std::sync::OnceLock<fuser::Notifier>,
+    /// A test hook: the number of lookups of each name.
+    #[cfg(test)]
+    lookups_seen: Option<Arc<Mutex<HashMap<OsString, u32>>>>,
     /// A test hook: a lookup of this name waits this long.
     #[cfg(test)]
     slow_lookup: Option<(OsString, Duration)>,
@@ -666,6 +763,10 @@ impl Tree {
             next_fh: AtomicU64::new(1),
             policy,
             stand_ins: Mutex::new(HashMap::new()),
+            watches: Watches::new(),
+            notifier: std::sync::OnceLock::new(),
+            #[cfg(test)]
+            lookups_seen: None,
             #[cfg(test)]
             slow_lookup: None,
         })
@@ -912,24 +1013,135 @@ impl Tree {
             if inodes.by_key.get(&key) == Some(&id) {
                 inodes.by_key.remove(&key);
             }
+            drop(inodes);
+            self.unwatch(id);
         }
     }
 
     /// Open `name` in `parent`, remember the node, and give its attributes.
-    fn lookup(&self, parent: INodeNo, name: &OsStr) -> Result<FileAttr, Errno> {
+    fn lookup(&self, parent: INodeNo, name: &OsStr) -> Result<Lookup, Errno> {
         #[cfg(test)]
         if let Some((slow, wait)) = &self.slow_lookup {
             if slow == name {
                 std::thread::sleep(*wait);
             }
         }
+        #[cfg(test)]
+        if let Some(seen) = &self.lookups_seen {
+            *lock(seen).entry(name.to_owned()).or_default() += 1;
+        }
         let cname = component(name)?;
         if self.policy.is_some() && self.hidden(&self.path(parent)?.join(name)) {
             return Err(Errno::ENOENT);
         }
         let dir = self.fd(parent)?;
-        let fd = open_path(dir.as_fd(), &cname)?;
-        self.entry(fd, parent, name)
+        match open_path(dir.as_fd(), &cname) {
+            Ok(fd) => self.entry(fd, parent, name).map(Lookup::Found),
+            Err(e) if e == Errno::ENOENT && self.watch(parent, &dir) => Ok(Lookup::Missing),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Watch the directory `dir` (the node `ino`) for new names. Returns
+    /// true when a watch holds it, so a negative entry there is safe.
+    fn watch(&self, ino: INodeNo, dir: &OwnedFd) -> bool {
+        let Some(watches) = &self.watches else {
+            return false;
+        };
+        if !watches.running.load(Ordering::Acquire) {
+            return false;
+        }
+        let id = u64::from(ino);
+        let mut maps = lock(&watches.maps);
+        if maps.by_node.contains_key(&id) {
+            return true;
+        }
+        let path = proc_path(dir.as_fd());
+        // SAFETY: `path` is NUL-terminated; the rest are integers.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let wd = unsafe {
+            libc::inotify_add_watch(
+                watches.fd.as_raw_fd(),
+                path.as_ptr(),
+                APPEAR | libc::IN_ONLYDIR,
+            )
+        };
+        if wd < 0 {
+            // At the limit of watches the tree just gives no negative
+            // entry.
+            return false;
+        }
+        maps.by_wd.insert(wd, id);
+        maps.by_node.insert(id, wd);
+        true
+    }
+
+    /// Handle a buffer of inotify events: drop the entry of each name that
+    /// appears, and forget a watch that the kernel removed.
+    fn events(&self, mut buf: &[u8]) {
+        const HEADER: usize = std::mem::size_of::<libc::inotify_event>();
+        let word = |b: &[u8], at: usize| {
+            b.get(at..at.saturating_add(4))
+                .and_then(|w| <[u8; 4]>::try_from(w).ok())
+                .map(u32::from_ne_bytes)
+        };
+        while buf.len() >= HEADER {
+            let (Some(wd), Some(mask), Some(len)) = (word(buf, 0), word(buf, 4), word(buf, 12))
+            else {
+                return;
+            };
+            let len = usize::try_from(len).unwrap_or(usize::MAX);
+            let Some(name) = buf.get(HEADER..HEADER.saturating_add(len)) else {
+                return;
+            };
+            // The name is padded with NUL bytes.
+            let name = name.split(|b| *b == 0).next().unwrap_or_default();
+            let wd = i32::from_ne_bytes(wd.to_ne_bytes());
+            self.event(wd, mask, OsStr::from_bytes(name));
+            buf = buf.get(HEADER.saturating_add(len)..).unwrap_or_default();
+        }
+    }
+
+    fn event(&self, wd: i32, mask: u32, name: &OsStr) {
+        let Some(watches) = &self.watches else {
+            return;
+        };
+        let node = {
+            let mut maps = lock(&watches.maps);
+            if mask & libc::IN_IGNORED != 0 {
+                if let Some(node) = maps.by_wd.remove(&wd) {
+                    maps.by_node.remove(&node);
+                }
+                return;
+            }
+            maps.by_wd.get(&wd).copied()
+        };
+        let (Some(node), Some(notifier)) = (node, self.notifier.get()) else {
+            return;
+        };
+        if mask & APPEAR == 0 || name.is_empty() {
+            return;
+        }
+        // The expiry keeps a mount below the entry; an old kernel has only
+        // the invalidation. The kernel may know no entry for the name; the
+        // error then means nothing.
+        if notifier.expire_entry(INodeNo(node), name).is_err() {
+            let _ = notifier.inval_entry(INodeNo(node), name);
+        }
+    }
+
+    /// Remove the watch of the node `id`, which the kernel forgot.
+    fn unwatch(&self, id: u64) {
+        let Some(watches) = &self.watches else {
+            return;
+        };
+        let mut maps = lock(&watches.maps);
+        if let Some(wd) = maps.by_node.remove(&id) {
+            maps.by_wd.remove(&wd);
+            // SAFETY: inotify_rm_watch(2) with integers.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            unsafe { libc::inotify_rm_watch(watches.fd.as_raw_fd(), wd) };
+        }
     }
 
     /// Remember the node of `fd`, the entry `name` of `parent`, and give
@@ -1554,6 +1766,36 @@ impl FuseTree {
     }
 }
 
+/// The answer of a lookup.
+enum Lookup {
+    /// The name exists.
+    Found(FileAttr),
+    /// The name is missing, and a watch of its directory holds: the kernel
+    /// may keep a negative entry.
+    Missing,
+}
+
+/// The attributes of a negative entry: node 0.
+fn negative_attr() -> FileAttr {
+    FileAttr {
+        ino: INodeNo(0),
+        size: 0,
+        blocks: 0,
+        atime: UNIX_EPOCH,
+        mtime: UNIX_EPOCH,
+        ctime: UNIX_EPOCH,
+        crtime: UNIX_EPOCH,
+        kind: FileType::RegularFile,
+        perm: 0,
+        nlink: 0,
+        uid: 0,
+        gid: 0,
+        rdev: 0,
+        blksize: 0,
+        flags: 0,
+    }
+}
+
 /// Send `result` as an entry reply.
 fn reply_entry(reply: ReplyEntry, result: Result<FileAttr, Errno>) {
     match result {
@@ -1587,12 +1829,25 @@ impl Filesystem for FuseTree {
     fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> std::io::Result<()> {
         config
             .add_capabilities(InitFlags::FUSE_PARALLEL_DIROPS)
-            .map_err(|_| std::io::Error::other("the kernel has no FUSE_PARALLEL_DIROPS"))
+            .map_err(|_| std::io::Error::other("the kernel has no FUSE_PARALLEL_DIROPS"))?;
+        // The expiry of an entry keeps a mount below it. An old kernel
+        // does not offer it; the server then invalidates the entry.
+        if config
+            .capabilities()
+            .contains(InitFlags::FUSE_HAS_EXPIRE_ONLY)
+        {
+            let _ = config.add_capabilities(InitFlags::FUSE_HAS_EXPIRE_ONLY);
+        }
+        Ok(())
     }
 
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let name = name.to_owned();
-        self.spawn(move |t| reply_entry(reply, t.lookup(parent, &name)));
+        self.spawn(move |t| match t.lookup(parent, &name) {
+            Ok(Lookup::Found(attr)) => reply.entry(&TTL, &attr, GENERATION),
+            Ok(Lookup::Missing) => reply.entry(&NEGATIVE_TTL, &negative_attr(), GENERATION),
+            Err(e) => reply.error(e),
+        });
     }
 
     fn forget(&self, _req: &Request, ino: INodeNo, nlookup: u64) {
@@ -2001,6 +2256,8 @@ pub(crate) mod tests {
         mnt: PathBuf,
         /// A lookup of this name waits this long (see `Tree::slow_lookup`).
         slow_lookup: Option<(OsString, Duration)>,
+        /// The count of the lookups of each name (see `Tree::lookups_seen`).
+        lookups_seen: Option<Arc<Mutex<HashMap<OsString, u32>>>>,
     }
 
     fn trees() -> Result<Option<Trees>, Box<dyn std::error::Error>> {
@@ -2024,6 +2281,7 @@ pub(crate) mod tests {
             real,
             mnt,
             slow_lookup: None,
+            lookups_seen: None,
         }))
     }
 
@@ -2084,14 +2342,14 @@ pub(crate) mod tests {
             .into());
         };
         let dev = fds.pop().ok_or("no descriptor")?;
-        let server = match &t.slow_lookup {
-            None => serve(dev, root, None)?,
-            Some(slow) => {
-                let mut tree = Tree::new(root, None)?;
-                tree.slow_lookup = Some(slow.clone());
-                let tree = Arc::new(tree);
-                serve_tree(dev, FuseTree { tree })?
-            }
+        let server = if t.slow_lookup.is_none() && t.lookups_seen.is_none() {
+            serve(dev, root, None)?
+        } else {
+            let mut tree = Tree::new(root, None)?;
+            tree.slow_lookup.clone_from(&t.slow_lookup);
+            tree.lookups_seen.clone_from(&t.lookups_seen);
+            let tree = Arc::new(tree);
+            serve_tree(dev, FuseTree { tree })?
         };
         let hosted = host();
         // A script that hangs (for example a listing that never ends) must
@@ -2449,6 +2707,50 @@ pub(crate) mod tests {
         assert!(opts.contains(&"nosuid"), "{line}");
         assert!(opts.contains(&"nodev"), "{line}");
         assert!(line.contains(" fuse pent "), "{line}");
+        Ok(())
+    }
+
+    /// A repeated probe of a missing name makes one lookup: the kernel
+    /// keeps the negative entry. A file that a process of the host makes
+    /// then becomes visible at once, long before the validity time ends.
+    #[test]
+    fn a_missing_name_is_cached_until_the_host_makes_it() -> TestResult {
+        let Some(mut t) = trees()? else { return Ok(()) };
+        let seen = Arc::new(Mutex::new(HashMap::new()));
+        t.lookups_seen = Some(Arc::clone(&seen));
+        let marker = t.real.join("made-by-host");
+        let created = marker.clone();
+        let out = run_sh_with(
+            &t,
+            r#"set -e
+            i=0
+            while [ $i -lt 100 ]; do [ -e "$M/later" ] && echo early; i=$((i+1)); done
+            : > "$M/probed"
+            j=0
+            while [ ! -e "$M/made-by-host" ] && [ $j -lt 400 ]; do sleep 0.05; j=$((j+1)); done
+            k=0
+            while [ ! -e "$M/later" ] && [ $k -lt 40 ]; do sleep 0.05; k=$((k+1)); done
+            [ -e "$M/later" ] && echo visible"#,
+            move || {
+                let probed = created.with_file_name("probed");
+                let deadline = std::time::Instant::now() + Duration::from_secs(20);
+                while !probed.exists() {
+                    if std::time::Instant::now() > deadline {
+                        return Err("the script did not probe".into());
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                std::fs::write(created.with_file_name("later"), "")?;
+                std::fs::write(&created, "")?;
+                Ok(())
+            },
+        )?;
+        assert_eq!(stdout(&out), "visible\n");
+        assert!(marker.exists());
+        // One lookup for the 100 probes, and one more after the host made
+        // the file.
+        let count = lock(&seen).get(OsStr::new("later")).copied().unwrap_or(0);
+        assert_eq!(count, 2, "lookups of the probed name");
         Ok(())
     }
 }

@@ -1,6 +1,6 @@
 # Plan: the new pent
 
-**Cursor: step 5.5.** Steps with `[x]` are done. Work on the branch `next`,
+**Cursor: step 5.6.** Steps with `[x]` are done. Work on the branch `next`,
 one commit for each step, and move this cursor when a step is done.
 
 **The way of work.** One commit for each step. Then the user runs
@@ -379,11 +379,18 @@ section 14 of the design has their results.
     so it must drop when the child ends (5.6). A program can take the home
     from the password database (`curl` and `~/.ssh/known_hosts`), and the
     path asks.
-- [ ] **5.5 The negative cache.** A long validity time for a missing name,
+- [x] **5.5 The negative cache.** A long validity time for a missing name,
   inotify on the real directories, and `FUSE_NOTIFY_INVAL_ENTRY` when a
   host process creates the file.
   - Done: a repeated probe makes no FUSE request; a file that the host
     creates becomes visible at once.
+  - Files: `NEGATIVE_TTL`, `Watches`, `watch_loop`, `Tree::watch`,
+    `Tree::events` and `Lookup` in `pent-sandbox/src/linux_fuse.rs`; NC-1
+    to NC-3 in `docs/security/fuse.md`.
+  - Decisions (2026-11-25): a negative entry lives one hour, and only
+    while a watch of its directory holds. The server asks for
+    `FUSE_HAS_EXPIRE_ONLY` and drops an entry with `expire_entry`, which
+    keeps a graft below it; an old kernel gets `inval_entry`.
 - [ ] **5.6 The rules at the start.** `pent run` grafts each rule of its key
   before the program starts.
 - [ ] **5.7 The measurement.** Repeat the benchmark of 2026-11-21 (a cold

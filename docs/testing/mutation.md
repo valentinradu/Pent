@@ -211,6 +211,9 @@ makes one mutation by hand. The test must fail on the mutant. No
 | 5.4 | A new temporary sibling gets no target. | `linux_graft::tests::each_kind_asks_and_the_files_of_pent_are_hidden` |
 | 5.4 | Each entry operation, also on an old file, takes the answer of a similar name. | `linux_graft::tests::each_kind_asks_and_the_files_of_pent_are_hidden` (`rm .claude.json.bak`) |
 | 5.4 | `require` does not check the pent class. | none: equivalent in normal use. The lookup hides such a path first, so no operation reaches `require` with it; the check is a second layer. |
+| 5.5 | A missing name gets no negative entry. | `linux_fuse::tests::a_missing_name_is_cached_until_the_host_makes_it` |
+| 5.5 | The events of the watch drop no entry. | `linux_fuse::tests::a_missing_name_is_cached_until_the_host_makes_it` |
+| 5.5 | No directory gets a watch. | `linux_fuse::tests::a_missing_name_is_cached_until_the_host_makes_it` |
 | 5.4 | A traversal rule above an area gives a listing in it. | `linux_graft::tests::each_kind_asks_and_the_files_of_pent_are_hidden` |
 | 5.4 | The decision sends no event. | `linux_graft::tests::each_kind_asks_and_the_files_of_pent_are_hidden` |
 
