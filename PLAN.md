@@ -1,6 +1,6 @@
 # Plan: the new pent
 
-**Cursor: step 5.7.** Steps with `[x]` are done. Work on the branch `next`,
+**Cursor: the review of phase 5, then step 6.1.** Steps with `[x]` are done. Work on the branch `next`,
 one commit for each step, and move this cursor when a step is done.
 
 **The way of work.** One commit for each step. Then the user runs
@@ -407,9 +407,17 @@ section 14 of the design has their results.
     - Pent sends the path of the area, and the helper finds the target
       itself: pent holds no descriptor of a FUSE root.
     - Without a decider, or without the classes of the user, no graft.
-- [ ] **5.7 The measurement.** Repeat the benchmark of 2026-11-21 (a cold
+- [x] **5.7 The measurement.** Repeat the benchmark of 2026-11-21 (a cold
   and an incremental `cargo build`, 12 processes with 360,000 opens). The
   result must stay near native speed after the first answers.
+  - Files: `e2e/bench-fuse.py`; the table in section 14 of
+    `docs/design/pent.md`.
+  - The result (2026-11-25): with the grafts, a cold build takes 23.8 s
+    against 20.9 s natively, an incremental build and the opens stay at
+    native speed. A width that FUSE serves alone takes 30.7 s for the
+    opens against 0.66 s: one thread for each request is expensive. The
+    machine had other work, so the numbers have noise; repeat on a quiet
+    machine.
 
 ## Phase 6: agents
 

@@ -434,6 +434,25 @@ privilege) showed:
   one;
 - a program in a nested user namespace cannot remove a graft (`EPERM`).
 
+**The FUSE areas and the grafts** (step 5.7, 2026-11-25,
+`python3 -I e2e/bench-fuse.py` with a release build). The home directory
+is a FUSE area; the workspace, `CARGO_HOME`, `RUSTUP_HOME` and the files of
+the opens are grafts at the start. The compiler cache is off. The first
+column is one round at a load of 1.9; the second is the best of three
+rounds, while the load of other work on the machine rose to 44:
+
+| Workload | Native | `pent run` | Native, 3 rounds | `pent run`, 3 rounds |
+|---|---:|---:|---:|---:|
+| Cold `cargo build --workspace` | 20.89 s | 23.80 s | 22.44 s | 24.08 s |
+| Incremental build | 2.26 s | 2.15 s | 2.44 s | 2.13 s |
+| 12 processes, 360,000 opens, a graft | 0.66 s | 0.72 s | 0.59 s | 1.08 s |
+| The same opens, FUSE only (no graft) | 0.66 s | 30.72 s | 0.59 s | 37.35 s |
+
+With the grafts, a run stays near native speed. A width that FUSE serves
+alone is slow: each open costs about four requests, and each request
+starts a thread. Such a width holds a sensitive location, a file of pent
+or a deny rule, or its grant is execute-only, list-only or one file.
+
 **The FUSE server in Rust** (step 5.1, 2026-11-25) showed one more fact:
 the kernel makes the root inode of a FUSE mount with UID 0. In a user
 namespace that maps only the real user, UID 0 has no map, so the kernel
