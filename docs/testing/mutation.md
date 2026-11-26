@@ -225,6 +225,9 @@ makes one mutation by hand. The test must fail on the mutant. No
 | 5.6 | `may_graft` checks only the flags for a deny inside. | `decide::tests::a_graft_needs_a_clean_subtree` |
 | 5.8 | The pool has one worker at most. | `linux_fuse::tests::a_slow_lookup_blocks_no_other_lookup_in_its_directory` |
 | 5.8 | The quick check of the pent class takes a sensitive path. | `classes::tests::the_quick_check_of_the_pent_class_takes_the_real_names` |
+| 5.10 | An open keeps no page cache. | `linux_fuse::tests::a_kept_file_cache_drops_at_a_change_of_the_host` |
+| 5.10 | A change of a file drops no cache. | `linux_fuse::tests::a_kept_file_cache_drops_at_a_change_of_the_host` |
+| 5.10 | The watch has no events of a change. | `linux_fuse::tests::a_kept_file_cache_drops_at_a_change_of_the_host` |
 | 5.4 | A traversal rule above an area gives a listing in it. | `linux_graft::tests::each_kind_asks_and_the_files_of_pent_are_hidden` |
 | 5.4 | The decision sends no event. | `linux_graft::tests::each_kind_asks_and_the_files_of_pent_are_hidden` |
 

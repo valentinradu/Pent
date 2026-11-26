@@ -1,6 +1,6 @@
 # Plan: the new pent
 
-**Cursor: step 5.10, then 5.11 and the review of phase 5.** Steps with `[x]` are done. Work on the branch `next`,
+**Cursor: step 5.11, then the review of phase 5.** Steps with `[x]` are done. Work on the branch `next`,
 one commit for each step, and move this cursor when a step is done.
 
 **The way of work.** One commit for each step. Then the user runs
@@ -447,12 +447,15 @@ section 14 of the design has their results.
     needs `CAP_SYS_ADMIN` in the initial user namespace. Pent needs no
     privilege, so no passthrough. Section 14 of the design records it.
     Probe again when a kernel relaxes the check.
-- [ ] **5.10 A cache with invalidation.** inotify also watches the changes
+- [x] **5.10 A cache with invalidation.** inotify also watches the changes
   of the files in a watched directory, and the server drops the cache of
   exactly the changed inode. Then the page cache stays across opens
   (`FOPEN_KEEP_CACHE`), and a change of the host is still seen at once.
   - Done: a second read of a file makes no `READ`; a change of the host is
     visible at once.
+  - Files: `GONE`, `CHANGE`, `Inodes::by_entry`, `Tree::open_flags` and
+    the new cases of `Tree::event` in `pent-sandbox/src/linux_fuse.rs`;
+    NC-4 in `docs/security/fuse.md`.
 - [ ] **5.11 Grafts with holes.** A width with a sensitive directory inside
   it becomes a graft, and the FUSE node of each sensitive directory goes
   back over its place in the graft. A width with a sensitive file pattern

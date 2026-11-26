@@ -461,6 +461,11 @@ device itself; a graft is the way to native speed. Measure again on a
 quiet machine. Such a width holds a sensitive location, a file of pent
 or a deny rule, or its grant is execute-only, list-only or one file.
 
+**The kept cache** (step 5.10, 2026-11-26). With the page cache kept in a
+watched directory, the opens of FUSE alone took 9.1 s (CPU 43 s) at a load
+of 13, against 0.75 s natively: no `READ` is left, and `OPEN` and
+`RELEASE` cost a round trip through the FUSE device each.
+
 **FUSE passthrough** (step 5.9, 2026-11-26, Linux 7.3). The kernel offers
 `FUSE_PASSTHROUGH`, and the server can negotiate it, but the registration
 of a backing file (`FUSE_DEV_IOC_BACKING_OPEN`) fails with `EPERM`: the

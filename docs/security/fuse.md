@@ -1,6 +1,6 @@
 # The FUSE server and the grafts
 
-Status: the branch `next`, steps 5.1 to 5.8 of `PLAN.md` (2026-11-26).
+Status: the branch `next`, steps 5.1 to 5.10 of `PLAN.md` (2026-11-26).
 This report lists the security properties of the FUSE server of pent, of
 the graft helper and of the FUSE areas, the test of each property, and the
 properties that later steps must add.
@@ -103,8 +103,10 @@ makes the skip a failure. The container runs of the pipeline give
 | NC-2 | A name that a process of the host makes in a watched directory (a create or a move into it) becomes visible at once. A thread reads the events and drops the entry: with `expire_entry` when the kernel has `FUSE_HAS_EXPIRE_ONLY`, which keeps a mount below the entry, else with `inval_entry`. The answer is never stale for longer than the reading of one event. | `linux_fuse::tests::a_missing_name_is_cached_until_the_host_makes_it` |
 | NC-3 | A directory node that the kernel forgets loses its watch, so the watches do not grow without a limit. The thread ends when the tree goes. | No test. |
 
+| NC-4 | An open in a watched directory keeps the page cache (`FOPEN_KEEP_CACHE`), so a second read makes no `READ` (step 5.10). The watch also sees each change of a file there (`IN_MODIFY`, `IN_ATTRIB`, `IN_CLOSE_WRITE`) and each removal or move away, and the server drops the cache of exactly that inode (`FUSE_NOTIFY_INVAL_INODE`) or that entry, so a change by the host is visible at once. A file in a directory with no watch is read again at each open. | `linux_fuse::tests::a_kept_file_cache_drops_at_a_change_of_the_host` |
+
 The limits: a name that the host removes stays visible for the validity
-time of a positive entry (1 s). A name that the program makes through FUSE
+time of a positive entry (1 s), unless a watch of its directory holds. A name that the program makes through FUSE
 also makes an event, so the kernel looks it up one more time.
 
 ## The kinds and the classes (step 5.4)

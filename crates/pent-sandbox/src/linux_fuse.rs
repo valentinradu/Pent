@@ -49,6 +49,12 @@
 //!   it tells the kernel to drop the entry (`FUSE_NOTIFY_INVAL_ENTRY`, or
 //!   the expiry of `FUSE_HAS_EXPIRE_ONLY`, which keeps a mount below the
 //!   entry). A directory that inotify cannot watch gets no negative entry.
+//! - **The cache of a file** (step 5.10). An open in a watched directory
+//!   keeps the page cache (`FOPEN_KEEP_CACHE`), so a second read makes no
+//!   request. The watch also sees each change of a file there (a write, a
+//!   new mode, a removal, a move away), and the server drops the cache of
+//!   exactly that inode (`FUSE_NOTIFY_INVAL_INODE`) or that entry. A file
+//!   in a directory with no watch is read again at each open.
 //! - **The inode number** that `stat` gives is the number of the node,
 //!   because `fuser` uses the same number for both. A listing gives the
 //!   number of the node when the node exists, else the real inode number.
@@ -82,6 +88,12 @@ const NEGATIVE_TTL: Duration = Duration::from_secs(3600);
 
 /// The events of a watched directory that make a name appear.
 const APPEAR: u32 = libc::IN_CREATE | libc::IN_MOVED_TO;
+
+/// The events of a watched directory that make a name go.
+const GONE: u32 = libc::IN_DELETE | libc::IN_MOVED_FROM;
+
+/// The events of a watched directory that change a file or the directory.
+const CHANGE: u32 = libc::IN_MODIFY | libc::IN_ATTRIB | libc::IN_CLOSE_WRITE;
 
 /// The generation of each node. A node number is never used two times in
 /// one session, so the generation stays 0.
@@ -541,7 +553,28 @@ type InodeKey = (u64, u64);
 struct Inodes {
     nodes: HashMap<u64, Node>,
     by_key: HashMap<InodeKey, u64>,
+    /// The node of each entry (a directory node and a name), for the
+    /// events of the watches.
+    by_entry: HashMap<(u64, OsString), u64>,
     next: u64,
+}
+
+impl Inodes {
+    /// Give the node `id` the entry `name` of `parent`, and keep the index.
+    fn set_entry(&mut self, id: u64, parent: u64, name: &OsStr) {
+        let Some(node) = self.nodes.get_mut(&id) else {
+            return;
+        };
+        let old = (
+            node.parent,
+            std::mem::replace(&mut node.name, name.to_owned()),
+        );
+        node.parent = parent;
+        if self.by_entry.get(&old) == Some(&id) {
+            self.by_entry.remove(&old);
+        }
+        self.by_entry.insert((parent, name.to_owned()), id);
+    }
 }
 
 /// One entry of a directory listing.
@@ -569,6 +602,9 @@ struct Tree {
     /// A test hook: the number of lookups of each name.
     #[cfg(test)]
     lookups_seen: Option<Arc<Mutex<HashMap<OsString, u32>>>>,
+    /// A test hook: the number of `READ` requests.
+    #[cfg(test)]
+    reads_seen: Option<Arc<AtomicU64>>,
     /// A test hook: a lookup of this name waits this long.
     #[cfg(test)]
     slow_lookup: Option<(OsString, Duration)>,
@@ -874,6 +910,7 @@ impl Tree {
         by_key.insert(key, root_id);
         Ok(Self {
             inodes: Mutex::new(Inodes {
+                by_entry: HashMap::new(),
                 nodes,
                 by_key,
                 next: root_id.saturating_add(1),
@@ -887,6 +924,8 @@ impl Tree {
             notifier: std::sync::OnceLock::new(),
             #[cfg(test)]
             lookups_seen: None,
+            #[cfg(test)]
+            reads_seen: None,
             #[cfg(test)]
             slow_lookup: None,
         })
@@ -917,8 +956,7 @@ impl Tree {
             if let Some(node) = inodes.nodes.get_mut(&id) {
                 node.lookups = node.lookups.saturating_add(1);
                 if id != u64::from(INodeNo::ROOT) {
-                    node.parent = u64::from(parent);
-                    node.name = name.to_owned();
+                    inodes.set_entry(id, u64::from(parent), name);
                 }
                 return Ok(id);
             }
@@ -936,6 +974,9 @@ impl Tree {
             },
         );
         inodes.by_key.insert(key, id);
+        inodes
+            .by_entry
+            .insert((u64::from(parent), name.to_owned()), id);
         Ok(id)
     }
 
@@ -1159,10 +1200,7 @@ impl Tree {
     fn moved(&self, key: InodeKey, newparent: INodeNo, newname: &OsStr) {
         let mut inodes = lock(&self.inodes);
         if let Some(id) = inodes.by_key.get(&key).copied() {
-            if let Some(node) = inodes.nodes.get_mut(&id) {
-                node.parent = u64::from(newparent);
-                node.name = newname.to_owned();
-            }
+            inodes.set_entry(id, u64::from(newparent), newname);
         }
     }
 
@@ -1181,7 +1219,12 @@ impl Tree {
             None => None,
         };
         if let Some(key) = gone {
-            inodes.nodes.remove(&id);
+            if let Some(node) = inodes.nodes.remove(&id) {
+                let entry = (node.parent, node.name);
+                if inodes.by_entry.get(&entry) == Some(&id) {
+                    inodes.by_entry.remove(&entry);
+                }
+            }
             if inodes.by_key.get(&key) == Some(&id) {
                 inodes.by_key.remove(&key);
             }
@@ -1235,7 +1278,7 @@ impl Tree {
             libc::inotify_add_watch(
                 watches.fd.as_raw_fd(),
                 path.as_ptr(),
-                APPEAR | libc::IN_ONLYDIR,
+                APPEAR | GONE | CHANGE | libc::IN_ONLYDIR,
             )
         };
         if wd < 0 {
@@ -1288,17 +1331,52 @@ impl Tree {
             }
             maps.by_wd.get(&wd).copied()
         };
-        let (Some(node), Some(notifier)) = (node, self.notifier.get()) else {
+        let (Some(dir), Some(notifier)) = (node, self.notifier.get()) else {
             return;
         };
-        if mask & APPEAR == 0 || name.is_empty() {
+        // The kernel may know no entry and no cache for the name; an error
+        // of a notification then means nothing.
+        if name.is_empty() {
+            // An event of the directory itself.
+            if mask & CHANGE != 0 {
+                let _ = notifier.inval_inode(INodeNo(dir), 0, 0);
+            }
             return;
         }
-        // The expiry keeps a mount below the entry; an old kernel has only
-        // the invalidation. The kernel may know no entry for the name; the
-        // error then means nothing.
-        if notifier.expire_entry(INodeNo(node), name).is_err() {
-            let _ = notifier.inval_entry(INodeNo(node), name);
+        if mask & (APPEAR | GONE) != 0 {
+            // The expiry keeps a mount below the entry; an old kernel has
+            // only the invalidation.
+            if notifier.expire_entry(INodeNo(dir), name).is_err() {
+                let _ = notifier.inval_entry(INodeNo(dir), name);
+            }
+        }
+        if mask & (CHANGE | GONE) != 0 {
+            let file = lock(&self.inodes)
+                .by_entry
+                .get(&(dir, name.to_owned()))
+                .copied();
+            if let Some(file) = file {
+                // The attributes and each page of the file.
+                let _ = notifier.inval_inode(INodeNo(file), 0, 0);
+            }
+        }
+    }
+
+    /// The flags of an open of the node `ino`: keep the page cache when a
+    /// watch of its directory holds, so that a change is seen at once.
+    fn open_flags(&self, ino: INodeNo) -> FopenFlags {
+        let parent = lock(&self.inodes)
+            .nodes
+            .get(&u64::from(ino))
+            .map(|n| n.parent);
+        let watched = parent.is_some_and(|p| {
+            self.fd(INodeNo(p))
+                .is_ok_and(|dir| self.watch(INodeNo(p), &dir))
+        });
+        if watched {
+            FopenFlags::FOPEN_KEEP_CACHE
+        } else {
+            FopenFlags::empty()
         }
     }
 
@@ -1745,6 +1823,10 @@ impl Tree {
     }
 
     fn read(&self, fh: FileHandle, offset: u64, size: u32) -> Result<Vec<u8>, Errno> {
+        #[cfg(test)]
+        if let Some(seen) = &self.reads_seen {
+            seen.fetch_add(1, Ordering::Relaxed);
+        }
         let file = self.file(fh)?;
         let mut buf = vec![0u8; usize::try_from(size).unwrap_or(0)];
         let mut done = 0usize;
@@ -2222,7 +2304,10 @@ impl Filesystem for FuseTree {
         reply: ReplyOpen,
     ) {
         let caller = Caller(req.pid());
-        self.spawn(move |t| reply_open(reply, t.open(caller, ino, flags)));
+        self.spawn(move |t| match t.open(caller, ino, flags) {
+            Ok(fh) => reply.opened(fh, t.open_flags(ino)),
+            Err(e) => reply.error(e),
+        });
     }
 
     fn read(
@@ -2434,6 +2519,8 @@ pub(crate) mod tests {
         slow_lookup: Option<(OsString, Duration)>,
         /// The count of the lookups of each name (see `Tree::lookups_seen`).
         lookups_seen: Option<Arc<Mutex<HashMap<OsString, u32>>>>,
+        /// The count of the `READ` requests (see `Tree::reads_seen`).
+        reads_seen: Option<Arc<AtomicU64>>,
     }
 
     fn trees() -> Result<Option<Trees>, Box<dyn std::error::Error>> {
@@ -2458,6 +2545,7 @@ pub(crate) mod tests {
             mnt,
             slow_lookup: None,
             lookups_seen: None,
+            reads_seen: None,
         }))
     }
 
@@ -2518,12 +2606,14 @@ pub(crate) mod tests {
             .into());
         };
         let dev = fds.pop().ok_or("no descriptor")?;
-        let server = if t.slow_lookup.is_none() && t.lookups_seen.is_none() {
+        let hooked = t.slow_lookup.is_some() || t.lookups_seen.is_some() || t.reads_seen.is_some();
+        let server = if !hooked {
             serve(dev, root, None)?
         } else {
             let mut tree = Tree::new(root, None)?;
             tree.slow_lookup.clone_from(&t.slow_lookup);
             tree.lookups_seen.clone_from(&t.lookups_seen);
+            tree.reads_seen.clone_from(&t.reads_seen);
             let tree = Arc::new(tree);
             serve_tree(dev, FuseTree::of(tree))?
         };
@@ -2927,6 +3017,54 @@ pub(crate) mod tests {
         // the file.
         let count = lock(&seen).get(OsStr::new("later")).copied().unwrap_or(0);
         assert_eq!(count, 2, "lookups of the probed name");
+        Ok(())
+    }
+
+    /// A second read of a file in a watched directory makes no `READ`: the
+    /// kernel keeps the page cache. A change by a process of the host is
+    /// visible at once: the watch drops the cache of the file.
+    #[test]
+    fn a_kept_file_cache_drops_at_a_change_of_the_host() -> TestResult {
+        let Some(mut t) = trees()? else { return Ok(()) };
+        std::fs::write(t.real.join("f"), "old\n")?;
+        let reads = Arc::new(AtomicU64::new(0));
+        t.reads_seen = Some(Arc::clone(&reads));
+        let real = t.real.clone();
+        let seen = Arc::clone(&reads);
+        let before = Arc::new(AtomicU64::new(u64::MAX));
+        let kept = Arc::clone(&before);
+        let out = run_sh_with(
+            &t,
+            r#"set -e
+            cat "$M/f"
+            cat "$M/f"
+            : > "$M/probed"
+            j=0
+            while [ ! -e "$M/changed" ] && [ $j -lt 400 ]; do sleep 0.05; j=$((j+1)); done
+            k=0
+            while [ "$(cat "$M/f")" != new ] && [ $k -lt 40 ]; do sleep 0.05; k=$((k+1)); done
+            cat "$M/f""#,
+            move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(20);
+                while !real.join("probed").exists() {
+                    if std::time::Instant::now() > deadline {
+                        return Err("the script did not read".into());
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                kept.store(seen.load(Ordering::Relaxed), Ordering::Relaxed);
+                // The same inode, new content.
+                std::fs::write(real.join("f"), "new\n")?;
+                std::fs::write(real.join("changed"), "")?;
+                Ok(())
+            },
+        )?;
+        assert_eq!(stdout(&out), "old\nold\nnew\n");
+        assert_eq!(
+            before.load(Ordering::Relaxed),
+            1,
+            "two reads made more than one READ"
+        );
         Ok(())
     }
 }
