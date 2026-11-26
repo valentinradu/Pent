@@ -1,6 +1,6 @@
 # Plan: the new pent
 
-**Cursor: the review of phase 5, then step 6.1.** Steps with `[x]` are done. Work on the branch `next`,
+**Cursor: decide step 5.13, then the review of phase 5, then step 6.1.** Steps with `[x]` are done. Work on the branch `next`,
 one commit for each step, and move this cursor when a step is done.
 
 **The way of work.** One commit for each step. Then the user runs
@@ -491,6 +491,25 @@ section 14 of the design has their results.
   - The result: each open costs `OPEN` and `RELEASE` only; the CPU time of
     the opens of FUSE alone went from 39.0 s to 25.8 s (4.6 s natively).
     The rest is the round trip through the FUSE device.
+
+- [ ] **5.13 Graft the children.** Open: the user decides first whether to
+  do it. FUSE alone (about 5 to 7 times native for many opens, step 5.12)
+  stays where a width cannot be one graft: a file of pent inside it
+  (`~/.config`, `~/.local/share`, `~/.local/state`, the home directory),
+  or a sensitive file that is missing directly in it (`~/.cargo` and
+  `credentials.toml`, decision of 5.11). The idea: graft each existing
+  child of such a width that is safe on its own (`~/.cargo/registry`,
+  `~/.config/git`, ...), and keep the width itself and its unsafe
+  children with FUSE, so a new file directly in the width still asks and
+  the files of pent stay hidden.
+  - Facts: passthrough needs `CAP_SYS_ADMIN` in the initial user
+    namespace, also for a process that is root in its own user namespace
+    (probe of 2026-11-26), and it would not remove `OPEN`; a privileged
+    helper would break the rule "no privilege" of CLAUDE.md. More grafts
+    are the way to native speed.
+  - Done: a read below a safe child of such a width makes no FUSE request;
+    a new file directly in the width still asks; the files of pent stay
+    hidden.
 
 ## Phase 6: agents
 
