@@ -1,6 +1,6 @@
 # Plan: the new pent
 
-**Cursor: the review of phase 5, then step 6.1.** Steps with `[x]` are done. Work on the branch `next`,
+**Cursor: step 5.10, then 5.11 and the review of phase 5.** Steps with `[x]` are done. Work on the branch `next`,
 one commit for each step, and move this cursor when a step is done.
 
 **The way of work.** One commit for each step. Then the user runs
@@ -434,6 +434,31 @@ section 14 of the design has their results.
   - The result: three to more than ten times faster, see section 14 of the
     design. Other work loaded the machine (a load of 17 to 58), so the
     numbers have noise; repeat on a quiet machine.
+
+- [x] **5.9 FUSE passthrough.** With `FUSE_PASSTHROUGH` (Linux 6.9) the
+  kernel reads and writes the real file itself. First probe whether an
+  unprivileged FUSE server in a user namespace may register a backing
+  file; the kernels before 7.x need `CAP_SYS_ADMIN` in the initial
+  namespace.
+  - Done: passthrough for each open where the kernel allows it, with a
+    test; or a record of the refusal.
+  - The result (2026-11-26, Linux 7.3): the kernel offers and negotiates
+    `FUSE_PASSTHROUGH`, but `FUSE_DEV_IOC_BACKING_OPEN` gives `EPERM`; it
+    needs `CAP_SYS_ADMIN` in the initial user namespace. Pent needs no
+    privilege, so no passthrough. Section 14 of the design records it.
+    Probe again when a kernel relaxes the check.
+- [ ] **5.10 A cache with invalidation.** inotify also watches the changes
+  of the files in a watched directory, and the server drops the cache of
+  exactly the changed inode. Then the page cache stays across opens
+  (`FOPEN_KEEP_CACHE`), and a change of the host is still seen at once.
+  - Done: a second read of a file makes no `READ`; a change of the host is
+    visible at once.
+- [ ] **5.11 Grafts with holes.** A width with a sensitive directory inside
+  it becomes a graft, and the FUSE node of each sensitive directory goes
+  back over its place in the graft. A width with a sensitive file pattern
+  stays with FUSE: a new file there must still ask.
+  - Done: a read in such a width makes no FUSE request; an access in the
+    sensitive directory still asks.
 
 ## Phase 6: agents
 

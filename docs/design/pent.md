@@ -461,6 +461,13 @@ device itself; a graft is the way to native speed. Measure again on a
 quiet machine. Such a width holds a sensitive location, a file of pent
 or a deny rule, or its grant is execute-only, list-only or one file.
 
+**FUSE passthrough** (step 5.9, 2026-11-26, Linux 7.3). The kernel offers
+`FUSE_PASSTHROUGH`, and the server can negotiate it, but the registration
+of a backing file (`FUSE_DEV_IOC_BACKING_OPEN`) fails with `EPERM`: the
+kernel asks for `CAP_SYS_ADMIN` in the initial user namespace. The helper
+has its capabilities only in the user namespace of the session, so pent,
+with no privilege, cannot use passthrough.
+
 **The FUSE server in Rust** (step 5.1, 2026-11-25) showed one more fact:
 the kernel makes the root inode of a FUSE mount with UID 0. In a user
 namespace that maps only the real user, UID 0 has no map, so the kernel
