@@ -304,6 +304,23 @@ impl Classifier {
 }
 
 impl Classifier {
+    /// Return true if `path` is in the pent class, for any kind of file
+    /// access: a directory of pent, or a rule of the guard list of the
+    /// class `PentFiles`. Quicker than [`Classifier::classify`], which also
+    /// looks for a sensitive class.
+    #[must_use]
+    pub fn in_pent_class(&self, path: &Path) -> bool {
+        self.is_pent(path)
+            || self.guard.iter().any(|rule| {
+                rule.class == GuardClass::PentFiles
+                    && match &rule.target {
+                        GuardTarget::Exact(p) => path == p,
+                        GuardTarget::Subtree(p) => path.starts_with(p),
+                        GuardTarget::FilesInDir { .. } | GuardTarget::BinaryName(_) => false,
+                    }
+            })
+    }
+
     /// Return true if a directory of pent is at `dir` or below it.
     #[must_use]
     pub fn holds_pent_dir(&self, dir: &Path) -> bool {

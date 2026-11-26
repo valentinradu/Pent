@@ -466,6 +466,17 @@ watched directory, the opens of FUSE alone took 9.1 s (CPU 43 s) at a load
 of 13, against 0.75 s natively: no `READ` is left, and `OPEN` and
 `RELEASE` cost a round trip through the FUSE device each.
 
+**The cost of an open through FUSE** (step 5.12, 2026-11-26). After the
+first open, each open of a file costs `OPEN` and `RELEASE` and nothing
+else; `RELEASE` does not block the program. With long validity times in a
+watched directory, an open with no hand-off when the grants give it, one
+shared descriptor for repeated opens, and a cache of the decided opens,
+the opens of FUSE alone took 25.8 s of CPU against 39.0 s before and 4.6 s
+natively (5.5 s on the clock at a load of 32). The round trip of `OPEN`
+through the FUSE device is now most of the cost. With the real home, a
+cold build in `pent run` took 30.9 s against 31.6 s natively: a build
+opens each file a few times.
+
 **FUSE passthrough** (step 5.9, 2026-11-26, Linux 7.3). The kernel offers
 `FUSE_PASSTHROUGH`, and the server can negotiate it, but the registration
 of a backing file (`FUSE_DEV_IOC_BACKING_OPEN`) fails with `EPERM`: the

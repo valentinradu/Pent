@@ -233,6 +233,8 @@ makes one mutation by hand. The test must fail on the mutant. No
 | 5.11 | The server asks `known` first, so a known rule gives no target and no graft. | `linux_graft::tests::a_graft_keeps_its_holes_with_fuse` (the fake decider knows the rule; with a decider that knew nothing, this mutant survived) |
 | 5.11 | A missing place directly in the width gets the width as its hole. | `classes::tests::a_graft_gets_a_hole_for_each_sensitive_place` |
 | 5.11 | A directory of pent inside the width gives a graft. | `classes::tests::a_graft_gets_a_hole_for_each_sensitive_place` |
+| 5.12 | A watched entry gets the short validity time. | `linux_fuse::tests::a_watched_entry_lives_long_and_drops_at_a_change` |
+| 5.12 | A change of the mode drops no attributes. | `linux_fuse::tests::a_watched_entry_lives_long_and_drops_at_a_change` |
 | 5.4 | A traversal rule above an area gives a listing in it. | `linux_graft::tests::each_kind_asks_and_the_files_of_pent_are_hidden` |
 | 5.4 | The decision sends no event. | `linux_graft::tests::each_kind_asks_and_the_files_of_pent_are_hidden` |
 

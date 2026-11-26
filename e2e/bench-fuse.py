@@ -33,6 +33,11 @@ import time
 ROUNDS = int(os.environ.get("BENCH_ROUNDS", "3"))
 # `BENCH_ONLY=opens` measures only the opens; `builds` only the builds.
 ONLY = os.environ.get("BENCH_ONLY", "")
+# `BENCH_HOME=real` keeps the real home directory, so `CARGO_HOME` and
+# `RUSTUP_HOME` get the guard spots of a real home (a credential file of
+# cargo that is missing keeps `~/.cargo` with FUSE alone). The copy of the
+# repository and the files of the opens stay in the temporary directory.
+REAL_HOME = os.environ.get("BENCH_HOME", "") == "real"
 FILES = 3000
 PROCESSES = 12
 OPENS = 360_000
@@ -111,7 +116,7 @@ def main():
                     'created = 2026-11-25T00:00:00Z\n')
         env = {
             "PATH": os.environ["PATH"],
-            "HOME": home,
+            "HOME": real_home if REAL_HOME else home,
             "CARGO_HOME": cargo_home,
             "RUSTUP_HOME": rustup_home,
             "CARGO_TARGET_DIR": os.path.join(ws, "target"),
@@ -142,7 +147,8 @@ def main():
         pent = [PENT, "run", "-w", "--network", "blocked",
                 "--write", cargo_home, "--read", rustup_home, "--execute", rustup_home,
                 *passed, "--"]
-        print(f"rounds: {ROUNDS}, CPUs: {os.cpu_count()}, load: {os.getloadavg()[0]:.1f}")
+        print(f"rounds: {ROUNDS}, CPUs: {os.cpu_count()}, load: {os.getloadavg()[0]:.1f}, "
+              f"home: {'real' if REAL_HOME else 'temporary'}")
         if ONLY in ("", "builds"):
             best("cold build, native", build, env, ws, clean)
             best("cold build, pent run", pent + build, env, ws, clean)

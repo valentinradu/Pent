@@ -1,6 +1,6 @@
 # The FUSE server and the grafts
 
-Status: the branch `next`, steps 5.1 to 5.11 of `PLAN.md` (2026-11-26).
+Status: the branch `next`, steps 5.1 to 5.12 of `PLAN.md` (2026-11-26).
 This report lists the security properties of the FUSE server of pent, of
 the graft helper and of the FUSE areas, the test of each property, and the
 properties that later steps must add.
@@ -108,8 +108,13 @@ makes the skip a failure. The container runs of the pipeline give
 
 | NC-4 | An open in a watched directory keeps the page cache (`FOPEN_KEEP_CACHE`), so a second read makes no `READ` (step 5.10). The watch also sees each change of a file there (`IN_MODIFY`, `IN_ATTRIB`, `IN_CLOSE_WRITE`) and each removal or move away, and the server drops the cache of exactly that inode (`FUSE_NOTIFY_INVAL_INODE`) or that entry, so a change by the host is visible at once. A file in a directory with no watch is read again at each open. | `linux_fuse::tests::a_kept_file_cache_drops_at_a_change_of_the_host` |
 
+| NC-5 | A lookup watches its directory, and an entry and its attributes in a watched directory live one hour (step 5.12): a second check of a path makes no request. Each change that the watch sees (a new name, a removal, a move, a write, a new mode) drops the entry, the attributes or the cache of the file, and the attributes of the directory, so the answer is still never stale. | `linux_fuse::tests::a_watched_entry_lives_long_and_drops_at_a_change` |
+| NC-6 | An open that the grants give runs at once in the reading thread; repeated opens of a file with the same flags share one open descriptor; an open that the grants gave once needs no check again until a rename. These change only the speed. | No test: speed only (`e2e/bench-fuse.py`). |
+
 The limits: a name that the host removes stays visible for the validity
-time of a positive entry (1 s), unless a watch of its directory holds. A name that the program makes through FUSE
+time of a positive entry (1 s), unless a watch of its directory holds. A
+change of a file through a hard link in a directory with no watch leaves
+the attributes of the other name stale for up to one hour. A name that the program makes through FUSE
 also makes an event, so the kernel looks it up one more time.
 
 ## The kinds and the classes (step 5.4)

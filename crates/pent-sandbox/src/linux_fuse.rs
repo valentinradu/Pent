@@ -54,7 +54,10 @@
 //!   request. The watch also sees each change of a file there (a write, a
 //!   new mode, a removal, a move away), and the server drops the cache of
 //!   exactly that inode (`FUSE_NOTIFY_INVAL_INODE`) or that entry. A file
-//!   in a directory with no watch is read again at each open.
+//!   in a directory with no watch is read again at each open. A lookup
+//!   watches the directory, and an entry and its attributes in a watched
+//!   directory live one hour ([`WATCHED_TTL`]), so a path that a program
+//!   checks again costs no request.
 //! - **The inode number** that `stat` gives is the number of the node,
 //!   because `fuser` uses the same number for both. A listing gives the
 //!   number of the node when the node exists, else the real inode number.
@@ -85,6 +88,10 @@ const TTL: Duration = Duration::from_secs(1);
 /// The validity time of a negative entry. The watch of its directory
 /// drops the entry when the name appears, so the time can be long.
 const NEGATIVE_TTL: Duration = Duration::from_secs(3600);
+
+/// The validity time of an entry and of its attributes in a watched
+/// directory: the watch drops them at each change (step 5.10).
+const WATCHED_TTL: Duration = Duration::from_secs(3600);
 
 /// The events of a watched directory that make a name appear.
 const APPEAR: u32 = libc::IN_CREATE | libc::IN_MOVED_TO;
@@ -595,6 +602,16 @@ struct Tree {
     /// The temporary siblings that the program made in this run, with the
     /// path of the file whose answer each one gets.
     stand_ins: Mutex<HashMap<PathBuf, PathBuf>>,
+    /// The open descriptor of each node and set of open flags, while a
+    /// handle uses it: a second open with the same flags shares it, with
+    /// no new open of the real file. `pread` and `pwrite` take an offset,
+    /// so the handles do not share a position.
+    shared: Mutex<HashMap<(u64, libc::c_int), std::sync::Weak<File>>>,
+    /// The opens that the grants gave already: a node and the rights. The
+    /// grants and the pent class do not change during a run, so a later
+    /// open with the same rights needs no check. A rename clears the set,
+    /// because it changes the paths of the nodes.
+    static_opens: Mutex<std::collections::HashSet<(u64, u64)>>,
     /// The watches of the negative cache, or `None` without inotify.
     watches: Option<Watches>,
     /// The notifier of the session, to drop an entry.
@@ -920,6 +937,8 @@ impl Tree {
             next_fh: AtomicU64::new(1),
             policy,
             stand_ins: Mutex::new(HashMap::new()),
+            shared: Mutex::new(HashMap::new()),
+            static_opens: Mutex::new(std::collections::HashSet::new()),
             watches: Watches::new(),
             notifier: std::sync::OnceLock::new(),
             #[cfg(test)]
@@ -1257,7 +1276,15 @@ impl Tree {
         }
         let dir = self.fd(parent)?;
         match open_path(dir.as_fd(), &cname) {
-            Ok(fd) => self.entry(fd, parent, name).map(Lookup::Found),
+            Ok(fd) => {
+                let ttl = if self.watch(parent, &dir) {
+                    WATCHED_TTL
+                } else {
+                    TTL
+                };
+                self.entry(fd, parent, name)
+                    .map(|attr| Lookup::Found(attr, ttl))
+            }
             Err(e) if e == Errno::ENOENT && self.watch(parent, &dir) => Ok(Lookup::Missing),
             Err(e) => Err(e),
         }
@@ -1355,6 +1382,8 @@ impl Tree {
             if notifier.expire_entry(INodeNo(dir), name).is_err() {
                 let _ = notifier.inval_entry(INodeNo(dir), name);
             }
+            // The directory changed too (its times, its links, its list).
+            let _ = notifier.inval_inode(INodeNo(dir), 0, 0);
         }
         if mask & (CHANGE | GONE) != 0 {
             let file = lock(&self.inodes)
@@ -1365,6 +1394,24 @@ impl Tree {
                 // The attributes and each page of the file.
                 let _ = notifier.inval_inode(INodeNo(file), 0, 0);
             }
+        }
+    }
+
+    /// The validity time of the entry and the attributes of the node `ino`:
+    /// long when a watch of its directory holds.
+    fn ttl_of(&self, ino: INodeNo) -> Duration {
+        let parent = lock(&self.inodes)
+            .nodes
+            .get(&u64::from(ino))
+            .map(|n| n.parent);
+        let watched = match (parent, &self.watches) {
+            (Some(parent), Some(watches)) => lock(&watches.maps).by_node.contains_key(&parent),
+            _ => false,
+        };
+        if watched {
+            WATCHED_TTL
+        } else {
+            TTL
         }
     }
 
@@ -1426,8 +1473,12 @@ impl Tree {
     }
 
     fn add_file(&self, file: File) -> FileHandle {
+        self.add_shared(Arc::new(file))
+    }
+
+    fn add_shared(&self, file: Arc<File>) -> FileHandle {
         let fh = self.new_fh();
-        lock(&self.files).insert(fh, Arc::new(file));
+        lock(&self.files).insert(fh, file);
         FileHandle(fh)
     }
 
@@ -1751,6 +1802,8 @@ impl Tree {
                 self.drop_stand_in(&dir_path.join(name));
             }
         }
+        // The paths below the moved node change.
+        lock(&self.static_opens).clear();
         self.moved(key_of(&source), newparent, newname);
         if let Some(target) = &target {
             self.moved(key_of(target), parent, name);
@@ -1765,14 +1818,58 @@ impl Tree {
             pent_profile::FileKind::Write => pent_profile::FsOp::Write,
             pent_profile::FileKind::Read | pent_profile::FileKind::List => pent_profile::FsOp::Read,
         };
-        self.require(caller, ino, None, needed, op)?;
+        // `open_is_static` checked an open that it keeps in the set.
+        if !lock(&self.static_opens).contains(&(u64::from(ino), needed)) {
+            self.require(caller, ino, None, needed, op)?;
+        }
+        let flags = (flags.0 & !REOPEN_STRIP) | libc::O_CLOEXEC;
+        let key = (u64::from(ino), flags);
+        if let Some(file) = lock(&self.shared)
+            .get(&key)
+            .and_then(std::sync::Weak::upgrade)
+        {
+            return Ok(self.add_shared(file));
+        }
         let fd = self.fd(ino)?;
         let path = proc_path(fd.as_fd());
-        let flags = (flags.0 & !REOPEN_STRIP) | libc::O_CLOEXEC;
         // SAFETY: `path` is NUL-terminated.
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-        let file = owned(unsafe { libc::open(path.as_ptr(), flags) })?;
-        Ok(self.add_file(File::from(file)))
+        let file = Arc::new(File::from(owned(unsafe {
+            libc::open(path.as_ptr(), flags)
+        })?));
+        let mut shared = lock(&self.shared);
+        // Forget the descriptors that no handle uses any more.
+        shared.retain(|_, weak| weak.strong_count() > 0);
+        shared.insert(key, Arc::downgrade(&file));
+        drop(shared);
+        Ok(self.add_shared(file))
+    }
+
+    /// Return true if an open of the node `ino` with `flags` needs no
+    /// question: the grants give it, or the tree has no policy. Such an
+    /// open runs at once in the reading thread.
+    fn open_is_static(&self, ino: INodeNo, flags: OpenFlags) -> bool {
+        let Some(policy) = &self.policy else {
+            return true;
+        };
+        let needed = open_rights(flags.0);
+        let key = (u64::from(ino), needed);
+        if lock(&self.static_opens).contains(&key) {
+            return true;
+        }
+        let Ok(path) = self.path(ino) else {
+            return false;
+        };
+        let given = !self.hidden(&path)
+            && policy
+                .grants
+                .rights_in_area(&path, &policy.area, &policy.private_above)
+                & needed
+                == needed;
+        if given {
+            lock(&self.static_opens).insert(key);
+        }
+        given
     }
 
     fn create(
@@ -2030,8 +2127,8 @@ impl FuseTree {
 
 /// The answer of a lookup.
 enum Lookup {
-    /// The name exists.
-    Found(FileAttr),
+    /// The name exists; the entry lives this long.
+    Found(FileAttr, Duration),
     /// The name is missing, and a watch of its directory holds: the kernel
     /// may keep a negative entry.
     Missing,
@@ -2059,9 +2156,9 @@ fn negative_attr() -> FileAttr {
 }
 
 /// Send `result` as an entry reply.
-fn reply_entry(reply: ReplyEntry, result: Result<FileAttr, Errno>) {
+fn reply_entry(reply: ReplyEntry, result: Result<FileAttr, Errno>, tree: &Tree) {
     match result {
-        Ok(attr) => reply.entry(&TTL, &attr, GENERATION),
+        Ok(attr) => reply.entry(&tree.ttl_of(attr.ino), &attr, GENERATION),
         Err(e) => reply.error(e),
     }
 }
@@ -2073,9 +2170,9 @@ fn reply_empty(reply: ReplyEmpty, result: Result<(), Errno>) {
     }
 }
 
-fn reply_attr(reply: ReplyAttr, result: Result<FileAttr, Errno>) {
+fn reply_attr(reply: ReplyAttr, result: Result<FileAttr, Errno>, tree: &Tree) {
     match result {
-        Ok(attr) => reply.attr(&TTL, &attr),
+        Ok(attr) => reply.attr(&tree.ttl_of(attr.ino), &attr),
         Err(e) => reply.error(e),
     }
 }
@@ -2106,7 +2203,7 @@ impl Filesystem for FuseTree {
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let name = name.to_owned();
         self.spawn(move |t| match t.lookup(parent, &name) {
-            Ok(Lookup::Found(attr)) => reply.entry(&TTL, &attr, GENERATION),
+            Ok(Lookup::Found(attr, ttl)) => reply.entry(&ttl, &attr, GENERATION),
             Ok(Lookup::Missing) => reply.entry(&NEGATIVE_TTL, &negative_attr(), GENERATION),
             Err(e) => reply.error(e),
         });
@@ -2117,7 +2214,7 @@ impl Filesystem for FuseTree {
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
-        self.now(move |t| reply_attr(reply, t.getattr(ino)));
+        self.now(move |t| reply_attr(reply, t.getattr(ino), t));
     }
 
     fn setattr(
@@ -2144,6 +2241,7 @@ impl Filesystem for FuseTree {
             reply_attr(
                 reply,
                 t.setattr(caller, ino, mode, uid, gid, size, atime, mtime, fh),
+                t,
             );
         });
     }
@@ -2167,7 +2265,7 @@ impl Filesystem for FuseTree {
     ) {
         let caller = Caller(req.pid());
         let name = name.to_owned();
-        self.spawn(move |t| reply_entry(reply, t.mkdir(caller, parent, &name, mode, umask)));
+        self.spawn(move |t| reply_entry(reply, t.mkdir(caller, parent, &name, mode, umask), t));
     }
 
     fn symlink(
@@ -2181,7 +2279,7 @@ impl Filesystem for FuseTree {
     ) {
         let caller = Caller(req.pid());
         let (name, target) = (link_name.to_owned(), target.to_owned());
-        self.spawn(move |t| reply_entry(reply, t.symlink(caller, parent, &name, &target)));
+        self.spawn(move |t| reply_entry(reply, t.symlink(caller, parent, &name, &target), t));
     }
 
     fn mknod(
@@ -2197,7 +2295,7 @@ impl Filesystem for FuseTree {
     ) {
         let caller = Caller(req.pid());
         let name = name.to_owned();
-        self.spawn(move |t| reply_entry(reply, t.mknod(caller, parent, &name, mode, umask)));
+        self.spawn(move |t| reply_entry(reply, t.mknod(caller, parent, &name, mode, umask), t));
     }
 
     fn getxattr(
@@ -2310,10 +2408,16 @@ impl Filesystem for FuseTree {
         reply: ReplyOpen,
     ) {
         let caller = Caller(req.pid());
-        self.spawn(move |t| match t.open(caller, ino, flags) {
+        let job = move |t: &Tree| match t.open(caller, ino, flags) {
             Ok(fh) => reply.opened(fh, t.open_flags(ino)),
             Err(e) => reply.error(e),
-        });
+        };
+        // An open that the grants give asks nothing: no hand-off.
+        if self.tree.open_is_static(ino, flags) {
+            self.now(job);
+        } else {
+            self.spawn(job);
+        }
     }
 
     fn read(
@@ -3070,6 +3174,54 @@ pub(crate) mod tests {
             before.load(Ordering::Relaxed),
             1,
             "two reads made more than one READ"
+        );
+        Ok(())
+    }
+
+    /// An entry and its attributes in a watched directory live long: a
+    /// second check of a path makes no lookup. A change of the mode by a
+    /// process of the host is visible at once: the watch drops the
+    /// attributes.
+    #[test]
+    fn a_watched_entry_lives_long_and_drops_at_a_change() -> TestResult {
+        let Some(mut t) = trees()? else { return Ok(()) };
+        std::fs::write(t.real.join("f"), "x")?;
+        std::fs::set_permissions(t.real.join("f"), std::fs::Permissions::from_mode(0o644))?;
+        let seen = Arc::new(Mutex::new(HashMap::new()));
+        t.lookups_seen = Some(Arc::clone(&seen));
+        let real = t.real.clone();
+        let out = run_sh_with(
+            &t,
+            r#"set -e
+            i=0
+            while [ $i -lt 50 ]; do stat -c %a "$M/f" > /dev/null; sleep 0.04; i=$((i+1)); done
+            stat -c %a "$M/f"
+            : > "$M/probed"
+            j=0
+            while [ ! -e "$M/changed" ] && [ $j -lt 400 ]; do sleep 0.05; j=$((j+1)); done
+            k=0
+            while [ "$(stat -c %a "$M/f")" != 600 ] && [ $k -lt 40 ]; do sleep 0.05; k=$((k+1)); done
+            stat -c %a "$M/f""#,
+            move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(20);
+                while !real.join("probed").exists() {
+                    if std::time::Instant::now() > deadline {
+                        return Err("the script did not check".into());
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                std::fs::set_permissions(real.join("f"), std::fs::Permissions::from_mode(0o600))?;
+                std::fs::write(real.join("changed"), "")?;
+                Ok(())
+            },
+        )?;
+        assert_eq!(stdout(&out), "644\n600\n");
+        // 2 s of checks with an entry time of 1 s would make more than one
+        // lookup; the long time makes one.
+        let count = lock(&seen).get(OsStr::new("f")).copied().unwrap_or(0);
+        assert_eq!(
+            count, 1,
+            "lookups of a path that the script checked 51 times"
         );
         Ok(())
     }

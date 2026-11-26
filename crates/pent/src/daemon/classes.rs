@@ -73,10 +73,12 @@ impl Classes {
     /// the directories of pent in both forms, so no link is resolved and no
     /// menu is made; the FUSE server asks this for each request.
     pub(crate) fn is_pent_unlinked(&self, request: &Request) -> bool {
-        let access = request.as_access();
+        let Request::File { path, .. } = request else {
+            return false;
+        };
         self.views
             .iter()
-            .any(|view| view.classify(&access) == Class::Pent)
+            .any(|view| view.in_pent_class(path.as_path()))
     }
 
     /// The holes of a graft of `dir` for an access of the kind `kind`: the

@@ -481,6 +481,17 @@ section 14 of the design has their results.
     - The server asks `decide_target` for each access that the grants do
       not give, so a known rule becomes a graft too.
 
+- [x] **5.12 The cost of an open through FUSE.** After 5.8 and 5.10, the
+  opens of FUSE alone still took about ten times the native time.
+  - Files: `WATCHED_TTL`, `Tree::ttl_of`, `Tree::open_is_static`, the
+    shared descriptors and `static_opens` in
+    `pent-sandbox/src/linux_fuse.rs`; `Classifier::in_pent_class`;
+    `BENCH_HOME=real` in `e2e/bench-fuse.py`; NC-5, NC-6 in
+    `docs/security/fuse.md`; section 14 of the design.
+  - The result: each open costs `OPEN` and `RELEASE` only; the CPU time of
+    the opens of FUSE alone went from 39.0 s to 25.8 s (4.6 s natively).
+    The rest is the round trip through the FUSE device.
+
 ## Phase 6: agents
 
 - [ ] **6.1 `agent.sock`.** pentd makes one agent socket for each session.
