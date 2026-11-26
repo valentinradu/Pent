@@ -364,7 +364,8 @@ impl Decider {
     }
 
     /// Return true if `path` is in the pent class: the FUSE server gives
-    /// `ENOENT` for it.
+    /// `ENOENT` for it. The server asks this for each request, with a path
+    /// that has no link in it (see `Classes::is_pent_unlinked`).
     pub(crate) fn hidden(&self, path: &Path) -> bool {
         let Ok(path) = RulePath::new(path.to_path_buf()) else {
             return false;
@@ -373,7 +374,9 @@ impl Decider {
             kind: FileKind::Read,
             path,
         };
-        self.class(&request) == Some(Class::Pent)
+        self.classes
+            .as_ref()
+            .is_some_and(|c| c.is_pent_unlinked(&request))
     }
 
     /// The class of `request`, or `None` when the home directory is not

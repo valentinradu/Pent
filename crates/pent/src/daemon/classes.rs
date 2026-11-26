@@ -65,6 +65,18 @@ impl Classes {
 }
 
 impl Classes {
+    /// Return true if the access `request` is in the pent class, for a
+    /// path with no link in it: the path of a FUSE request is made of real
+    /// names below a canonical area. The views already hold the home and
+    /// the directories of pent in both forms, so no link is resolved and no
+    /// menu is made; the FUSE server asks this for each request.
+    pub(crate) fn is_pent_unlinked(&self, request: &Request) -> bool {
+        let access = request.as_access();
+        self.views
+            .iter()
+            .any(|view| view.classify(&access) == Class::Pent)
+    }
+
     /// Return true if a subtree rule of the kind `kind` on `dir`, or on
     /// `dir` with its links resolved, covers a location of the guard list
     /// that makes such an access sensitive, in one form of the home
@@ -157,6 +169,21 @@ mod tests {
         let classes = Classes::new(&real_home, &[]);
         let (class, _) = classes.decide(&read(&link_home.join(".ssh/id_ed25519")));
         assert_eq!(class, Class::Sensitive(Sensitive::Credential));
+    }
+
+    #[test]
+    fn the_quick_check_of_the_pent_class_takes_the_real_names() {
+        let (_tmp, link_home, real_home) = homes();
+        // The directories of pent by their link names, as the XDG
+        // variables give them; the FUSE server sends the real names.
+        let pent = link_home.join(".config/pent");
+        let classes = Classes::new(&link_home, std::slice::from_ref(&pent));
+        let real_pent = real_home.join(".config/pent");
+        assert!(classes.is_pent_unlinked(&read(&real_pent.join("rules/x.toml"))));
+        assert!(classes.is_pent_unlinked(&read(&pent.join("rules/x.toml"))));
+        assert!(!classes.is_pent_unlinked(&read(&real_home.join(".config/foo/x"))));
+        // A credential is sensitive, not hidden.
+        assert!(!classes.is_pent_unlinked(&read(&real_home.join(".ssh/id_ed25519"))));
     }
 
     #[test]

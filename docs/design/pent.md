@@ -449,8 +449,16 @@ rounds, while the load of other work on the machine rose to 44:
 | The same opens, FUSE only (no graft) | 0.66 s | 30.72 s | 0.59 s | 37.35 s |
 
 With the grafts, a run stays near native speed. A width that FUSE serves
-alone is slow: each open costs about four requests, and each request
-starts a thread. Such a width holds a sensitive location, a file of pent
+alone was slow: each open cost four requests, and each request started a
+thread. Step 5.8 (2026-11-26) gives the requests to a pool of workers,
+runs the operations on a handle at once in several reading threads,
+answers `FLUSH` with `ENOSYS` (the kernel then sends no more), and makes
+the check of the pent class quick. At a load of 34 of other work, the
+opens of FUSE alone then took 10.5 s against 0.61 s natively; at a load of
+58, the old code did not end two rounds in 900 s, and the new code took
+33.5 s. Each open still costs three requests, near the cost of the FUSE
+device itself; a graft is the way to native speed. Measure again on a
+quiet machine. Such a width holds a sensitive location, a file of pent
 or a deny rule, or its grant is execute-only, list-only or one file.
 
 **The FUSE server in Rust** (step 5.1, 2026-11-25) showed one more fact:

@@ -1,6 +1,6 @@
 # The FUSE server and the grafts
 
-Status: the branch `next`, steps 5.1 to 5.6 of `PLAN.md` (2026-11-25).
+Status: the branch `next`, steps 5.1 to 5.8 of `PLAN.md` (2026-11-26).
 This report lists the security properties of the FUSE server of pent, of
 the graft helper and of the FUSE areas, the test of each property, and the
 properties that later steps must add.
@@ -68,7 +68,7 @@ makes the skip a failure. The container runs of the pipeline give
 | FU-4 | The mount has `nosuid` and `nodev`, so a set-user-ID file or a device node in the tree gives no privilege. | `linux_fuse::tests::the_mount_has_nosuid_and_nodev` |
 | FU-5 | The server serves only the user that owns the session (`SessionACL::Owner`), and the mount has no `allow_other`. | No test: a test cannot make a request of another user without privilege. |
 | FU-6 | A new file and a new directory get the mode of the request, with the umask of the program. The umask of pent does not cut it, and the server does not make it wider. | `linux_fuse::tests::create_write_and_modes` |
-| FU-7 | A slow request blocks no other request, also in the same directory. The answer to `INIT` has `FUSE_PARALLEL_DIROPS`, and each request runs in its own thread. When a thread cannot start, the request runs in the thread of the session, so it still gets its answer. | `linux_fuse::tests::a_slow_lookup_blocks_no_other_lookup_in_its_directory` (the thread that cannot start: no test) |
+| FU-7 | A slow request blocks no other request, also in the same directory. The answer to `INIT` has `FUSE_PARALLEL_DIROPS`. Each request that can ask or wait (a lookup, an open, a create, a change of the tree) goes to a pool of workers that starts one more worker when none is idle, up to 1024 (step 5.8); an operation on a handle or a known node runs at once in one of the threads that read the requests (2 to 8). When no worker can start and none runs, the request runs in the reading thread, so it still gets its answer. | `linux_fuse::tests::a_slow_lookup_blocks_no_other_lookup_in_its_directory` (the worker that cannot start: no test) |
 | FU-8 | Until the first `GETATTR` of the root, the kernel refuses each write in the root of the mount. The kernel makes the root inode with UID 0, and UID 0 has no map in the user namespace of the session. Thus the hook does one `stat` of each FUSE root before the program starts. Pent serves each area in a thread that starts before the spawn, so the `stat` gets its answer during the spawn. | `linux_fuse::tests::a_write_in_the_root_waits_for_its_first_getattr` (it records the behavior of the kernel), `linux_graft::tests::a_graft_during_a_run_holds_and_the_program_cannot_remove_it` (the create in the second area) |
 
 ## The graft helper
@@ -120,6 +120,7 @@ also makes an event, so the kernel looks it up one more time.
 | KC-7 | A rule that only lists (`TRAVERSAL`, the rule on `/` of the default paths) on a parent of an area gives no listing in the area: a listing there asks. | `linux_graft::tests::each_kind_asks_and_the_files_of_pent_are_hidden` (`private`) |
 | KC-8 | In an area the chain applies each file rule, also one that the static layers cannot hold (a deny inside its width, an exact directory, a sensitive path inside). `pent run` warns about such a rule only outside the areas. | `differential_profile_kernel::fs_table::a_rule_on_the_whole_home_directory_gives_no_sensitive_file`, `an_exact_rule_on_a_directory_gives_no_child`, `a_deny_rule_inside_an_allow_rule_wins` |
 | KC-9 | `PENT_FILE_DEADLINE_MS` can only shorten the deadline of a file question, never make it longer. The tests set 300 ms, so a probe of a refusal does not wait 120 s. | No test. |
+| KC-10 | The check of the pent class for each request is quick: it classifies the path as it is, with no link resolution and no menu (`Classes::is_pent_unlinked`), because a path of the FUSE server is made of real names and the classes hold each directory of pent in both forms. | `classes::tests::the_quick_check_of_the_pent_class_takes_the_real_names` |
 
 ## The areas (step 5.3)
 

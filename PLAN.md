@@ -419,6 +419,22 @@ section 14 of the design has their results.
     machine had other work, so the numbers have noise; repeat on a quiet
     machine.
 
+- [x] **5.8 The speed of FUSE alone.** A width that FUSE serves alone (no
+  graft) took 30.7 s for 360,000 opens against 0.66 s natively (step 5.7):
+  the server starts one thread for each request. A pool of worker threads
+  that grows when no worker is idle keeps the property of step 5.1 (a slow
+  request blocks no other request) with no start of a thread for each
+  request.
+  - Done: the test of the parallel lookups passes; the opens of FUSE alone
+    get much faster in `e2e/bench-fuse.py`.
+  - Files: `Pool`, `FuseTree::now`, the reading threads and `flush` in
+    `pent-sandbox/src/linux_fuse.rs`; `Classes::is_pent_unlinked` in
+    `pent/src/daemon/classes.rs`; `BENCH_ONLY`, `BENCH_PENT` and the CPU
+    time in `e2e/bench-fuse.py`; FU-7 and KC-10 in `docs/security/fuse.md`.
+  - The result: three to more than ten times faster, see section 14 of the
+    design. Other work loaded the machine (a load of 17 to 58), so the
+    numbers have noise; repeat on a quiet machine.
+
 ## Phase 6: agents
 
 - [ ] **6.1 `agent.sock`.** pentd makes one agent socket for each session.

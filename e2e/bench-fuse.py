@@ -23,6 +23,7 @@ ends with a refusal after 2 s.
 
 import multiprocessing
 import os
+import resource
 import shutil
 import subprocess
 import sys
@@ -30,10 +31,12 @@ import tempfile
 import time
 
 ROUNDS = int(os.environ.get("BENCH_ROUNDS", "3"))
+# `BENCH_ONLY=opens` measures only the opens; `builds` only the builds.
+ONLY = os.environ.get("BENCH_ONLY", "")
 FILES = 3000
 PROCESSES = 12
 OPENS = 360_000
-PENT = os.path.abspath("target/release/pent")
+PENT = os.path.abspath(os.environ.get("BENCH_PENT", "target/release/pent"))
 
 OPENER = f"""
 import multiprocessing, os, sys
@@ -48,20 +51,30 @@ with multiprocessing.Pool({PROCESSES}) as pool:
 """
 
 
+def cpu_of_children():
+    """The user and system time of the waited children, in seconds."""
+    use = resource.getrusage(resource.RUSAGE_CHILDREN)
+    return use.ru_utime + use.ru_stime
+
+
 def best(label, command, env, cwd, before=None):
-    """Run `command` ROUNDS times and print the best time."""
-    times = []
+    """Run `command` ROUNDS times and print the best time and the least CPU
+    time. The CPU time of pent and the program changes less than the time
+    on the clock when other work loads the machine."""
+    times, cpus = [], []
     for _ in range(ROUNDS):
         if before:
             before()
-        start = time.monotonic()
+        start, cpu = time.monotonic(), cpu_of_children()
         done = subprocess.run(command, env=env, cwd=cwd, capture_output=True, text=True)
-        took = time.monotonic() - start
+        took, cpu = time.monotonic() - start, cpu_of_children() - cpu
         if done.returncode != 0:
             print(f"{label}: failed\n{done.stdout[-2000:]}\n{done.stderr[-2000:]}")
             sys.exit(1)
         times.append(took)
-    print(f"{label:<40} {min(times):8.2f} s   (all: {', '.join(f'{t:.2f}' for t in times)})")
+        cpus.append(cpu)
+    print(f"{label:<40} {min(times):8.2f} s   CPU {min(cpus):7.2f} s   "
+          f"(all: {', '.join(f'{t:.2f}' for t in times)})")
 
 
 def main():
@@ -130,10 +143,13 @@ def main():
                 "--write", cargo_home, "--read", rustup_home, "--execute", rustup_home,
                 *passed, "--"]
         print(f"rounds: {ROUNDS}, CPUs: {os.cpu_count()}, load: {os.getloadavg()[0]:.1f}")
-        best("cold build, native", build, env, ws, clean)
-        best("cold build, pent run", pent + build, env, ws, clean)
-        best("incremental build, native", build, env, ws, touch)
-        best("incremental build, pent run", pent + build, env, ws, touch)
+        if ONLY in ("", "builds"):
+            best("cold build, native", build, env, ws, clean)
+            best("cold build, pent run", pent + build, env, ws, clean)
+            best("incremental build, native", build, env, ws, touch)
+            best("incremental build, pent run", pent + build, env, ws, touch)
+        if ONLY not in ("", "opens"):
+            return
         opener = ["python3", "-I", "-c", OPENER, opens]
         best("360,000 opens, native", opener, env, ws)
         best("360,000 opens, pent run (a graft)",

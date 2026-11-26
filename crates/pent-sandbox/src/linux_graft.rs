@@ -235,7 +235,7 @@ impl Grafter {
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         match unsafe { linux_fdpass::send_with_fds(ctl.as_raw_fd(), &msg, &fds) } {
             Ok(()) => {}
-            Err(e) if e.raw_os_error() == Some(libc::EPIPE) => return Err(GraftError::HelperGone),
+            Err(e) if peer_gone(&e) => return Err(GraftError::HelperGone),
             Err(e) => return Err(GraftError::Channel(e)),
         }
         let mut reply = [0u8; 4];
@@ -244,6 +244,7 @@ impl Grafter {
         match unsafe { linux_fdpass::read_message(ctl.as_raw_fd(), &mut reply) } {
             Ok(true) => {}
             Ok(false) => return Err(GraftError::HelperGone),
+            Err(e) if peer_gone(&e) => return Err(GraftError::HelperGone),
             Err(e) => return Err(GraftError::Channel(e)),
         }
         match i32::from_ne_bytes(reply) {
@@ -251,6 +252,14 @@ impl Grafter {
             errno => Err(GraftError::Failed(std::io::Error::from_raw_os_error(errno))),
         }
     }
+}
+
+/// Return true if `e` says that the peer of the socket is gone.
+fn peer_gone(e: &std::io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::EPIPE | libc::ECONNRESET | libc::ENOTCONN)
+    )
 }
 
 /// Return true if `area` is an absolute path with no empty, `.` or `..`

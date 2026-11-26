@@ -14,10 +14,15 @@
 //!   request. The server refuses a name with `/`, a NUL byte, `.` or `..`,
 //!   and it opens each component with `O_NOFOLLOW`, so a request never
 //!   leaves the tree through a symbolic link.
-//! - **One thread for each request.** A slow request, for example one that
-//!   waits for a question in a later step, blocks no other request. The
-//!   answer to `INIT` has `FUSE_PARALLEL_DIROPS`, so the kernel also sends
-//!   parallel requests in one directory.
+//! - **A pool of workers that grows.** Each request that can ask or wait
+//!   (a lookup, an open, a create, a change of the tree) goes to an idle
+//!   worker thread; when no worker is idle, the pool starts one more
+//!   ([`Pool`]). An operation on a handle or a known node that never asks
+//!   runs at once in one of the threads that read the requests.
+//!   So a slow request, for example one that waits for a question, blocks
+//!   no other request, and a request does not pay for the start of a
+//!   thread. The answer to `INIT` has `FUSE_PARALLEL_DIROPS`, so the kernel
+//!   also sends parallel requests in one directory.
 //! - **The first `GETATTR` of the root.** The kernel makes the root inode
 //!   with UID 0 and GID 0; the `user_id` option is only for the access
 //!   check. In a user namespace that maps only the real user, UID 0 has no
@@ -423,8 +428,15 @@ fn entry_rights(mode: u32) -> (u64, u64) {
 
 fn serve_tree(dev: OwnedFd, tree: FuseTree) -> Result<FuseServer, FuseError> {
     let shared = Arc::clone(&tree.tree);
-    let session = Session::from_fd(tree, dev, SessionACL::Owner, Config::default())
-        .map_err(FuseError::Handshake)?;
+    // Several threads read the requests, so the operations that run at
+    // once (`FuseTree::now`) still run in parallel. Each thread has its own
+    // copy of the descriptor (`FUSE_DEV_IOC_CLONE`).
+    let readers = std::thread::available_parallelism().map_or(2, |n| n.get().clamp(2, 8));
+    let mut config = Config::default();
+    config.n_threads = Some(readers);
+    config.clone_fd = true;
+    let session =
+        Session::from_fd(tree, dev, SessionACL::Owner, config).map_err(FuseError::Handshake)?;
     // The negative cache needs the notifier, and the notifier needs the
     // session; a second `set` cannot happen.
     let _ = shared.notifier.set(session.notifier());
@@ -562,9 +574,112 @@ struct Tree {
     slow_lookup: Option<(OsString, Duration)>,
 }
 
-/// The `fuser` filesystem: it sends each request to its own thread.
+/// The `fuser` filesystem: it sends each request to the pool.
 struct FuseTree {
     tree: Arc<Tree>,
+    pool: Arc<Pool>,
+}
+
+impl Drop for FuseTree {
+    /// The session ends: the workers end, and with them the last holds on
+    /// the tree (its event sender too).
+    fn drop(&mut self) {
+        self.pool.close();
+    }
+}
+
+/// One request for a worker of the pool.
+type Job = Box<dyn FnOnce(&Tree) + Send>;
+
+/// The most workers of one tree. A request waits in the queue when all of
+/// them are busy.
+const MAX_WORKERS: usize = 1024;
+
+/// The workers that stay when they have no job.
+const MIN_WORKERS: usize = 4;
+
+/// How long a worker with no job waits before it ends.
+const IDLE_LIFE: Duration = Duration::from_secs(5);
+
+/// The worker threads of one tree. A request goes to an idle worker. When
+/// no worker is idle, the pool starts one more, up to [`MAX_WORKERS`], so a
+/// request that waits for a question blocks no other request. A worker
+/// with no job for [`IDLE_LIFE`] ends, but [`MIN_WORKERS`] stay.
+#[derive(Default)]
+struct Pool {
+    state: Mutex<PoolState>,
+    wake: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct PoolState {
+    jobs: std::collections::VecDeque<Job>,
+    workers: usize,
+    idle: usize,
+    closed: bool,
+}
+
+impl Pool {
+    /// Give `job` to a worker. If no worker can start and none runs, run
+    /// the job here, so that the request still gets its answer.
+    fn submit(self: &Arc<Self>, tree: &Arc<Tree>, job: Job) {
+        let mut state = lock(&self.state);
+        state.jobs.push_back(job);
+        if state.idle >= state.jobs.len() || state.workers >= MAX_WORKERS {
+            self.wake.notify_one();
+            return;
+        }
+        state.workers = state.workers.saturating_add(1);
+        drop(state);
+        let (pool, theirs) = (Arc::clone(self), Arc::clone(tree));
+        let started = std::thread::Builder::new()
+            .name("pent-fuse-req".to_string())
+            .spawn(move || pool.work(&theirs));
+        if started.is_err() {
+            let mut state = lock(&self.state);
+            state.workers = state.workers.saturating_sub(1);
+            if state.workers == 0 {
+                let job = state.jobs.pop_front();
+                drop(state);
+                if let Some(job) = job {
+                    job(tree);
+                }
+            }
+        }
+    }
+
+    /// The loop of one worker.
+    fn work(&self, tree: &Tree) {
+        let mut state = lock(&self.state);
+        loop {
+            if let Some(job) = state.jobs.pop_front() {
+                drop(state);
+                job(tree);
+                state = lock(&self.state);
+                continue;
+            }
+            if state.closed {
+                break;
+            }
+            state.idle = state.idle.saturating_add(1);
+            let (next, wait) = self
+                .wake
+                .wait_timeout(state, IDLE_LIFE)
+                .unwrap_or_else(PoisonError::into_inner);
+            state = next;
+            state.idle = state.idle.saturating_sub(1);
+            if wait.timed_out() && state.jobs.is_empty() && state.workers > MIN_WORKERS {
+                break;
+            }
+        }
+        state.workers = state.workers.saturating_sub(1);
+    }
+
+    /// Let each worker end when the queue is empty.
+    fn close(&self) {
+        lock(&self.state).closed = true;
+        self.wake.notify_all();
+    }
 }
 
 /// Lock a mutex. A panic in another thread does not make the table
@@ -1794,32 +1909,34 @@ impl Tree {
 
 impl FuseTree {
     fn new(root: OwnedFd, policy: Option<AreaPolicy>) -> std::io::Result<Self> {
-        Ok(Self {
-            tree: Arc::new(Tree::new(root, policy)?),
-        })
+        Ok(Self::of(Arc::new(Tree::new(root, policy)?)))
     }
 
-    /// Run `job` in a new thread. If the thread does not start, run it
-    /// here, so that the request still gets its answer.
+    fn of(tree: Arc<Tree>) -> Self {
+        Self {
+            tree,
+            pool: Arc::new(Pool::default()),
+        }
+    }
+
+    /// Run `job` at once, in the thread that read the request: for an
+    /// operation that never asks and never waits long (the handle or the
+    /// node exists already). The session reads with several threads, so
+    /// such operations still run in parallel.
+    fn now<F>(&self, job: F)
+    where
+        F: FnOnce(&Tree),
+    {
+        job(&self.tree);
+    }
+
+    /// Run `job` in a worker of the pool: for an operation that can ask a
+    /// question or wait.
     fn spawn<F>(&self, job: F)
     where
         F: FnOnce(&Tree) + Send + 'static,
     {
-        let slot = Arc::new(Mutex::new(Some(job)));
-        let theirs = Arc::clone(&slot);
-        let tree = Arc::clone(&self.tree);
-        let started = std::thread::Builder::new()
-            .name("pent-fuse-req".to_string())
-            .spawn(move || {
-                if let Some(job) = lock(&theirs).take() {
-                    job(&tree);
-                }
-            });
-        if started.is_err() {
-            if let Some(job) = lock(&slot).take() {
-                job(&self.tree);
-            }
-        }
+        self.pool.submit(&self.tree, Box::new(job));
     }
 }
 
@@ -1912,7 +2029,7 @@ impl Filesystem for FuseTree {
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
-        self.spawn(move |t| reply_attr(reply, t.getattr(ino)));
+        self.now(move |t| reply_attr(reply, t.getattr(ino)));
     }
 
     fn setattr(
@@ -1944,7 +2061,7 @@ impl Filesystem for FuseTree {
     }
 
     fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
-        self.spawn(move |t| match t.readlink(ino) {
+        self.now(move |t| match t.readlink(ino) {
             Ok(target) => reply.data(&target),
             Err(e) => reply.error(e),
         });
@@ -2043,7 +2160,7 @@ impl Filesystem for FuseTree {
         mode: i32,
         reply: ReplyEmpty,
     ) {
-        self.spawn(move |t| reply_empty(reply, t.fallocate(fh, offset, length, mode)));
+        self.now(move |t| reply_empty(reply, t.fallocate(fh, offset, length, mode)));
     }
 
     fn lseek(
@@ -2055,7 +2172,7 @@ impl Filesystem for FuseTree {
         whence: i32,
         reply: fuser::ReplyLseek,
     ) {
-        self.spawn(move |t| match t.lseek(fh, offset, whence) {
+        self.now(move |t| match t.lseek(fh, offset, whence) {
             Ok(at) => reply.offset(at),
             Err(e) => reply.error(e),
         });
@@ -2119,7 +2236,7 @@ impl Filesystem for FuseTree {
         _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
-        self.spawn(move |t| match t.read(fh, offset, size) {
+        self.now(move |t| match t.read(fh, offset, size) {
             Ok(data) => reply.data(&data),
             Err(e) => reply.error(e),
         });
@@ -2138,7 +2255,7 @@ impl Filesystem for FuseTree {
         reply: ReplyWrite,
     ) {
         let data = data.to_vec();
-        self.spawn(move |t| match t.write(fh, offset, &data) {
+        self.now(move |t| match t.write(fh, offset, &data) {
             Ok(n) => reply.written(n),
             Err(e) => reply.error(e),
         });
@@ -2152,8 +2269,10 @@ impl Filesystem for FuseTree {
         _lock_owner: LockOwner,
         reply: ReplyEmpty,
     ) {
-        // Each write goes to the real file at once: nothing waits.
-        reply.ok();
+        // Each write goes to the real file at once: nothing waits. After
+        // `ENOSYS` the kernel sends no more `FLUSH`, and `close(2)` gives 0:
+        // one request less for each open.
+        reply.error(Errno::ENOSYS);
     }
 
     fn release(
@@ -2166,7 +2285,7 @@ impl Filesystem for FuseTree {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        self.spawn(move |t| {
+        self.now(move |t| {
             t.release(fh);
             reply.ok();
         });
@@ -2180,7 +2299,7 @@ impl Filesystem for FuseTree {
         datasync: bool,
         reply: ReplyEmpty,
     ) {
-        self.spawn(move |t| reply_empty(reply, t.fsync(fh, datasync)));
+        self.now(move |t| reply_empty(reply, t.fsync(fh, datasync)));
     }
 
     fn opendir(&self, req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
@@ -2196,7 +2315,7 @@ impl Filesystem for FuseTree {
         offset: u64,
         reply: ReplyDirectory,
     ) {
-        self.spawn(move |t| t.readdir(fh, offset, reply));
+        self.now(move |t| t.readdir(fh, offset, reply));
     }
 
     fn releasedir(
@@ -2207,18 +2326,18 @@ impl Filesystem for FuseTree {
         _flags: OpenFlags,
         reply: ReplyEmpty,
     ) {
-        self.spawn(move |t| {
+        self.now(move |t| {
             t.releasedir(fh);
             reply.ok();
         });
     }
 
     fn statfs(&self, _req: &Request, ino: INodeNo, reply: ReplyStatfs) {
-        self.spawn(move |t| t.statfs(ino, reply));
+        self.now(move |t| t.statfs(ino, reply));
     }
 
     fn access(&self, _req: &Request, ino: INodeNo, mask: AccessFlags, reply: ReplyEmpty) {
-        self.spawn(move |t| reply_empty(reply, t.access(ino, mask)));
+        self.now(move |t| reply_empty(reply, t.access(ino, mask)));
     }
 
     fn create(
@@ -2406,7 +2525,7 @@ pub(crate) mod tests {
             tree.slow_lookup.clone_from(&t.slow_lookup);
             tree.lookups_seen.clone_from(&t.lookups_seen);
             let tree = Arc::new(tree);
-            serve_tree(dev, FuseTree { tree })?
+            serve_tree(dev, FuseTree::of(tree))?
         };
         let hosted = host();
         // A script that hangs (for example a listing that never ends) must
