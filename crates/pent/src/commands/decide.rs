@@ -307,28 +307,47 @@ impl Decider {
         }
     }
 
-    /// Return true if a graft may give `target` (see
-    /// `pent_sandbox::AccessDecider::may_graft`): a subtree of files with
-    /// no deny rule of a flag, a rule or an answer inside it, and with no
-    /// sensitive location and no file of pent inside it. Without the
+    /// The plan of a graft of `target` (see
+    /// `pent_sandbox::AccessDecider::graft_plan`): `None` for no graft, or
+    /// the holes of the graft. A graft needs a subtree of files that is in
+    /// the normal class, with no deny rule of a flag, a rule or an answer
+    /// inside it and no file of pent inside it. Each existing sensitive
+    /// directory inside it becomes a hole; another sensitive location
+    /// keeps the width with FUSE (`Classes::graft_holes`). Without the
     /// classes of the user no graft is safe.
-    pub(crate) fn may_graft(&self, target: &Target) -> bool {
+    pub(crate) fn graft_plan(&self, target: &Target) -> Option<Vec<PathBuf>> {
         let Target::File { kind, width } = target else {
-            return false;
+            return None;
         };
-        if !matches!(width, PathWidth::Subtree(_)) {
-            return false;
-        }
-        let Some(classes) = self.classes.as_ref() else {
-            return false;
+        let PathWidth::Subtree(base) = width else {
+            return None;
         };
+        let classes = self.classes.as_ref()?;
         let answers = self
             .answers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        [&self.flags, &self.rules, &answers.rules]
-            .iter()
-            .all(|set| file_held_back(set, *kind, width, Some(classes), Path::is_dir).is_none())
+        for set in [&self.flags, &self.rules, &answers.rules] {
+            match file_held_back(set, *kind, width, Some(classes), Path::is_dir) {
+                None | Some(HeldBack::Sensitive) => {}
+                Some(_) => return None,
+            }
+        }
+        drop(answers);
+        let mut holes = Vec::new();
+        for &given in static_kinds(*kind) {
+            let request = Request::File {
+                kind: given,
+                path: base.clone(),
+            };
+            if classes.decide(&request).0 != Class::Normal {
+                return None;
+            }
+            holes.extend(classes.graft_holes(base.as_path(), given)?);
+        }
+        holes.sort();
+        holes.dedup();
+        Some(holes)
     }
 
     /// The target of the flag, the rule or the answer that allowed
@@ -483,8 +502,8 @@ impl pent_sandbox::AccessDecider for SandboxDecider {
         self.decider.hidden(path)
     }
 
-    fn may_graft(&self, target: &Target) -> bool {
-        self.decider.may_graft(target)
+    fn graft_plan(&self, target: &Target) -> Option<Vec<PathBuf>> {
+        self.decider.graft_plan(target)
     }
 
     fn decide_target(
@@ -969,18 +988,20 @@ mod tests {
         ]);
         let decider = Decider::new(set(vec![]), rules, classes(), None);
         // A clean subtree may be a graft.
-        assert!(decider.may_graft(&target("/home/u/projects")));
+        assert!(decider.graft_plan(&target("/home/u/projects")).is_some());
         // A deny rule inside, a sensitive location inside, an exact width.
-        assert!(!decider.may_graft(&target("/home/u/src")));
-        assert!(!decider.may_graft(&target("/home/u")));
-        assert!(!decider.may_graft(&target("/home/u/.ssh")));
-        assert!(!decider.may_graft(&Target::File {
-            kind: FileKind::Read,
-            width: PathWidth::Exact(path("/home/u/projects")),
-        }));
+        assert!(decider.graft_plan(&target("/home/u/src")).is_none());
+        assert!(decider.graft_plan(&target("/home/u")).is_none());
+        assert!(decider.graft_plan(&target("/home/u/.ssh")).is_none());
+        assert!(decider
+            .graft_plan(&Target::File {
+                kind: FileKind::Read,
+                width: PathWidth::Exact(path("/home/u/projects")),
+            })
+            .is_none());
         // Without the classes of the user no graft is safe.
         let blind = Decider::new(set(vec![]), set(vec![]), None, None);
-        assert!(!blind.may_graft(&target("/home/u/projects")));
+        assert!(blind.graft_plan(&target("/home/u/projects")).is_none());
     }
 
     #[test]

@@ -36,8 +36,8 @@ pub mod rule_file;
 pub mod summary;
 
 pub use class::{
-    exact_target, Class, Classifier, Sensitive, ESCAPE_SOCKETS, HOME_AGENT_SOCKETS, PENT_HOME_DIRS,
-    RESOLVER_SOCKETS,
+    exact_target, Class, Classifier, GuardSpot, Sensitive, ESCAPE_SOCKETS, HOME_AGENT_SOCKETS,
+    PENT_HOME_DIRS, RESOLVER_SOCKETS,
 };
 pub use doc::{DocError, FilesystemRules, NetworkRules, ProfileDoc};
 pub use event::{FsOp, GuardClass, NetProtocol, Outcome, ProcessInfo, WatchEvent};

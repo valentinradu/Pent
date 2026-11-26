@@ -1,6 +1,6 @@
 # Plan: the new pent
 
-**Cursor: step 5.11, then the review of phase 5.** Steps with `[x]` are done. Work on the branch `next`,
+**Cursor: the review of phase 5, then step 6.1.** Steps with `[x]` are done. Work on the branch `next`,
 one commit for each step, and move this cursor when a step is done.
 
 **The way of work.** One commit for each step. Then the user runs
@@ -456,12 +456,30 @@ section 14 of the design has their results.
   - Files: `GONE`, `CHANGE`, `Inodes::by_entry`, `Tree::open_flags` and
     the new cases of `Tree::event` in `pent-sandbox/src/linux_fuse.rs`;
     NC-4 in `docs/security/fuse.md`.
-- [ ] **5.11 Grafts with holes.** A width with a sensitive directory inside
+- [x] **5.11 Grafts with holes.** A width with a sensitive directory inside
   it becomes a graft, and the FUSE node of each sensitive directory goes
   back over its place in the graft. A width with a sensitive file pattern
   stays with FUSE: a new file there must still ask.
   - Done: a read in such a width makes no FUSE request; an access in the
     sensitive directory still asks.
+  - Files: `graft`, `attach_hole`, `Holes` and `relative_holes` in
+    `pent-sandbox/src/linux_graft.rs`; `AccessDecider::graft_plan` (in the
+    place of `may_graft`); `Decider::graft_plan` in
+    `pent/src/commands/decide.rs`; `Classes::graft_holes` and `hole_of` in
+    `pent/src/daemon/classes.rs`; `Classifier::guard_spots_in` and
+    `holds_pent_dir` in `pent-profile/src/class.rs`; GS-3, GS-6 to GS-8 in
+    `docs/security/fuse.md`.
+  - Decisions (2026-11-26):
+    - The safe holes only: a place that exists is its own hole, a missing
+      place gets a hole at its nearest existing directory below the width,
+      and a missing place directly in the width keeps the width with
+      FUSE. So `read ~/.cargo/**` stays with FUSE until
+      `~/.cargo/credentials.toml` and `~/.cargo/credentials` exist.
+    - A width with a directory of pent is never a graft, for each kind
+      (before, a read graft of `~/.config` showed the mask as an empty
+      directory).
+    - The server asks `decide_target` for each access that the grants do
+      not give, so a known rule becomes a graft too.
 
 ## Phase 6: agents
 

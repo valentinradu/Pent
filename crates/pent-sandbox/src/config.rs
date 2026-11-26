@@ -199,13 +199,15 @@ pub trait AccessDecider: Send + Sync + std::fmt::Debug {
         false
     }
 
-    /// Return true if a graft may give `target`: a graft gives each path
-    /// below it with no question, so the width must hold no sensitive
-    /// location, no file of pent and no deny rule. The default allows no
-    /// graft; FUSE then serves each access.
-    fn may_graft(&self, target: &pent_profile::Target) -> bool {
+    /// The plan of a graft of `target`: `None` for no graft, or the holes
+    /// of the graft, as absolute paths below the width. A graft gives each
+    /// path below it with no question, so the width must hold no file of
+    /// pent and no deny rule, and each sensitive location in it must be a
+    /// hole, which FUSE keeps serving. The default allows no graft; FUSE
+    /// then serves each access.
+    fn graft_plan(&self, target: &pent_profile::Target) -> Option<Vec<std::path::PathBuf>> {
         let _ = target; // The default allows no graft, so it needs no target.
-        false
+        None
     }
 
     /// [`AccessDecider::decide`], and the target of the rule or the answer

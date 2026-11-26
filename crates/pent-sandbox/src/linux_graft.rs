@@ -72,6 +72,9 @@ struct OpenHow {
 /// The longest relative path of a graft, in bytes.
 const MAX_GRAFT_PATH: usize = 4096;
 
+/// The most holes of one graft.
+const MAX_HOLES: usize = 16;
+
 /// The access of a graft.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GraftAccess {
@@ -201,6 +204,7 @@ pub(crate) struct Grafter {
 
 impl Grafter {
     /// Graft `rel` of the area `area`, whose real directory is `source`.
+    /// Each path of `holes` (relative to `rel`) keeps its FUSE node.
     ///
     /// # Errors
     /// Returns [`GraftError::BadPath`] for a bad path,
@@ -211,11 +215,12 @@ impl Grafter {
         source: BorrowedFd<'_>,
         area: &Path,
         rel: &Path,
+        holes: &[PathBuf],
         access: GraftAccess,
     ) -> Result<(), GraftError> {
         let bytes = rel.as_os_str().as_bytes();
         let area_bytes = area.as_os_str().as_bytes();
-        if !valid_relative(bytes) || !valid_area(area_bytes) {
+        if !valid_relative(bytes) || !valid_area(area_bytes) || holes.len() > MAX_HOLES {
             return Err(GraftError::BadPath(rel.to_path_buf()));
         }
         let mut msg = Vec::with_capacity(
@@ -228,6 +233,14 @@ impl Grafter {
         msg.extend_from_slice(area_bytes);
         msg.push(0);
         msg.extend_from_slice(bytes);
+        for hole in holes {
+            let hole_bytes = hole.as_os_str().as_bytes();
+            if hole_bytes.is_empty() || !valid_relative(hole_bytes) {
+                return Err(GraftError::BadPath(hole.clone()));
+            }
+            msg.push(0);
+            msg.extend_from_slice(hole_bytes);
+        }
         // One request at a time: the reply carries no number.
         let ctl = self.ctl.lock().unwrap_or_else(PoisonError::into_inner);
         let fds = [source.as_raw_fd()];
@@ -291,7 +304,7 @@ impl FileAreas {
     ) -> Result<(), GraftError> {
         let area = self.areas.get(area).ok_or(GraftError::NoArea(area))?;
         self.grafter
-            .graft(area.source.as_fd(), &area.path, rel, access)
+            .graft(area.source.as_fd(), &area.path, rel, &[], access)
     }
 }
 
@@ -460,6 +473,15 @@ fn receive_areas(
     Ok(areas)
 }
 
+/// The holes `holes` (absolute paths) relative to the width `width`, or
+/// `None` when a hole is not below the width.
+pub(crate) fn relative_holes(width: &Path, holes: &[PathBuf]) -> Option<Vec<PathBuf>> {
+    holes
+        .iter()
+        .map(|h| h.strip_prefix(width).ok().map(Path::to_path_buf))
+        .collect()
+}
+
 /// The access of a graft that the Landlock rights `rights` of a grant
 /// give, or `None` when a graft would give more: a graft needs the right to
 /// read files and to list.
@@ -489,9 +511,10 @@ const fn kind_of_access(access: GraftAccess) -> pent_profile::FileKind {
 
 /// Graft each grant that a graft can hold, before the program starts: a
 /// directory in an area, with the right to read files and to list. The
-/// decider must agree ([`crate::AccessDecider::may_graft`]): a width with a
-/// sensitive location, a file of pent or a deny rule inside it stays with
-/// FUSE. Without a decider there is no graft. A grant inside a graft that
+/// decider must agree ([`crate::AccessDecider::graft_plan`]): a file of pent
+/// or a deny rule inside the width keeps it with FUSE, and each sensitive
+/// place inside it becomes a hole that FUSE keeps serving. Without a
+/// decider there is no graft. A grant inside a graft that
 /// gives it already needs no graft of its own. A failed graft only means
 /// that FUSE serves the width.
 fn start_grafts(
@@ -531,15 +554,18 @@ fn start_grafts(
             kind: kind_of_access(access),
             width: pent_profile::PathWidth::Subtree(base),
         };
-        if !decider.may_graft(&target) {
+        let Some(holes) = decider
+            .graft_plan(&target)
+            .and_then(|holes| relative_holes(&path, &holes))
+        else {
             continue;
-        }
+        };
         let Ok(rel) = path.strip_prefix(&area.path) else {
             continue;
         };
         match context
             .grafter
-            .graft(area.source.as_fd(), &area.path, rel, access)
+            .graft(area.source.as_fd(), &area.path, rel, &holes, access)
         {
             Ok(()) => done.push((path, access)),
             Err(e) => tracing::debug!("no graft of {}: {e}", path.display()),
@@ -689,8 +715,9 @@ pub(crate) fn serve_grafts(ctl: RawFd, child: libc::pid_t) {
 /// Read one request from `ctl`, do it, and write the reply. Returns false
 /// when the channel is closed. Async-signal-safe.
 fn serve_one(ctl: RawFd) -> bool {
-    // The access byte, the area, a NUL byte and the relative path.
-    let mut buf = [0u8; 2 * MAX_GRAFT_PATH + 3];
+    // The access byte, the area, a NUL byte, the relative path, and a NUL
+    // byte before each hole.
+    let mut buf = [0u8; 4 * MAX_GRAFT_PATH + 3];
     let mut fds = [-1; MAX_FDS];
     // SAFETY: `ctl` is an open socket.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
@@ -701,11 +728,14 @@ fn serve_one(ctl: RawFd) -> bool {
     };
     let result = match (buf.get(..len), fds.get(..count)) {
         (Some([access, rest @ ..]), Some(&[source])) => {
-            let mut parts = rest.splitn(2, |b| *b == 0);
+            let mut parts = rest.splitn(3, |b| *b == 0);
             let (area, path) = (parts.next().unwrap_or_default(), parts.next());
-            match (GraftAccess::from_byte(*access), path) {
-                (Some(access), Some(path)) if valid_area(area) && valid_relative(path) => {
-                    graft(source, area, path, access)
+            let holes = Holes::parse(parts.next().unwrap_or_default());
+            match (GraftAccess::from_byte(*access), path, holes) {
+                (Some(access), Some(path), Some(holes))
+                    if valid_area(area) && valid_relative(path) =>
+                {
+                    graft(source, area, path, &holes, access)
                 }
                 _ => Err(libc::EINVAL),
             }
@@ -786,39 +816,119 @@ fn errno() -> i32 {
 }
 
 /// Graft `rel` of the real directory `source` over `rel` of the area
-/// `area`, which the helper finds in its mount namespace.
-/// Async-signal-safe.
-fn graft(source: RawFd, area: &[u8], rel: &[u8], access: GraftAccess) -> Result<(), i32> {
+/// `area`, which the helper finds in its mount namespace. Each hole (a
+/// path below `rel`) gets the FUSE node of its place back, so FUSE keeps
+/// serving it. The helper builds the whole tree while it is detached and
+/// mounts it at the end, so a hole is never native, not for a moment.
+/// When a step fails, nothing is mounted. Async-signal-safe.
+fn graft(
+    source: RawFd,
+    area: &[u8],
+    rel: &[u8],
+    holes: &Holes<'_>,
+    access: GraftAccess,
+) -> Result<(), i32> {
     let src = open_beneath(source, rel)?;
+    let tree = clone_tree(src, access);
+    close(src);
+    let tree = tree?;
     // The root of the area in the mount namespace of the helper: the FUSE
     // root, or a graft on it.
     let root = match open_area(area) {
         Ok(fd) => fd,
         Err(e) => {
-            close(src);
+            close(tree);
             return Err(e);
         }
     };
-    // The lookup of the target goes through FUSE; pent answers it in
-    // another thread.
-    let target = open_beneath(root, rel);
+    let result = holes
+        .iter()
+        .try_for_each(|hole| attach_hole(root, rel, hole, tree))
+        // The lookup of the target goes through FUSE; pent answers it in
+        // another thread.
+        .and_then(|()| open_beneath(root, rel))
+        .and_then(|dst| {
+            let moved = move_mount(tree, dst);
+            close(dst);
+            moved
+        });
     close(root);
-    let dst = match target {
-        Ok(fd) => fd,
-        Err(e) => {
-            close(src);
-            return Err(e);
-        }
-    };
-    let result = move_tree(src, dst, access);
-    close(src);
-    close(dst);
+    close(tree);
     result
 }
 
-/// Clone the tree at `src`, make it read-only for a read grant, and mount
-/// it on `dst`. Async-signal-safe.
-fn move_tree(src: RawFd, dst: RawFd, access: GraftAccess) -> Result<(), i32> {
+/// The holes of a request: at most [`MAX_HOLES`] paths, each relative to
+/// the width.
+struct Holes<'a> {
+    paths: [&'a [u8]; MAX_HOLES],
+    count: usize,
+}
+
+impl<'a> Holes<'a> {
+    /// Split `rest` at each NUL byte. Returns `None` for too many holes or
+    /// for a path that is not relative.
+    fn parse(rest: &'a [u8]) -> Option<Self> {
+        let mut holes = Self {
+            paths: [&[]; MAX_HOLES],
+            count: 0,
+        };
+        if rest.is_empty() {
+            return Some(holes);
+        }
+        for path in rest.split(|b| *b == 0) {
+            if path.is_empty() || !valid_relative(path) {
+                return None;
+            }
+            let slot = holes.paths.get_mut(holes.count)?;
+            *slot = path;
+            holes.count = holes.count.saturating_add(1);
+        }
+        Some(holes)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &'a [u8]> + '_ {
+        self.paths.iter().take(self.count).copied()
+    }
+}
+
+/// Put the FUSE node of `hole` back over its place in the detached `tree`:
+/// clone the FUSE subtree at `rel/hole` below `root` (the graft is not
+/// mounted yet, so the path still reaches FUSE), and move the clone onto
+/// `hole` inside the tree. Async-signal-safe.
+fn attach_hole(root: RawFd, rel: &[u8], hole: &[u8], tree: RawFd) -> Result<(), i32> {
+    let mut full = [0u8; MAX_GRAFT_PATH + 1];
+    let mut len = 0usize;
+    let sep: &[u8] = if rel.is_empty() { b"" } else { b"/" };
+    for part in [rel, sep, hole] {
+        let Some(slot) = full.get_mut(len..len.saturating_add(part.len())) else {
+            return Err(libc::ENAMETOOLONG);
+        };
+        slot.copy_from_slice(part);
+        len = len.saturating_add(part.len());
+    }
+    let fuse = open_beneath(root, full.get(..len).unwrap_or_default())?;
+    let flags =
+        OPEN_TREE_CLONE | libc::O_CLOEXEC as libc::c_uint | libc::AT_EMPTY_PATH as libc::c_uint;
+    // SAFETY: the empty path is NUL-terminated; the rest are integers.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let clone = unsafe { libc::syscall(libc::SYS_open_tree, fuse, c"".as_ptr(), flags) };
+    close(fuse);
+    let clone = match libc::c_int::try_from(clone) {
+        Ok(fd) if fd >= 0 => fd,
+        _ => return Err(errno()),
+    };
+    let result = open_beneath(tree, hole).and_then(|at| {
+        let moved = move_mount(clone, at);
+        close(at);
+        moved
+    });
+    close(clone);
+    result
+}
+
+/// Clone the tree at `src` with each mount below it, and give it the
+/// attributes of `access`. Async-signal-safe.
+fn clone_tree(src: RawFd, access: GraftAccess) -> Result<RawFd, i32> {
     // `AT_RECURSIVE` keeps each mount below the subtree: a mask of pent in
     // it stays.
     let flags = OPEN_TREE_CLONE
@@ -860,6 +970,11 @@ fn move_tree(src: RawFd, dst: RawFd, access: GraftAccess) -> Result<(), i32> {
             return Err(e);
         }
     }
+    Ok(tree)
+}
+
+/// Mount the detached tree `tree` on `dst`. Async-signal-safe.
+fn move_mount(tree: RawFd, dst: RawFd) -> Result<(), i32> {
     // SAFETY: both paths are empty and NUL-terminated; the rest are
     // integers.
     // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
@@ -873,9 +988,11 @@ fn move_tree(src: RawFd, dst: RawFd, access: GraftAccess) -> Result<(), i32> {
             MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH,
         )
     };
-    let result = if ret == 0 { Ok(()) } else { Err(errno()) };
-    close(tree);
-    result
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(errno())
+    }
 }
 
 #[cfg(test)]
@@ -1309,9 +1426,14 @@ cat "$H/graft/file"
         graftable: Vec<PathBuf>,
         /// The target of an allowed request, for the graft of an answer.
         targets: Vec<(pent_profile::Request, pent_profile::Target)>,
-        /// How long `may_graft` waits: a slow decider shows that the
+        /// How long `graft_plan` waits: a slow decider shows that the
         /// program waits for the grafts at the start.
         graft_delay: std::time::Duration,
+        /// The holes of each graft: the paths below a graftable width.
+        holes: Vec<PathBuf>,
+        /// The requests that a rule allows: the decider knows them with no
+        /// question, as the chain of `pent run` knows a rule.
+        rules: Vec<pent_profile::Request>,
     }
 
     impl FakeDecider {
@@ -1323,13 +1445,17 @@ cat "$H/graft/file"
                 graftable: Vec::new(),
                 targets: Vec::new(),
                 graft_delay: std::time::Duration::ZERO,
+                holes: Vec::new(),
+                rules: Vec::new(),
             }
         }
     }
 
     impl crate::AccessDecider for FakeDecider {
-        fn known(&self, _request: &pent_profile::Request) -> Option<pent_profile::Decision> {
-            None
+        fn known(&self, request: &pent_profile::Request) -> Option<pent_profile::Decision> {
+            self.rules
+                .contains(request)
+                .then_some(pent_profile::Decision::Allow)
         }
 
         fn decide(
@@ -1354,11 +1480,23 @@ cat "$H/graft/file"
             path.starts_with(&self.pent)
         }
 
-        fn may_graft(&self, target: &pent_profile::Target) -> bool {
+        fn graft_plan(&self, target: &pent_profile::Target) -> Option<Vec<PathBuf>> {
             std::thread::sleep(self.graft_delay);
-            matches!(target, pent_profile::Target::File {
-                width: pent_profile::PathWidth::Subtree(base), ..
-            } if self.graftable.iter().any(|g| g == base.as_path()))
+            let pent_profile::Target::File {
+                width: pent_profile::PathWidth::Subtree(base),
+                ..
+            } = target
+            else {
+                return None;
+            };
+            let base = base.as_path();
+            self.graftable.iter().any(|g| g == base).then(|| {
+                self.holes
+                    .iter()
+                    .filter(|h| h.starts_with(base))
+                    .cloned()
+                    .collect()
+            })
         }
 
         fn decide_target(
@@ -1685,6 +1823,110 @@ cat "$H/keep/two"
         );
         // The grants at the start ask nothing.
         assert!(!asked_for("proj/f")?, "{asked:?}");
+        Ok(())
+    }
+
+    /// The program of the test of the holes.
+    const HOLES_SCRIPT: &str = r#"set -e
+exec > "$T/out" 2>&1
+: pent-graft-holes-marker
+cat "$H/cfg/open.txt"
+i=0
+while ! grep -q " $H/cfg " /proc/self/mountinfo && [ $i -lt 100 ]; do sleep 0.02; i=$((i+1)); done
+for d in cfg cfg/secret cfg/key.txt; do
+  grep -q " $H/$d " /proc/self/mountinfo && echo "mount-$d" || true
+done
+cat "$H/cfg/open2.txt"
+(cat "$H/cfg/secret/x") 2>/dev/null || echo secret-refused
+(cat "$H/cfg/key.txt") 2>/dev/null || echo key-refused
+(echo n > "$H/cfg/secret/new") 2>/dev/null || echo secret-create-refused
+"#;
+
+    /// A rule on a width with a sensitive directory and a sensitive file
+    /// inside it becomes a graft with two holes at its first access: the
+    /// rest is native, and each access in a hole still asks. The CLI holds
+    /// such a rule back from the static grants, so the test gives it as the
+    /// decider would: an allow with the target of the rule.
+    #[test]
+    fn a_graft_keeps_its_holes_with_fuse() -> TestResult {
+        if !ready() {
+            return Ok(());
+        }
+        let tmp = tempfile::tempdir()?;
+        let base = std::fs::canonicalize(tmp.path())?;
+        let (ws, home) = (base.join("ws"), base.join("home"));
+        std::fs::create_dir_all(home.join("cfg/secret"))?;
+        std::fs::create_dir(&ws)?;
+        std::fs::write(home.join("cfg/open.txt"), "open\n")?;
+        std::fs::write(home.join("cfg/open2.txt"), "open2\n")?;
+        std::fs::write(home.join("cfg/secret/x"), "SECRET\n")?;
+        std::fs::write(home.join("cfg/key.txt"), "KEY\n")?;
+
+        let text = |p: &Path| p.to_string_lossy().into_owned();
+        let open = pent_profile::Request::File {
+            kind: pent_profile::FileKind::Read,
+            path: pent_profile::RulePath::new(home.join("cfg/open.txt"))?,
+        };
+        let rule = pent_profile::Target::File {
+            kind: pent_profile::FileKind::Read,
+            width: pent_profile::PathWidth::Subtree(pent_profile::RulePath::new(home.join("cfg"))?),
+        };
+        let mut fake = FakeDecider::new(vec![open.clone()], home.join(".config/pent"));
+        fake.rules = vec![open.clone()];
+        fake.targets = vec![(open, rule)];
+        fake.graftable = vec![home.join("cfg")];
+        fake.holes = vec![home.join("cfg/secret"), home.join("cfg/key.txt")];
+        let decider = Arc::new(fake);
+        let mut env = crate::build_env(&[]);
+        env.insert("T".to_string(), text(&ws));
+        env.insert("H".to_string(), text(&home));
+        env.insert("HOME".to_string(), text(&home));
+        let mut config =
+            crate::SandboxConfig::new(ws.clone(), crate::system_default_paths(), ws.clone())
+                .with_env(env.clone())
+                .with_network(crate::NetworkMode::LocalhostOnly);
+        config.file_areas = crate::FuseAreas::OutsideBase;
+        config.file_decider = Some(decider.clone());
+        let args = vec!["-c".to_string(), HOLES_SCRIPT.to_string()];
+        let spawned = crate::linux::spawn_linux(
+            &config,
+            "sh",
+            &args,
+            &env,
+            &crate::resolve_path_directories(),
+            crate::linux::SpawnMode::Sandbox,
+        )?;
+        let mut child = spawned.child;
+        drop(spawned.files);
+        let status = child.wait()?;
+        let out = std::fs::read_to_string(ws.join("out")).unwrap_or_default();
+        assert!(status.success(), "the program failed: {status}\n{out}");
+        assert_eq!(
+            out,
+            "open\nmount-cfg\nmount-cfg/secret\nmount-cfg/key.txt\nopen2\nsecret-refused\n\
+             key-refused\nsecret-create-refused\n"
+        );
+        let asked = decider
+            .asked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let asked_for = |p: &str| {
+            asked.iter().any(|(_, r)| {
+                matches!(r, pent_profile::Request::File { path, .. }
+                    if path.as_path() == home.join(p))
+            })
+        };
+        // The graft serves the rest with no question; the holes ask.
+        assert!(
+            asked_for("cfg/open.txt") && !asked_for("cfg/open2.txt"),
+            "{asked:?}"
+        );
+        assert!(
+            asked_for("cfg/secret/x") && asked_for("cfg/key.txt"),
+            "{asked:?}"
+        );
+        assert!(asked_for("cfg/secret/new"), "{asked:?}");
         Ok(())
     }
 }

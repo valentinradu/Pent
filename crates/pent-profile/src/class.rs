@@ -303,6 +303,51 @@ impl Classifier {
     }
 }
 
+impl Classifier {
+    /// Return true if a directory of pent is at `dir` or below it.
+    #[must_use]
+    pub fn holds_pent_dir(&self, dir: &Path) -> bool {
+        self.pent.iter().any(|p| p.starts_with(dir))
+    }
+
+    /// The locations of the guard list below `dir` (or at `dir`) that make
+    /// an access of the kind `kind` sensitive, or put it in the pent class.
+    /// A graft of `dir` must keep each of them with FUSE.
+    #[must_use]
+    pub fn guard_spots_in(&self, dir: &Path, kind: FileKind) -> Vec<GuardSpot<'_>> {
+        let checks = guard_checks(kind);
+        self.guard
+            .iter()
+            .filter(|rule| checks.contains(&rule.access))
+            .filter_map(|rule| {
+                let (path, subtree) = match &rule.target {
+                    GuardTarget::Subtree(p) => (p.as_path(), true),
+                    GuardTarget::FilesInDir { dir, .. } => (dir.as_path(), true),
+                    GuardTarget::Exact(p) => (p.as_path(), false),
+                    GuardTarget::BinaryName(_) => return None,
+                };
+                path.starts_with(dir).then_some(GuardSpot {
+                    path,
+                    class: rule.class,
+                    subtree,
+                })
+            })
+            .collect()
+    }
+}
+
+/// One location of the guard list below a directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuardSpot<'a> {
+    /// The path of the location.
+    pub path: &'a Path,
+    /// The class of the guard rule.
+    pub class: GuardClass,
+    /// True for a whole directory (a `Subtree` or a `FilesInDir` target);
+    /// false for one path, which can be a file that does not exist yet.
+    pub subtree: bool,
+}
+
 /// The guard accesses that can make a file access of the kind `kind`
 /// sensitive. A list shows the names in a credential directory (the entries
 /// of a password store name the sites). A write can create or replace a
@@ -395,6 +440,30 @@ mod tests {
             kind,
             path: &path(p),
         })
+    }
+
+    #[test]
+    fn the_guard_spots_below_a_directory_have_their_form_and_class() {
+        let c = classifier();
+        let spots = c.guard_spots_in(Path::new("/home/u"), FileKind::Read);
+        let find = |p: &str| spots.iter().find(|s| s.path == Path::new(p)).copied();
+        // `~/.ssh` holds keys: a whole directory of credentials.
+        let ssh = find("/home/u/.ssh").unwrap_or_else(|| panic!("{spots:?}"));
+        assert!(ssh.subtree);
+        assert_eq!(ssh.class, GuardClass::Credential);
+        // A spot outside the directory is not in the list.
+        assert!(c
+            .guard_spots_in(Path::new("/home/u/projects"), FileKind::Read)
+            .is_empty());
+        // A read does not see a spot where the guard stops only a write:
+        // `~/.bashrc` is a write spot of one path.
+        assert!(find("/home/u/.bashrc").is_none());
+        let writes = c.guard_spots_in(Path::new("/home/u"), FileKind::Write);
+        let rc = writes
+            .iter()
+            .find(|s| s.path == Path::new("/home/u/.bashrc"))
+            .unwrap_or_else(|| panic!("{writes:?}"));
+        assert!(!rc.subtree);
     }
 
     fn socket_class(p: &str) -> Class {

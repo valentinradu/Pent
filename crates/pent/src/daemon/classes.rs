@@ -12,7 +12,9 @@
 
 use std::path::{Path, PathBuf};
 
-use pent_profile::{exact_target, Class, Classifier, FileKind, Request, RulePath, Target};
+use pent_profile::{
+    exact_target, Class, Classifier, FileKind, GuardClass, Request, RulePath, Target,
+};
 
 /// The classes of the user, in each form of the home directory.
 #[derive(Debug, Clone)]
@@ -77,6 +79,41 @@ impl Classes {
             .any(|view| view.classify(&access) == Class::Pent)
     }
 
+    /// The holes of a graft of `dir` for an access of the kind `kind`: the
+    /// places of the guard list below it that FUSE keeps serving, so that
+    /// each access there still asks. A spot that exists (a directory or a
+    /// file) is its own hole. A missing spot gets a hole at its nearest
+    /// existing directory below `dir`, so that a new file there still asks.
+    /// `None` when no graft is safe: a missing spot directly in `dir` (a
+    /// file could appear there in the graft with no question), a directory
+    /// or a file of pent (its FUSE node is hidden), or `dir` inside a
+    /// spot.
+    pub(crate) fn graft_holes(&self, dir: &Path, kind: FileKind) -> Option<Vec<PathBuf>> {
+        let mut holes: Vec<PathBuf> = Vec::new();
+        for view in &self.views {
+            // A mask of pent would show an empty directory in the graft,
+            // where FUSE gives `ENOENT`.
+            if view.holds_pent_dir(dir) {
+                return None;
+            }
+            for spot in view.guard_spots_in(dir, kind) {
+                if spot.class == GuardClass::PentFiles || spot.path == dir {
+                    return None;
+                }
+                holes.push(hole_of(spot.path, dir)?);
+            }
+        }
+        holes.sort();
+        holes.dedup();
+        // A hole inside another hole is in it already.
+        let outer: Vec<PathBuf> = holes
+            .iter()
+            .filter(|h| !holes.iter().any(|o| o != *h && h.starts_with(o)))
+            .cloned()
+            .collect();
+        Some(outer)
+    }
+
     /// Return true if a subtree rule of the kind `kind` on `dir`, or on
     /// `dir` with its links resolved, covers a location of the guard list
     /// that makes such an access sensitive, in one form of the home
@@ -87,6 +124,19 @@ impl Classes {
             view.subtree_holds_guard_for(dir, kind) || view.subtree_holds_guard_for(&real, kind)
         })
     }
+}
+
+/// The hole of the guard spot `spot` in a graft of `dir`: the spot when it
+/// exists, else its nearest existing directory strictly below `dir`.
+fn hole_of(spot: &Path, dir: &Path) -> Option<PathBuf> {
+    if std::fs::symlink_metadata(spot).is_ok() {
+        return Some(spot.to_path_buf());
+    }
+    spot.ancestors()
+        .skip(1)
+        .take_while(|a| a.starts_with(dir) && *a != dir)
+        .find(|a| std::fs::symlink_metadata(a).is_ok_and(|m| m.is_dir()))
+        .map(Path::to_path_buf)
 }
 
 /// How strict a class is: the pent class, then a sensitive class, then the
@@ -169,6 +219,43 @@ mod tests {
         let classes = Classes::new(&real_home, &[]);
         let (class, _) = classes.decide(&read(&link_home.join(".ssh/id_ed25519")));
         assert_eq!(class, Class::Sensitive(Sensitive::Credential));
+    }
+
+    #[test]
+    fn a_graft_gets_a_hole_for_each_sensitive_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(tmp.path()).unwrap();
+        let classes = Classes::new(&home, &[]);
+        let holes = |dir: &str| classes.graft_holes(&home.join(dir), FileKind::Read);
+        // A missing credential directly in the width: no safe hole.
+        std::fs::create_dir_all(home.join(".cargo/registry")).unwrap();
+        assert_eq!(holes(".cargo"), None);
+        // The files exist: each one is a hole.
+        std::fs::write(home.join(".cargo/credentials.toml"), "").unwrap();
+        std::fs::write(home.join(".cargo/credentials"), "").unwrap();
+        assert_eq!(
+            holes(".cargo"),
+            Some(vec![
+                home.join(".cargo/credentials"),
+                home.join(".cargo/credentials.toml"),
+            ])
+        );
+        // A missing directory spot gets a hole at its nearest existing
+        // directory below the width; a file spot that exists is a hole.
+        std::fs::create_dir_all(home.join(".aws/sso")).unwrap();
+        std::fs::write(home.join(".aws/credentials"), "").unwrap();
+        assert_eq!(
+            holes(".aws"),
+            Some(vec![home.join(".aws/credentials"), home.join(".aws/sso")])
+        );
+        // A clean width has no hole; a directory of pent keeps the width
+        // with FUSE, for each kind.
+        std::fs::create_dir_all(home.join("projects")).unwrap();
+        assert_eq!(holes("projects"), Some(Vec::new()));
+        assert_eq!(holes(".config"), None);
+        // `~/.local/state` holds no spot of a read, only the state of pent.
+        std::fs::create_dir_all(home.join(".local/state")).unwrap();
+        assert_eq!(holes(".local/state"), None);
     }
 
     #[test]

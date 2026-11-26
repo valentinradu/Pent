@@ -1069,10 +1069,12 @@ impl Tree {
             path: rule_path,
         };
         let process = policy.shared.process(caller);
-        let (decision, target) = match decider.known(&request) {
-            Some(decision) => (decision, None),
-            None => decider.decide_target(&process.name, request, pent_profile::FILE_DEADLINE),
-        };
+        // The decider knows a rule, a flag or an answer first, and asks only
+        // when none decides. The target of an allow becomes a graft, also
+        // for a rule that the static grants could not hold (a sensitive
+        // place inside it gives the graft its holes).
+        let (decision, target) =
+            decider.decide_target(&process.name, request, pent_profile::FILE_DEADLINE);
         if let Some(events) = &policy.shared.events {
             // The run can be at its end; then nobody reads the event.
             let _ = events.send(pent_profile::WatchEvent::Fs {
@@ -1116,12 +1118,16 @@ impl Tree {
         let Ok(rel) = base.strip_prefix(&policy.area) else {
             return;
         };
-        let may = policy
+        let plan = policy
             .shared
             .decider
             .as_ref()
-            .is_some_and(|d| d.may_graft(target));
-        if !may || !std::fs::symlink_metadata(base).is_ok_and(|m| m.is_dir()) {
+            .and_then(|d| d.graft_plan(target))
+            .and_then(|holes| crate::linux_graft::relative_holes(base, &holes));
+        let Some(holes) = plan else {
+            return;
+        };
+        if !std::fs::symlink_metadata(base).is_ok_and(|m| m.is_dir()) {
             return;
         }
         if !lock(&policy.shared.grafted).insert(base.to_path_buf()) {
@@ -1138,7 +1144,7 @@ impl Tree {
         let spawned = std::thread::Builder::new()
             .name("pent-fuse-graft".to_string())
             .spawn(move || {
-                if let Err(e) = grafter.graft(root.as_fd(), &area, &rel, access) {
+                if let Err(e) = grafter.graft(root.as_fd(), &area, &rel, &holes, access) {
                     tracing::debug!("no graft of {}: {e}", area.join(&rel).display());
                 }
             });
