@@ -235,6 +235,7 @@ makes one mutation by hand. The test must fail on the mutant. No
 | 5.11 | A directory of pent inside the width gives a graft. | `classes::tests::a_graft_gets_a_hole_for_each_sensitive_place` |
 | 5.12 | A watched entry gets the short validity time. | `linux_fuse::tests::a_watched_entry_lives_long_and_drops_at_a_change` |
 | 5.12 | A change of the mode drops no attributes. | `linux_fuse::tests::a_watched_entry_lives_long_and_drops_at_a_change` |
+| 5.13 | A move or a new name in a watched directory drops no entry. | `linux_graft::tests::a_graft_goes_away_when_the_host_moves_or_replaces_its_directory` |
 | 5.4 | A traversal rule above an area gives a listing in it. | `linux_graft::tests::each_kind_asks_and_the_files_of_pent_are_hidden` |
 | 5.4 | The decision sends no event. | `linux_graft::tests::each_kind_asks_and_the_files_of_pent_are_hidden` |
 

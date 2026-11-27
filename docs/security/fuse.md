@@ -97,6 +97,7 @@ makes the skip a failure. The container runs of the pipeline give
 | GS-7 | The helper builds a graft with its holes while the tree is detached: a clone of the real width, its attributes, and on each hole a clone of the FUSE node of that place (resolved before the graft exists). Only then it mounts the tree, so a hole is never native, not for a moment; when a step fails, nothing is mounted. | `linux_graft::tests::a_graft_keeps_its_holes_with_fuse` |
 | GS-8 | The server asks the decider for each access that the grants do not give, and the decider knows a rule, a flag or an answer before it asks. So a rule that the static grants cannot hold (a sensitive place inside it) becomes a graft with holes at its first access. | `linux_graft::tests::a_graft_keeps_its_holes_with_fuse` (the fake decider knows the rule) |
 | GS-5 | The helper finds the target of a graft in its mount namespace, and pent holds only the source descriptors of the real directories. A descriptor of a FUSE root would keep the FUSE mount and the session of its server alive after the run. | No direct test: the tests of the events end when the run ends. |
+| GS-9 | A graft holds the inode of the real directory, not its path. When the host moves the directory away or puts a new directory at its path during a run, the watch of the parent drops the entry (NC-2). At the next lookup the server gives `ENOENT` or a new node, and the kernel drops the entry and detaches the graft with it. Then the path shows the state of the host. In a directory with no watch, the entry lives 1 s (`TTL`), and the same check comes after that time. | `linux_graft::tests::a_graft_goes_away_when_the_host_moves_or_replaces_its_directory` (the directory with no watch: no test) |
 
 ## The negative cache (step 5.5)
 
@@ -156,10 +157,11 @@ the mount namespace goes: `lookup_getattr_and_read`, `create_write_and_modes`,
   mounts one FUSE area for each directory outside the base (12 on the
   machine of the tests), and an access in an area that no graft covers
   goes through FUSE.
-- **The validity of a graft.** The entry under a graft lives 1 s, and the
-  kernel checks it again after that time. The server gives the same node,
-  so the graft stays. When the host removes or renames the real
-  directory, the kernel drops the entry and the graft with it.
+- **The validity of a graft.** The kernel checks the entry under a graft
+  again when its validity time ends or when the watch drops it. The server
+  gives the same node, so the graft stays. When the host moves or
+  replaces the real directory, the kernel drops the entry and the graft
+  with it (GS-9).
 - **The Landlock rules in an area.** The Landlock step of the hook opens
   each path of its rules in the child, after the FUSE mounts. A rule in an
   area thus binds to a FUSE node, and its open sends requests to pent;

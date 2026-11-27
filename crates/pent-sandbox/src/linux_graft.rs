@@ -1258,6 +1258,102 @@ ls /proc/self/fd | tr '\n' ' '
         Ok(())
     }
 
+    /// The program reads two grafted directories, waits while the host
+    /// moves one away and replaces the other, and then waits until each
+    /// path shows the state of the host (at most 5 s).
+    const STALE_SCRIPT: &str = r#"set -e
+exec > "$T/out" 2>&1
+cat "$A/moved/f" "$A/swapped/f"
+: > "$T/ready"
+i=0
+while [ ! -e "$T/grafted" ] && [ $i -lt 600 ]; do sleep 0.05; i=$((i+1)); done
+grep -c " $A/moved " /proc/self/mountinfo
+grep -c " $A/swapped " /proc/self/mountinfo
+cat "$A/moved/f" "$A/swapped/f"
+: > "$T/checked"
+i=0
+while [ ! -e "$T/changed" ] && [ $i -lt 600 ]; do sleep 0.05; i=$((i+1)); done
+i=0
+while [ -e "$A/moved" ] && [ $i -lt 100 ]; do sleep 0.05; i=$((i+1)); done
+[ -e "$A/moved" ] && echo moved-stays || echo moved-gone
+i=0
+while [ "$(cat "$A/swapped/f")" != new ] && [ $i -lt 100 ]; do sleep 0.05; i=$((i+1)); done
+cat "$A/swapped/f"
+grep -c " $A/moved " /proc/self/mountinfo || true
+grep -c " $A/swapped " /proc/self/mountinfo || true
+"#;
+
+    /// A graft holds an inode, not a path. When the host moves the real
+    /// directory away or puts a new directory at its path, the graft goes
+    /// away, and the path shows the state of the host.
+    #[test]
+    fn a_graft_goes_away_when_the_host_moves_or_replaces_its_directory() -> TestResult {
+        if !ready() {
+            return Ok(());
+        }
+        let tmp = tempfile::tempdir()?;
+        let base = std::fs::canonicalize(tmp.path())?;
+        let (ws, area) = (base.join("ws"), base.join("area"));
+        for dir in ["moved", "swapped"] {
+            std::fs::create_dir_all(area.join(dir))?;
+            std::fs::write(area.join(dir).join("f"), format!("{dir}\n"))?;
+        }
+        std::fs::create_dir(&ws)?;
+
+        let mut env = crate::build_env(&[]);
+        env.insert("T".to_string(), ws.to_string_lossy().into_owned());
+        env.insert("A".to_string(), area.to_string_lossy().into_owned());
+        let mut config =
+            crate::SandboxConfig::new(ws.clone(), crate::system_default_paths(), ws.clone())
+                .with_env(env.clone())
+                .with_network(crate::NetworkMode::LocalhostOnly);
+        config
+            .paths
+            .read_write
+            .push(area.to_string_lossy().into_owned());
+        config.file_areas = crate::FuseAreas::Listed(vec![area.clone()]);
+        let args = vec!["-c".to_string(), STALE_SCRIPT.to_string()];
+        let path_dirs = crate::resolve_path_directories();
+        let spawned = crate::linux::spawn_linux(
+            &config,
+            "sh",
+            &args,
+            &env,
+            &path_dirs,
+            crate::linux::SpawnMode::Sandbox,
+        )?;
+        let mut child = spawned.child;
+        let files = spawned.files.ok_or("the spawn gave no FUSE areas")?;
+        let result = (|| -> TestResult {
+            wait_for(&ws.join("ready"))?;
+            files.graft(0, Path::new("moved"), GraftAccess::Read)?;
+            files.graft(0, Path::new("swapped"), GraftAccess::Read)?;
+            std::fs::write(ws.join("grafted"), "")?;
+            wait_for(&ws.join("checked"))?;
+            std::fs::rename(area.join("moved"), base.join("moved-away"))?;
+            std::fs::rename(area.join("swapped"), area.join("swapped.old"))?;
+            std::fs::create_dir(area.join("swapped"))?;
+            std::fs::write(area.join("swapped/f"), "new\n")?;
+            std::fs::write(ws.join("changed"), "")?;
+            Ok(())
+        })();
+        if result.is_err() {
+            // Unblock the program, so that the waits below end.
+            let _ = std::fs::write(ws.join("grafted"), "");
+            let _ = std::fs::write(ws.join("changed"), "");
+            let _ = child.kill();
+        }
+        let status = child.wait()?;
+        result?;
+        let out = std::fs::read_to_string(ws.join("out"))?;
+        assert!(status.success(), "the program failed: {status}\n{out}");
+        assert_eq!(
+            out,
+            "moved\nswapped\n1\n1\nmoved\nswapped\nmoved-gone\nnew\n0\n0\n"
+        );
+        Ok(())
+    }
+
     /// The program in the home area. Each line names the result of one
     /// access; see the expected text in the test.
     const HOME_SCRIPT: &str = r#"set -e
