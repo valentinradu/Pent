@@ -18,7 +18,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use pent_profile::{Ask, Event, Hold, Message, QuestionId, Verdict};
+use pent_profile::{AgentFailure, Ask, Event, Hold, Message, QuestionId, Skip, Source, Verdict};
 use pent_settings::RuntimeDir;
 use tokio::io::{AsyncWriteExt as _, BufReader};
 use tokio::net::UnixStream;
@@ -53,6 +53,24 @@ const FLUSH_WAIT: Duration = Duration::from_secs(2);
 /// A connection that lasts this long resets the count of reconnects.
 const STABLE: Duration = Duration::from_secs(30);
 
+/// The longest wait for the reply of pentd to a request of the agent.
+const AGENT_WAIT: Duration = Duration::from_secs(5);
+
+/// The result of a request of the agent: done, or why not.
+pub(crate) type AgentOutcome = Result<(), AgentFailure>;
+
+/// The channel of the result of one request of the agent.
+type AgentReply = tokio::sync::oneshot::Sender<AgentOutcome>;
+
+/// A request of the agent that waits for pentd.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentKind {
+    /// A deny: the verdict of the agent ends it.
+    Deny,
+    /// A skip: the skip that pentd sends back ends it.
+    Skip,
+}
+
 /// The result of a question.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Outcome {
@@ -85,6 +103,10 @@ enum Command {
     Event(Box<Event>, Queued),
     /// Reply when each command before this one left.
     Flush(tokio::sync::oneshot::Sender<()>),
+    /// A deny of the agent for a question of this session.
+    AgentDeny(QuestionId, AgentReply),
+    /// A skip of the agent for a question of this session.
+    Skip(Skip, AgentReply),
 }
 
 /// The place of one event in the count of the queue. The drop leaves the
@@ -223,6 +245,35 @@ impl Session {
         }
     }
 
+    /// Send a deny of the agent for the question `id` of this session, and
+    /// wait for the reply of pentd, at most [`AGENT_WAIT`]. pentd checks
+    /// that the question belongs to this session.
+    pub(crate) async fn agent_deny(&self, id: QuestionId) -> AgentOutcome {
+        let (reply, result) = tokio::sync::oneshot::channel();
+        self.agent(Command::AgentDeny(id, reply), result).await
+    }
+
+    /// Send a skip of the agent, as [`Session::agent_deny`] does.
+    pub(crate) async fn agent_skip(&self, skip: Skip) -> AgentOutcome {
+        let (reply, result) = tokio::sync::oneshot::channel();
+        self.agent(Command::Skip(skip, reply), result).await
+    }
+
+    async fn agent(
+        &self,
+        command: Command,
+        result: tokio::sync::oneshot::Receiver<AgentOutcome>,
+    ) -> AgentOutcome {
+        if self.commands.send(command).is_err() {
+            return Err(AgentFailure::NoPentd);
+        }
+        match tokio::time::timeout(AGENT_WAIT, result).await {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(_)) => Err(AgentFailure::NoPentd),
+            Err(_) => Err(AgentFailure::NoReply),
+        }
+    }
+
     /// Ask `ask` and wait for the verdict, at most until its deadline.
     pub(crate) async fn ask(&self, ask: Ask) -> Outcome {
         let deadline = tokio::time::Instant::now() + ask.deadline.duration();
@@ -256,6 +307,10 @@ struct Waiting {
     numbered: HashMap<QuestionId, Vec<Reply>>,
     /// Each verdict that arrives, for [`Session::take_verdicts`].
     kept: KeptVerdicts,
+    /// The requests of the agent that wait, for each question in the order
+    /// of the requests. pentd handles the messages of one connection in
+    /// order, so the next reply for a question is for the first request.
+    agent: HashMap<QuestionId, VecDeque<(AgentKind, AgentReply)>>,
 }
 
 impl Waiting {
@@ -268,6 +323,30 @@ impl Waiting {
         for reply in self.numbered.drain().flat_map(|(_, r)| r) {
             // The caller can be gone after its deadline.
             let _ = reply.send(Step::Done(None));
+        }
+        for (_, reply) in self.agent.drain().flat_map(|(_, r)| r) {
+            // The agent can be gone after its wait.
+            let _ = reply.send(Err(AgentFailure::NoPentd));
+        }
+    }
+
+    /// End the first request of the agent for `id`, when it has the kind
+    /// `kind` (or any kind for `None`), with `outcome`.
+    fn end_agent(&mut self, id: QuestionId, kind: Option<AgentKind>, outcome: AgentOutcome) {
+        let Some(waiting) = self.agent.get_mut(&id) else {
+            return;
+        };
+        if waiting
+            .front()
+            .is_some_and(|(k, _)| kind.is_none_or(|want| *k == want))
+        {
+            if let Some((_, reply)) = waiting.pop_front() {
+                // The agent can be gone after its wait.
+                let _ = reply.send(outcome);
+            }
+        }
+        if waiting.is_empty() {
+            self.agent.remove(&id);
         }
     }
 
@@ -293,6 +372,9 @@ impl Waiting {
                 self.forget_gone();
             }
             Message::Verdict(verdict) => {
+                if verdict.source == Source::Agent {
+                    self.end_agent(verdict.id, Some(AgentKind::Deny), Ok(()));
+                }
                 for reply in self.numbered.remove(&verdict.id).unwrap_or_default() {
                     // The caller can be gone after its deadline.
                     let _ = reply.send(Step::Done(Some(verdict.clone())));
@@ -307,13 +389,19 @@ impl Waiting {
                 kept.push_back(verdict);
             }
             // pentd refused an ask in place of a number. A refusal with a
-            // number is for an answer, and a session does not answer.
-            Message::Rejected(rejected) if rejected.id.is_none() => {
-                if let Some(reply) = self.unnumbered.pop_front() {
-                    // The caller can be gone after its deadline.
-                    let _ = reply.send(Step::Done(None));
+            // number is for a request of the agent.
+            Message::Rejected(rejected) => match rejected.id {
+                None => {
+                    if let Some(reply) = self.unnumbered.pop_front() {
+                        // The caller can be gone after its deadline.
+                        let _ = reply.send(Step::Done(None));
+                    }
                 }
-            }
+                Some(id) => {
+                    self.end_agent(id, None, Err(AgentFailure::Rejected(rejected.reason)));
+                }
+            },
+            Message::Skip(skip) => self.end_agent(skip.id, Some(AgentKind::Skip), Ok(())),
             other => tracing::debug!("the session does not take {other:?}"),
         }
     }
@@ -372,8 +460,39 @@ async fn run(
                 let _ = done.send(());
             }
             Command::Event(..) => {}
+            Command::AgentDeny(_, reply) | Command::Skip(_, reply) => {
+                // The agent can be gone after its wait.
+                let _ = reply.send(Err(AgentFailure::NoPentd));
+            }
         }
     }
+}
+
+/// Write the request `message` of the agent, and keep `reply` until the
+/// reply of pentd. Returns false when the connection is lost.
+async fn send_agent(
+    write: &mut tokio::net::unix::OwnedWriteHalf,
+    waiting: &mut Waiting,
+    id: QuestionId,
+    kind: AgentKind,
+    reply: AgentReply,
+    message: &Message,
+) -> bool {
+    let line = match message.encode_line() {
+        Ok(line) => line,
+        Err(e) => {
+            tracing::debug!("the session cannot send a request of the agent: {e}");
+            // The agent can be gone after its wait.
+            let _ = reply.send(Err(AgentFailure::NoReply));
+            return true;
+        }
+    };
+    waiting
+        .agent
+        .entry(id)
+        .or_default()
+        .push_back((kind, reply));
+    write.write_all(line.as_bytes()).await.is_ok()
 }
 
 /// Why [`serve`] returned.
@@ -446,6 +565,19 @@ async fn serve(
                     // Each write before this one is in the socket now. The
                     // caller can be gone after its wait.
                     let _ = done.send(());
+                }
+                Some(Command::AgentDeny(id, reply)) => {
+                    let message = Message::AgentDeny(id);
+                    if !send_agent(&mut write, &mut waiting, id, AgentKind::Deny, reply, &message).await {
+                        break Served::Lost;
+                    }
+                }
+                Some(Command::Skip(skip, reply)) => {
+                    let id = skip.id;
+                    let message = Message::Skip(skip);
+                    if !send_agent(&mut write, &mut waiting, id, AgentKind::Skip, reply, &message).await {
+                        break Served::Lost;
+                    }
                 }
             },
             message = incoming.recv() => match message {

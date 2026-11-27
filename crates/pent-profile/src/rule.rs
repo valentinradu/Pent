@@ -481,6 +481,9 @@ pub enum Source {
     Human,
     /// The judge model.
     Model,
+    /// The agent in the sandbox, through `agent.sock`. It can only deny,
+    /// for one run, so pentd never writes a rule with this source.
+    Agent,
 }
 
 impl Source {
@@ -490,6 +493,7 @@ impl Source {
         match self {
             Self::Human => "human",
             Self::Model => "model",
+            Self::Agent => "agent",
         }
     }
 }

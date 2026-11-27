@@ -335,12 +335,16 @@ questions.
 - **The agent cannot allow.** On the same user ID, nothing can stop a
   process outside the sandbox from changing pent. Inside the sandbox, the
   agent cannot reach `pentd.sock`, the rules, `pent.toml` or the model.
-- **`agent.sock`** is the one channel of the agent to pentd. pent binds it
-  into the sandbox and names it in `PENT_AGENT_SOCK`. It knows three verbs:
-  `denials` (read the denials of the session), `deny ID`, and `skip ID
-  REASON` (send the request up to the human, with a reason). `allow` does not
-  exist on this socket. The `pent` binary inside the sandbox uses it
-  (`pent denials`, `pent deny`, `pent skip`).
+- **`agent.sock`** is the one channel of the agent. `pent run` serves it,
+  so it lives as long as the run, also when pentd restarts. The sandbox
+  gets it as an allowed Unix socket, and `PENT_AGENT_SOCK` names it. It
+  knows three verbs: `denials` (read the refusals of the run, from the list
+  of `pent run`), `deny ID`, and `skip ID REASON` (send the request up to
+  the human, with a reason). `pent run` relays `deny` and `skip` to pentd,
+  which checks that the question belongs to the session. A deny of the
+  agent holds for this run and for the exact target, so it cannot block a
+  later run. `allow` does not exist on this socket. The `pent` binary
+  inside the sandbox uses it (`pent denials`, `pent deny`, `pent skip`).
 - **The agent learns of a denial** from the error of the program, or from a
   hook of the user that runs `pent denials`.
 

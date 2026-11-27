@@ -15,6 +15,7 @@ result.
 | [pentd.md](pentd.md) | The daemon, its socket, its lock and its holds (branch `next`) |
 | [run.md](run.md) | The rules in `pent run`: the key, the chain of deciders, the grants and the events (branch `next`) |
 | [fuse.md](fuse.md) | The FUSE server, the grafts and the areas of the files (branch `next`) |
+| [agent.md](agent.md) | `agent.sock`, the channel of the agent in the sandbox (branch `next`) |
 | [fuzzing.md](fuzzing.md) | The parsers that read bytes which an attacker chooses: the fuzz run and its findings |
 
 ## The state of the branch `next`

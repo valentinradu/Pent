@@ -39,8 +39,13 @@ pub(crate) enum Command {
     Daemon(DaemonArgs),
     /// Allow one open question. `pent questions` shows the codes
     Allow(AnswerArgs),
-    /// Deny one open question. `pent questions` shows the codes
+    /// Deny one open question. `pent questions` shows the codes. Inside
+    /// the sandbox of `pent run`, the deny holds for this run and for the
+    /// exact target
     Deny(AnswerArgs),
+    /// Inside the sandbox of `pent run`: send one open question of the run
+    /// up to the human, with a reason
+    Skip(SkipArgs),
     /// List the open questions with their width menus
     Questions(QuestionsArgs),
     /// Answer the questions, and see the events and the rules, on a
@@ -66,6 +71,17 @@ pub(crate) struct AnswerArgs {
     /// answer holds only for the runs that wait now
     #[arg(long)]
     pub remember: bool,
+}
+
+#[derive(Args)]
+pub(crate) struct SkipArgs {
+    /// The code of the question, for example k3m9tx. `pent denials` shows
+    /// it
+    pub id: String,
+
+    /// Why the human must answer it, in at most 512 bytes. The human sees
+    /// it as untrusted text
+    pub reason: String,
 }
 
 #[derive(Args)]

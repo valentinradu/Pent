@@ -1,6 +1,6 @@
 # Plan: the new pent
 
-**Cursor: step 6.1.** Steps with `[x]` are done. Work on the branch `next`,
+**Cursor: step 6.2.** Steps with `[x]` are done. Work on the branch `next`,
 one commit for each step, and move this cursor when a step is done.
 
 **The way of work.** One commit for each step. Then the user runs
@@ -546,12 +546,40 @@ section 14 of the design has their results.
 
 ## Phase 6: agents
 
-- [ ] **6.1 `agent.sock`.** pentd makes one agent socket for each session.
-  pent binds it into the sandbox and names it in `PENT_AGENT_SOCK`. It
-  knows only `denials`, `deny ID` and `skip ID REASON`. The `pent` binary
-  inside the sandbox uses it.
+- [x] **6.1 `agent.sock`.** One agent socket for each run. pent binds it
+  into the sandbox and names it in `PENT_AGENT_SOCK`. It knows only
+  `denials`, `deny ID` and `skip ID REASON`. The `pent` binary inside the
+  sandbox uses it.
   - Done: a test proves that no message on `agent.sock` can allow an
     access, and that the program cannot reach `pentd.sock`.
+  - Files: `pent-profile/src/agent.rs` (the protocol); `AgentServer`,
+    `DenialLog` and `call` in `pent/src/agent.rs`; `agent_deny`,
+    `agent_skip` and the routing of the replies in
+    `pent/src/daemon/client.rs`; `Hub::agent_deny`, `Hub::skip` and
+    `Hub::apply` in `hub.rs`; `Queue::check_agent_deny` and `Queue::skip`;
+    `pent skip`, and `pent denials` and `pent deny` with
+    `PENT_AGENT_SOCK`, in `commands/answer.rs`; the reason in
+    `pent monitor`; `docs/security/agent.md` (AG-1 to AG-8).
+  - Decisions (2026-11-27):
+    - `pent run` serves the socket, not pentd: a session of pentd changes
+      at each restart of pentd, but the sandbox gets its sockets once, at
+      the start. `pent run` relays `deny` and `skip` on the connection of
+      its session, and pentd checks the owner of the question.
+    - `pent run` answers `denials` from its own list: at most 1024
+      different refusals, the same access of the same program as one entry
+      with a count, and the oldest entry leaves first. The reply names the
+      number of refusals that left the list. No decision reads the list.
+    - A deny of the agent holds for this run and for the exact target, with
+      the new source `agent`: an agent cannot block a later run.
+    - A skip keeps the reason on the question, as untrusted text of at most
+      512 bytes. `pent monitor` and `pent questions` show it.
+    - The socket is in `$XDG_RUNTIME_DIR/pent-agent-CODE/` (mode 0700), or
+      in `/tmp` when that path is too long for a socket. The file is not
+      visible in the sandbox, as each socket in a private directory: the
+      supervisor connects to it from the host.
+    - `pent run` gives exec access to its own binary.
+    - The fuzz record of `protocol_line` is stale, and no fuzz target reads
+      `agent.sock` yet.
 - [ ] **6.2 An example hook for Claude Code** in the docs: a `PostToolUse`
   hook that runs `pent denials`.
 

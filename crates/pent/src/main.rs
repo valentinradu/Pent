@@ -1,6 +1,7 @@
 #[cfg(not(target_os = "linux"))]
 compile_error!("pent runs on Linux only");
 
+mod agent;
 mod cli;
 mod commands;
 mod daemon;
@@ -48,6 +49,7 @@ async fn dispatch(cli: Cli) -> Result<(), CliError> {
             commands::answer::answer(&args, pent_profile::Decision::Allow).await
         }
         Command::Deny(args) => commands::answer::answer(&args, pent_profile::Decision::Deny).await,
+        Command::Skip(args) => commands::answer::skip(&args).await,
         Command::Questions(args) => commands::answer::questions(&args).await,
         Command::Monitor => monitor::monitor().await,
         Command::Denials(args) => commands::answer::denials(&args).await,

@@ -40,6 +40,15 @@
 //!   orphan of an ended session, after its time). Each watcher removes it.
 //! - [`EventsDropped`]: a watcher fell behind, and pentd dropped events for
 //!   it. pentd never drops a question or a verdict.
+//! - [`Message::AgentDeny`]: the agent of a session denies one question of
+//!   that session, for this run and for the exact target, through
+//!   `agent.sock` and `pent run`.
+//! - [`Skip`]: the agent of a session sends one question of that session
+//!   up to the human, with a reason. pentd sends it to each watcher too.
+//!
+//! The agent in the sandbox has its own protocol on `agent.sock` (see
+//! [`crate::agent`]); `pent run` relays two of its requests with the
+//! messages above.
 
 use std::fmt;
 use std::num::NonZeroU16;
@@ -574,6 +583,56 @@ pub struct Verdict {
     pub source: Source,
 }
 
+/// The most bytes of the reason of a [`Skip`].
+pub const MAX_REASON_LEN: usize = 512;
+
+/// The reason of the agent for a [`Skip`]: text of 1 to [`MAX_REASON_LEN`]
+/// bytes. The agent chose it, so it is untrusted: a screen shows it through
+/// [`safe`], and the judge gets it as data.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct AgentReason(String);
+
+/// The text of a reason is empty or longer than [`MAX_REASON_LEN`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("a reason has 1 to {MAX_REASON_LEN} bytes; this one has {0}")]
+pub struct BadReason(usize);
+
+impl TryFrom<String> for AgentReason {
+    type Error = BadReason;
+
+    fn try_from(text: String) -> Result<Self, Self::Error> {
+        if text.is_empty() || text.len() > MAX_REASON_LEN {
+            return Err(BadReason(text.len()));
+        }
+        Ok(Self(text))
+    }
+}
+
+impl From<AgentReason> for String {
+    fn from(reason: AgentReason) -> Self {
+        reason.0
+    }
+}
+
+impl AgentReason {
+    /// The text, as the agent wrote it. Show it only through [`safe`].
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The agent sends a question up to the human, with a reason.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Skip {
+    /// The question.
+    pub id: QuestionId,
+    /// Why the human must answer it.
+    pub reason: AgentReason,
+}
+
 /// Why pentd refused a message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -675,6 +734,10 @@ pub enum Message {
     EventsDropped(EventsDropped),
     /// pentd dropped this open question with no answer.
     Gone(QuestionId),
+    /// The agent of the session denies this question of the session.
+    AgentDeny(QuestionId),
+    /// See [`Skip`].
+    Skip(Skip),
     /// The end of the reply to [`Message::Questions`] or
     /// [`Message::Denials`].
     End,

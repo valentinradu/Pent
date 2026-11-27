@@ -14,7 +14,8 @@ the cause `base` to an event: the fixed rules decided with no question.
 - `crates/pent-profile/src/protocol.rs`: the messages `Hold`, `Ask`,
   `Question`, `Answer`, `Verdict`, `Watch`, `Rejected`, `Event`,
   `Questions`, `Denials`, `Denial`, `Forget`, `Forgotten`, `End`, `Session`,
-  `EventsDropped` and `Gone`, and the
+  `EventsDropped`, `Gone`, `AgentDeny` and `Skip` (step 6.1, see
+  [agent.md](agent.md)), and the
   JSON lines codec. `Rejected` names one of ten reasons:
   `unknown_question`, `bad_width`, `not_human`, `not_permitted`, `too_long`,
   `too_many`, `rule_not_kept`, `unknown_session`, `rules_not_written` and
@@ -59,7 +60,7 @@ cargo +nightly fuzz run protocol_line -- -max_total_time=150 -rss_limit_mb=4096
 | PR-4 | The decoder checks each value with the type of the rules: a path is absolute, has no `..` component and no NUL byte, a key is a safe file name, a port is not 0, and a wildcard does not cover a public suffix. | `a_line_with_a_bad_value_is_refused` |
 | PR-5 | An unknown field is an error at each level, also in a target of a menu. An unknown message and an unknown value are errors. | `a_line_with_a_bad_value_is_refused` |
 | PR-6 | A test holds the form of a line, so a change of the form is a decision, not an accident. | `the_form_of_a_line_is_stable` |
-| PR-7 | A line that the decoder accepts encodes to one line that decodes to the same message. | The fuzz target `protocol_line`: 10,132,170 inputs in 151 seconds with the messages of step 2.5 (`session`, `events_dropped`, `gone`), no finding (2026-11-23). **The record is stale:** step 3.1 adds the cause `base` to `Event`, and the target did not run with it yet. |
+| PR-7 | A line that the decoder accepts encodes to one line that decodes to the same message. | The fuzz target `protocol_line`: 10,132,170 inputs in 151 seconds with the messages of step 2.5 (`session`, `events_dropped`, `gone`), no finding (2026-11-23). **The record is stale:** step 3.1 adds the cause `base` to `Event`, and step 6.1 adds `AgentDeny`, `Skip` and the source `agent`; the target did not run with them yet. |
 | PR-8 | A deadline has at most 600 s (`MAX_DEADLINE`). The decoder refuses a longer one, so `Instant::now() + deadline` in pentd cannot overflow. | `a_line_with_a_bad_value_is_refused`, `a_deadline_has_a_limit` |
 | PR-9 | A time is a signed number of milliseconds since 1970. A host with a clock before 1970 can still encode each message. | `a_time_before_1970_is_negative_and_survives` |
 | PR-10 | `pent run` sends an `Ask`, which has no number. Only pentd gives a number, in a `Question`. Thus no number has a special meaning. | `each_message_survives_a_round_trip_on_one_line` |

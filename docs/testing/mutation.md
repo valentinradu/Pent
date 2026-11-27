@@ -251,6 +251,12 @@ makes one mutation by hand. The test must fail on the mutant. No
 | 5.13 | The check of a hole looks only at the kinds of a write or an exec. | `decide::tests::a_graft_needs_a_clean_subtree` |
 | 5.13 | The attributes in a watched directory live one hour. | `linux_fuse::tests::a_write_through_a_shared_mmap_becomes_visible` (with `cat` the mutant survived: after a read the `fstat` of `cat` asks for the attributes anyway; the test reads with a plain `read`) |
 | 5.13 | The server does not ask for `FUSE_AUTO_INVAL_DATA`. | `linux_fuse::tests::a_write_through_a_shared_mmap_becomes_visible` |
+| 6.1 | The queue does not check the session of a question. | `hub::tests::the_agent_of_a_session_denies_only_its_own_questions` |
+| 6.1 | The deny of the agent keeps the source `human`. | `hub::tests::the_agent_of_a_session_denies_only_its_own_questions` |
+| 6.1 | The deny of the agent takes the widest place of the menu. | `hub::tests::the_deny_of_the_agent_names_the_exact_target` (a question of a port has one place, so the first test did not see it) |
+| 6.1 | `pent run` does not relay a deny. | `pentd::the_agent_can_deny_and_skip_but_never_allow` |
+| 6.1 | `pent run` does not relay a skip. | `pentd::the_agent_can_deny_and_skip_but_never_allow` |
+| 6.1 | `pent run` gives no exec access to its own binary. | `pentd::the_agent_can_deny_and_skip_but_never_allow` |
 | 5.4 | A traversal rule above an area gives a listing in it. | `linux_graft::tests::each_kind_asks_and_the_files_of_pent_are_hidden` |
 | 5.4 | The decision sends no event. | `linux_graft::tests::each_kind_asks_and_the_files_of_pent_are_hidden` |
 

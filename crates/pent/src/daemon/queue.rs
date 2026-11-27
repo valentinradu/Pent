@@ -23,14 +23,18 @@
 //!   with the scope `remember` becomes a rule.
 //! - **A question of a session that ended** stays open for [`ORPHAN_TTL`],
 //!   so a late answer still becomes a rule. Then the queue drops it.
+//! - **The agent of a session** can deny or skip only a question of that
+//!   session ([`Queue::check_agent_deny`], [`Queue::skip`]). Its deny holds
+//!   for this run and for the exact target.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
 use super::random;
 use pent_profile::{
-    exact_target, Access, Answer, Ask, Class, Decision, Question, QuestionId, RejectReason,
-    Request, Rule, RuleKey, RuleSet, Scope, SessionId, Source, Target, Verdict,
+    exact_target, Access, AgentReason, Answer, Ask, Class, Decision, MenuIndex, Question,
+    QuestionId, RejectReason, Request, Rule, RuleKey, RuleSet, Scope, SessionId, Skip, Source,
+    Target, Verdict,
 };
 
 /// How long a question of a session that ended stays open.
@@ -42,6 +46,9 @@ struct Entry {
     question: Question,
     /// When the session of the question ended, or `None` while it runs.
     orphaned: Option<std::time::Instant>,
+    /// The reason of the agent of the session, after a skip. It is
+    /// untrusted.
+    reason: Option<AgentReason>,
 }
 
 /// The most open questions of one session. A run waits on far fewer; the
@@ -204,6 +211,7 @@ impl Queue {
             Entry {
                 question: question.clone(),
                 orphaned: None,
+                reason: None,
             },
         );
         Ok((question, true))
@@ -304,6 +312,69 @@ impl Queue {
     /// The open question `id`.
     fn entry(&self, id: QuestionId) -> Option<&Entry> {
         self.seq_of.get(&id).and_then(|seq| self.open.get(seq))
+    }
+
+    /// The open question `id` of the live session `session`. A question of
+    /// another session, or of a session that ended, gives
+    /// `UnknownQuestion`, as a code that does not exist: the agent of one
+    /// run learns nothing of the questions of another run.
+    fn own_entry(&self, session: SessionId, id: QuestionId) -> Result<&Entry, RejectReason> {
+        self.entry(id)
+            .filter(|e| e.question.ask.session == session && e.orphaned.is_none())
+            .ok_or(RejectReason::UnknownQuestion)
+    }
+
+    /// Check a deny of the agent of `session` for its question `id`,
+    /// without a change to the queue. The deny holds for this run
+    /// ([`Scope::Run`]) and for the exact target (the first place of the
+    /// menu), and its source is [`Source::Agent`].
+    ///
+    /// # Errors
+    /// Returns `UnknownQuestion` when `id` is not an open question of
+    /// `session`, and the reasons of [`Queue::check`].
+    pub(crate) fn check_agent_deny(
+        &self,
+        session: SessionId,
+        id: QuestionId,
+    ) -> Result<Plan, RejectReason> {
+        self.own_entry(session, id)?;
+        let mut plan = self.check(&Answer {
+            id,
+            decision: Decision::Deny,
+            width: MenuIndex(0),
+            scope: Scope::Run,
+            source: Source::Human,
+        })?;
+        plan.source = Source::Agent;
+        Ok(plan)
+    }
+
+    /// Keep the reason of a skip of the agent of `session`. A later skip
+    /// of the same question replaces the reason.
+    ///
+    /// # Errors
+    /// Returns `UnknownQuestion` when the question is not an open question
+    /// of `session`.
+    pub(crate) fn skip(&mut self, session: SessionId, skip: &Skip) -> Result<(), RejectReason> {
+        self.own_entry(session, skip.id)?;
+        let entry = self
+            .seq_of
+            .get(&skip.id)
+            .and_then(|seq| self.open.get_mut(seq))
+            .ok_or(RejectReason::UnknownQuestion)?;
+        entry.reason = Some(skip.reason.clone());
+        Ok(())
+    }
+
+    /// The skip of each open question that has a reason, in the order of
+    /// the questions.
+    pub(crate) fn skips(&self) -> impl Iterator<Item = Skip> + '_ {
+        self.open.values().filter_map(|e| {
+            e.reason.as_ref().map(|reason| Skip {
+                id: e.question.id,
+                reason: reason.clone(),
+            })
+        })
     }
 
     /// Remove the question `id` from the queue and from the index.

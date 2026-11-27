@@ -21,6 +21,7 @@
 //!
 //! See `docs/design/watch.md` for the full design.
 
+pub mod agent;
 pub mod class;
 pub mod doc;
 pub mod event;
@@ -35,6 +36,7 @@ pub mod rule;
 pub mod rule_file;
 pub mod summary;
 
+pub use agent::{AgentDenial, AgentFailure, AgentReply, AgentRequest, AGENT_PROTOCOL_VERSION};
 pub use class::{
     exact_target, Class, Classifier, GuardSpot, Sensitive, ESCAPE_SOCKETS, HOME_AGENT_SOCKETS,
     PENT_HOME_DIRS, RESOLVER_SOCKETS,
@@ -47,11 +49,11 @@ pub use guard::{
 pub use localhost::{control_port, is_localhost_name, is_loopback, CONTROL_PORTS};
 pub use name::{ProfileName, ProfileNameError};
 pub use protocol::{
-    Answer, Ask, BadCode, Deadline, DeadlineTooLong, DecidedBy, Denial, Event, EventsDropped,
-    Forget, Forgotten, Hold, MenuIndex, Message, ProtocolError, Question, QuestionId, RejectReason,
-    Rejected, Request, Scope, SessionId, SessionInfo, Timestamp, Verdict, CODE_ALPHABET, CODE_LEN,
-    CODE_SPACE, DNS_DEADLINE, FILE_DEADLINE, MAX_DEADLINE, MAX_LINE_LEN, PROTOCOL_VERSION,
-    PROXY_DEADLINE,
+    AgentReason, Answer, Ask, BadCode, BadReason, Deadline, DeadlineTooLong, DecidedBy, Denial,
+    Event, EventsDropped, Forget, Forgotten, Hold, MenuIndex, Message, ProtocolError, Question,
+    QuestionId, RejectReason, Rejected, Request, Scope, SessionId, SessionInfo, Skip, Timestamp,
+    Verdict, CODE_ALPHABET, CODE_LEN, CODE_SPACE, DNS_DEADLINE, FILE_DEADLINE, MAX_DEADLINE,
+    MAX_LINE_LEN, MAX_REASON_LEN, PROTOCOL_VERSION, PROXY_DEADLINE,
 };
 pub use render::{
     render_draft, render_draft_with, render_header, render_profile, render_terminal, safe,

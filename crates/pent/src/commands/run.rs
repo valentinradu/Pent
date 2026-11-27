@@ -132,7 +132,21 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
         rules,
         hold_pentd(&key, &args.command),
     ));
-    let env_map = build_run_env(&args.env);
+    let mut env_map = build_run_env(&args.env);
+    // `agent.sock` (design, section 9): the agent reads the refusals of the
+    // run, and it can deny or skip a question of the run. Without a sandbox
+    // the program reaches pentd anyway, so it gets no socket.
+    let agent = if args.no_sandbox {
+        None
+    } else {
+        start_agent(&decider)
+    };
+    if let Some(agent) = &agent {
+        env_map.insert(
+            crate::agent::AGENT_SOCK_VAR.to_string(),
+            agent.path().to_string_lossy().into_owned(),
+        );
+    }
     // In a FUSE area the chain of deciders applies each file rule, also one
     // that the static layers cannot hold, so such a rule needs no warning.
     // The sandbox gets the same list, with the home directory of its
@@ -164,6 +178,13 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
 
     let mut paths = grants.paths.clone();
     add_cli_paths(&mut paths, &args);
+    // The agent runs `pent denials`, `pent deny` and `pent skip` with this
+    // binary, and its first run must not ask.
+    if agent.is_some() {
+        if let Ok(exe) = std::env::current_exe() {
+            paths.execute.push(exe.to_string_lossy().into_owned());
+        }
+    }
     paths.resolve_relative(&cwd);
     // The read_write paths must be exact filenames — glob ('*') patterns
     // are not supported because overlayfs requires specific paths to mount over.
@@ -255,6 +276,9 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
     sandbox_cfg.record_events = args.trace;
     sandbox_cfg.file_areas = pent_sandbox::FuseAreas::Listed(areas);
     sandbox_cfg.unix_sockets = unix_socket_paths(&grants.unix_sockets, &args.unix_socket, &cwd);
+    if let Some(agent) = &agent {
+        sandbox_cfg.unix_sockets.push(agent.path().to_path_buf());
+    }
     sandbox_cfg.localhost = LocalhostPorts::Listed(localhost_ports);
     // A Unix socket or a port off the lists asks, except with
     // `--network blocked`: that flag refuses each such access with no
@@ -420,6 +444,30 @@ fn make_decider(
 }
 
 /// Add the paths of the CLI flags to the paths of the rules.
+/// Start the server of `agent.sock` next to the runtime directory of pentd,
+/// or in `/tmp` when that fails (a socket path has at most 108 bytes). Both
+/// are private directories of the sandbox, so the program does not see the
+/// file; the supervisor connects to it from the host. Without both, warn
+/// and go on.
+fn start_agent(
+    decider: &std::sync::Arc<crate::commands::decide::Decider>,
+) -> Option<crate::agent::AgentServer> {
+    let runtime = pent_settings::RuntimeDir::from_env();
+    let mut parents: Vec<&Path> = runtime.path().parent().into_iter().collect();
+    parents.push(Path::new("/tmp"));
+    let mut last = None;
+    for parent in parents {
+        match crate::agent::AgentServer::start(parent, std::sync::Arc::clone(decider)) {
+            Ok(server) => return Some(server),
+            Err(e) => last = Some(e),
+        }
+    }
+    if let Some(e) = last {
+        ui::warn(format!("the run has no agent.sock: {e}"));
+    }
+    None
+}
+
 fn add_cli_paths(paths: &mut pent_settings::SandboxPaths, args: &RunArgs) {
     let strings = |list: &[PathBuf]| -> Vec<String> {
         list.iter()

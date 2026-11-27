@@ -92,6 +92,9 @@ fn draw_questions(frame: &mut Frame<'_>, area: Rect, model: &Model) {
             if let Class::Sensitive(sensitive) = question.ask.class {
                 spans.push(Span::styled(format!("  ! {}", sensitive.warning()), WARN));
             }
+            if model.reason(question.id).is_some() {
+                spans.push(Span::raw("  (the agent asks you)"));
+            }
             let line = Line::from(spans);
             lines.push(if Some(question.id) == selected {
                 line.style(SELECTED)
@@ -153,6 +156,12 @@ fn detail_lines(model: &Model) -> Vec<Line<'static>> {
                 "warning: {}; only the exact target, and only you can answer",
                 sensitive.warning()
             ),
+            WARN,
+        ));
+    }
+    if let Some(reason) = model.reason(question.id) {
+        lines.push(Line::styled(
+            format!("the agent says (untrusted): {}", safe(reason.as_str())),
             WARN,
         ));
     }
@@ -379,6 +388,31 @@ mod tests {
             ),
             "{text}"
         );
+    }
+
+    #[test]
+    fn a_skip_of_the_agent_shows_its_reason_as_untrusted_text() {
+        let mut model = Model::default();
+        model.apply(Message::Question(read(3, "claude", "/h/r/a", "/h/r")));
+        let reason =
+            pent_profile::AgentReason::try_from("needs it \u{1b}[31m".to_string()).unwrap();
+        model.apply(Message::Skip(pent_profile::Skip {
+            id: pent_profile::QuestionId(3),
+            reason,
+        }));
+        let text = screen(&model, 100, 24);
+        assert!(text.contains("(the agent asks you)"), "{text}");
+        assert!(
+            text.contains("the agent says (untrusted): needs it"),
+            "{text}"
+        );
+        assert!(!text.contains('\u{1b}'), "{text}");
+        // A skip of a question that is not on the screen changes nothing.
+        model.apply(Message::Skip(pent_profile::Skip {
+            id: pent_profile::QuestionId(9),
+            reason: pent_profile::AgentReason::try_from("x".to_string()).unwrap(),
+        }));
+        assert!(model.reason(pent_profile::QuestionId(9)).is_none());
     }
 
     #[test]

@@ -34,7 +34,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use pent_profile::Class;
 use pent_profile::{
     Answer, EventsDropped, Forget, Forgotten, Hold, Message, QuestionId, RejectReason, Rejected,
-    RuleKey, Scope, SessionId, SessionInfo, Verdict,
+    RuleKey, Scope, SessionId, SessionInfo, Skip, Verdict,
 };
 
 use super::classes::Classes;
@@ -383,9 +383,14 @@ impl Hub {
                     return;
                 }
                 let mut batch = Batch::default();
-                for question in self.lock().queue.open() {
+                let state = self.lock();
+                for question in state.queue.open() {
                     batch.push(&Message::Question(question.clone()));
                 }
+                for skip in state.queue.skips() {
+                    batch.push(&Message::Skip(skip));
+                }
+                drop(state);
                 batch.push(&Message::End);
                 outbox.send(batch);
             }
@@ -433,6 +438,9 @@ impl Hub {
                 for question in state.queue.open() {
                     batch.push(&Message::Question(question.clone()));
                 }
+                for skip in state.queue.skips() {
+                    batch.push(&Message::Skip(skip));
+                }
                 for event in state.denials.recent() {
                     batch.push(&Message::Event(event));
                 }
@@ -442,6 +450,20 @@ impl Hub {
                         dropped: 0,
                     });
                 }
+            }
+            Message::AgentDeny(id) => {
+                let Role::Session { id: session, .. } = role else {
+                    reject(outbox, Some(id), RejectReason::NotPermitted);
+                    return;
+                };
+                self.agent_deny(*session, outbox, id).await;
+            }
+            Message::Skip(skip) => {
+                let Role::Session { id: session, .. } = role else {
+                    reject(outbox, Some(skip.id), RejectReason::NotPermitted);
+                    return;
+                };
+                self.skip(*session, outbox, skip);
             }
             other => tracing::debug!("pentd does not take {other:?} from a client"),
         }
@@ -537,6 +559,42 @@ impl Hub {
                 return;
             }
         };
+        self.apply(outbox, plan, Answerer::Client).await;
+    }
+
+    /// The deny of the agent of `session` for its question `id`
+    /// ([`super::queue::Queue::check_agent_deny`]). The session gets the
+    /// verdict as the session of the question; a refusal goes to it with
+    /// the number.
+    async fn agent_deny(&self, session: SessionId, outbox: &Outbox, id: QuestionId) {
+        let _write = self.writes.lock().await;
+        let plan = match self.lock().queue.check_agent_deny(session, id) {
+            Ok(plan) => plan,
+            Err(reason) => {
+                reject(outbox, Some(id), reason);
+                return;
+            }
+        };
+        self.apply(outbox, plan, Answerer::Session).await;
+    }
+
+    /// Keep the reason of a skip of the agent of `session`, and send the
+    /// skip to the session and to each watcher.
+    fn skip(&self, session: SessionId, outbox: &Outbox, skip: Skip) {
+        let mut state = self.lock();
+        if let Err(reason) = state.queue.skip(session, &skip) {
+            reject(outbox, Some(skip.id), reason);
+            return;
+        }
+        let batch = Batch::of(&Message::Skip(skip));
+        outbox.send(batch.clone());
+        broadcast(&mut state.watchers, &batch);
+    }
+
+    /// Resolve the checked answer `plan`, write its rule for `remember`,
+    /// and send the verdicts. The caller holds `writes`.
+    async fn apply(&self, outbox: &Outbox, plan: Plan, answerer: Answerer) {
+        let answer_id = plan.id;
         let scope = match plan.scope {
             Scope::Remember if self.write_rule(&plan).await => Scope::Remember,
             Scope::Remember | Scope::Run => Scope::Run,
@@ -547,9 +605,9 @@ impl Hub {
         let mut to_answerer = Batch::default();
         match answer_end(plan.id, &verdicts, plan.scope, scope) {
             AnswerEnd::Verdicts => {}
-            AnswerEnd::NotKept => to_answerer.push(&rejected(answer.id, RejectReason::RuleNotKept)),
+            AnswerEnd::NotKept => to_answerer.push(&rejected(answer_id, RejectReason::RuleNotKept)),
             AnswerEnd::Gone => {
-                to_answerer.push(&rejected(answer.id, RejectReason::UnknownQuestion))
+                to_answerer.push(&rejected(answer_id, RejectReason::UnknownQuestion))
             }
             AnswerEnd::GoneButKept => to_answerer.push(&Message::Verdict(plan.verdict(scope))),
         }
@@ -566,9 +624,10 @@ impl Hub {
                 target.send(batch);
             }
         }
-        // A watcher gets the verdicts with the other watchers; one copy is
+        // A watcher gets the verdicts with the other watchers, and a
+        // session gets them as the session of its question; one copy is
         // enough.
-        if !state.watches(outbox) {
+        if answerer == Answerer::Client && !state.watches(outbox) {
             to_answerer.0.push_str(&to_watchers.0);
         }
         // The answerer gets its batch first: when it watches, its
@@ -722,6 +781,15 @@ fn flush(state: &mut State) {
             watcher.dropped = missed.saturating_add(count);
         }
     }
+}
+
+/// Who sent an answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Answerer {
+    /// A client of `pentd.sock` (`pent monitor`, `pent deny`).
+    Client,
+    /// A session, for its agent.
+    Session,
 }
 
 /// What the client that answered gets besides the verdicts.
@@ -900,6 +968,15 @@ mod tests {
 
     /// Hold a session of `cargo` and ask for the port `port`.
     async fn ask_port(hub: &Arc<Hub>, port: u16) -> (Role, Outbox, QuestionId) {
+        let (role, session, _rx, id) = ask_port_rx(hub, port).await;
+        (role, session, id)
+    }
+
+    /// [`ask_port`], and the messages of pentd to the session.
+    async fn ask_port_rx(
+        hub: &Arc<Hub>,
+        port: u16,
+    ) -> (Role, Outbox, mpsc::Receiver<Batch>, QuestionId) {
         let (session, mut rx, _c) = Outbox::new();
         let mut role = Role::Client;
         let hold = Hold::Run {
@@ -927,7 +1004,176 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        (role, session, id)
+        (role, session, rx, id)
+    }
+
+    /// The messages of each batch in `rx`, in one list.
+    fn messages(rx: &mut mpsc::Receiver<Batch>) -> Vec<Message> {
+        drain(rx).into_iter().flatten().collect()
+    }
+
+    fn reason(text: &str) -> pent_profile::AgentReason {
+        pent_profile::AgentReason::try_from(text.to_string()).unwrap()
+    }
+
+    /// The agent of a session denies its own question for this run and for
+    /// the exact target; it cannot touch the question of another session,
+    /// and a client of `pentd.sock` cannot send its messages.
+    #[tokio::test]
+    async fn the_agent_of_a_session_denies_only_its_own_questions() {
+        let hub = hub_with(None);
+        let (watcher, mut watched, _c) = Outbox::new();
+        hub.handle(&mut Role::Client, &watcher, Message::Watch)
+            .await;
+        let (mut role_a, session_a, mut rx_a, id_a) = ask_port_rx(&hub, 5432).await;
+        let (mut role_b, session_b, mut rx_b, id_b) = ask_port_rx(&hub, 6379).await;
+        drain(&mut watched);
+
+        // The other session gets the refusal of an unknown code, and the
+        // question stays open.
+        hub.handle(&mut role_b, &session_b, Message::AgentDeny(id_a))
+            .await;
+        assert!(matches!(
+            &messages(&mut rx_b)[..],
+            [Message::Rejected(Rejected { id: Some(r), reason: RejectReason::UnknownQuestion })] if *r == id_a
+        ));
+        let skip = Skip {
+            id: id_a,
+            reason: reason("x"),
+        };
+        hub.handle(&mut role_b, &session_b, Message::Skip(skip.clone()))
+            .await;
+        assert!(matches!(
+            &messages(&mut rx_b)[..],
+            [Message::Rejected(Rejected {
+                reason: RejectReason::UnknownQuestion,
+                ..
+            })]
+        ));
+        // A client of the socket may not send them.
+        let (client, mut rx_c, _cc) = Outbox::new();
+        let mut plain = Role::Client;
+        hub.handle(&mut plain, &client, Message::AgentDeny(id_a))
+            .await;
+        hub.handle(&mut plain, &client, Message::Skip(skip)).await;
+        let refused = messages(&mut rx_c);
+        assert_eq!(refused.len(), 2);
+        assert!(refused.iter().all(|m| matches!(
+            m,
+            Message::Rejected(Rejected {
+                reason: RejectReason::NotPermitted,
+                ..
+            })
+        )));
+        assert_eq!(hub.lock().queue.len(), 2);
+        assert!(drain(&mut watched).is_empty());
+
+        // The own deny: one verdict for the session and one for the watcher,
+        // with the scope `run`, the exact target and the source `agent`.
+        hub.handle(&mut role_a, &session_a, Message::AgentDeny(id_a))
+            .await;
+        let port = NonZeroU16::new(5432).unwrap();
+        let is_deny = |m: &Message| {
+            matches!(m, Message::Verdict(v) if v.id == id_a
+                && v.decision == Decision::Deny
+                && v.scope == Scope::Run
+                && v.source == Source::Agent
+                && v.target == Target::Localhost(port))
+        };
+        let to_a = messages(&mut rx_a);
+        assert!(matches!(&to_a[..], [m] if is_deny(m)), "{to_a:?}");
+        let to_watcher = messages(&mut watched);
+        assert!(
+            matches!(&to_watcher[..], [m] if is_deny(m)),
+            "{to_watcher:?}"
+        );
+        assert!(messages(&mut rx_b).is_empty());
+        assert_eq!(hub.lock().queue.len(), 1);
+        // The question of the other session is still open.
+        assert!(hub.lock().queue.open().any(|q| q.id == id_b));
+    }
+
+    /// The deny of the agent names the exact target, also when the menu of
+    /// the question has wider places.
+    #[tokio::test]
+    async fn the_deny_of_the_agent_names_the_exact_target() {
+        let hub = hub_with(None);
+        let (session, mut rx, _c) = Outbox::new();
+        let mut role = Role::Client;
+        let hold = Hold::Run {
+            key: "cargo".parse().unwrap(),
+            command: vec![],
+        };
+        hub.handle(&mut role, &session, Message::Hold(hold)).await;
+        let path = pent_profile::RulePath::new("/home/u/proj/src/x.rs").unwrap();
+        let request = Request::File {
+            kind: pent_profile::FileKind::Read,
+            path: path.clone(),
+        };
+        let ask = pent_profile::Ask {
+            session: SessionId(0),
+            key: "cargo".parse().unwrap(),
+            program: "cat".into(),
+            request,
+            class: Class::Normal,
+            menu: vec![],
+            asked: Timestamp(0),
+            deadline: pent_profile::Deadline::new(pent_profile::FILE_DEADLINE).unwrap(),
+        };
+        hub.handle(&mut role, &session, Message::Ask(ask)).await;
+        let question = messages(&mut rx)
+            .into_iter()
+            .find_map(|m| match m {
+                Message::Question(q) => Some(q),
+                _ => None,
+            })
+            .unwrap();
+        assert!(question.ask.menu.len() > 1, "{:?}", question.ask.menu);
+        hub.handle(&mut role, &session, Message::AgentDeny(question.id))
+            .await;
+        let exact = Target::File {
+            kind: pent_profile::FileKind::Read,
+            width: pent_profile::PathWidth::Exact(path),
+        };
+        let replies = messages(&mut rx);
+        assert!(
+            matches!(&replies[..], [Message::Verdict(v)] if v.target == exact),
+            "{replies:?}"
+        );
+    }
+
+    /// A skip keeps its reason on the question: the session and each
+    /// watcher get it, and so do `pent questions` and a new watcher.
+    #[tokio::test]
+    async fn a_skip_of_the_agent_reaches_each_watcher() {
+        let hub = hub_with(None);
+        let (watcher, mut watched, _c) = Outbox::new();
+        hub.handle(&mut Role::Client, &watcher, Message::Watch)
+            .await;
+        let (mut role, session, mut rx, id) = ask_port_rx(&hub, 5432).await;
+        drain(&mut watched);
+        let skip = Skip {
+            id,
+            reason: reason("the tests need the database"),
+        };
+        hub.handle(&mut role, &session, Message::Skip(skip.clone()))
+            .await;
+        assert_eq!(messages(&mut rx), [Message::Skip(skip.clone())]);
+        assert_eq!(messages(&mut watched), [Message::Skip(skip.clone())]);
+        // The question stays open for the human.
+        assert_eq!(hub.lock().queue.len(), 1);
+
+        let (client, mut rx_c, _cc) = Outbox::new();
+        hub.handle(&mut Role::Client, &client, Message::Questions)
+            .await;
+        let listed = messages(&mut rx_c);
+        assert!(
+            matches!(&listed[..], [Message::Question(q), Message::Skip(s), Message::End] if q.id == id && *s == skip),
+            "{listed:?}"
+        );
+        let (late, mut rx_late, _cl) = Outbox::new();
+        hub.handle(&mut Role::Client, &late, Message::Watch).await;
+        assert!(messages(&mut rx_late).contains(&Message::Skip(skip)));
     }
 
     #[tokio::test]

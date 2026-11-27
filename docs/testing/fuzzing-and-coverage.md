@@ -125,6 +125,11 @@ Step 5.4 adds the operation `list` to `FsOp`, which the events of
 `pentd.sock` carry. The target reads it, but it did not run with it yet:
 one more reason for the next run.
 
+Step 6.1 adds the messages `AgentDeny` and `Skip` and the source `agent`
+to `pentd.sock`, and a new protocol on `agent.sock` (`AgentRequest`). No
+fuzz target reads `agent.sock` yet, and `protocol_line` did not run with
+the new messages.
+
 ## The property tests
 
 Each test ran with `PENT_PROPERTY_ROUNDS=1000000`. The whole run took 196

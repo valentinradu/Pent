@@ -99,6 +99,9 @@ pub(crate) struct Model {
     questions: Vec<Question>,
     /// The selected place in the menu of each question.
     widths: HashMap<QuestionId, u16>,
+    /// The reason of the agent for each question that it skipped. It is
+    /// untrusted.
+    reasons: HashMap<QuestionId, pent_profile::AgentReason>,
     selected: Option<QuestionId>,
     scope: Scope,
     details: bool,
@@ -118,6 +121,7 @@ impl Default for Model {
         Self {
             questions: Vec::new(),
             widths: HashMap::new(),
+            reasons: HashMap::new(),
             selected: None,
             scope: Scope::Run,
             details: false,
@@ -222,6 +226,11 @@ impl Model {
         self.sessions.iter().find(|s| s.id == id)
     }
 
+    /// The reason of the agent for the question `id`, after a skip.
+    pub(crate) fn reason(&self, id: QuestionId) -> Option<&pent_profile::AgentReason> {
+        self.reasons.get(&id)
+    }
+
     /// The events that the filters keep, from the oldest to the newest.
     pub(crate) fn events(&self) -> Vec<&Event> {
         self.events
@@ -301,6 +310,9 @@ impl Model {
             }
             Message::EventsDropped(dropped) => {
                 self.dropped = self.dropped.saturating_add(dropped.count);
+            }
+            Message::Skip(skip) if self.questions.iter().any(|q| q.id == skip.id) => {
+                self.reasons.insert(skip.id, skip.reason);
             }
             _ => {}
         }
@@ -426,6 +438,7 @@ impl Model {
         let ordered: Vec<QuestionId> = self.ordered().iter().map(|q| q.id).collect();
         self.questions.retain(|q| q.id != id);
         self.widths.remove(&id);
+        self.reasons.remove(&id);
         if self.selected != Some(id) {
             return;
         }

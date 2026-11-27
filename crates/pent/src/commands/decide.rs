@@ -71,6 +71,8 @@ pub(crate) struct Decider {
     /// layer (the proxy), and it takes its cause from here: an answer or a
     /// deadline has a question that the chain alone cannot know again.
     hooked: Mutex<std::collections::VecDeque<Hooked>>,
+    /// The refusals of the run, for `agent.sock`. No decision reads them.
+    refusals: Mutex<crate::agent::DenialLog>,
 }
 
 /// The most hook decisions that wait for their event.
@@ -108,6 +110,35 @@ impl Decider {
             classes,
             session,
             hooked: Mutex::new(std::collections::VecDeque::new()),
+            refusals: Mutex::new(crate::agent::DenialLog::default()),
+        }
+    }
+
+    /// The refusals of the run for the agent, and the number of refusals
+    /// that left the list (see [`crate::agent::DenialLog`]).
+    pub(crate) fn agent_denials(&self) -> (Vec<pent_profile::AgentDenial>, u64) {
+        self.refusals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .list()
+    }
+
+    /// Relay a deny of the agent to pentd (see [`Session::agent_deny`]).
+    pub(crate) async fn agent_deny(&self, id: QuestionId) -> crate::daemon::client::AgentOutcome {
+        match &self.session {
+            Some(session) => session.agent_deny(id).await,
+            None => Err(pent_profile::AgentFailure::NoPentd),
+        }
+    }
+
+    /// Relay a skip of the agent to pentd (see [`Session::agent_skip`]).
+    pub(crate) async fn agent_skip(
+        &self,
+        skip: pent_profile::Skip,
+    ) -> crate::daemon::client::AgentOutcome {
+        match &self.session {
+            Some(session) => session.agent_skip(skip).await,
+            None => Err(pent_profile::AgentFailure::NoPentd),
         }
     }
 
@@ -271,6 +302,10 @@ impl Decider {
     /// Send the event of a decision to pentd. pentd puts the number of the
     /// session in it.
     fn report(&self, program: &str, request: Request, decided_by: DecidedBy) {
+        self.refusals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record(program, &request, decided_by);
         let Some(session) = &self.session else {
             return;
         };
@@ -1528,6 +1563,45 @@ mod tests {
                 "localhost 8080",
             ]
         );
+    }
+
+    /// The list of refusals for the agent is only information: a full
+    /// list, far past its limit, changes no decision of the chain, and the
+    /// list counts the refusals that left it.
+    #[test]
+    fn a_full_list_of_refusals_changes_no_decision() {
+        let rules = set(vec![
+            rule(Target::Domain("a.org".parse().unwrap()), Decision::Allow),
+            rule(Target::Domain("b.org".parse().unwrap()), Decision::Deny),
+        ]);
+        let chain = Decider::new(set(vec![]), rules, classes(), None);
+        let probes = [
+            domain("a.org"),
+            domain("b.org"),
+            domain("c.org"),
+            read("/home/u/x"),
+            read("/home/u/.config/pent/pent.toml"),
+        ];
+        let before: Vec<Option<DecidedBy>> = probes.iter().map(|r| chain.known(r)).collect();
+        let total = crate::agent::MAX_DENIALS * 2;
+        for i in 0..total {
+            chain.report(
+                "cat",
+                read(&format!("/home/u/{i}")),
+                DecidedBy::Base(Decision::Deny),
+            );
+        }
+        // The refusals of the probes themselves go into the list too.
+        for probe in &probes {
+            chain.report("cat", probe.clone(), DecidedBy::Base(Decision::Deny));
+        }
+        let after: Vec<Option<DecidedBy>> = probes.iter().map(|r| chain.known(r)).collect();
+        assert_eq!(before, after);
+        let (list, dropped) = chain.agent_denials();
+        assert_eq!(list.len(), crate::agent::MAX_DENIALS);
+        let added = u64::try_from(total + probes.len()).unwrap();
+        let kept = u64::try_from(list.len()).unwrap();
+        assert_eq!(dropped, added - kept);
     }
 
     #[test]

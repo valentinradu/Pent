@@ -1,18 +1,23 @@
 //! `pent allow`, `pent deny`, `pent questions` and `pent denials`: the
 //! clients of pentd for a script or a terminal.
 //!
+//! Inside the sandbox of `pent run` ([`crate::agent::AGENT_SOCK_VAR`] is
+//! set), `pent denials`, `pent deny` and `pent skip` use `agent.sock`, and
+//! `pent allow` fails: the agent cannot allow.
+//!
 //! Each command sends one request to pentd (see [`Call`]). The data goes to
 //! stdout, and the status goes to stderr. Each text that a program chose (a
 //! path, a name, a command) goes through [`safe`], so it cannot hold a
 //! control character for the terminal.
 
 use pent_profile::{
-    format_date, safe, Answer, Class, DecidedBy, Decision, Denial, MenuIndex, Message, Question,
-    QuestionId, RejectReason, Rejected, Scope, SessionId, Source, Timestamp, Verdict,
+    format_date, safe, AgentDenial, AgentReason, AgentReply, AgentRequest, Answer, Class,
+    DecidedBy, Decision, Denial, MenuIndex, Message, Question, QuestionId, RejectReason, Rejected,
+    Scope, SessionId, Skip, Source, Timestamp, Verdict,
 };
 use pent_settings::RuntimeDir;
 
-use crate::cli::{AnswerArgs, DenialsArgs, QuestionsArgs};
+use crate::cli::{AnswerArgs, DenialsArgs, QuestionsArgs, SkipArgs};
 use crate::daemon::call::Call;
 use crate::daemon::DaemonError;
 use crate::error::CliError;
@@ -21,6 +26,9 @@ use crate::ui;
 /// `pent allow ID` and `pent deny ID`: answer one question.
 pub(crate) async fn answer(args: &AnswerArgs, decision: Decision) -> Result<(), CliError> {
     let id: QuestionId = args.id.parse()?;
+    if let Some(socket) = crate::agent::agent_socket() {
+        return agent_deny(&socket, args, id, decision).await;
+    }
     let scope = if args.remember {
         Scope::Remember
     } else {
@@ -77,22 +85,17 @@ pub(crate) fn verdict_text(verdict: &Verdict) -> String {
     )
 }
 
-/// `pent questions`: list the open questions.
+/// `pent questions`: list the open questions. A question that the agent
+/// skipped shows its reason as untrusted text; with `--json`, each skip is
+/// one more line of JSON after the questions.
 pub(crate) async fn questions(args: &QuestionsArgs) -> Result<(), CliError> {
     let mut call = Call::send(&RuntimeDir::from_env(), &Message::Questions).await?;
-    let mut count = 0_usize;
+    let mut questions = Vec::new();
+    let mut skips = Vec::new();
     loop {
         match call.next().await? {
-            Message::Question(question) => {
-                count = count.saturating_add(1);
-                if args.json {
-                    let line = serde_json::to_string(&question)
-                        .map_err(|e| CliError::Other(e.to_string()))?;
-                    println!("{line}");
-                } else {
-                    print!("{}", question_text(&question));
-                }
-            }
+            Message::Question(question) => questions.push(question),
+            Message::Skip(skip) => skips.push(skip),
             Message::Rejected(Rejected { reason, .. }) => {
                 return Err(DaemonError::Rejected(reason).into())
             }
@@ -100,7 +103,26 @@ pub(crate) async fn questions(args: &QuestionsArgs) -> Result<(), CliError> {
             _ => {}
         }
     }
-    if count == 0 && !args.json {
+    if args.json {
+        let failed = |e: serde_json::Error| CliError::Other(e.to_string());
+        for question in &questions {
+            println!("{}", serde_json::to_string(question).map_err(failed)?);
+        }
+        for skip in &skips {
+            println!("{}", serde_json::to_string(skip).map_err(failed)?);
+        }
+        return Ok(());
+    }
+    for question in &questions {
+        print!("{}", question_text(question));
+        if let Some(skip) = skips.iter().find(|s| s.id == question.id) {
+            println!(
+                "    the agent says (untrusted): {}",
+                safe(skip.reason.as_str())
+            );
+        }
+    }
+    if questions.is_empty() {
         ui::status("questions", "none");
     }
     Ok(())
@@ -130,8 +152,121 @@ fn question_text(question: &Question) -> String {
     text
 }
 
+/// The deny of the agent, inside the sandbox: for this run and for the
+/// exact target only.
+async fn agent_deny(
+    socket: &std::path::Path,
+    args: &AnswerArgs,
+    id: QuestionId,
+    decision: Decision,
+) -> Result<(), CliError> {
+    if decision == Decision::Allow {
+        return Err(CliError::Other(
+            "inside the sandbox of pent run, the agent cannot allow; the human answers in \
+             pent monitor"
+                .to_string(),
+        ));
+    }
+    if args.width != 0 || args.remember {
+        return Err(CliError::Other(
+            "inside the sandbox of pent run, a deny holds for this run and for the exact \
+             target; --width and --remember are not possible"
+                .to_string(),
+        ));
+    }
+    agent_done(
+        socket,
+        &AgentRequest::Deny(id),
+        &format!("question {id}: deny (this run)"),
+    )
+    .await
+}
+
+/// `pent skip ID REASON`: send a question up to the human, inside the
+/// sandbox.
+pub(crate) async fn skip(args: &SkipArgs) -> Result<(), CliError> {
+    let Some(socket) = crate::agent::agent_socket() else {
+        return Err(CliError::Other(
+            "pent skip works only inside the sandbox of pent run".to_string(),
+        ));
+    };
+    let id: QuestionId = args.id.parse()?;
+    let reason =
+        AgentReason::try_from(args.reason.clone()).map_err(|e| CliError::Other(e.to_string()))?;
+    agent_done(
+        &socket,
+        &AgentRequest::Skip(Skip { id, reason }),
+        &format!("question {id}: sent to the human"),
+    )
+    .await
+}
+
+/// Send one request that ends with `Done` or `Failed`.
+async fn agent_done(
+    socket: &std::path::Path,
+    request: &AgentRequest,
+    done: &str,
+) -> Result<(), CliError> {
+    for reply in crate::agent::call(socket, request).await? {
+        match reply {
+            AgentReply::Done => {
+                ui::ok(done);
+                return Ok(());
+            }
+            AgentReply::Failed(failure) => return Err(CliError::Other(failure.to_string())),
+            AgentReply::Denial(_) | AgentReply::End { .. } => {}
+        }
+    }
+    Err(CliError::Other("agent.sock gave no result".to_string()))
+}
+
+/// `pent denials` inside the sandbox: the refusals of this run.
+async fn agent_denials(socket: &std::path::Path) -> Result<(), CliError> {
+    let mut any = false;
+    for reply in crate::agent::call(socket, &AgentRequest::Denials).await? {
+        match reply {
+            AgentReply::Denial(denial) => {
+                any = true;
+                println!("{}", agent_denial_text(&denial));
+            }
+            AgentReply::End { dropped } if dropped > 0 => {
+                ui::warn(format!("{dropped} older refusals are not in the list"));
+            }
+            AgentReply::End { .. } | AgentReply::Done | AgentReply::Failed(_) => {}
+        }
+    }
+    if !any {
+        ui::status("denials", "none");
+    }
+    Ok(())
+}
+
+/// The text of one refusal of the run, on one line.
+fn agent_denial_text(denial: &AgentDenial) -> String {
+    let count = if denial.count > 1 {
+        format!(", {} times", denial.count)
+    } else {
+        String::new()
+    };
+    format!(
+        "  {}  {}  by {}  ({}{count})",
+        time_text(denial.last),
+        safe(&denial.request.to_string()),
+        safe(&denial.program),
+        why_text(denial.decided_by),
+    )
+}
+
 /// `pent denials [SESSION]`: show the refusals of a session.
 pub(crate) async fn denials(args: &DenialsArgs) -> Result<(), CliError> {
+    if let Some(socket) = crate::agent::agent_socket() {
+        if args.session.is_some() {
+            return Err(CliError::Other(
+                "inside the sandbox of pent run, pent denials shows only this run".to_string(),
+            ));
+        }
+        return agent_denials(&socket).await;
+    }
     let session: Option<SessionId> = args.session.as_deref().map(str::parse).transpose()?;
     let request = Message::Denials(session);
     let mut call = Call::send(&RuntimeDir::from_env(), &request).await?;

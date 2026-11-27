@@ -2925,3 +2925,126 @@ mod hook_fds {
         Ok(())
     }
 }
+
+/// The program of the test of `agent.sock`. `$P` is the `pent` binary, `$A`
+/// and `$B` are two files that no rule gives, and `$S` is the socket of
+/// pentd. Each access waits for a short deadline, so its question stays
+/// open.
+const AGENT_SCRIPT: &str = r#"exec 2>&1
+code_of() { "$P" denials | grep -F "$1" | sed -n 's/.*question \([2-9a-z]*\)).*/\1/p' | tail -n 1; }
+[ -n "$PENT_AGENT_SOCK" ] && echo agent-sock
+cat "$A" 2>/dev/null || echo a-refused
+cat "$B" 2>/dev/null || echo b-refused
+a=$(code_of "$A"); b=$(code_of "$B")
+[ -n "$a" ] && [ -n "$b" ] && [ "$a" != "$b" ] && echo two-codes
+python3 -I - "$PENT_AGENT_SOCK" "$a" <<'PY'
+import socket, sys
+path, code = sys.argv[1], sys.argv[2]
+lines = [
+    '{"v":1,"msg":{"answer":{"id":"%s","decision":"allow","width":0,"scope":"remember","source":"human"}}}' % code,
+    '{"v":1,"msg":{"allow":"%s"}}' % code,
+    '{"v":1,"msg":"allow"}',
+]
+for line in lines:
+    s = socket.socket(socket.AF_UNIX)
+    s.connect(path)
+    s.sendall((line + "\n").encode())
+    s.settimeout(5)
+    print("closed" if s.recv(4096) == b"" else "replied")
+PY
+cat "$A" 2>/dev/null || echo a-still-refused
+"$P" allow "$a" >/dev/null 2>&1 || echo allow-fails
+"$P" deny --remember "$a" >/dev/null 2>&1 || echo wide-deny-fails
+"$P" deny "$a" >/dev/null 2>&1 && echo denied
+"$P" skip "$b" "the build needs b" >/dev/null 2>&1 && echo skipped
+"$P" skip zzzzzz "no such question" >/dev/null 2>&1 || echo unknown-fails
+python3 -I - "$S" <<'PY'
+import socket, sys
+try:
+    socket.socket(socket.AF_UNIX).connect(sys.argv[1])
+    print("pentd-reached")
+except OSError:
+    print("pentd-unreachable")
+PY
+echo "$b" > "$T/b-code"
+"#;
+
+/// `agent.sock` (step 6.1): the agent reads the refusals of its run,
+/// denies one question for this run and sends another up to the human. No
+/// line on the socket allows, `pent allow` fails in the sandbox, and the
+/// program cannot reach `pentd.sock`.
+#[test]
+fn the_agent_can_deny_and_skip_but_never_allow() -> TestResult {
+    let test = "the_agent_can_deny_and_skip_but_never_allow";
+    if !have_tools(test, &["sh", "cat", "grep", "sed", "python3"]) || !sandbox_ready(test) {
+        return Ok(());
+    }
+    let rt = Runtime::new()?;
+    let env = TestEnv::new()?;
+    let _pentd = Reap(rt.pent(&["daemon"]).env("HOME", &env.home).spawn()?);
+    assert!(rt.wait_for_socket());
+    let a = env.write_home("agent/a.txt", "A\n")?;
+    let b = env.write_home("agent/b.txt", "B\n")?;
+    let out = env
+        .command(&[
+            "run",
+            "-w",
+            "--key",
+            "agent",
+            "--env",
+            "P",
+            "--env",
+            "A",
+            "--env",
+            "B",
+            "--env",
+            "S",
+            "--env",
+            "T",
+            "--",
+            "sh",
+            "-c",
+            AGENT_SCRIPT,
+        ])
+        .env("XDG_RUNTIME_DIR", rt.xdg())
+        .env("PENT_FILE_DEADLINE_MS", "300")
+        .env("P", PENT)
+        .env("A", &a)
+        .env("B", &b)
+        .env("S", rt.socket())
+        .env("T", &env.ws)
+        .output()?;
+    assert_eq!(
+        stdout(&out),
+        "agent-sock\na-refused\nb-refused\ntwo-codes\nclosed\nclosed\nclosed\n\
+         a-still-refused\nallow-fails\nwide-deny-fails\ndenied\nskipped\nunknown-fails\n\
+         pentd-unreachable\n",
+        "{out:?}"
+    );
+    // The deny of the agent closed the question of `a`; the question of `b`
+    // stays open for the human, with the reason of the agent.
+    let b_code = std::fs::read_to_string(env.ws.join("b-code"))?;
+    let listed = rt
+        .pent(&["questions", "--json"])
+        .stdout(Stdio::piped())
+        .output()?;
+    let text = stdout(&listed);
+    let open: Vec<pent_profile::Question> = text
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    assert!(
+        matches!(&open[..], [q] if q.id.to_string() == b_code.trim()),
+        "{text}"
+    );
+    let skips: Vec<pent_profile::Skip> = text
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    assert!(
+        matches!(&skips[..], [s] if s.id.to_string() == b_code.trim()
+            && s.reason.as_str() == "the build needs b"),
+        "{text}"
+    );
+    Ok(())
+}
