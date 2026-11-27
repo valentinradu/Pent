@@ -302,10 +302,12 @@ impl Decider {
     /// Send the event of a decision to pentd. pentd puts the number of the
     /// session in it.
     fn report(&self, program: &str, request: Request, decided_by: DecidedBy) {
-        self.refusals
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .record(program, &request, decided_by);
+        if decided_by.is_refusal() {
+            self.refusals
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .record(program, &request, decided_by);
+        }
         let Some(session) = &self.session else {
             return;
         };

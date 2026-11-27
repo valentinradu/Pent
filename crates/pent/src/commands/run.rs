@@ -391,6 +391,9 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
     // after they leave: the drop of the session ends its task.
     decider.flush().await;
 
+    // `exit_like_child` does not return, so no value drops after it: the
+    // socket of the agent and its directory must go now.
+    drop(agent);
     exit_like_child(exit_status)
 }
 
@@ -443,7 +446,6 @@ fn make_decider(
     Decider::new(flags, rules, classes, session)
 }
 
-/// Add the paths of the CLI flags to the paths of the rules.
 /// Start the server of `agent.sock` next to the runtime directory of pentd,
 /// or in `/tmp` when that fails (a socket path has at most 108 bytes). Both
 /// are private directories of the sandbox, so the program does not see the
@@ -468,6 +470,7 @@ fn start_agent(
     None
 }
 
+/// Add the paths of the CLI flags to the paths of the rules.
 fn add_cli_paths(paths: &mut pent_settings::SandboxPaths, args: &RunArgs) {
     let strings = |list: &[PathBuf]| -> Vec<String> {
         list.iter()

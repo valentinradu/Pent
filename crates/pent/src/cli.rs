@@ -86,7 +86,9 @@ pub(crate) struct SkipArgs {
 
 #[derive(Args)]
 pub(crate) struct QuestionsArgs {
-    /// Print each question as one line of JSON (for scripts)
+    /// Print each question as one line of JSON (for scripts). Each skip of
+    /// the agent is one more line {"skip":{"id":..,"reason":..}}, and its
+    /// reason is untrusted text
     #[arg(long)]
     pub json: bool,
 }

@@ -87,7 +87,8 @@ pub(crate) fn verdict_text(verdict: &Verdict) -> String {
 
 /// `pent questions`: list the open questions. A question that the agent
 /// skipped shows its reason as untrusted text; with `--json`, each skip is
-/// one more line of JSON after the questions.
+/// one more line `{"skip":{...}}` after the questions, so a script cannot
+/// take it for a question.
 pub(crate) async fn questions(args: &QuestionsArgs) -> Result<(), CliError> {
     let mut call = Call::send(&RuntimeDir::from_env(), &Message::Questions).await?;
     let mut questions = Vec::new();
@@ -109,7 +110,8 @@ pub(crate) async fn questions(args: &QuestionsArgs) -> Result<(), CliError> {
             println!("{}", serde_json::to_string(question).map_err(failed)?);
         }
         for skip in &skips {
-            println!("{}", serde_json::to_string(skip).map_err(failed)?);
+            let tagged = serde_json::json!({ "skip": skip });
+            println!("{}", serde_json::to_string(&tagged).map_err(failed)?);
         }
         return Ok(());
     }

@@ -3039,12 +3039,20 @@ fn the_agent_can_deny_and_skip_but_never_allow() -> TestResult {
     );
     let skips: Vec<pent_profile::Skip> = text
         .lines()
-        .filter_map(|line| serde_json::from_str(line).ok())
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|value| serde_json::from_value(value.get("skip")?.clone()).ok())
         .collect();
     assert!(
         matches!(&skips[..], [s] if s.id.to_string() == b_code.trim()
             && s.reason.as_str() == "the build needs b"),
         "{text}"
     );
+    // The end of the run removes the socket of the agent and its directory.
+    let left: Vec<std::ffi::OsString> = std::fs::read_dir(rt.xdg())?
+        .filter_map(Result::ok)
+        .map(|e| e.file_name())
+        .filter(|name| name.to_string_lossy().starts_with("pent-agent-"))
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
     Ok(())
 }

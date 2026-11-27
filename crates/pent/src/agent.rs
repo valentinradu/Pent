@@ -19,6 +19,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use pent_profile::{
     AgentDenial, AgentReply, AgentRequest, DecidedBy, Request, Timestamp, MAX_LINE_LEN,
@@ -39,6 +40,14 @@ pub(crate) const MAX_DENIALS: usize = 1024;
 /// closes at once, so the program cannot make `pent run` grow.
 const MAX_CONNECTIONS: usize = 16;
 
+/// How long a connection may wait for its next request. Then it closes, so
+/// idle connections cannot keep each place.
+const IDLE: Duration = Duration::from_secs(30);
+
+/// The pause after an error of `accept(2)`, so a lasting error (no free
+/// descriptor) does not make the loop busy.
+const ACCEPT_PAUSE: Duration = Duration::from_millis(100);
+
 /// One entry of the list.
 struct Entry {
     denial: AgentDenial,
@@ -52,9 +61,12 @@ struct Entry {
 /// `dropped`.
 #[derive(Default)]
 pub(crate) struct DenialLog {
-    entries: HashMap<(String, Request), Entry>,
+    /// The entries by access, then by program: a repeated refusal finds its
+    /// entry with no copy of the access or of the program.
+    entries: HashMap<Request, HashMap<String, Entry>>,
     /// The key of each entry by its place, oldest first.
     order: BTreeMap<u64, (String, Request)>,
+    len: usize,
     next: u64,
     dropped: u64,
 }
@@ -67,26 +79,37 @@ impl DenialLog {
         }
         let seq = self.next;
         self.next = self.next.saturating_add(1);
-        let key = (program.to_string(), request.clone());
-        if let Some(entry) = self.entries.get_mut(&key) {
-            self.order.remove(&entry.seq);
+        if let Some(entry) = self
+            .entries
+            .get_mut(request)
+            .and_then(|by_program| by_program.get_mut(program))
+        {
+            if let Some(key) = self.order.remove(&entry.seq) {
+                self.order.insert(seq, key);
+            }
             entry.seq = seq;
             entry.denial.count = entry.denial.count.saturating_add(1);
             entry.denial.decided_by = decided_by;
             entry.denial.last = Timestamp::now();
-            self.order.insert(seq, key);
             return;
         }
-        if self.entries.len() >= MAX_DENIALS {
-            if let Some((_, oldest)) = self.order.pop_first() {
-                if let Some(gone) = self.entries.remove(&oldest) {
-                    self.dropped = self.dropped.saturating_add(gone.denial.count);
+        if self.len >= MAX_DENIALS {
+            if let Some((_, (old_program, old_request))) = self.order.pop_first() {
+                if let Some(by_program) = self.entries.get_mut(&old_request) {
+                    if let Some(gone) = by_program.remove(&old_program) {
+                        self.dropped = self.dropped.saturating_add(gone.denial.count);
+                        self.len = self.len.saturating_sub(1);
+                    }
+                    if by_program.is_empty() {
+                        self.entries.remove(&old_request);
+                    }
                 }
             }
         }
-        self.order.insert(seq, key.clone());
-        self.entries.insert(
-            key,
+        self.order
+            .insert(seq, (program.to_string(), request.clone()));
+        self.entries.entry(request.clone()).or_default().insert(
+            program.to_string(),
             Entry {
                 denial: AgentDenial {
                     program: program.to_string(),
@@ -98,6 +121,7 @@ impl DenialLog {
                 seq,
             },
         );
+        self.len = self.len.saturating_add(1);
     }
 
     /// The entries, oldest last refusal first, and the number of refusals
@@ -106,7 +130,11 @@ impl DenialLog {
         let denials = self
             .order
             .values()
-            .filter_map(|key| self.entries.get(key))
+            .filter_map(|(program, request)| {
+                self.entries
+                    .get(request)
+                    .and_then(|by_program| by_program.get(program))
+            })
             .map(|e| e.denial.clone())
             .collect();
         (denials, self.dropped)
@@ -154,6 +182,11 @@ impl AgentServer {
     /// # Errors
     /// Returns the I/O error of the directory or of the socket.
     pub(crate) fn start(parent: &Path, decider: Arc<Decider>) -> std::io::Result<Self> {
+        Self::start_with(parent, decider, IDLE)
+    }
+
+    /// [`AgentServer::start`] with the idle time `idle` of a connection.
+    fn start_with(parent: &Path, decider: Arc<Decider>, idle: Duration) -> std::io::Result<Self> {
         let dir = new_dir(parent)?;
         let path = dir.join("agent.sock");
         let listener = match UnixListener::bind(&path) {
@@ -167,7 +200,7 @@ impl AgentServer {
         // SAFETY: getuid has no preconditions.
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let own_uid = unsafe { libc::getuid() };
-        let task = tokio::spawn(accept_loop(listener, decider, own_uid));
+        let task = tokio::spawn(accept_loop(listener, decider, own_uid, idle));
         Ok(Self { dir, path, task })
     }
 
@@ -177,13 +210,14 @@ impl AgentServer {
     }
 }
 
-async fn accept_loop(listener: UnixListener, decider: Arc<Decider>, own_uid: u32) {
+async fn accept_loop(listener: UnixListener, decider: Arc<Decider>, own_uid: u32, idle: Duration) {
     let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
         let stream = match listener.accept().await {
             Ok((stream, _)) => stream,
             Err(e) => {
                 tracing::debug!("agent.sock: no connection: {e}");
+                tokio::time::sleep(ACCEPT_PAUSE).await;
                 continue;
             }
         };
@@ -197,25 +231,27 @@ async fn accept_loop(listener: UnixListener, decider: Arc<Decider>, own_uid: u32
         };
         let decider = Arc::clone(&decider);
         tokio::spawn(async move {
-            connection(stream, &decider).await;
+            connection(stream, &decider, idle).await;
             drop(slot);
         });
     }
 }
 
-/// Serve one connection until it ends or sends a line that is not a
-/// request.
-async fn connection(stream: UnixStream, decider: &Decider) {
+/// Serve one connection until it ends, sends a line that is not a
+/// request, or waits longer than `idle` for its next request.
+async fn connection(stream: UnixStream, decider: &Decider, idle: Duration) {
     let (read, mut write) = stream.into_split();
     let mut reader = BufReader::new(read);
     // The limit counts the newline too: `MAX_LINE_LEN` bytes and `\r\n`.
     let limit = u64::try_from(MAX_LINE_LEN.saturating_add(2)).unwrap_or(u64::MAX);
     loop {
         let mut line = Vec::new();
-        match (&mut reader).take(limit).read_until(b'\n', &mut line).await {
-            Ok(0) => return,
-            Ok(_) if line.last() == Some(&b'\n') => {}
-            Ok(_) | Err(_) => return,
+        let mut limited = (&mut reader).take(limit);
+        let read = limited.read_until(b'\n', &mut line);
+        match tokio::time::timeout(idle, read).await {
+            Ok(Ok(0)) | Err(_) => return,
+            Ok(Ok(_)) if line.last() == Some(&b'\n') => {}
+            Ok(Ok(_) | Err(_)) => return,
         }
         let Ok(text) = std::str::from_utf8(&line) else {
             return;
@@ -321,6 +357,36 @@ mod tests {
             kind: FileKind::Read,
             path: RulePath::new(path).unwrap(),
         }
+    }
+
+    /// At most `MAX_CONNECTIONS` connections at one time: a later one
+    /// closes at once. An idle connection closes after its time, so its
+    /// place is free again. The drop removes the socket and its directory.
+    #[tokio::test]
+    async fn an_idle_connection_frees_its_place_and_the_drop_removes_the_socket() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key: pent_profile::RuleKey = "agent".parse().unwrap();
+        let decider = Arc::new(Decider::new(
+            pent_profile::RuleSet::new(key.clone()),
+            pent_profile::RuleSet::new(key),
+            None,
+            None,
+        ));
+        let server =
+            AgentServer::start_with(tmp.path(), decider, Duration::from_millis(500)).unwrap();
+        let mut idle = Vec::new();
+        for _ in 0..MAX_CONNECTIONS {
+            idle.push(UnixStream::connect(server.path()).await.unwrap());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(call(server.path(), &AgentRequest::Denials).await.is_err());
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        let replies = call(server.path(), &AgentRequest::Denials).await.unwrap();
+        assert_eq!(replies, [AgentReply::End { dropped: 0 }]);
+        let dir = server.path().parent().unwrap().to_path_buf();
+        assert!(dir.starts_with(tmp.path()));
+        drop(server);
+        assert!(!dir.exists());
     }
 
     #[test]

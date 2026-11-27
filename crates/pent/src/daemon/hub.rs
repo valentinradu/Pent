@@ -565,9 +565,10 @@ impl Hub {
     /// The deny of the agent of `session` for its question `id`
     /// ([`super::queue::Queue::check_agent_deny`]). The session gets the
     /// verdict as the session of the question; a refusal goes to it with
-    /// the number.
+    /// the number. The deny has the scope `run` and writes no rule, so it
+    /// does not wait for `writes`: a slow write of another answer must not
+    /// make the agent wait past its time.
     async fn agent_deny(&self, session: SessionId, outbox: &Outbox, id: QuestionId) {
-        let _write = self.writes.lock().await;
         let plan = match self.lock().queue.check_agent_deny(session, id) {
             Ok(plan) => plan,
             Err(reason) => {
@@ -592,7 +593,8 @@ impl Hub {
     }
 
     /// Resolve the checked answer `plan`, write its rule for `remember`,
-    /// and send the verdicts. The caller holds `writes`.
+    /// and send the verdicts. The caller holds `writes` when the scope is
+    /// `remember`.
     async fn apply(&self, outbox: &Outbox, plan: Plan, answerer: Answerer) {
         let answer_id = plan.id;
         let scope = match plan.scope {

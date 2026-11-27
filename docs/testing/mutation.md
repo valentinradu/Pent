@@ -257,6 +257,9 @@ makes one mutation by hand. The test must fail on the mutant. No
 | 6.1 | `pent run` does not relay a deny. | `pentd::the_agent_can_deny_and_skip_but_never_allow` |
 | 6.1 | `pent run` does not relay a skip. | `pentd::the_agent_can_deny_and_skip_but_never_allow` |
 | 6.1 | `pent run` gives no exec access to its own binary. | `pentd::the_agent_can_deny_and_skip_but_never_allow` |
+| 6.1 | The normal end of the run does not drop the socket of the agent. | `pentd::the_agent_can_deny_and_skip_but_never_allow` |
+| 6.1 | An idle connection to `agent.sock` has no time limit. | `agent::tests::an_idle_connection_frees_its_place_and_the_drop_removes_the_socket` |
+| 6.1 | `pent questions --json` writes a skip with no tag. | `pentd::the_agent_can_deny_and_skip_but_never_allow` |
 | 5.4 | A traversal rule above an area gives a listing in it. | `linux_graft::tests::each_kind_asks_and_the_files_of_pent_are_hidden` |
 | 5.4 | The decision sends no event. | `linux_graft::tests::each_kind_asks_and_the_files_of_pent_are_hidden` |
 
