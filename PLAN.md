@@ -1,6 +1,6 @@
 # Plan: the new pent
 
-**Cursor: one decision of the review of phase 5 (below the step 5.13), then step 6.1.** Steps with `[x]` are done. Work on the branch `next`,
+**Cursor: step 6.1.** Steps with `[x]` are done. Work on the branch `next`,
 one commit for each step, and move this cursor when a step is done.
 
 **The way of work.** One commit for each step. Then the user runs
@@ -525,7 +525,7 @@ section 14 of the design has their results.
       width with no graft at its first answer stays with FUSE (a matter of
       speed only).
 
-- [ ] **The review of phase 5** (2026-11-27, `/code-review
+- [x] **The review of phase 5** (2026-11-27, `/code-review
   origin/main..HEAD`, 10 findings). Fixed, each with a test and a mutation
   check: a deep hole in a write graft (GS-11), the watch after the open of
   a lookup (NC-7), the overflow of the inotify queue (NC-8), the decided
@@ -538,12 +538,11 @@ section 14 of the design has their results.
     `mmap` is visible after 1 s (NC-9). The page cache stays.
   - Done: a write in a read graft gets `EROFS` with no question; the
     documents record it (GS-2, design 5.4).
-  - Open: the overlay outside the areas. The overlay covers only paths
-    below the home directory (`overlay_roots_for_accessible`), and the
-    home directory is always a FUSE area, except a home inside the base.
-    So a write-listed file outside the home (`/etc/app.conf`) had no
-    overlay before step 5.3 either. The user decides whether anything
-    changes.
+  - No change: the overlay outside the areas. The overlay covers only
+    paths below the home directory (`overlay_roots_for_accessible`), and
+    the home directory is always a FUSE area, except a home inside the
+    base. So a write-listed file outside the home (`/etc/app.conf`) had no
+    overlay before step 5.3 either. AR-7 records it.
 
 ## Phase 6: agents
 

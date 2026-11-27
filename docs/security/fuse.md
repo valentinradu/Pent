@@ -150,7 +150,7 @@ expire (1 s, NC-9).
 | AR-4 | A rule on a path that does not exist yet applies: `write ~/made/**` lets the program make `~/made`. Landlock skips such a rule, so before this step only the overlay gave it. | the two tests of AR-3, the row `made-in-the-run-write` of `the_rules_and_the_kernel_agree` |
 | AR-5 | A rule on a file holds after a rename puts a new inode at its path (an atomic replace): the server checks paths, not inodes. | the two tests of AR-3 (the file `cfg`) |
 | AR-6 | The rules of a private directory above an area (all rights on the empty tmpfs of `/tmp`) do not reach into the area. | `linux_graft::tests::the_home_area_applies_the_grants_and_its_rule_covers_a_graft` |
-| AR-7 | A run with FUSE areas has no overlay and no staging directory: the server writes each file in place. | `e2e_linux::linux::sigterm_ends_the_child_and_cleans_up` |
+| AR-7 | A run with FUSE areas has no overlay and no staging directory: the server writes each file in place. The overlay covered only paths below the home directory, and the home directory is always an area (except a home inside the base). So a write-listed file outside the home (`/etc/app.conf`) gets only a Landlock rule on its inode, as before step 5.3, and an atomic replace of it fails. | `e2e_linux::linux::sigterm_ends_the_child_and_cleans_up` |
 | AR-8 | A symbolic link, a named pipe and a Unix socket need `MAKE_SYM`, `MAKE_FIFO` and `MAKE_SOCK` at their path. A device node gets `EPERM`. A hard link gets `EPERM` (not implemented). | the two tests of AR-3 (`ln -s`, `mkfifo`); the device and the hard link: no test |
 
 Each test of the operations also checks that the session ends cleanly when
