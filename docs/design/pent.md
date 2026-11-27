@@ -174,6 +174,8 @@ create, listing), not at a lookup.
 - **The capabilities.** Only the helper keeps capabilities in the user
   namespace of the session. The program runs in a nested user namespace, so
   it cannot remove a graft or a FUSE mount (`EPERM`).
+- **A write in a read graft** gets `EROFS` at once, with no question: the
+  kernel refuses it before FUSE sees it. Pent keeps this for the speed.
 - **A graft stays valid.** The FUSE entry under a graft has a long validity
   time, because an invalid entry would remove the mount above it.
 - **The children of a width.** A width that cannot be one graft (a

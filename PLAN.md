@@ -1,6 +1,6 @@
 # Plan: the new pent
 
-**Cursor: three decisions of the review of phase 5 (below the step 5.13), then step 6.1.** Steps with `[x]` are done. Work on the branch `next`,
+**Cursor: one decision of the review of phase 5 (below the step 5.13), then step 6.1.** Steps with `[x]` are done. Work on the branch `next`,
 one commit for each step, and move this cursor when a step is done.
 
 **The way of work.** One commit for each step. Then the user runs
@@ -532,13 +532,18 @@ section 14 of the design has their results.
   opens of a node that the host moves (NC-6), the limit of the child plans
   (GS-10), the areas of `pent run` from one list, the `allow(dead_code)`
   of the grafts. Not a defect: a deny rule of another kind inside a graft
-  (a test proves it). Open, for the user:
-  - A write through a shared `mmap` makes no inotify event, so the kept
-    page cache and the attributes of one hour can stay old. A shorter time
-    fixes it, at the cost of one more request for each open.
-  - A write in a read graft gets `EROFS` at once, with no question.
-  - With a FUSE area, a write-listed file outside each area gets no
-    overlay (decision of 5.3), so an atomic replace of it fails.
+  (a test proves it). Decisions of the user (2026-11-27):
+  - Done: the attributes live 1 s also in a watched directory, and the
+    server asks for `FUSE_AUTO_INVAL_DATA`, so a write through a shared
+    `mmap` is visible after 1 s (NC-9). The page cache stays.
+  - Done: a write in a read graft gets `EROFS` with no question; the
+    documents record it (GS-2, design 5.4).
+  - Open: the overlay outside the areas. The overlay covers only paths
+    below the home directory (`overlay_roots_for_accessible`), and the
+    home directory is always a FUSE area, except a home inside the base.
+    So a write-listed file outside the home (`/etc/app.conf`) had no
+    overlay before step 5.3 either. The user decides whether anything
+    changes.
 
 ## Phase 6: agents
 

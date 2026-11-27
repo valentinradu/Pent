@@ -249,6 +249,8 @@ makes one mutation by hand. The test must fail on the mutant. No
 | 5.13 | An overflow drops no cache of a file. | `linux_fuse::tests::an_overflow_of_the_watch_drops_each_cache` |
 | 5.13 | A node with a new path keeps its decided opens. | `linux_graft::tests::a_file_that_the_host_moves_is_checked_again_at_its_new_path` (the program read the file at a path with no grant) |
 | 5.13 | The check of a hole looks only at the kinds of a write or an exec. | `decide::tests::a_graft_needs_a_clean_subtree` |
+| 5.13 | The attributes in a watched directory live one hour. | `linux_fuse::tests::a_write_through_a_shared_mmap_becomes_visible` (with `cat` the mutant survived: after a read the `fstat` of `cat` asks for the attributes anyway; the test reads with a plain `read`) |
+| 5.13 | The server does not ask for `FUSE_AUTO_INVAL_DATA`. | `linux_fuse::tests::a_write_through_a_shared_mmap_becomes_visible` |
 | 5.4 | A traversal rule above an area gives a listing in it. | `linux_graft::tests::each_kind_asks_and_the_files_of_pent_are_hidden` |
 | 5.4 | The decision sends no event. | `linux_graft::tests::each_kind_asks_and_the_files_of_pent_are_hidden` |
 

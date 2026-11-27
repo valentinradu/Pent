@@ -55,9 +55,11 @@
 //!   new mode, a removal, a move away), and the server drops the cache of
 //!   exactly that inode (`FUSE_NOTIFY_INVAL_INODE`) or that entry. A file
 //!   in a directory with no watch is read again at each open. A lookup
-//!   watches the directory, and an entry and its attributes in a watched
-//!   directory live one hour ([`WATCHED_TTL`]), so a path that a program
-//!   checks again costs no request.
+//!   watches the directory, and an entry in a watched directory lives one
+//!   hour ([`WATCHED_TTL`]), so a path that a program checks again costs no
+//!   lookup. The attributes live 1 s ([`TTL`]): a write through a shared
+//!   `mmap` makes no event, and the new `mtime` then drops the page cache
+//!   (`FUSE_AUTO_INVAL_DATA`).
 //! - **The inode number** that `stat` gives is the number of the node,
 //!   because `fuser` uses the same number for both. A listing gives the
 //!   number of the node when the node exists, else the real inode number.
@@ -89,8 +91,10 @@ const TTL: Duration = Duration::from_secs(1);
 /// drops the entry when the name appears, so the time can be long.
 const NEGATIVE_TTL: Duration = Duration::from_secs(3600);
 
-/// The validity time of an entry and of its attributes in a watched
-/// directory: the watch drops them at each change (step 5.10).
+/// The validity time of an entry in a watched directory: the watch drops
+/// it at each change (step 5.10). The attributes keep [`TTL`]: a write
+/// through a shared `mmap` makes no event, and a new `mtime` at the next
+/// `GETATTR` drops the page cache (`FUSE_AUTO_INVAL_DATA`).
 const WATCHED_TTL: Duration = Duration::from_secs(3600);
 
 /// The events of a watched directory that make a name appear.
@@ -1485,8 +1489,8 @@ impl Tree {
         }
     }
 
-    /// The validity time of the entry and the attributes of the node `ino`:
-    /// long when a watch of its directory holds.
+    /// The validity time of the entry of the node `ino`: long when a watch
+    /// of its directory holds. Its attributes always keep [`TTL`].
     fn ttl_of(&self, ino: INodeNo) -> Duration {
         let parent = lock(&self.inodes)
             .nodes
@@ -2246,7 +2250,7 @@ fn negative_attr() -> FileAttr {
 /// Send `result` as an entry reply.
 fn reply_entry(reply: ReplyEntry, result: Result<FileAttr, Errno>, tree: &Tree) {
     match result {
-        Ok(attr) => reply.entry(&tree.ttl_of(attr.ino), &attr, GENERATION),
+        Ok(attr) => reply.entry_with_ttls(&TTL, &tree.ttl_of(attr.ino), &attr, GENERATION),
         Err(e) => reply.error(e),
     }
 }
@@ -2258,9 +2262,9 @@ fn reply_empty(reply: ReplyEmpty, result: Result<(), Errno>) {
     }
 }
 
-fn reply_attr(reply: ReplyAttr, result: Result<FileAttr, Errno>, tree: &Tree) {
+fn reply_attr(reply: ReplyAttr, result: Result<FileAttr, Errno>) {
     match result {
-        Ok(attr) => reply.attr(&tree.ttl_of(attr.ino), &attr),
+        Ok(attr) => reply.attr(&TTL, &attr),
         Err(e) => reply.error(e),
     }
 }
@@ -2277,6 +2281,17 @@ impl Filesystem for FuseTree {
         config
             .add_capabilities(InitFlags::FUSE_PARALLEL_DIROPS)
             .map_err(|_| std::io::Error::other("the kernel has no FUSE_PARALLEL_DIROPS"))?;
+        // A new `mtime` or size at a `GETATTR` drops the page cache of the
+        // file: a write on the host through a shared `mmap` makes no inotify
+        // event. A kernel that does not offer it reads the file again only
+        // after an event.
+        if config
+            .capabilities()
+            .contains(InitFlags::FUSE_AUTO_INVAL_DATA)
+        {
+            // The kernel offers the flag, so the call cannot fail.
+            let _ = config.add_capabilities(InitFlags::FUSE_AUTO_INVAL_DATA);
+        }
         // The expiry of an entry keeps a mount below it. An old kernel
         // does not offer it; the server then invalidates the entry.
         if config
@@ -2291,7 +2306,7 @@ impl Filesystem for FuseTree {
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let name = name.to_owned();
         self.spawn(move |t| match t.lookup(parent, &name) {
-            Ok(Lookup::Found(attr, ttl)) => reply.entry(&ttl, &attr, GENERATION),
+            Ok(Lookup::Found(attr, ttl)) => reply.entry_with_ttls(&TTL, &ttl, &attr, GENERATION),
             Ok(Lookup::Missing) => reply.entry(&NEGATIVE_TTL, &negative_attr(), GENERATION),
             Err(e) => reply.error(e),
         });
@@ -2302,7 +2317,7 @@ impl Filesystem for FuseTree {
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
-        self.now(move |t| reply_attr(reply, t.getattr(ino), t));
+        self.now(move |t| reply_attr(reply, t.getattr(ino)));
     }
 
     fn setattr(
@@ -2329,7 +2344,6 @@ impl Filesystem for FuseTree {
             reply_attr(
                 reply,
                 t.setattr(caller, ino, mode, uid, gid, size, atime, mtime, fh),
-                t,
             );
         });
     }
@@ -3287,6 +3301,92 @@ pub(crate) mod tests {
             },
         )?;
         assert_eq!(stdout(&out), "missing\nold\nvisible\nnew\n");
+        Ok(())
+    }
+
+    /// A write of the host through a shared `mmap` makes no inotify event.
+    /// The attributes live 1 s, and the new `mtime` drops the kept page
+    /// cache, so the program sees the new content after that time.
+    #[test]
+    fn a_write_through_a_shared_mmap_becomes_visible() -> TestResult {
+        let Some(t) = trees()? else { return Ok(()) };
+        // `cat` calls `fstat`, and after a read the kernel then asks for the
+        // attributes anyway (the access time changed). A plain `read` asks
+        // only when the attributes expired.
+        if Command::new("python3").arg("-V").output().is_err() {
+            let reason = "no python3 in PATH";
+            assert!(
+                std::env::var_os("PENT_REQUIRE_ALL_TESTS").is_none(),
+                "the test does not run, and PENT_REQUIRE_ALL_TESTS is set: {reason}"
+            );
+            eprintln!("skip: {reason}");
+            return Ok(());
+        }
+        let file = t.real.join("f");
+        std::fs::write(&file, "old\n")?;
+        let real = t.real.clone();
+        let out = run_sh_with(
+            &t,
+            r#"set -e
+            cat "$M/f"
+            : > "$M/read"
+            i=0
+            while [ ! -e "$M/written" ] && [ $i -lt 400 ]; do sleep 0.05; i=$((i+1)); done
+            sleep 1.5
+            python3 -I -c 'import os, sys; sys.stdout.write(os.read(os.open(sys.argv[1], os.O_RDONLY), 4).decode())' "$M/f"
+            : > "$M/done""#,
+            move || {
+                let wait = |name: &str| -> Result<(), Box<dyn std::error::Error>> {
+                    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+                    while !real.join(name).exists() {
+                        if std::time::Instant::now() > deadline {
+                            return Err(format!("no {name}").into());
+                        }
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Ok(())
+                };
+                wait("read")?;
+                let f = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(real.join("f"))?;
+                // The `mtime` changes at the first write to the mapping;
+                // the old one must be older than the time step of the disk.
+                std::thread::sleep(Duration::from_millis(20));
+                // SAFETY: a shared mapping of 4 bytes of an open file of 4
+                // bytes; the result is checked below.
+                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+                let map = unsafe {
+                    libc::mmap(
+                        std::ptr::null_mut(),
+                        4,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_SHARED,
+                        f.as_raw_fd(),
+                        0,
+                    )
+                };
+                if map == libc::MAP_FAILED {
+                    return Err(std::io::Error::last_os_error().into());
+                }
+                // The descriptor closes before the write, so its close
+                // makes no `IN_CLOSE_WRITE` after it.
+                drop(f);
+                // SAFETY: `map` points to 4 writable bytes of the mapping.
+                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+                unsafe { std::ptr::copy_nonoverlapping(b"new\n".as_ptr(), map.cast::<u8>(), 4) };
+                std::fs::write(real.join("written"), "")?;
+                // The mapping stays until the script ends: its end would
+                // make an event.
+                let waited = wait("done");
+                // SAFETY: `map` is the mapping of 4 bytes from above.
+                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+                unsafe { libc::munmap(map, 4) };
+                waited
+            },
+        )?;
+        assert_eq!(stdout(&out), "old\nnew\n");
         Ok(())
     }
 
