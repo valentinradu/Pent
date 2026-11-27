@@ -132,12 +132,19 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
         rules,
         hold_pentd(&key, &args.command),
     ));
+    let env_map = build_run_env(&args.env);
     // In a FUSE area the chain of deciders applies each file rule, also one
     // that the static layers cannot hold, so such a rule needs no warning.
+    // The sandbox gets the same list, with the home directory of its
+    // environment, so the warnings and the areas agree.
     let areas = if args.no_sandbox {
         Vec::new()
     } else {
-        pent_sandbox::default_fuse_areas(dirs::home_dir().as_deref())
+        let home = env_map
+            .get("HOME")
+            .map(PathBuf::from)
+            .or_else(dirs::home_dir);
+        pent_sandbox::default_fuse_areas(home.as_deref())
     };
     let in_area = |target: &pent_profile::Target| match target {
         pent_profile::Target::File { width, .. } => {
@@ -176,7 +183,6 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
     } else {
         merge_ports(&grants.ports, &args.localhost)
     };
-    let env_map = build_run_env(&args.env);
     let trace_log_path = open_trace_log(args.trace, &key);
 
     for warning in network_warnings(decision, &args.allow, args.trace) {
@@ -247,6 +253,7 @@ pub(crate) async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
             .with_network(resolved_network)
             .with_env(env_map);
     sandbox_cfg.record_events = args.trace;
+    sandbox_cfg.file_areas = pent_sandbox::FuseAreas::Listed(areas);
     sandbox_cfg.unix_sockets = unix_socket_paths(&grants.unix_sockets, &args.unix_socket, &cwd);
     sandbox_cfg.localhost = LocalhostPorts::Listed(localhost_ports);
     // A Unix socket or a port off the lists asks, except with

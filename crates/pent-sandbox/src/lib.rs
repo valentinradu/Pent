@@ -58,10 +58,7 @@ mod linux_loopback;
 #[cfg(target_os = "linux")]
 mod linux_fuse;
 
-// Step 5.4 (the questions of the files) asks for the grafts; until then
-// only the tests graft.
 #[cfg(target_os = "linux")]
-#[cfg_attr(not(test), allow(dead_code))]
 mod linux_graft;
 
 pub use config::{system_default_paths, AccessDecider, FuseAreas, LocalhostPorts, SandboxConfig};

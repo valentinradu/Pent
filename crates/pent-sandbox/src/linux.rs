@@ -3399,7 +3399,8 @@ pub(crate) struct Spawned {
     /// The events of the recorder, if it runs.
     pub events: Option<std::sync::mpsc::Receiver<pent_profile::WatchEvent>>,
     /// The FUSE areas and the graft helper (with `config.file_areas`).
-    #[cfg_attr(not(test), allow(dead_code))] // Step 5.4 asks for the grafts.
+    // `pent run` only drops it after the spawn; the tests graft through it.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub files: Option<crate::linux_graft::FileAreas>,
 }
 

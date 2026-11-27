@@ -1,6 +1,6 @@
 # Plan: the new pent
 
-**Cursor: the review of phase 5, then step 6.1.** Steps with `[x]` are done. Work on the branch `next`,
+**Cursor: three decisions of the review of phase 5 (below the step 5.13), then step 6.1.** Steps with `[x]` are done. Work on the branch `next`,
 one commit for each step, and move this cursor when a step is done.
 
 **The way of work.** One commit for each step. Then the user runs
@@ -524,6 +524,21 @@ section 14 of the design has their results.
       it can list the width. So a width gets one plan for each run: a
       width with no graft at its first answer stays with FUSE (a matter of
       speed only).
+
+- [ ] **The review of phase 5** (2026-11-27, `/code-review
+  origin/main..HEAD`, 10 findings). Fixed, each with a test and a mutation
+  check: a deep hole in a write graft (GS-11), the watch after the open of
+  a lookup (NC-7), the overflow of the inotify queue (NC-8), the decided
+  opens of a node that the host moves (NC-6), the limit of the child plans
+  (GS-10), the areas of `pent run` from one list, the `allow(dead_code)`
+  of the grafts. Not a defect: a deny rule of another kind inside a graft
+  (a test proves it). Open, for the user:
+  - A write through a shared `mmap` makes no inotify event, so the kept
+    page cache and the attributes of one hour can stay old. A shorter time
+    fixes it, at the cost of one more request for each open.
+  - A write in a read graft gets `EROFS` at once, with no question.
+  - With a FUSE area, a write-listed file outside each area gets no
+    overlay (decision of 5.3), so an atomic replace of it fails.
 
 ## Phase 6: agents
 

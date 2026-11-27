@@ -154,6 +154,7 @@ pub(crate) enum GraftError {
     #[error("the path of a graft must be relative, with no `.` or `..`: {0}")]
     BadPath(PathBuf),
     /// No area has this number.
+    #[cfg(test)]
     #[error("no FUSE area has the number {0}")]
     NoArea(usize),
     /// The helper ended, so no graft is possible.
@@ -192,6 +193,9 @@ pub(crate) struct FuseArea {
 }
 
 /// The FUSE areas of a session and the channel to its graft helper.
+// `pent run` grafts through the FUSE server and only drops this value after
+// the spawn; the tests read it to graft by hand.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct FileAreas {
     areas: Vec<FuseArea>,
     grafter: Arc<Grafter>,
@@ -204,7 +208,9 @@ pub(crate) struct Grafter {
 
 impl Grafter {
     /// Graft `rel` of the area `area`, whose real directory is `source`.
-    /// Each path of `holes` (relative to `rel`) keeps its FUSE node.
+    /// Each path of `holes` (relative to `rel`) keeps its FUSE node; in a
+    /// graft that can write, each hole goes up to its first component
+    /// ([`writable_holes`]).
     ///
     /// # Errors
     /// Returns [`GraftError::BadPath`] for a bad path,
@@ -233,7 +239,12 @@ impl Grafter {
         msg.extend_from_slice(area_bytes);
         msg.push(0);
         msg.extend_from_slice(bytes);
-        for hole in holes {
+        let holes = if access.parts().0 {
+            writable_holes(holes)
+        } else {
+            holes.to_vec()
+        };
+        for hole in &holes {
             let hole_bytes = hole.as_os_str().as_bytes();
             if hole_bytes.is_empty() || !valid_relative(hole_bytes) {
                 return Err(GraftError::BadPath(hole.clone()));
@@ -284,6 +295,7 @@ fn valid_area(area: &[u8]) -> bool {
     }
 }
 
+#[cfg(test)]
 impl FileAreas {
     /// The areas, in the order of [`crate::SandboxConfig::file_areas`].
     pub(crate) fn areas(&self) -> &[FuseArea] {
@@ -482,17 +494,45 @@ pub(crate) fn relative_holes(width: &Path, holes: &[PathBuf]) -> Option<Vec<Path
         .collect()
 }
 
+/// The holes of a graft that can write: each hole goes up to its first
+/// component, so each hole is a mount point directly in the graft. A
+/// rename of a mount point fails with `EBUSY`. A deeper hole would sit in
+/// a real directory of the graft, and the program could rename that
+/// directory: the hole moves with it, and the program could then make the
+/// sensitive path again in the real tree, with no question. In a read-only
+/// graft each rename fails, so a deeper hole is safe there.
+pub(crate) fn writable_holes(holes: &[PathBuf]) -> Vec<PathBuf> {
+    let mut tops: Vec<PathBuf> = holes
+        .iter()
+        .map(|h| {
+            // An empty hole stays empty, and the check of the paths refuses it.
+            h.components()
+                .next()
+                .map_or_else(|| h.clone(), |c| PathBuf::from(c.as_os_str()))
+        })
+        .collect();
+    tops.sort();
+    tops.dedup();
+    tops
+}
+
 /// The maximum number of child grafts of one width (step 5.13). Each graft
 /// is a mount in the session; above the limit, FUSE serves the other
 /// children.
 pub(crate) const MAX_CHILD_GRAFTS: usize = 64;
+
+/// The maximum number of children of one width that get a plan. Each plan
+/// asks the decider and looks at the guard list on the disk, and at the
+/// start the program waits for the grafts.
+pub(crate) const MAX_CHILD_PLANS: usize = 256;
 
 /// The grafts that give the width `base` for an access of the kind `kind`:
 /// pairs of a directory and its holes, relative to the directory. The
 /// width itself when the decider agrees
 /// ([`crate::AccessDecider::graft_plan`]). Else each child directory of
 /// `base` that the decider lets a graft give alone, in the order of the
-/// names, and at most [`MAX_CHILD_GRAFTS`]. The width itself then stays
+/// names, and at most [`MAX_CHILD_GRAFTS`] from the first
+/// [`MAX_CHILD_PLANS`] children. The width itself then stays
 /// with FUSE, so a new name directly in it still asks, and a file of pent
 /// in it stays hidden.
 pub(crate) fn graft_plans(
@@ -526,6 +566,7 @@ pub(crate) fn graft_plans(
     children.sort();
     children
         .iter()
+        .take(MAX_CHILD_PLANS)
         .filter_map(|child| plan(child))
         .take(MAX_CHILD_GRAFTS)
         .collect()
@@ -2204,12 +2245,163 @@ cat "$H/ans/a/f"
             plans.get(1).map(|(_, h)| h.clone()),
             Some(vec![PathBuf::from("secret")])
         );
+        // A child after the first `MAX_CHILD_PLANS` gets no plan.
+        let late = tempfile::tempdir()?;
+        let late = std::fs::canonicalize(late.path())?;
+        let mut few = FakeDecider::new(Vec::new(), late.join("pent"));
+        for i in 0..MAX_CHILD_PLANS {
+            std::fs::create_dir(late.join(format!("a{i:03}")))?;
+        }
+        std::fs::create_dir(late.join("z"))?;
+        few.graftable.push(late.join("z"));
+        assert!(graft_plans(&few, pent_profile::FileKind::Read, &late).is_empty());
         fake.graftable.push(base.clone());
         let whole = graft_plans(&fake, pent_profile::FileKind::Read, &base);
         assert_eq!(
             whole,
             vec![(base.clone(), vec![PathBuf::from("d001/secret")])]
         );
+        Ok(())
+    }
+
+    /// The program of the test of a deep hole in a write graft.
+    const DEEP_HOLE_SCRIPT: &str = r#"set -e
+exec > "$T/out" 2>&1
+for d in w w/a w/a/b; do
+  grep -q " $H/$d " /proc/self/mountinfo && echo "mount-$d" || true
+done
+(mv "$H/w/a" "$H/w/a2") 2>/dev/null && echo moved || echo move-refused
+echo n > "$H/w/new"
+cat "$H/w/new"
+"#;
+
+    /// A write graft with a hole two levels deep: the hole goes up to the
+    /// child directly in the width, so the program cannot rename the parent
+    /// of the hole and make the sensitive path again in the real tree.
+    #[test]
+    fn a_write_graft_keeps_each_hole_directly_in_the_width() -> TestResult {
+        if !ready() {
+            return Ok(());
+        }
+        let tmp = tempfile::tempdir()?;
+        let base = std::fs::canonicalize(tmp.path())?;
+        let (ws, home) = (base.join("ws"), base.join("home"));
+        std::fs::create_dir_all(home.join("w/a/b"))?;
+        std::fs::create_dir(&ws)?;
+        std::fs::write(home.join("w/a/b/x"), "SECRET\n")?;
+
+        let text = |p: &Path| p.to_string_lossy().into_owned();
+        let mut fake = FakeDecider::new(Vec::new(), home.join(".config/pent"));
+        fake.graftable = vec![home.join("w")];
+        fake.holes = vec![home.join("w/a/b")];
+        let decider = Arc::new(fake);
+        let mut env = crate::build_env(&[]);
+        env.insert("T".to_string(), text(&ws));
+        env.insert("H".to_string(), text(&home));
+        env.insert("HOME".to_string(), text(&home));
+        let mut config =
+            crate::SandboxConfig::new(ws.clone(), crate::system_default_paths(), ws.clone())
+                .with_env(env.clone())
+                .with_network(crate::NetworkMode::LocalhostOnly);
+        config.file_areas = crate::FuseAreas::OutsideBase;
+        config.paths.read_write.push(text(&home.join("w")));
+        config.file_decider = Some(decider);
+        let args = vec!["-c".to_string(), DEEP_HOLE_SCRIPT.to_string()];
+        let spawned = crate::linux::spawn_linux(
+            &config,
+            "sh",
+            &args,
+            &env,
+            &crate::resolve_path_directories(),
+            crate::linux::SpawnMode::Sandbox,
+        )?;
+        let mut child = spawned.child;
+        drop(spawned.files);
+        let status = child.wait()?;
+        let out = std::fs::read_to_string(ws.join("out")).unwrap_or_default();
+        assert!(status.success(), "the program failed: {status}\n{out}");
+        assert_eq!(out, "mount-w\nmount-w/a\nmove-refused\nn\n");
+        assert!(home.join("w/a/b/x").exists() && !home.join("w/a2").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn the_holes_of_a_write_graft_go_up_to_their_first_component() {
+        let holes = [
+            PathBuf::from("a/b"),
+            PathBuf::from("a/c/d"),
+            PathBuf::from("e"),
+            PathBuf::new(),
+        ];
+        assert_eq!(
+            writable_holes(&holes),
+            [PathBuf::new(), PathBuf::from("a"), PathBuf::from("e")]
+        );
+    }
+
+    /// The program reads a granted file, and the host moves it into a
+    /// directory with no grant.
+    const MOVED_OPEN_SCRIPT: &str = r#"exec > "$T/out" 2>&1
+cat "$A/ok/f"
+: > "$T/read"
+i=0
+while [ ! -e "$T/moved" ] && [ $i -lt 600 ]; do sleep 0.05; i=$((i+1)); done
+cat "$A/no/f" 2>/dev/null || echo refused
+"#;
+
+    /// An open that the grants gave once needs no check again, until the
+    /// node gets a new path. A rename on the host gives it one too.
+    #[test]
+    fn a_file_that_the_host_moves_is_checked_again_at_its_new_path() -> TestResult {
+        if !ready() {
+            return Ok(());
+        }
+        let tmp = tempfile::tempdir()?;
+        let base = std::fs::canonicalize(tmp.path())?;
+        let (ws, area) = (base.join("ws"), base.join("area"));
+        std::fs::create_dir_all(area.join("ok"))?;
+        std::fs::create_dir_all(area.join("no"))?;
+        std::fs::create_dir(&ws)?;
+        std::fs::write(area.join("ok/f"), "granted\n")?;
+
+        let mut env = crate::build_env(&[]);
+        env.insert("T".to_string(), ws.to_string_lossy().into_owned());
+        env.insert("A".to_string(), area.to_string_lossy().into_owned());
+        let mut config =
+            crate::SandboxConfig::new(ws.clone(), crate::system_default_paths(), ws.clone())
+                .with_env(env.clone())
+                .with_network(crate::NetworkMode::LocalhostOnly);
+        config
+            .paths
+            .read
+            .push(area.join("ok").to_string_lossy().into_owned());
+        config.file_areas = crate::FuseAreas::Listed(vec![area.clone()]);
+        let args = vec!["-c".to_string(), MOVED_OPEN_SCRIPT.to_string()];
+        let spawned = crate::linux::spawn_linux(
+            &config,
+            "sh",
+            &args,
+            &env,
+            &crate::resolve_path_directories(),
+            crate::linux::SpawnMode::Sandbox,
+        )?;
+        let mut child = spawned.child;
+        let result = (|| -> TestResult {
+            wait_for(&ws.join("read"))?;
+            std::fs::rename(area.join("ok/f"), area.join("no/f"))?;
+            std::fs::write(ws.join("moved"), "")?;
+            Ok(())
+        })();
+        if result.is_err() {
+            // Unblock the program, so that the wait below ends.
+            let _ = std::fs::write(ws.join("moved"), "");
+        }
+        let status = child.wait()?;
+        drop(spawned.files);
+        result?;
+        let out = std::fs::read_to_string(ws.join("out"))?;
+        assert!(status.success(), "the program failed: {status}\n{out}");
+        assert_eq!(out, "granted\nrefused\n");
         Ok(())
     }
 }

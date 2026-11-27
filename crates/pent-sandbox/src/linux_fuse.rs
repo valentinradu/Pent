@@ -584,6 +584,17 @@ impl Inodes {
     }
 }
 
+/// Tell the kernel to drop the entry `name` in the directory node `dir`.
+/// The expiry keeps a mount below the entry; an old kernel has only the
+/// invalidation.
+fn drop_entry(notifier: &fuser::Notifier, dir: u64, name: &OsStr) {
+    if notifier.expire_entry(INodeNo(dir), name).is_err() {
+        // The kernel may know no entry for the name; the error then means
+        // nothing.
+        let _ = notifier.inval_entry(INodeNo(dir), name);
+    }
+}
+
 /// One entry of a directory listing.
 struct DirItem {
     name: OsString,
@@ -625,6 +636,14 @@ struct Tree {
     /// A test hook: a lookup of this name waits this long.
     #[cfg(test)]
     slow_lookup: Option<(OsString, Duration)>,
+    /// A test hook: after the open of a lookup of this name, the host
+    /// makes the file at this path.
+    #[cfg(test)]
+    make_after_open: Option<(OsString, PathBuf)>,
+    /// A test hook: 1 drops each inotify event, 2 turns the next event
+    /// into an overflow of the queue (see `Tree::overflow`).
+    #[cfg(test)]
+    lose_events: Option<Arc<std::sync::atomic::AtomicU8>>,
 }
 
 /// The `fuser` filesystem: it sends each request to the pool.
@@ -947,6 +966,10 @@ impl Tree {
             reads_seen: None,
             #[cfg(test)]
             slow_lookup: None,
+            #[cfg(test)]
+            make_after_open: None,
+            #[cfg(test)]
+            lose_events: None,
         })
     }
 
@@ -974,8 +997,16 @@ impl Tree {
         if let Some(id) = inodes.by_key.get(&key).copied() {
             if let Some(node) = inodes.nodes.get_mut(&id) {
                 node.lookups = node.lookups.saturating_add(1);
+                let moved = node.parent != u64::from(parent) || node.name != name;
                 if id != u64::from(INodeNo::ROOT) {
                     inodes.set_entry(id, u64::from(parent), name);
+                }
+                drop(inodes);
+                if moved {
+                    // The node has a new path (a rename on the host, or a
+                    // second name), so each decided open of it must be
+                    // checked again, as after a FUSE rename.
+                    lock(&self.static_opens).clear();
                 }
                 return Ok(id);
             }
@@ -1277,17 +1308,24 @@ impl Tree {
             return Err(Errno::ENOENT);
         }
         let dir = self.fd(parent)?;
-        match open_path(dir.as_fd(), &cname) {
+        // The watch comes first: a name that appears or goes after the open
+        // then gives an event, and the long entry never stays stale.
+        let watched = self.watch(parent, &dir);
+        let opened = open_path(dir.as_fd(), &cname);
+        #[cfg(test)]
+        if let Some((made, path)) = &self.make_after_open {
+            if made == name {
+                // The test checks the result through the mount.
+                let _ = std::fs::write(path, "");
+            }
+        }
+        match opened {
             Ok(fd) => {
-                let ttl = if self.watch(parent, &dir) {
-                    WATCHED_TTL
-                } else {
-                    TTL
-                };
+                let ttl = if watched { WATCHED_TTL } else { TTL };
                 self.entry(fd, parent, name)
                     .map(|attr| Lookup::Found(attr, ttl))
             }
-            Err(e) if e == Errno::ENOENT && self.watch(parent, &dir) => Ok(Lookup::Missing),
+            Err(e) if e == Errno::ENOENT && watched => Ok(Lookup::Missing),
             Err(e) => Err(e),
         }
     }
@@ -1356,6 +1394,22 @@ impl Tree {
         let Some(watches) = &self.watches else {
             return;
         };
+        #[cfg(test)]
+        if let Some(lose) = &self.lose_events {
+            match lose.load(Ordering::Acquire) {
+                1 => return,
+                2 => {
+                    lose.store(0, Ordering::Release);
+                    self.overflow();
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if mask & libc::IN_Q_OVERFLOW != 0 {
+            self.overflow();
+            return;
+        }
         let node = {
             let mut maps = lock(&watches.maps);
             if mask & libc::IN_IGNORED != 0 {
@@ -1379,11 +1433,7 @@ impl Tree {
             return;
         }
         if mask & (APPEAR | GONE) != 0 {
-            // The expiry keeps a mount below the entry; an old kernel has
-            // only the invalidation.
-            if notifier.expire_entry(INodeNo(dir), name).is_err() {
-                let _ = notifier.inval_entry(INodeNo(dir), name);
-            }
+            drop_entry(notifier, dir, name);
             // The directory changed too (its times, its links, its list).
             let _ = notifier.inval_inode(INodeNo(dir), 0, 0);
         }
@@ -1395,6 +1445,42 @@ impl Tree {
             if let Some(file) = file {
                 // The attributes and each page of the file.
                 let _ = notifier.inval_inode(INodeNo(file), 0, 0);
+            }
+        }
+    }
+
+    /// The queue of inotify overflowed, so the server lost events: drop
+    /// each entry, each attribute and each page cache that a lost event
+    /// could make stale. A negative entry has no record in the server, so
+    /// each name that now exists in a watched directory drops its entry.
+    fn overflow(&self) {
+        let (Some(watches), Some(notifier)) = (&self.watches, self.notifier.get()) else {
+            return;
+        };
+        tracing::debug!("the inotify queue overflowed: the FUSE caches drop");
+        let entries: Vec<((u64, OsString), u64)> = lock(&self.inodes)
+            .by_entry
+            .iter()
+            .map(|(entry, file)| (entry.clone(), *file))
+            .collect();
+        // The kernel may know no entry and no cache for a node; an error of
+        // a notification then means nothing.
+        for ((dir, name), file) in &entries {
+            drop_entry(notifier, *dir, name);
+            let _ = notifier.inval_inode(INodeNo(*file), 0, 0);
+        }
+        let dirs: Vec<u64> = lock(&watches.maps).by_node.keys().copied().collect();
+        for dir in dirs {
+            let _ = notifier.inval_inode(INodeNo(dir), 0, 0);
+            let Ok(fd) = self.fd(INodeNo(dir)) else {
+                continue;
+            };
+            let path = proc_path(fd.as_fd());
+            let Ok(list) = std::fs::read_dir(Path::new(OsStr::from_bytes(path.as_bytes()))) else {
+                continue;
+            };
+            for entry in list.flatten() {
+                drop_entry(notifier, dir, &entry.file_name());
             }
         }
     }
@@ -2633,6 +2719,10 @@ pub(crate) mod tests {
         lookups_seen: Option<Arc<Mutex<HashMap<OsString, u32>>>>,
         /// The count of the `READ` requests (see `Tree::reads_seen`).
         reads_seen: Option<Arc<AtomicU64>>,
+        /// See `Tree::make_after_open`.
+        make_after_open: Option<(OsString, PathBuf)>,
+        /// See `Tree::lose_events`.
+        lose_events: Option<Arc<std::sync::atomic::AtomicU8>>,
     }
 
     fn trees() -> Result<Option<Trees>, Box<dyn std::error::Error>> {
@@ -2658,6 +2748,8 @@ pub(crate) mod tests {
             slow_lookup: None,
             lookups_seen: None,
             reads_seen: None,
+            make_after_open: None,
+            lose_events: None,
         }))
     }
 
@@ -2718,7 +2810,11 @@ pub(crate) mod tests {
             .into());
         };
         let dev = fds.pop().ok_or("no descriptor")?;
-        let hooked = t.slow_lookup.is_some() || t.lookups_seen.is_some() || t.reads_seen.is_some();
+        let hooked = t.slow_lookup.is_some()
+            || t.lookups_seen.is_some()
+            || t.reads_seen.is_some()
+            || t.make_after_open.is_some()
+            || t.lose_events.is_some();
         let server = if !hooked {
             serve(dev, root, None)?
         } else {
@@ -2726,6 +2822,8 @@ pub(crate) mod tests {
             tree.slow_lookup.clone_from(&t.slow_lookup);
             tree.lookups_seen.clone_from(&t.lookups_seen);
             tree.reads_seen.clone_from(&t.reads_seen);
+            tree.make_after_open.clone_from(&t.make_after_open);
+            tree.lose_events.clone_from(&t.lose_events);
             let tree = Arc::new(tree);
             serve_tree(dev, FuseTree::of(tree))?
         };
@@ -3129,6 +3227,66 @@ pub(crate) mod tests {
         // the file.
         let count = lock(&seen).get(OsStr::new("later")).copied().unwrap_or(0);
         assert_eq!(count, 2, "lookups of the probed name");
+        Ok(())
+    }
+
+    /// The first lookup in a directory watches it before the open, so a
+    /// name that the host makes just after the open still becomes visible.
+    #[test]
+    fn a_name_made_just_after_the_first_lookup_becomes_visible() -> TestResult {
+        let Some(mut t) = trees()? else { return Ok(()) };
+        std::fs::create_dir(t.real.join("fresh"))?;
+        t.make_after_open = Some(("late".into(), t.real.join("fresh/late")));
+        let out = run_sh(
+            &t,
+            r#"[ -e "$M/fresh/late" ] || echo missing
+            i=0
+            while [ ! -e "$M/fresh/late" ] && [ $i -lt 40 ]; do sleep 0.05; i=$((i+1)); done
+            [ -e "$M/fresh/late" ] && echo visible"#,
+        )?;
+        assert_eq!(stdout(&out), "missing\nvisible\n");
+        Ok(())
+    }
+
+    /// When the inotify queue overflows, the lost events stale nothing: a
+    /// name that the host made and a file that it changed become visible.
+    #[test]
+    fn an_overflow_of_the_watch_drops_each_cache() -> TestResult {
+        let Some(mut t) = trees()? else { return Ok(()) };
+        let lose = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        t.lose_events = Some(Arc::clone(&lose));
+        std::fs::write(t.real.join("f"), "old\n")?;
+        let real = t.real.clone();
+        let out = run_sh_with(
+            &t,
+            r#"set -e
+            [ -e "$M/later" ] || echo missing
+            cat "$M/f"
+            : > "$M/probed"
+            i=0
+            while [ ! -e "$M/later" ] && [ $i -lt 100 ]; do sleep 0.05; i=$((i+1)); done
+            [ -e "$M/later" ] && echo visible
+            cat "$M/f""#,
+            move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(20);
+                while !real.join("probed").exists() {
+                    if std::time::Instant::now() > deadline {
+                        return Err("the script did not probe".into());
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                // These events are lost; the next one stands for the
+                // overflow.
+                lose.store(1, Ordering::Release);
+                std::fs::write(real.join("later"), "")?;
+                std::fs::write(real.join("f"), "new\n")?;
+                std::thread::sleep(Duration::from_millis(200));
+                lose.store(2, Ordering::Release);
+                std::fs::write(real.join("trigger"), "")?;
+                Ok(())
+            },
+        )?;
+        assert_eq!(stdout(&out), "missing\nold\nvisible\nnew\n");
         Ok(())
     }
 

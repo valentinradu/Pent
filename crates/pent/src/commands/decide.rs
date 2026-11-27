@@ -1010,6 +1010,26 @@ mod tests {
                 width: PathWidth::Exact(path("/home/u/projects")),
             })
             .is_none());
+        // A graft gives more than its kind: a write graft reads and lists,
+        // a read graft lists. A deny rule of such a kind inside the width
+        // stops the graft too.
+        let kinds = set(vec![
+            file(FileKind::Write, sub("/home/u/w"), Decision::Allow),
+            file(FileKind::Read, sub("/home/u/w/secret"), Decision::Deny),
+            file(FileKind::Read, sub("/home/u/r"), Decision::Allow),
+            file(FileKind::List, sub("/home/u/r/private"), Decision::Deny),
+        ]);
+        let decider = Decider::new(set(vec![]), kinds, classes(), None);
+        let of = |kind, p: &str| Target::File {
+            kind,
+            width: sub(p),
+        };
+        assert!(decider
+            .graft_plan(&of(FileKind::Write, "/home/u/w"))
+            .is_none());
+        assert!(decider
+            .graft_plan(&of(FileKind::Read, "/home/u/r"))
+            .is_none());
         // Without the classes of the user no graft is safe.
         let blind = Decider::new(set(vec![]), set(vec![]), None, None);
         assert!(blind.graft_plan(&target("/home/u/projects")).is_none());
