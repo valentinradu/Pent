@@ -993,6 +993,17 @@ mod tests {
         assert!(decider.graft_plan(&target("/home/u/src")).is_none());
         assert!(decider.graft_plan(&target("/home/u")).is_none());
         assert!(decider.graft_plan(&target("/home/u/.ssh")).is_none());
+        // The children of a width with a directory of pent (step 5.13):
+        // pent and a missing credential stay with FUSE, a clean child may
+        // be a graft.
+        assert!(decider.graft_plan(&target("/home/u/.config")).is_none());
+        assert!(decider
+            .graft_plan(&target("/home/u/.config/pent"))
+            .is_none());
+        assert!(decider.graft_plan(&target("/home/u/.config/gh")).is_none());
+        assert!(decider
+            .graft_plan(&target("/home/u/.config/nvim"))
+            .is_some());
         assert!(decider
             .graft_plan(&Target::File {
                 kind: FileKind::Read,

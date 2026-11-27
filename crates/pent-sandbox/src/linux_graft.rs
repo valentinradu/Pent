@@ -482,6 +482,55 @@ pub(crate) fn relative_holes(width: &Path, holes: &[PathBuf]) -> Option<Vec<Path
         .collect()
 }
 
+/// The maximum number of child grafts of one width (step 5.13). Each graft
+/// is a mount in the session; above the limit, FUSE serves the other
+/// children.
+pub(crate) const MAX_CHILD_GRAFTS: usize = 64;
+
+/// The grafts that give the width `base` for an access of the kind `kind`:
+/// pairs of a directory and its holes, relative to the directory. The
+/// width itself when the decider agrees
+/// ([`crate::AccessDecider::graft_plan`]). Else each child directory of
+/// `base` that the decider lets a graft give alone, in the order of the
+/// names, and at most [`MAX_CHILD_GRAFTS`]. The width itself then stays
+/// with FUSE, so a new name directly in it still asks, and a file of pent
+/// in it stays hidden.
+pub(crate) fn graft_plans(
+    decider: &dyn crate::AccessDecider,
+    kind: pent_profile::FileKind,
+    base: &Path,
+) -> Vec<(PathBuf, Vec<PathBuf>)> {
+    let plan = |dir: &Path| {
+        let width = pent_profile::RulePath::new(dir).ok()?;
+        let target = pent_profile::Target::File {
+            kind,
+            width: pent_profile::PathWidth::Subtree(width),
+        };
+        decider
+            .graft_plan(&target)
+            .and_then(|holes| relative_holes(dir, &holes))
+            .map(|holes| (dir.to_path_buf(), holes))
+    };
+    if let Some(whole) = plan(base) {
+        return vec![whole];
+    }
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return Vec::new();
+    };
+    // A link is no child: a graft never follows a link.
+    let mut children: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| e.path())
+        .collect();
+    children.sort();
+    children
+        .iter()
+        .filter_map(|child| plan(child))
+        .take(MAX_CHILD_GRAFTS)
+        .collect()
+}
+
 /// The access of a graft that the Landlock rights `rights` of a grant
 /// give, or `None` when a graft would give more: a graft needs the right to
 /// read files and to list.
@@ -513,8 +562,9 @@ const fn kind_of_access(access: GraftAccess) -> pent_profile::FileKind {
 /// directory in an area, with the right to read files and to list. The
 /// decider must agree ([`crate::AccessDecider::graft_plan`]): a file of pent
 /// or a deny rule inside the width keeps it with FUSE, and each sensitive
-/// place inside it becomes a hole that FUSE keeps serving. Without a
-/// decider there is no graft. A grant inside a graft that
+/// place inside it becomes a hole that FUSE keeps serving. When no graft of
+/// the width is safe, its safe children become grafts ([`graft_plans`]).
+/// Without a decider there is no graft. A grant inside a graft that
 /// gives it already needs no graft of its own. A failed graft only means
 /// that FUSE serves the width.
 fn start_grafts(
@@ -547,28 +597,17 @@ fn start_grafts(
         {
             continue;
         }
-        let Ok(base) = pent_profile::RulePath::new(path.clone()) else {
-            continue;
-        };
-        let target = pent_profile::Target::File {
-            kind: kind_of_access(access),
-            width: pent_profile::PathWidth::Subtree(base),
-        };
-        let Some(holes) = decider
-            .graft_plan(&target)
-            .and_then(|holes| relative_holes(&path, &holes))
-        else {
-            continue;
-        };
-        let Ok(rel) = path.strip_prefix(&area.path) else {
-            continue;
-        };
-        match context
-            .grafter
-            .graft(area.source.as_fd(), &area.path, rel, &holes, access)
-        {
-            Ok(()) => done.push((path, access)),
-            Err(e) => tracing::debug!("no graft of {}: {e}", path.display()),
+        for (dir, holes) in graft_plans(decider.as_ref(), kind_of_access(access), &path) {
+            let Ok(rel) = dir.strip_prefix(&area.path) else {
+                continue;
+            };
+            match context
+                .grafter
+                .graft(area.source.as_fd(), &area.path, rel, &holes, access)
+            {
+                Ok(()) => done.push((dir, access)),
+                Err(e) => tracing::debug!("no graft of {}: {e}", dir.display()),
+            }
         }
     }
 }
@@ -2023,6 +2062,154 @@ cat "$H/cfg/open2.txt"
             "{asked:?}"
         );
         assert!(asked_for("cfg/secret/new"), "{asked:?}");
+        Ok(())
+    }
+
+    /// The program of the test of the child grafts. It reads the mounts
+    /// first, before any access to the home directory.
+    const CHILDREN_SCRIPT: &str = r#"set -e
+exec > "$T/out" 2>&1
+for d in cfg cfg/git cfg/gh cfg/pent; do
+  grep -q " $H/$d " /proc/self/mountinfo && echo "graft-$d" || true
+done
+cat "$H/cfg/git/config"
+[ -e "$H/cfg/pent" ] || echo pent-hidden
+(echo x > "$H/cfg/new") 2>/dev/null || echo create-refused
+cat "$H/ans/top.txt"
+i=0
+while ! grep -q " $H/ans/a " /proc/self/mountinfo && [ $i -lt 100 ]; do sleep 0.02; i=$((i+1)); done
+for d in ans ans/a ans/b; do
+  grep -q " $H/$d " /proc/self/mountinfo && echo "graft-$d" || true
+done
+cat "$H/ans/a/f"
+(cat "$H/ans/b/f") 2>/dev/null || echo b-refused
+"#;
+
+    /// A width that cannot be one graft, from a grant at the start or from
+    /// an answer, grafts each child that is safe alone. The width itself
+    /// stays with FUSE: a new name in it still goes to the decider, and a
+    /// file of pent in it stays hidden.
+    #[test]
+    fn a_width_that_cannot_be_one_graft_grafts_its_safe_children() -> TestResult {
+        if !ready() {
+            return Ok(());
+        }
+        let tmp = tempfile::tempdir()?;
+        let base = std::fs::canonicalize(tmp.path())?;
+        let (ws, home) = (base.join("ws"), base.join("home"));
+        for dir in ["cfg/git", "cfg/gh", "cfg/pent", "ans/a", "ans/b"] {
+            std::fs::create_dir_all(home.join(dir))?;
+        }
+        std::fs::create_dir(&ws)?;
+        for (file, text) in [
+            ("cfg/git/config", "git\n"),
+            ("cfg/gh/hosts.yml", "TOKEN\n"),
+            ("cfg/pent/x", "PENT\n"),
+            ("ans/top.txt", "top\n"),
+            ("ans/a/f", "a\n"),
+            ("ans/b/f", "b\n"),
+        ] {
+            std::fs::write(home.join(file), text)?;
+        }
+
+        let text = |p: &Path| p.to_string_lossy().into_owned();
+        let top = pent_profile::Request::File {
+            kind: pent_profile::FileKind::Read,
+            path: pent_profile::RulePath::new(home.join("ans/top.txt"))?,
+        };
+        let answer = pent_profile::Target::File {
+            kind: pent_profile::FileKind::Read,
+            width: pent_profile::PathWidth::Subtree(pent_profile::RulePath::new(home.join("ans"))?),
+        };
+        let mut fake = FakeDecider::new(vec![top.clone()], home.join("cfg/pent"));
+        fake.targets = vec![(top, answer)];
+        // `cfg` and `ans` are not safe as one graft; `cfg/gh` holds a
+        // credential, and `ans/b` holds a deny rule, say.
+        fake.graftable = vec![home.join("cfg/git"), home.join("ans/a")];
+        let decider = Arc::new(fake);
+        let mut env = crate::build_env(&[]);
+        env.insert("T".to_string(), text(&ws));
+        env.insert("H".to_string(), text(&home));
+        env.insert("HOME".to_string(), text(&home));
+        let mut config =
+            crate::SandboxConfig::new(ws.clone(), crate::system_default_paths(), ws.clone())
+                .with_env(env.clone())
+                .with_network(crate::NetworkMode::LocalhostOnly);
+        config.file_areas = crate::FuseAreas::OutsideBase;
+        config.paths.read.push(text(&home.join("cfg")));
+        config.file_decider = Some(decider.clone());
+        let args = vec!["-c".to_string(), CHILDREN_SCRIPT.to_string()];
+        let spawned = crate::linux::spawn_linux(
+            &config,
+            "sh",
+            &args,
+            &env,
+            &crate::resolve_path_directories(),
+            crate::linux::SpawnMode::Sandbox,
+        )?;
+        let mut child = spawned.child;
+        drop(spawned.files);
+        let status = child.wait()?;
+        let out = std::fs::read_to_string(ws.join("out")).unwrap_or_default();
+        assert!(status.success(), "the program failed: {status}\n{out}");
+        // `ans/a/f` has no allow: only the graft can give it.
+        assert_eq!(
+            out,
+            "graft-cfg/git\ngit\npent-hidden\ncreate-refused\ntop\ngraft-ans/a\na\nb-refused\n"
+        );
+        assert!(!home.join("cfg/new").exists());
+        let asked = decider
+            .asked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let asked_for = |p: &str| {
+            asked.iter().any(|(_, r)| {
+                matches!(r, pent_profile::Request::File { path, .. }
+                    if path.as_path() == home.join(p))
+            })
+        };
+        assert!(asked_for("cfg/new") && asked_for("ans/b/f"), "{asked:?}");
+        assert!(!asked_for("ans/a/f"), "{asked:?}");
+        Ok(())
+    }
+
+    /// The child grafts of a width: only the safe child directories, never
+    /// a link, in the order of the names, and at most `MAX_CHILD_GRAFTS`.
+    /// A width that is safe as a whole is one graft.
+    #[test]
+    fn the_child_plans_skip_links_and_stop_at_the_limit() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        let base = std::fs::canonicalize(tmp.path())?;
+        let mut fake = FakeDecider::new(Vec::new(), base.join("pent"));
+        let count = MAX_CHILD_GRAFTS + 6;
+        for i in 0..count {
+            let dir = base.join(format!("d{i:03}"));
+            std::fs::create_dir(&dir)?;
+            fake.graftable.push(dir);
+        }
+        std::fs::create_dir(base.join("unsafe"))?;
+        std::fs::write(base.join("file"), "")?;
+        std::os::unix::fs::symlink(base.join("d000"), base.join("a-link"))?;
+        fake.graftable.push(base.join("a-link"));
+        fake.graftable.push(base.join("file"));
+        fake.holes = vec![base.join("d001/secret")];
+        let plans = graft_plans(&fake, pent_profile::FileKind::Read, &base);
+        let dirs: Vec<PathBuf> = plans.iter().map(|(d, _)| d.clone()).collect();
+        let wanted: Vec<PathBuf> = (0..MAX_CHILD_GRAFTS)
+            .map(|i| base.join(format!("d{i:03}")))
+            .collect();
+        assert_eq!(dirs, wanted);
+        assert_eq!(
+            plans.get(1).map(|(_, h)| h.clone()),
+            Some(vec![PathBuf::from("secret")])
+        );
+        fake.graftable.push(base.clone());
+        let whole = graft_plans(&fake, pent_profile::FileKind::Read, &base);
+        assert_eq!(
+            whole,
+            vec![(base.clone(), vec![PathBuf::from("d001/secret")])]
+        );
         Ok(())
     }
 }

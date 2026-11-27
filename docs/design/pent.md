@@ -176,6 +176,12 @@ create, listing), not at a lookup.
   it cannot remove a graft or a FUSE mount (`EPERM`).
 - **A graft stays valid.** The FUSE entry under a graft has a long validity
   time, because an invalid entry would remove the mount above it.
+- **The children of a width.** A width that cannot be one graft (a
+  directory of pent inside it, or a sensitive file that is missing directly
+  in it) keeps FUSE for itself. Each child directory of it that is safe
+  alone becomes a graft, at most 64 for each width (step 5.13). So
+  `~/.config/git` is native, a new file directly in `~/.config` still asks,
+  and `~/.config/pent` stays hidden.
 
 ### 5.5 The FUSE server
 
@@ -476,6 +482,13 @@ natively (5.5 s on the clock at a load of 32). The round trip of `OPEN`
 through the FUSE device is now most of the cost. With the real home, a
 cold build in `pent run` took 30.9 s against 31.6 s natively: a build
 opens each file a few times.
+
+**The child grafts** (step 5.13, 2026-11-27). A width that cannot be one
+graft (`~/.config`, `~/.local/share`, the home directory, `~/.cargo` with
+no `credentials.toml`) now grafts each safe child directory, so only the
+opens directly in the width and in the unsafe children still go through
+FUSE. No new measurement: the cost of a grafted child is the cost of a
+graft above.
 
 **FUSE passthrough** (step 5.9, 2026-11-26, Linux 7.3). The kernel offers
 `FUSE_PASSTHROUGH`, and the server can negotiate it, but the registration

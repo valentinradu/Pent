@@ -1,6 +1,6 @@
 # Plan: the new pent
 
-**Cursor: decide step 5.13, then the review of phase 5, then step 6.1.** Steps with `[x]` are done. Work on the branch `next`,
+**Cursor: the review of phase 5, then step 6.1.** Steps with `[x]` are done. Work on the branch `next`,
 one commit for each step, and move this cursor when a step is done.
 
 **The way of work.** One commit for each step. Then the user runs
@@ -492,16 +492,14 @@ section 14 of the design has their results.
     the opens of FUSE alone went from 39.0 s to 25.8 s (4.6 s natively).
     The rest is the round trip through the FUSE device.
 
-- [ ] **5.13 Graft the children.** Open: the user decides first whether to
-  do it. FUSE alone (about 5 to 7 times native for many opens, step 5.12)
-  stays where a width cannot be one graft: a file of pent inside it
-  (`~/.config`, `~/.local/share`, `~/.local/state`, the home directory),
-  or a sensitive file that is missing directly in it (`~/.cargo` and
-  `credentials.toml`, decision of 5.11). The idea: graft each existing
-  child of such a width that is safe on its own (`~/.cargo/registry`,
-  `~/.config/git`, ...), and keep the width itself and its unsafe
-  children with FUSE, so a new file directly in the width still asks and
-  the files of pent stay hidden.
+- [x] **5.13 Graft the children.** FUSE alone (about 5 to 7 times native
+  for many opens, step 5.12) stayed where a width cannot be one graft: a
+  file of pent inside it (`~/.config`, `~/.local/share`, `~/.local/state`,
+  the home directory), or a sensitive file that is missing directly in it
+  (`~/.cargo` and `credentials.toml`, decision of 5.11). Now each existing
+  child directory of such a width that is safe alone becomes a graft
+  (`~/.cargo/registry`, `~/.config/git`, ...), and the width itself and
+  its unsafe children stay with FUSE.
   - Facts: passthrough needs `CAP_SYS_ADMIN` in the initial user
     namespace, also for a process that is root in its own user namespace
     (probe of 2026-11-26), and it would not remove `OPEN`; a privileged
@@ -510,6 +508,22 @@ section 14 of the design has their results.
   - Done: a read below a safe child of such a width makes no FUSE request;
     a new file directly in the width still asks; the files of pent stay
     hidden.
+  - Files: `graft_plans` and `MAX_CHILD_GRAFTS` in
+    `pent-sandbox/src/linux_graft.rs` (used by `start_grafts` and
+    `Tree::graft_answer`); GS-9 and GS-10 in `docs/security/fuse.md`.
+  - Decisions (2026-11-27):
+    - First a test for the grafts of today: when the host moves or
+      replaces a grafted directory, the graft goes away (GS-9). It passed
+      with no change of the code.
+    - Directories only: a host often replaces a file, and a graft of a
+      file would show the old content.
+    - At most 64 child grafts for each width; FUSE serves the rest.
+    - One level only: a child that is not safe stays with FUSE as a whole
+      (for the home directory, `~/.config` stays with FUSE).
+    - The plan of a graft of an answer runs in the graft thread, because
+      it can list the width. So a width gets one plan for each run: a
+      width with no graft at its first answer stays with FUSE (a matter of
+      speed only).
 
 ## Phase 6: agents
 

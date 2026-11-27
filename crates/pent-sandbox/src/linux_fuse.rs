@@ -1119,9 +1119,12 @@ impl Tree {
     }
 
     /// Graft the width of an answer in a new thread, when the decider lets
-    /// a graft give it. This access goes through FUSE; the later ones go to
-    /// the graft. A graft must not wait in the thread of a request: the
-    /// kernel can hold the lock of a directory that the graft must look up.
+    /// a graft give it, or else its safe children
+    /// ([`crate::linux_graft::graft_plans`]). This access goes through FUSE;
+    /// the later ones go to the graft. A graft must not wait in the thread
+    /// of a request: the kernel can hold the lock of a directory that the
+    /// graft must look up. The plan runs in the new thread too, because it
+    /// can list the width.
     fn graft_answer(&self, policy: &AreaPolicy, target: &pent_profile::Target) {
         let pent_profile::Target::File {
             kind,
@@ -1134,16 +1137,10 @@ impl Tree {
             return;
         };
         let base = base.as_path();
-        let Ok(rel) = base.strip_prefix(&policy.area) else {
+        if !base.starts_with(&policy.area) {
             return;
-        };
-        let plan = policy
-            .shared
-            .decider
-            .as_ref()
-            .and_then(|d| d.graft_plan(target))
-            .and_then(|holes| crate::linux_graft::relative_holes(base, &holes));
-        let Some(holes) = plan else {
+        }
+        let Some(decider) = policy.shared.decider.clone() else {
             return;
         };
         if !std::fs::symlink_metadata(base).is_ok_and(|m| m.is_dir()) {
@@ -1159,12 +1156,17 @@ impl Tree {
             return;
         };
         let grafter = Arc::clone(&policy.shared.grafter);
-        let (area, rel) = (policy.area.clone(), rel.to_path_buf());
+        let (area, base, kind) = (policy.area.clone(), base.to_path_buf(), *kind);
         let spawned = std::thread::Builder::new()
             .name("pent-fuse-graft".to_string())
             .spawn(move || {
-                if let Err(e) = grafter.graft(root.as_fd(), &area, &rel, &holes, access) {
-                    tracing::debug!("no graft of {}: {e}", area.join(&rel).display());
+                for (dir, holes) in crate::linux_graft::graft_plans(decider.as_ref(), kind, &base) {
+                    let Ok(rel) = dir.strip_prefix(&area) else {
+                        continue;
+                    };
+                    if let Err(e) = grafter.graft(root.as_fd(), &area, rel, &holes, access) {
+                        tracing::debug!("no graft of {}: {e}", dir.display());
+                    }
                 }
             });
         // Without the thread FUSE serves the width; that is still correct.

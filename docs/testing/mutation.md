@@ -236,6 +236,11 @@ makes one mutation by hand. The test must fail on the mutant. No
 | 5.12 | A watched entry gets the short validity time. | `linux_fuse::tests::a_watched_entry_lives_long_and_drops_at_a_change` |
 | 5.12 | A change of the mode drops no attributes. | `linux_fuse::tests::a_watched_entry_lives_long_and_drops_at_a_change` |
 | 5.13 | A move or a new name in a watched directory drops no entry. | `linux_graft::tests::a_graft_goes_away_when_the_host_moves_or_replaces_its_directory` |
+| 5.13 | A width that cannot be one graft lists no children. | `linux_graft::tests::a_width_that_cannot_be_one_graft_grafts_its_safe_children`, `linux_graft::tests::the_child_plans_skip_links_and_stop_at_the_limit` |
+| 5.13 | The grafts at the start keep only the whole width. | `linux_graft::tests::a_width_that_cannot_be_one_graft_grafts_its_safe_children` |
+| 5.13 | The grafts of an answer keep only the whole width. | `linux_graft::tests::a_width_that_cannot_be_one_graft_grafts_its_safe_children` |
+| 5.13 | The child grafts have no limit. | `linux_graft::tests::the_child_plans_skip_links_and_stop_at_the_limit` |
+| 5.13 | A link or a file becomes a child graft. | `linux_graft::tests::the_child_plans_skip_links_and_stop_at_the_limit` |
 | 5.4 | A traversal rule above an area gives a listing in it. | `linux_graft::tests::each_kind_asks_and_the_files_of_pent_are_hidden` |
 | 5.4 | The decision sends no event. | `linux_graft::tests::each_kind_asks_and_the_files_of_pent_are_hidden` |
 
